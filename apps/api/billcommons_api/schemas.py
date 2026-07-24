@@ -1,0 +1,197 @@
+"""Pydantic response models for the public API. Read-only projections of the
+SQLAlchemy models in billcommons_schema; field sets follow SPEC.md's
+"Bill data" capture list. Missing upstream data is null, never fabricated.
+"""
+from __future__ import annotations
+
+import uuid
+from datetime import date as date_
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict
+
+
+class OrmModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+
+class Jurisdiction(OrmModel):
+    id: uuid.UUID
+    name: str
+    abbreviation: str
+    classification: str
+    openstates_id: str | None = None
+
+
+class LegislativeBody(OrmModel):
+    id: uuid.UUID
+    jurisdiction_id: uuid.UUID
+    name: str
+    classification: str
+
+
+class Session(OrmModel):
+    id: uuid.UUID
+    jurisdiction_id: uuid.UUID
+    identifier: str
+    name: str | None = None
+    classification: str | None = None
+    start_date: date_ | None = None
+    end_date: date_ | None = None
+    active: bool
+
+
+class BillSummary(OrmModel):
+    """Row shape used in list/search results (lighter than the detail view)."""
+
+    id: uuid.UUID
+    jurisdiction_id: uuid.UUID
+    session_id: uuid.UUID
+    chamber: str | None = None
+    identifier: str
+    identifier_norm: str
+    title: str
+    short_title: str | None = None
+    bill_type: str | None = None
+    status: str | None = None
+    status_date: date_ | None = None
+    introduced_date: date_ | None = None
+    latest_action_text: str | None = None
+    latest_action_date: date_ | None = None
+    source_url: str | None = None
+
+
+class BillDetail(BillSummary):
+    description: str | None = None
+    source_name: str | None = None
+    retrieved_at: datetime | None = None
+    upstream_updated_at: datetime | None = None
+
+
+class BillIdentifierOut(OrmModel):
+    id: uuid.UUID
+    identifier: str
+    identifier_norm: str
+    scheme: str | None = None
+
+
+class BillVersionOut(OrmModel):
+    id: uuid.UUID
+    bill_id: uuid.UUID
+    note: str | None = None
+    date: date_ | None = None
+
+
+class BillDocumentOut(OrmModel):
+    id: uuid.UUID
+    bill_version_id: uuid.UUID
+    media_type: str | None = None
+    url: str | None = None
+    has_extracted_text: bool = False
+
+
+class BillActionOut(OrmModel):
+    id: uuid.UUID
+    bill_id: uuid.UUID
+    description: str
+    action_date: date_ | None = None
+    classification: str | None = None
+    order: int | None = None
+
+
+class SponsorshipOut(OrmModel):
+    id: uuid.UUID
+    bill_id: uuid.UUID
+    person_id: uuid.UUID | None = None
+    name: str | None = None
+    classification: str | None = None
+    primary: bool
+
+
+class VoteRecordOut(OrmModel):
+    id: uuid.UUID
+    person_id: uuid.UUID | None = None
+    voter_name: str | None = None
+    option: str
+
+
+class VoteEventOut(OrmModel):
+    id: uuid.UUID
+    bill_id: uuid.UUID | None = None
+    motion_text: str | None = None
+    motion_classification: str | None = None
+    start_date: date_ | None = None
+    result: str | None = None
+    yes_count: int | None = None
+    no_count: int | None = None
+    other_count: int | None = None
+    votes: list[VoteRecordOut] = []
+
+
+class PersonSummary(OrmModel):
+    id: uuid.UUID
+    name: str
+    party: str | None = None
+    jurisdiction_id: uuid.UUID | None = None
+
+
+class PersonDetail(PersonSummary):
+    openstates_id: str | None = None
+
+
+class CommitteeOut(OrmModel):
+    id: uuid.UUID
+    organization_id: uuid.UUID
+    name: str
+    classification: str | None = None
+
+
+class LegislativeEventOut(OrmModel):
+    id: uuid.UUID
+    jurisdiction_id: uuid.UUID | None = None
+    bill_id: uuid.UUID | None = None
+    committee_id: uuid.UUID | None = None
+    name: str
+    description: str | None = None
+    start_date: datetime | None = None
+    location: str | None = None
+
+
+class SourceRecordOut(OrmModel):
+    id: uuid.UUID
+    entity_type: str
+    entity_id: uuid.UUID
+    source_name: str
+    source_url: str | None = None
+    upstream_id: str | None = None
+    retrieved_at: datetime | None = None
+
+
+class CoverageOut(OrmModel):
+    id: uuid.UUID
+    jurisdiction_id: uuid.UUID
+    session_id: uuid.UUID | None = None
+    status: str
+    bill_count: int
+    full_text_count: int
+    last_attempt_at: datetime | None = None
+    last_success_at: datetime | None = None
+    validation_pass_rate: float | None = None
+    known_gaps: str | None = None
+    notes: str | None = None
+
+
+class SearchResult(BillSummary):
+    rank: float | None = None
+    highlight: str | None = None
+    match_type: str
+
+
+class HealthOut(BaseModel):
+    status: str
+    database: str
+
+
+class ReadyOut(BaseModel):
+    ready: bool
+    database: str

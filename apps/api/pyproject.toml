@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "billcommons-api"
+version = "0.1.0"
+description = "Bill Commons public REST API (FastAPI, /api/v1)"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pydantic-settings",
+    "sqlalchemy>=2.0",
+    "slowapi",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["billcommons_api"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
