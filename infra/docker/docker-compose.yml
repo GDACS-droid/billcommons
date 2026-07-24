@@ -1,0 +1,77 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: billcommons
+      POSTGRES_PASSWORD: billcommons
+      POSTGRES_DB: billcommons
+    ports:
+      - "5432:5432"
+    volumes:
+      - billcommons_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U billcommons"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://billcommons:billcommons@postgres:5432/billcommons
+    ports:
+      - "8000:8000"
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://billcommons:billcommons@postgres:5432/billcommons
+      RAWSTORE_ROOT: /data/rawstore
+    volumes:
+      - billcommons_rawstore:/data/rawstore
+
+  mcp:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.mcp
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://billcommons:billcommons@postgres:5432/billcommons
+    ports:
+      - "8001:8001"
+
+  # Placeholder: the Next.js web app is normally run separately via
+  # `npm run dev` during local development. This service definition is a
+  # starting point for containerized local stacks / CI, not yet wired to a
+  # real Dockerfile.web (apps/web has no build output until the Next.js app
+  # is scaffolded).
+  web:
+    image: node:20-slim
+    working_dir: /app
+    volumes:
+      - ../../apps/web:/app
+    command: ["sh", "-c", "echo 'apps/web not yet scaffolded — placeholder service' && sleep infinity"]
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  billcommons_pgdata:
+  billcommons_rawstore:
