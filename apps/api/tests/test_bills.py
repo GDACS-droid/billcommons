@@ -32,4 +32,7 @@ def test_subresource_routes_404_when_parent_bill_missing(client):
 def test_list_bills_envelope_and_filters(client):
     resp = client.get("/api/v1/bills", params={"jurisdiction": "NC", "chamber": "lower"})
     assert resp.status_code == 200
-    assert resp.json()["data"] == []
+    # data-tolerant: the live DB may hold real NC bills; the contract is that
+    # every returned row honors the chamber filter, not that the list is empty
+    for row in resp.json()["data"]:
+        assert row["chamber"] == "lower"

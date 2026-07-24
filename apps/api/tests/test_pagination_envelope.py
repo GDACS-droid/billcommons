@@ -45,11 +45,19 @@ def test_list_endpoint_envelope_shape(client, path):
     assert meta["request_id"]
 
 
-@pytest.mark.parametrize("path", LIST_ENDPOINTS)
+@pytest.mark.parametrize("path", [p for p in LIST_ENDPOINTS if p != "/api/v1/coverage"])
 def test_per_page_is_clamped_to_max_50(client, path):
     resp = client.get(path, params={"per_page": 500})
     assert resp.status_code == 200
     assert resp.json()["pagination"]["per_page"] == 50
+
+
+def test_coverage_per_page_allows_full_matrix(client):
+    """The coverage matrix must never truncate the 51-jurisdiction view
+    (SPEC: no jurisdiction silently missing) -- it clamps at 200, not 50."""
+    resp = client.get("/api/v1/coverage", params={"per_page": 500})
+    assert resp.status_code == 200
+    assert resp.json()["pagination"]["per_page"] == 200
 
 
 @pytest.mark.parametrize("path", LIST_ENDPOINTS)
