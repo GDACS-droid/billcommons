@@ -53,6 +53,7 @@ export default async function CoveragePage() {
                 <th className="py-2 pr-3">Session</th>
                 <th className="py-2 pr-3">Bills</th>
                 <th className="py-2 pr-3">Full text</th>
+                <th className="py-2 pr-3">Of obtainable</th>
                 <th className="py-2 pr-3">Last update</th>
                 <th className="py-2 pr-3">Source</th>
                 <th className="py-2 pr-3">Validation</th>
@@ -89,6 +90,17 @@ export default async function CoveragePage() {
                       {row.full_text_pct != null
                         ? `${row.full_text_pct}%`
                         : "—"}
+                    </td>
+                    <td className="py-2 pr-3 text-slate-600">
+                      {row.full_text_of_available_pct != null ? (
+                        `${row.full_text_of_available_pct}%`
+                      ) : row.full_text_available_count === 0 ? (
+                        <span title="No full text is obtainable from this source; bills remain metadata-searchable.">
+                          none published
+                        </span>
+                      ) : (
+                        "—"
+                      )}
                     </td>
                     <td className="py-2 pr-3 text-slate-600">
                       {row.last_update ?? "—"}

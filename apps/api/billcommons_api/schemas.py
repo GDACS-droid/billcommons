@@ -181,7 +181,14 @@ class CoverageRowOut(BaseModel):
     session_status: str | None = None  # active | adjourned | special
     bill_count: int
     full_text_count: int
+    # Share of ALL bills we hold text for. Reads low for a jurisdiction whose
+    # source simply publishes few documents, so it is not the GREEN criterion.
     full_text_pct: float | None = None
+    # Bills whose text is obtainable at all (excludes bills with no published
+    # document, and documents that are robots-disallowed or have no text
+    # layer). This is the denominator SPEC GREEN criterion #5 is judged on.
+    full_text_available_count: int | None = None
+    full_text_of_available_pct: float | None = None
     last_update: str | None = None
     source_name: str | None = None
     validation_sample: int | None = None

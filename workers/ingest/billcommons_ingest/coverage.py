@@ -26,9 +26,10 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_ as sa_or, select
 from sqlalchemy.orm import Session as OrmSession
 
+from billcommons_ingest.fulltext import TERMINAL_STATUSES
 from billcommons_schema.models import (
     Bill,
     BillDocument,
@@ -37,6 +38,11 @@ from billcommons_schema.models import (
     JurisdictionCoverage,
     Session as SessionModel,
 )
+
+# fulltext.py stamps a document's terminal outcome into license_note as
+# `fulltext_status=<status>`; these are the ones that mean "text will never
+# be obtainable from this URL", as opposed to ok/never-attempted.
+_TERMINAL_LICENSE_NOTES = tuple(f"fulltext_status={status}" for status in sorted(TERMINAL_STATUSES))
 
 _ADVANCEMENT_ORDER = [
     "NOT_STARTED",
@@ -82,14 +88,39 @@ def recompute_coverage_row(db: OrmSession, coverage: JurisdictionCoverage) -> Ju
             .join(BillDocument, BillDocument.bill_version_id == BillVersion.id)
             .where(Bill.session_id == coverage.session_id, BillDocument.extracted_text.is_not(None))
         ).scalar_one()
+        # SPEC GREEN #5's denominator: bills we could still legitimately get
+        # text for. A document already extracted counts (we got it); one that
+        # terminally failed does not (robots-disallowed, no text layer, ...);
+        # one never attempted (NULL license_note) does. A bill whose every
+        # document is terminally unfetchable therefore drops out entirely,
+        # which is what makes an all-robots-blocked jurisdiction a documented
+        # limitation rather than a permanent sub-100% score.
+        full_text_available_count = db.execute(
+            select(func.count(func.distinct(Bill.id)))
+            .select_from(Bill)
+            .join(BillVersion, BillVersion.bill_id == Bill.id)
+            .join(BillDocument, BillDocument.bill_version_id == BillVersion.id)
+            .where(
+                Bill.session_id == coverage.session_id,
+                BillDocument.url.is_not(None),
+                BillDocument.url != "",
+                sa_or(
+                    BillDocument.extracted_text.is_not(None),
+                    BillDocument.license_note.is_(None),
+                    BillDocument.license_note.notin_(_TERMINAL_LICENSE_NOTES),
+                ),
+            )
+        ).scalar_one()
     else:
         bill_count = db.execute(
             select(func.count(Bill.id)).where(Bill.jurisdiction_id == coverage.jurisdiction_id)
         ).scalar_one()
         full_text_count = 0
+        full_text_available_count = 0
 
     coverage.bill_count = bill_count
     coverage.full_text_count = full_text_count
+    coverage.full_text_available_count = full_text_available_count
     coverage.status = _next_status_for_counts(coverage.status, bill_count, full_text_count)
     coverage.last_attempt_at = datetime.now(timezone.utc)
     if bill_count > 0:
@@ -130,6 +161,16 @@ def build_coverage_report(db: OrmSession) -> dict:
                 if coverage.bill_count
                 else 0.0
             )
+            # The GREEN-relevant number: share of the text that is actually
+            # obtainable which we hold. `full_text_pct` (over ALL bills) reads
+            # far worse for a jurisdiction whose source simply publishes few
+            # documents, so both are published rather than either alone.
+            # available == 0 means nothing is obtainable -- reported as null,
+            # not 100%, so it can't be mistaken for full coverage.
+            available = coverage.full_text_available_count
+            full_text_of_available_pct = (
+                round(100.0 * coverage.full_text_count / available, 1) if available else None
+            )
             report_rows.append(
                 {
                     "jurisdiction": jurisdiction.abbreviation,
@@ -139,6 +180,8 @@ def build_coverage_report(db: OrmSession) -> dict:
                     "bill_count": coverage.bill_count,
                     "full_text_count": coverage.full_text_count,
                     "full_text_pct": full_text_pct,
+                    "full_text_available_count": available,
+                    "full_text_of_available_pct": full_text_of_available_pct,
                     "status": coverage.status,
                     "validation_pass_rate": float(coverage.validation_pass_rate)
                     if coverage.validation_pass_rate is not None

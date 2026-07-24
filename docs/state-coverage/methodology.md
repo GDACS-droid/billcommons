@@ -72,34 +72,61 @@ ceiling depends on full-text coverage:
 
 ## GREEN's honest ceiling
 
-**GREEN requires `full_text_count > 0` for that jurisdiction/session, in
-addition to a passing validation sample.** A jurisdiction can have a
-perfectly clean validation run (100% pass rate on every checkable leg) and
-still be capped at `VALIDATING` — never `GREEN` — if full-text extraction
-hasn't happened yet for it. This is `validation.apply_validation_result`'s
-explicit, documented deferral:
+**GREEN requires full text for at least
+`GREEN_FULLTEXT_COVERAGE_THRESHOLD = 0.80` of the bills whose text is
+actually obtainable, in addition to a passing validation sample.** A
+jurisdiction can have a perfectly clean validation run (100% pass rate on
+every checkable leg) and still be capped at `VALIDATING` — never `GREEN` —
+while its full-text crawl is still filling in.
+
+The denominator is `full_text_available_count`, **not** `bill_count`. It
+counts bills with at least one document whose text we could still
+legitimately obtain, so two categories never count against a jurisdiction:
+
+* bills whose source publishes no document at all, and
+* documents that are terminally unfetchable — `robots_disallowed`,
+  `scanned_pdf_no_text`, and the other `fulltext.TERMINAL_STATUSES`.
 
 ```python
-if coverage.full_text_count > 0:
+available = coverage.full_text_available_count
+if available is None:                 # never recomputed -> unknown, don't promote
+    ...
+elif available == 0:                   # nothing obtainable -> criterion #5 vacuous
     coverage.status = "GREEN"
-else:
-    if coverage.status in ("BOOTSTRAPPED", "METADATA_SEARCHABLE", "SOURCE_IDENTIFIED"):
-        coverage.status = "VALIDATING"
-    coverage.known_gaps = (
-        "full-text coverage is 0; GREEN deferred until the fulltext "
-        "pipeline (billcommons_ingest.fulltext) has run for this jurisdiction"
-    )
+    coverage.known_gaps = "no full text obtainable from source ..."
+elif coverage.full_text_count >= GREEN_FULLTEXT_COVERAGE_THRESHOLD * available:
+    coverage.status = "GREEN"
+else:                                  # crawl in progress -- NOT a fault
+    coverage.status = "VALIDATING"
 ```
 
-This matches SPEC's GREEN criterion #5 ("full text searchable wherever
-technically available from source") literally — a jurisdiction is not
-"covered" by this platform's own bar if you can't search inside the actual
-bill text, no matter how clean its metadata is. As of this writing, every
-production jurisdiction in `/api/v1/coverage` is at `full_text_count: 0`
-(the full-text pipeline is bulk-CSV-metadata-first; `enqueue-fulltext` +
-worker `fetch_text` processing populates it separately, and hasn't been run
-at volume in production yet) — so no jurisdiction is currently `GREEN` for
-this reason, which is the honest, expected state, not a bug.
+### Why a ratio, and not `full_text_count > 0`
+
+The rule was previously `full_text_count > 0`. That satisfied the literal
+words of SPEC criterion #5 while letting a jurisdiction holding text for
+1–2% of its obtainable bills wear a GREEN badge — on 2026-07-24, 19
+jurisdictions were GREEN at a median of **2%** full-text coverage (e.g. PA
+at 37/4,876 bills). Criterion #5 says "**wherever** technically available",
+which is a ratio, not an existence check. The threshold is what makes the
+badge mean what the SPEC says.
+
+Three deliberate consequences:
+
+1. **An existing GREEN is demoted** when measured below the threshold.
+   Otherwise the pre-existing badges would outlive the facts behind them.
+2. **Falling short reads as `VALIDATING`, not `DEGRADED`.** A crawl still in
+   progress is not a fault, and `known_gaps` states the actual ratio
+   (`"full text for 37/4876 obtainable bills (0.8%) ..."`).
+3. **`full_text_available_count` is NULLable**, and NULL blocks promotion.
+   NULL means "not yet measured"; 0 means "nothing obtainable". Backfilling
+   0 in migration `0003` would have read as the vacuous-criterion case and
+   handed every un-recomputed row a free GREEN.
+
+A jurisdiction whose sources are entirely robots-blocked (the DC/TN shape)
+lands at `available == 0`, where criterion #5 is vacuously satisfied. It may
+be GREEN, but `known_gaps` must say the text isn't obtainable and the bills
+are metadata-searchable only — GREEN must never imply full-text search a
+user will not actually get.
 
 ## What "not provided by source" means
 

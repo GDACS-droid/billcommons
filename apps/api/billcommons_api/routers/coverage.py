@@ -26,6 +26,16 @@ def _to_coverage_row(coverage: JurisdictionCoverage, jurisdiction: Jurisdiction,
         if coverage.bill_count > 0
         else None
     )
+    # The ratio the GREEN badge is actually decided on: text we hold over text
+    # that is obtainable at all. Published alongside full_text_pct so a reader
+    # can tell "this source publishes few documents" apart from "we haven't
+    # crawled it yet" -- full_text_pct alone conflates them. None when the
+    # denominator is unknown (never recomputed) or zero (nothing obtainable);
+    # in both cases a percentage would invent precision we don't have.
+    available = coverage.full_text_available_count
+    full_text_of_available_pct = (
+        round(100 * coverage.full_text_count / available, 1) if available else None
+    )
     known_gaps = (
         [line.strip() for line in coverage.known_gaps.splitlines() if line.strip()]
         if coverage.known_gaps
@@ -41,6 +51,8 @@ def _to_coverage_row(coverage: JurisdictionCoverage, jurisdiction: Jurisdiction,
         bill_count=coverage.bill_count,
         full_text_count=coverage.full_text_count,
         full_text_pct=full_text_pct,
+        full_text_available_count=coverage.full_text_available_count,
+        full_text_of_available_pct=full_text_of_available_pct,
         last_update=coverage.last_success_at.isoformat() if coverage.last_success_at else None,
         source_name=DEFAULT_SOURCE_NAME,
         validation_sample=None,

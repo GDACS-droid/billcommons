@@ -97,7 +97,11 @@ States: NOT_STARTED → SOURCE_IDENTIFIED → BOOTSTRAPPED → METADATA_SEARCHAB
 GREEN requires ALL: (1) session identified from authoritative source;
 (2) all discoverable bills imported; (3) number+title searchable;
 (4) description/subjects/sponsors/actions searchable where supplied;
-(5) full text searchable wherever technically available from source;
+(5) full text searchable wherever technically available from source —
+measured as ≥80% of the bills whose text is obtainable at all, excluding
+bills with no published document and documents that are robots-disallowed
+or have no extractable text (a jurisdiction with nothing obtainable
+satisfies this vacuously, and must say so in known_gaps);
 (6) official URLs retained; (7) incremental refresh succeeds; (8) validation
 samples pass; (9) search-index count == DB count; (10) no unexplained zero
 counts. No-2026-session states: GREEN only after current-cycle +

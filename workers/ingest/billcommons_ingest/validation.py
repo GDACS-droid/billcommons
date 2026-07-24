@@ -122,6 +122,17 @@ _NON_CHECKABLE = {UNVERIFIABLE, SKIPPED_ROBOTS, ADVISORY_PASS, ADVISORY_FAIL, UN
 # stage (fulltext.py) has actually run.
 GREEN_PASS_RATE_THRESHOLD = 0.80
 
+# SPEC GREEN criterion #5 is "full text searchable WHEREVER technically
+# available" -- not "somewhere". `full_text_count > 0` satisfied the literal
+# words while letting a jurisdiction holding text for 1% of its obtainable
+# bills wear a GREEN badge, which is what this threshold exists to stop.
+# Measured against full_text_available_count (see coverage.py), so bills whose
+# source publishes nothing, and documents that are terminally unfetchable,
+# never count against a jurisdiction. available == 0 means nothing is
+# obtainable at all: criterion #5 is then vacuous and GREEN is allowed, with
+# the limitation recorded in known_gaps.
+GREEN_FULLTEXT_COVERAGE_THRESHOLD = 0.80
+
 
 @dataclass
 class LegResult:
@@ -947,15 +958,22 @@ def apply_validation_result(
     machine per SPEC's GREEN criteria.
 
     Honest ceiling: GREEN requires (per SPEC #5, #8) both a passing
-    validation sample AND full-text coverage actually existing
-    (`full_text_count > 0`) -- this harness alone can promote a
-    jurisdiction only as far as VALIDATING (clean sample, no full text yet)
-    or GREEN (clean sample AND full text present). A jurisdiction with
-    bill_count == 0 is left alone (nothing to validate). Never regresses a
-    row already at GREEN/DEGRADED/BLOCKED past what a human/operator set,
-    except a hard validation FAILURE (pass_rate below threshold) explicitly
-    demotes toward DEGRADED so a real problem isn't hidden behind a stale
-    green status.
+    validation sample AND full text for at least
+    GREEN_FULLTEXT_COVERAGE_THRESHOLD of the bills whose text is actually
+    obtainable (`full_text_available_count`) -- this harness alone can
+    promote a jurisdiction only as far as VALIDATING (clean sample, crawl
+    still filling in) or GREEN (clean sample AND the text substantially
+    landed). A jurisdiction with nothing obtainable at all (available == 0)
+    satisfies #5 vacuously and may be GREEN with the limitation spelled out
+    in known_gaps. A jurisdiction with bill_count == 0 is left alone
+    (nothing to validate).
+
+    Two things regress an existing GREEN, so a stale badge can't outlive the
+    facts behind it: a hard validation FAILURE (pass_rate below threshold)
+    demotes toward DEGRADED, and full-text coverage below the threshold
+    demotes to VALIDATING (a crawl in progress, deliberately NOT DEGRADED --
+    it isn't a fault). Otherwise a row already at GREEN/DEGRADED/BLOCKED is
+    left where a human/operator set it.
     """
     coverage_rows = db.execute(
         select(JurisdictionCoverage).where(JurisdictionCoverage.jurisdiction_id == jurisdiction.id)
@@ -986,7 +1004,32 @@ def apply_validation_result(
             continue
 
         # Pass rate is healthy. Ceiling depends on full-text coverage.
-        if coverage.full_text_count > 0:
+        available = coverage.full_text_available_count
+        if available is None:
+            # Never recomputed, so how much text is obtainable is unknown.
+            # Refuse to promote on an unmeasured denominator rather than
+            # guess; the next coverage recompute pass resolves this.
+            if coverage.status in ("BOOTSTRAPPED", "METADATA_SEARCHABLE", "SOURCE_IDENTIFIED"):
+                coverage.status = "VALIDATING"
+            coverage.known_gaps = (
+                "obtainable full-text count not yet computed; GREEN deferred "
+                "until the next coverage recompute pass"
+            )
+            continue
+
+        if available == 0:
+            # Nothing is obtainable (no documents published, or every one is
+            # robots-disallowed / has no text layer). Criterion #5 is vacuous
+            # here, so a clean sample earns GREEN -- but the limitation is
+            # stated rather than papered over, because "GREEN" must not imply
+            # full-text search a user won't actually get.
+            coverage.status = "GREEN"
+            coverage.known_gaps = (
+                "no full text obtainable from source (no documents published, "
+                "or all are robots-disallowed / have no extractable text); "
+                "bills remain metadata-searchable"
+            )
+        elif coverage.full_text_count >= GREEN_FULLTEXT_COVERAGE_THRESHOLD * available:
             coverage.status = "GREEN"
             # Clear any stale gap message left by a prior DEGRADED/VALIDATING
             # pass -- a GREEN row that still says "full-text coverage is 0" is
@@ -996,12 +1039,21 @@ def apply_validation_result(
             # SPEC GREEN criterion #5 ("full text searchable wherever
             # technically available") is not yet satisfied by this pass --
             # cap at METADATA_SEARCHABLE/VALIDATING rather than fabricate a
-            # GREEN this harness can't actually back up.
-            if coverage.status in ("BOOTSTRAPPED", "METADATA_SEARCHABLE", "SOURCE_IDENTIFIED"):
+            # GREEN this harness can't actually back up. This is a crawl still
+            # in progress, not a fault, so it must not read as DEGRADED.
+            if coverage.status in (
+                "BOOTSTRAPPED",
+                "METADATA_SEARCHABLE",
+                "SOURCE_IDENTIFIED",
+                "FULL_TEXT_SEARCHABLE",
+                "GREEN",
+            ):
                 coverage.status = "VALIDATING"
+            pct = 100.0 * coverage.full_text_count / available
             coverage.known_gaps = (
-                "full-text coverage is 0; GREEN deferred until the fulltext "
-                "pipeline (billcommons_ingest.fulltext) has run for this jurisdiction"
+                f"full text for {coverage.full_text_count}/{available} obtainable "
+                f"bills ({pct:.1f}%); GREEN requires "
+                f"{GREEN_FULLTEXT_COVERAGE_THRESHOLD:.0%} -- full-text crawl in progress"
             )
 
     db.flush()

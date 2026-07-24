@@ -822,7 +822,12 @@ def test_clean_validation_with_no_fulltext_caps_at_validating_not_green(db_sessi
     """The core GREEN-honesty requirement from the task brief: a perfect
     pass rate must NOT promote a jurisdiction to GREEN while
     full_text_count is still 0 -- GREEN criterion #5 (full text searchable
-    wherever available) is a separate, unmet condition."""
+    wherever available) is a separate, unmet condition.
+
+    `full_text_available_count=1` is what makes this the "text exists but we
+    don't have it" case; leaving it 0 would mean nothing is obtainable, which
+    is the vacuous-criterion case covered separately below.
+    """
     jurisdiction, session_row, bills = _make_jurisdiction_with_bills(db_session, n=1)
     coverage = JurisdictionCoverage(
         jurisdiction_id=jurisdiction.id,
@@ -830,6 +835,7 @@ def test_clean_validation_with_no_fulltext_caps_at_validating_not_green(db_sessi
         status="METADATA_SEARCHABLE",
         bill_count=1,
         full_text_count=0,
+        full_text_available_count=1,
     )
     db_session.add(coverage)
     db_session.flush()
@@ -856,6 +862,7 @@ def test_clean_validation_with_fulltext_present_promotes_to_green(db_session):
         status="METADATA_SEARCHABLE",
         bill_count=1,
         full_text_count=1,
+        full_text_available_count=1,
     )
     db_session.add(coverage)
     db_session.flush()
@@ -872,6 +879,122 @@ def test_clean_validation_with_fulltext_present_promotes_to_green(db_session):
     assert coverage.status == "GREEN"
 
 
+def _clean_summary(jurisdiction, session_row, bills):
+    summary = ValidationSummary(
+        jurisdiction_abbr=jurisdiction.abbreviation, session_id=str(session_row.id)
+    )
+    bill_result = BillValidationResult(bill_id=str(bills[0].id), identifier=bills[0].identifier)
+    bill_result.legs = [LegResult("structural", PASS, "ok"), LegResult("search_retrieval", PASS, "ok")]
+    summary.bills.append(bill_result)
+    return summary
+
+
+def test_partial_fulltext_coverage_is_not_green(db_session):
+    """A clean sample plus SOME text must not earn GREEN.
+
+    Business intent: this is the bug that let 19 jurisdictions wear GREEN
+    while holding text for 1-2% of their obtainable bills. SPEC criterion #5
+    is "full text searchable WHEREVER technically available", so the bar is a
+    ratio, not `full_text_count > 0`. Revert the gate to a >0 check and this
+    fails.
+    """
+    jurisdiction, session_row, bills = _make_jurisdiction_with_bills(db_session, n=1)
+    coverage = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        status="FULL_TEXT_SEARCHABLE",
+        bill_count=100,
+        full_text_count=37,  # 37% of what's obtainable -- the real PA shape
+        full_text_available_count=100,
+    )
+    db_session.add(coverage)
+    db_session.flush()
+
+    apply_validation_result(db_session, jurisdiction, _clean_summary(jurisdiction, session_row, bills))
+    db_session.flush()
+    db_session.refresh(coverage)
+
+    assert coverage.status == "VALIDATING"
+    # A crawl still in progress is not a fault -- it must not read as DEGRADED.
+    assert coverage.status != "DEGRADED"
+    assert "37/100" in (coverage.known_gaps or "")
+
+
+def test_stale_green_is_demoted_when_coverage_is_below_threshold(db_session):
+    """An already-GREEN row must lose the badge once measured honestly --
+    otherwise the 19 pre-existing GREENs would keep it forever."""
+    jurisdiction, session_row, bills = _make_jurisdiction_with_bills(db_session, n=1)
+    coverage = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        status="GREEN",
+        bill_count=100,
+        full_text_count=2,
+        full_text_available_count=100,
+    )
+    db_session.add(coverage)
+    db_session.flush()
+
+    apply_validation_result(db_session, jurisdiction, _clean_summary(jurisdiction, session_row, bills))
+    db_session.flush()
+    db_session.refresh(coverage)
+
+    assert coverage.status == "VALIDATING"
+
+
+def test_nothing_obtainable_earns_green_but_states_the_limitation(db_session):
+    """The DC/TN case: every source is robots-blocked, so criterion #5 is
+    vacuous and a clean sample earns GREEN -- but known_gaps must say so, or
+    GREEN would imply full-text search users will never get."""
+    jurisdiction, session_row, bills = _make_jurisdiction_with_bills(db_session, n=1)
+    coverage = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        status="METADATA_SEARCHABLE",
+        bill_count=50,
+        full_text_count=0,
+        full_text_available_count=0,
+    )
+    db_session.add(coverage)
+    db_session.flush()
+
+    apply_validation_result(db_session, jurisdiction, _clean_summary(jurisdiction, session_row, bills))
+    db_session.flush()
+    db_session.refresh(coverage)
+
+    assert coverage.status == "GREEN"
+    assert "no full text obtainable" in (coverage.known_gaps or "").lower()
+    assert "metadata-searchable" in (coverage.known_gaps or "").lower()
+
+
+def test_uncomputed_available_count_never_promotes_to_green(db_session):
+    """NULL means "not measured yet", NOT "nothing obtainable".
+
+    Business intent: migration 0003 adds this column NULL rather than 0
+    precisely because 0 reads as the vacuous-criterion case. If NULL were
+    treated as 0, every un-recomputed row on deploy would be handed a free
+    GREEN -- all 51 at once.
+    """
+    jurisdiction, session_row, bills = _make_jurisdiction_with_bills(db_session, n=1)
+    coverage = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        status="METADATA_SEARCHABLE",
+        bill_count=100,
+        full_text_count=100,
+        full_text_available_count=None,
+    )
+    db_session.add(coverage)
+    db_session.flush()
+
+    apply_validation_result(db_session, jurisdiction, _clean_summary(jurisdiction, session_row, bills))
+    db_session.flush()
+    db_session.refresh(coverage)
+
+    assert coverage.status != "GREEN"
+    assert "not yet computed" in (coverage.known_gaps or "").lower()
+
+
 def test_failing_validation_demotes_to_degraded(db_session):
     jurisdiction, session_row, bills = _make_jurisdiction_with_bills(db_session, n=1)
     coverage = JurisdictionCoverage(
@@ -880,6 +1003,7 @@ def test_failing_validation_demotes_to_degraded(db_session):
         status="VALIDATING",
         bill_count=1,
         full_text_count=1,
+        full_text_available_count=1,
     )
     db_session.add(coverage)
     db_session.flush()
@@ -932,6 +1056,9 @@ def test_validate_job_kind_dispatch_updates_jurisdiction_coverage_status(db_sess
         status="FULL_TEXT_SEARCHABLE",
         bill_count=2,
         full_text_count=2,
+        # Text held for everything obtainable -- the state that should reach
+        # GREEN. NULL would mean "denominator not yet measured".
+        full_text_available_count=2,
     )
     db_session.add(coverage)
     db_session.flush()
@@ -1045,6 +1172,11 @@ def _make_committed_jurisdiction_with_bills(n=2):
             status="FULL_TEXT_SEARCHABLE",
             bill_count=n,
             full_text_count=n,
+            # Fully-covered jurisdiction: we hold text for everything that is
+            # obtainable. In production the validate-worker recomputes this
+            # denominator before validating; leaving it NULL here would mean
+            # "not yet measured", which correctly refuses promotion.
+            full_text_available_count=n,
         )
         db.add(coverage)
         db.commit()

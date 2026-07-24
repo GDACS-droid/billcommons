@@ -227,6 +227,11 @@ export interface CoverageRow {
   bill_count?: number;
   full_text_count?: number;
   full_text_pct?: number | null;
+  // Bills whose text is obtainable at all, and our share of it. This is the
+  // ratio the GREEN badge is decided on -- full_text_pct is over ALL bills,
+  // which reads low for a source that simply publishes few documents.
+  full_text_available_count?: number | null;
+  full_text_of_available_pct?: number | null;
   last_update?: string | null;
   source_name?: string | null;
   validation_sample?: number | null;

@@ -485,6 +485,15 @@ class JurisdictionCoverage(UUIDPkMixin, TimestampMixin, Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'NOT_STARTED'"))
     bill_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     full_text_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Bills with >=1 document whose text we could still legitimately obtain --
+    # the honest denominator for SPEC GREEN criterion #5 ("full text
+    # searchable wherever technically available"). Excludes bills with no
+    # document at all and bills whose every document is terminally
+    # unfetchable (robots-disallowed, scanned PDF with no text layer).
+    # NULL means "not yet recomputed", which is NOT the same as 0 ("nothing
+    # obtainable") -- 0 lets a jurisdiction be GREEN on a vacuous criterion
+    # #5, so the unknown case must stay distinguishable and block promotion.
+    full_text_available_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     validation_pass_rate: Mapped[float | None] = mapped_column(Numeric, nullable=True)
