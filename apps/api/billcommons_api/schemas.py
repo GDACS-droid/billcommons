@@ -8,7 +8,7 @@ import uuid
 from datetime import date as date_
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class OrmModel(BaseModel):
@@ -209,7 +209,18 @@ class BillCompareEnvelope(BaseModel):
 
 class SearchResult(BillSummary):
     rank: float | None = None
-    highlight: str | None = None
+    highlight: str | None = Field(
+        default=None,
+        description=(
+            "Plain text (never HTML) with matched fragments wrapped in the "
+            "sentinel tokens '⟦H⟧'...'⟦/H⟧' (see billcommons_api.search "
+            "HIGHLIGHT_START_SENTINEL/HIGHLIGHT_STOP_SENTINEL). Source titles/"
+            "descriptions/document text come from upstream jurisdictions and "
+            "are not sanitized -- clients must split on the sentinels and "
+            "render their own emphasis (e.g. <mark>); never render this "
+            "field with dangerouslySetInnerHTML or any raw-HTML sink."
+        ),
+    )
     match_type: str
 
 

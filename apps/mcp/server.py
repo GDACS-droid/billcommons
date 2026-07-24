@@ -4,6 +4,11 @@ Runs the 10 Bill Commons tools (see docs/SPEC.md "MCP" section) over
 Streamable HTTP, mounted at /mcp, stateless (no session affinity — safe
 behind a load balancer). Listens on env PORT (default 8400).
 
+Security: this server is public and anonymous-callable, so it is fronted by
+an ASGI-level per-IP token-bucket rate limiter (billcommons_mcp.rate_limit;
+env-tunable via MCP_RATE_LIMIT_PER_MINUTE / MCP_RATE_LIMIT_BURST) in addition
+to the per-tool work caps enforced inside billcommons_mcp.tools.
+
 Run directly: .venv/bin/python apps/mcp/server.py
 """
 from __future__ import annotations
@@ -18,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import FastMCP
 
 from billcommons_mcp import tools
+from billcommons_mcp.rate_limit import RateLimitMiddleware
 
 mcp = FastMCP(
     name="billcommons",
@@ -134,5 +140,20 @@ def get_active_sessions(jurisdiction: str | None = None) -> dict:
     return tools.get_active_sessions(jurisdiction)
 
 
+def build_app():
+    """Return the ASGI app: FastMCP's Streamable HTTP Starlette app wrapped
+    in the per-IP rate limiter. Used both by `__main__` (uvicorn.run below)
+    and by tests that want to boot the app in-process."""
+    app = mcp.streamable_http_app()
+    return RateLimitMiddleware(app)
+
+
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    import uvicorn
+
+    uvicorn.run(
+        build_app(),
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=mcp.settings.log_level.lower(),
+    )

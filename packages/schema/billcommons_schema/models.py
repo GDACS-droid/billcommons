@@ -500,6 +500,13 @@ class JurisdictionCoverage(UUIDPkMixin, TimestampMixin, Base):
             "'FULL_TEXT_SEARCHABLE','VALIDATING','GREEN','DEGRADED','BLOCKED')",
             name="ck_jurisdiction_coverage_status",
         ),
+        # Enforces uniqueness for rows with a non-null session_id. Postgres
+        # treats NULL as distinct from itself in a UNIQUE constraint, so this
+        # alone does NOT prevent duplicate (jurisdiction_id, NULL) rows --
+        # migration 0002 adds a partial unique index
+        # (uq_jurisdiction_coverage_jurisdiction_null_session, ON
+        # jurisdiction_coverage(jurisdiction_id) WHERE session_id IS NULL) to
+        # close that gap for the jurisdiction-level (no-session) coverage row.
         UniqueConstraint(
             "jurisdiction_id", "session_id", name="uq_jurisdiction_coverage_jurisdiction_session"
         ),

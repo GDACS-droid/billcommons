@@ -17,6 +17,15 @@ All three branches are combined with the same structural filters
 date range) applied as a WHERE clause on the underlying bills query, and the
 same pagination/sort semantics. Deterministic lexical retrieval only --
 no embeddings in v1.
+
+Security note (highlight field): source titles/descriptions/document text
+come from upstream jurisdictions and are not sanitized HTML -- they must be
+treated as plain text. `highlight` is therefore PLAIN TEXT with a pair of
+non-HTML sentinel tokens (HIGHLIGHT_START_SENTINEL / HIGHLIGHT_STOP_SENTINEL)
+wrapping each matched fragment, produced via ts_headline's StartSel/StopSel
+options. It contains no HTML and must never be rendered with
+dangerouslySetInnerHTML; clients split on the sentinels and render their own
+<mark> (or equivalent) around the wrapped segments.
 """
 from __future__ import annotations
 
@@ -29,6 +38,18 @@ from sqlalchemy.orm import Session
 from billcommons_shared.normalize import normalize_bill_number
 
 VALID_SORTS = {"relevance", "latest_action", "introduced", "jurisdiction"}
+
+# Sentinel tokens used to mark matched fragments inside the plain-text
+# `highlight` field returned by the FTS branch (see module docstring
+# "Security note"). These are unlikely-to-occur plain-text tokens -- never
+# HTML -- so the field can never carry a script/markup payload from
+# externally sourced bill titles/descriptions/document text.
+HIGHLIGHT_START_SENTINEL = "⟦H⟧"  # ⟦H⟧
+HIGHLIGHT_STOP_SENTINEL = "⟦/H⟧"  # ⟦/H⟧
+_TS_HEADLINE_OPTIONS = (
+    "MaxFragments=1, MinWords=5, MaxWords=25, "
+    f"StartSel={HIGHLIGHT_START_SENTINEL}, StopSel={HIGHLIGHT_STOP_SENTINEL}"
+)
 
 
 @dataclass
@@ -152,6 +173,7 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
     where, params = _filter_clause(f)
     where_sql = f" AND {where}" if where else ""
     params["q"] = f.q or ""
+    params["headline_options"] = _TS_HEADLINE_OPTIONS
 
     order = _order_by(f.sort)
 
@@ -161,7 +183,7 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
                    ts_rank(b.search_tsv, websearch_to_tsquery('english', :q)) AS rank,
                    ts_headline('english', coalesce(b.title, '') || ' ' || coalesce(b.description, ''),
                                websearch_to_tsquery('english', :q),
-                               'MaxFragments=1, MinWords=5, MaxWords=25') AS highlight
+                               :headline_options) AS highlight
             FROM bills b
             WHERE b.search_tsv @@ websearch_to_tsquery('english', :q)
             UNION
@@ -169,7 +191,7 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
                    ts_rank(bd.text_tsv, websearch_to_tsquery('english', :q)) AS rank,
                    ts_headline('english', coalesce(bd.extracted_text, ''),
                                websearch_to_tsquery('english', :q),
-                               'MaxFragments=1, MinWords=5, MaxWords=25') AS highlight
+                               :headline_options) AS highlight
             FROM bill_documents bd
             JOIN bill_versions bv ON bv.id = bd.bill_version_id
             WHERE bd.text_tsv @@ websearch_to_tsquery('english', :q)

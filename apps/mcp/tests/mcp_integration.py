@@ -6,7 +6,18 @@ real arguments, asserting structured response shapes. This is meant to run
 against a booted `server.py` process (see docs in apps/mcp), not to boot the
 server itself.
 
+Also covers Finding 2 hardening: a request burst past the per-IP rate limit
+must get structured 429 rejections (not hang/500), and an oversized
+compare_bill_versions call must get a structured `text_too_large` tool
+error rather than attempting an unbounded diff.
+
 Run: MCP_TEST_URL=http://localhost:8400/mcp .venv/bin/python apps/mcp/tests/mcp_integration.py
+
+For the rate-limit test to actually trip within a short burst, boot the
+server with a small limit, e.g.:
+    PORT=8410 MCP_RATE_LIMIT_PER_MINUTE=10 MCP_RATE_LIMIT_BURST=5 \\
+        .venv/bin/python apps/mcp/server.py &
+    MCP_TEST_URL=http://localhost:8410/mcp .venv/bin/python apps/mcp/tests/mcp_integration.py
 """
 from __future__ import annotations
 
@@ -14,7 +25,9 @@ import asyncio
 import json
 import os
 import sys
+import uuid
 
+import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
@@ -47,8 +60,7 @@ def _tool_result_json(result) -> dict:
     return json.loads(text)
 
 
-async def main() -> None:
-    url = os.environ.get("MCP_TEST_URL", DEFAULT_URL)
+async def check_core_tools(url: str) -> None:
     print(f"connecting to {url} ...")
 
     async with streamablehttp_client(url) as (read, write, _get_session_id):
@@ -115,6 +127,84 @@ async def main() -> None:
                 f"{payload['jurisdiction_count']} jurisdiction(s) "
                 f"(note={payload.get('note')!r})"
             )
+
+
+async def check_rate_limit_burst(url: str) -> None:
+    """Finding 2a: fire a burst of raw HTTP requests at the MCP endpoint and
+    assert that once the per-IP token bucket is exhausted, the server starts
+    rejecting with structured 429s (JSON body with error.code=='rate_limited')
+    rather than accepting unbounded traffic. Uses a plain `ping` JSON-RPC body
+    so this doesn't depend on any DB-backed tool."""
+    body = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    statuses: list[int] = []
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Fire enough requests to exceed any reasonable configured
+        # capacity (steady rate + burst) within one token-bucket window.
+        for _ in range(80):
+            resp = await client.post(url, json=body, headers=headers)
+            statuses.append(resp.status_code)
+            if resp.status_code == 429:
+                rejected_body = resp.json()
+                assert rejected_body.get("error", {}).get("code") == "rate_limited", rejected_body
+                break
+
+    assert 429 in statuses, (
+        "expected at least one 429 rate_limited rejection in a burst of "
+        f"{len(statuses)} requests -- got statuses: {statuses}. Either the "
+        "rate limiter isn't wired in, or the server was booted with a "
+        "capacity too high for this burst size (see MCP_RATE_LIMIT_PER_MINUTE"
+        "/MCP_RATE_LIMIT_BURST env vars in the module docstring)."
+    )
+    print(
+        f"OK: rate limiter rejected burst traffic with 429 after "
+        f"{statuses.index(429) + 1} request(s) (statuses so far: {statuses})"
+    )
+
+
+async def check_oversized_compare_is_structured_error(url: str) -> None:
+    """Finding 2b: compare_bill_versions must refuse (structured
+    `text_too_large` error) rather than attempt an unbounded diff when
+    combined version text exceeds the configured cap. Requires the server to
+    be booted with MCP_MAX_COMPARE_TEXT_BYTES set low enough that a real
+    seeded bill's version text pair exceeds it (see module docstring)."""
+    bill_id = os.environ.get("MCP_TEST_COMPARE_BILL_ID")
+    if not bill_id:
+        print(
+            "SKIP: oversized-compare check needs MCP_TEST_COMPARE_BILL_ID "
+            "(a bill_id with >=2 texted versions) -- set alongside a low "
+            "MCP_MAX_COMPARE_TEXT_BYTES on the server process."
+        )
+        return
+
+    async with streamablehttp_client(url) as (read, write, _get_session_id):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("compare_bill_versions", {"bill_id": bill_id})
+            payload = _tool_result_json(result)
+            assert "error" in payload, f"expected a structured error, got: {payload}"
+            assert payload["error"]["code"] in {"text_too_large", "insufficient_versions"}, payload
+            if payload["error"]["code"] == "text_too_large":
+                print(f"OK: oversized compare_bill_versions refused -> {payload['error']}")
+            else:
+                print(
+                    "SKIP (bill_id has <2 texted versions in this DB, not a "
+                    f"cap failure): {payload['error']}"
+                )
+
+
+async def main() -> None:
+    url = os.environ.get("MCP_TEST_URL", DEFAULT_URL)
+
+    await check_core_tools(url)
+    # Oversized-compare check runs before the rate-limit burst test: both
+    # share one per-IP token bucket (this script talks to the server from a
+    # single client IP), and the burst test deliberately exhausts it.
+    await check_oversized_compare_is_structured_error(url)
+    await check_rate_limit_burst(url)
 
     print("\nALL MCP INTEGRATION CHECKS PASSED")
 

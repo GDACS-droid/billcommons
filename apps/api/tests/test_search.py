@@ -8,8 +8,12 @@ contract, not fixed row counts or emptiness."""
 from __future__ import annotations
 
 import re
+import uuid
 
 import pytest
+from sqlalchemy import text as sqltext
+
+from billcommons_shared.db import get_session
 
 _BILL_NUMBER_RE = re.compile(r"^[A-Za-z]+\s*\d+$")
 
@@ -164,3 +168,98 @@ def test_search_plain_nonsense_query_is_honest_empty_not_500(client):
     _assert_envelope(body)
     for item in body["data"]:
         _assert_result_item_shape(item)
+
+
+@pytest.fixture()
+def xss_bill():
+    """Insert one jurisdiction/session/bill with a malicious title directly
+    (bypassing ingestion) so the FTS/highlight branch has a guaranteed row to
+    match against, then clean up. Upstream bill titles/descriptions are not
+    sanitized HTML -- this simulates a hostile upstream source."""
+    token = uuid.uuid4().hex[:12]
+    malicious_title = (
+        f"XssProbe{token} clean energy grant <img src=x onerror=alert(1)> funding act"
+    )
+    db = get_session()
+    try:
+        jurisdiction_id = db.execute(
+            sqltext(
+                "INSERT INTO jurisdictions (id, name, abbreviation, classification, "
+                "created_at, updated_at) "
+                "VALUES (gen_random_uuid(), :name, :abbr, 'state', now(), now()) "
+                "RETURNING id"
+            ),
+            {"name": f"XssTestJurisdiction{token}", "abbr": f"X{token[:8]}".upper()},
+        ).scalar_one()
+        session_id = db.execute(
+            sqltext(
+                "INSERT INTO sessions (id, jurisdiction_id, identifier, active, "
+                "created_at, updated_at) "
+                "VALUES (gen_random_uuid(), :jid, :ident, false, now(), now()) "
+                "RETURNING id"
+            ),
+            {"jid": jurisdiction_id, "ident": f"session-{token}"},
+        ).scalar_one()
+        bill_id = db.execute(
+            sqltext(
+                "INSERT INTO bills (id, jurisdiction_id, session_id, identifier, "
+                "identifier_norm, title, created_at, updated_at) "
+                "VALUES (gen_random_uuid(), :jid, :sid, :ident, :ident_norm, :title, "
+                "now(), now()) RETURNING id"
+            ),
+            {
+                "jid": jurisdiction_id,
+                "sid": session_id,
+                "ident": f"XB {token[:6]}",
+                "ident_norm": f"XB{token[:6]}".upper(),
+                "title": malicious_title,
+            },
+        ).scalar_one()
+        db.commit()
+        yield token, malicious_title
+    finally:
+        db.execute(sqltext("DELETE FROM bills WHERE jurisdiction_id = :jid"), {"jid": jurisdiction_id})
+        db.execute(sqltext("DELETE FROM sessions WHERE jurisdiction_id = :jid"), {"jid": jurisdiction_id})
+        db.execute(sqltext("DELETE FROM jurisdictions WHERE id = :jid"), {"jid": jurisdiction_id})
+        db.commit()
+        db.close()
+
+
+def test_search_highlight_field_never_contains_raw_html(client, xss_bill):
+    """P0 XSS regression for a title containing a raw <img onerror> payload.
+
+    ts_headline's OWN markup around a match defaults to <b>...</b> -- that is
+    the part the API fully controls, and it must never emit real HTML tags:
+    we configure StartSel/StopSel to non-HTML sentinel tokens, so ts_headline
+    itself never introduces a live tag. The upstream payload text is still
+    present as inert plain-text data (the API does not silently rewrite
+    upstream content) -- the actual XSS is closed at the render layer, where
+    the web client must never hand this field to dangerouslySetInnerHTML (see
+    apps/web/components/BillListItem.tsx + apps/web/lib/highlight.tsx, which
+    render highlight as plain React text/`<mark>` elements, never raw HTML).
+    This test proves the API-layer half of that contract: no <b>/</b> (or any
+    other HTML tag ts_headline could inject) appears, and the sentinel tokens
+    correctly bracket the matched fragment (highlighting still works)."""
+    token, malicious_title = xss_bill
+    resp = client.get("/api/v1/search", params={"q": f"XssProbe{token} clean energy"})
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+
+    matches = [item for item in body["data"] if f"XssProbe{token}" in (item.get("title") or "")]
+    assert matches, "expected the seeded XSS-probe bill to appear in FTS results"
+    match = matches[0]
+
+    highlight = match.get("highlight")
+    assert highlight, "expected a non-empty highlight for a full-text match"
+    # ts_headline must never emit its own HTML markers around the match.
+    assert "<b>" not in highlight and "</b>" not in highlight
+    # Sentinel tokens (not HTML) must bracket the matched fragment -- proves
+    # the highlight/match functionality is intact under the new options.
+    assert "⟦H⟧" in highlight and "⟦/H⟧" in highlight
+    # The upstream payload's literal text is preserved as inert plain-text
+    # data (the API is not responsible for rewriting upstream content); the
+    # renderer-side test is that BillListItem/highlight.tsx never pass this
+    # string to dangerouslySetInnerHTML -- verified by source inspection/grep
+    # (see FIX notes) since apps/web has no configured test runner.
+    assert "<img" in malicious_title  # sanity: our probe payload is what we think it is

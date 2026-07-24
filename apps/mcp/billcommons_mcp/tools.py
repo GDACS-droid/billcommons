@@ -14,6 +14,7 @@ trigram similarity scores, diff results) and is always labeled as such.
 from __future__ import annotations
 
 import difflib
+import os
 import uuid
 from typing import Any
 
@@ -54,6 +55,18 @@ from billcommons_mcp.serializers import (
 
 MAX_LIMIT = 50
 DEFAULT_LIMIT = 20
+
+# Work caps for expensive tools: this is a public, anonymous-callable MCP
+# server (Finding 2 / rate-limiting-and-work-caps hardening) -- every tool
+# that can do O(n) or worse work over caller-influenced data must have a hard
+# ceiling, independent of the request-rate limiter, so a single request can't
+# pin a worker on a multi-MB quadratic diff or an unbounded fan-out.
+MAX_COMPARE_TEXT_BYTES = int(
+    os.environ.get("MCP_MAX_COMPARE_TEXT_BYTES", "1500000")
+)  # ~1.5MB combined text before refusing a diff; env-tunable for tests
+MAX_EVIDENCE_VOTES = 100
+MAX_EVIDENCE_HEARINGS = 100
+MAX_EVIDENCE_HISTORY_ITEMS = 500
 
 
 def _clamp_limit(limit: int | None) -> int:
@@ -304,7 +317,10 @@ def compare_bill_versions(
     If version_id_a/b are omitted, compares the earliest and latest versions
     that have extracted text. Errors if fewer than 2 versions have text.
     This is a DERIVED result (difflib unified + structured diff), not an
-    official document.
+    official document. Refuses (structured `text_too_large` error) when the
+    combined text of the two versions exceeds MAX_COMPARE_TEXT_BYTES, since
+    the underlying diff is O(n*m) and unbounded input sizes are a DoS vector
+    on this public, anonymous-callable server.
     """
 
     def body() -> dict[str, Any]:
@@ -361,6 +377,21 @@ def compare_bill_versions(
 
             version_a, text_a = pick(version_id_a, texted_versions[0])
             version_b, text_b = pick(version_id_b, texted_versions[-1])
+
+            combined_bytes = len(text_a.encode("utf-8")) + len(text_b.encode("utf-8"))
+            if combined_bytes > MAX_COMPARE_TEXT_BYTES:
+                raise ToolError(
+                    "text_too_large",
+                    "Combined text of the two versions "
+                    f"({combined_bytes:,} bytes) exceeds the "
+                    f"{MAX_COMPARE_TEXT_BYTES:,}-byte limit for a diff. "
+                    "This tool computes an O(n*m) diff and cannot safely "
+                    "process documents this large; download the version(s) "
+                    "via get_bill_record(include_full_text=True) and diff "
+                    "them client-side instead.",
+                    combined_bytes=combined_bytes,
+                    limit_bytes=MAX_COMPARE_TEXT_BYTES,
+                )
 
             lines_a = text_a.splitlines()
             lines_b = text_b.splitlines()
@@ -733,7 +764,10 @@ def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = Fa
     """Compile a single evidence packet for a bill: full record, timeline,
     vote events with member votes, and hearings, each with official source
     URLs and explicit official-vs-derived labeling. Intended as citation-ready
-    output for downstream research/reporting.
+    output for downstream research/reporting. Votes/hearings/history are
+    capped (MAX_EVIDENCE_VOTES / MAX_EVIDENCE_HEARINGS /
+    MAX_EVIDENCE_HISTORY_ITEMS) so a data anomaly on one bill can't produce
+    an unbounded response on this public, anonymous-callable server.
     """
 
     def body() -> dict[str, Any]:
@@ -754,6 +788,7 @@ def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = Fa
                 .options(selectinload(VoteEvent.vote_records))
                 .where(VoteEvent.bill_id == bid)
                 .order_by(VoteEvent.start_date)
+                .limit(MAX_EVIDENCE_VOTES)
             )
             votes = list(db.execute(vote_stmt).unique().scalars().all())
 
@@ -761,10 +796,13 @@ def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = Fa
                 select(LegislativeEvent)
                 .where(LegislativeEvent.bill_id == bid)
                 .order_by(LegislativeEvent.start_date)
+                .limit(MAX_EVIDENCE_HEARINGS)
             )
             hearings = list(db.execute(hearing_stmt).unique().scalars().all())
 
             history = trace_legislative_history(str(bid))
+            if isinstance(history.get("timeline"), list):
+                history["timeline"] = history["timeline"][:MAX_EVIDENCE_HISTORY_ITEMS]
 
             jr = db.get(Jurisdiction, bill.jurisdiction_id)
             warning = coverage_warning_for_jurisdiction(db, jr) if jr else None

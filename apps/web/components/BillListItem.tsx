@@ -1,5 +1,6 @@
 import Link from "next/link";
 import type { BillSummary } from "@/lib/types";
+import { renderHighlight } from "@/lib/highlight";
 import { BillStatusBadge } from "./StatusBadge";
 
 export default function BillListItem({ bill }: { bill: BillSummary }) {
@@ -15,10 +16,9 @@ export default function BillListItem({ bill }: { bill: BillSummary }) {
         <BillStatusBadge status={bill.status} />
       </div>
       {bill.highlight ? (
-        <p
-          className="mt-2 text-sm text-slate-600 [&_mark]:bg-amber-200 [&_mark]:font-medium [&_mark]:text-slate-900"
-          dangerouslySetInnerHTML={{ __html: bill.highlight }}
-        />
+        <p className="mt-2 text-sm text-slate-600 [&_mark]:bg-amber-200 [&_mark]:font-medium [&_mark]:text-slate-900">
+          {renderHighlight(bill.highlight)}
+        </p>
       ) : null}
       <p className="mt-2 text-xs text-slate-500">
         {bill.latest_action_date
