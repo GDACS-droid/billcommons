@@ -927,7 +927,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_validate_worker.set_defaults(func=cmd_validate_worker)
 
+    p_ca = sub.add_parser(
+        "ca-fulltext",
+        help="backfill California full text from the official leginfo pubinfo "
+        "bulk (Tier-1 source; leginfo.ca.gov robots-blocks the website, the "
+        "downloads host does not)",
+    )
+    p_ca.add_argument("--zip-url", default=None, help="override pubinfo zip URL")
+    p_ca.add_argument("--zip-path", default=None, help="use a local pubinfo zip instead of downloading")
+    p_ca.add_argument("--limit", type=int, default=None, help="cap number of CA docs to backfill")
+    p_ca.add_argument("--dry-run", action="store_true", help="report match counts without writing")
+    p_ca.set_defaults(func=cmd_ca_fulltext)
+
     return parser
+
+
+def cmd_ca_fulltext(args: argparse.Namespace) -> int:
+    from billcommons_ingest import ca_bulk_fulltext as ca_mod
+
+    result = ca_mod.run_ca_fulltext(
+        zip_url=args.zip_url,
+        zip_path=args.zip_path,
+        limit=args.limit,
+        dry_run=args.dry_run,
+    )
+    print(f"ca-fulltext: {result}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
