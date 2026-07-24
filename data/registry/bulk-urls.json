@@ -1,0 +1,675 @@
+{
+  "generated_at": "2026-07-23",
+  "source_page": "session-csv-page-2026-07-23.html",
+  "jurisdictions": {
+    "AK": {
+      "current": [
+        {
+          "slug": "34",
+          "display_name": "Alaska 34th Legislature (2025-2026)",
+          "url": "https://data.openstates.org/csv/latest/AK_34_csv_3PWCykHU6APBxaU52rFw6X.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "Alaska bulk dumps are per-Legislature-biennium, not per-session; no separate special-session dumps exist on the page. The 34th Legislature (2025-2026) dump covers the current regular session AND the 2026 special session cycle (LNG gasline) once ingested by Open States."
+    },
+    "AL": {
+      "current": [
+        {
+          "slug": "2026rs",
+          "display_name": "Alabama 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/AL_2026rs_csv_5rr0r9A9TSjzvpm0UIhKFg.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "2026 Regular Session dump present. Registry also lists a May-Jun 2026 special session (congressional maps) with no corresponding bulk CSV found on the page \u2014 see gaps."
+    },
+    "AR": {
+      "current": [
+        {
+          "slug": "2026S1",
+          "display_name": "Arkansas 2026 First Extraordinary Session",
+          "url": "https://data.openstates.org/csv/latest/AR_2026S1_csv_3giFKe8LAvEsB0anjoaPGy.zip",
+          "kind": "special"
+        },
+        {
+          "slug": "2026F",
+          "display_name": "Arkansas 2026 Fiscal Session",
+          "url": "https://data.openstates.org/csv/latest/AR_2026F_csv_4P7EWoO8Fh98frCv0YR0v3.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "Arkansas 2026 Fiscal Session (registry's session_identifier) plus the 2026 First Extraordinary Session (tax-rate special, 5/4-5/6/2026) both included as current-cycle."
+    },
+    "AZ": {
+      "current": [
+        {
+          "slug": "57th-2nd-regular",
+          "display_name": "Arizona 57th Legislature - Second Regular Session",
+          "url": "https://data.openstates.org/csv/latest/AZ_57th-2nd-regular_csv_4wYce7f2jQsz9t5u3mEpDC.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "CA": {
+      "current": [
+        {
+          "slug": "20252026",
+          "display_name": "California 2025-2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/CA_20252026_csv_4i0zQ1AcWTKrifBmfkiSsb.zip",
+          "kind": "regular"
+        },
+        {
+          "slug": "20252026%20Special%20Session%201",
+          "display_name": "California 2025-2026, Special Session 1",
+          "url": "https://data.openstates.org/csv/latest/CA_20252026%20Special%20Session%201_csv_2YKXQZ31mpk1L8tc5nju2g.zip",
+          "kind": "special"
+        }
+      ],
+      "notes": "2025-2026 biennium regular + Special Session 1, both current-cycle per registry (uses_biennium=true)."
+    },
+    "CO": {
+      "current": [
+        {
+          "slug": "2026A",
+          "display_name": "Colorado 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/CO_2026A_csv_5jTx0BykCTCkGomBVKS0Mk.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "CT": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Connecticut 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/CT_2026_csv_7adGeXpfBeom0MJWfsSany.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "DC": {
+      "current": [
+        {
+          "slug": "26",
+          "display_name": "District of Columbia 26th Council Period (2025-2026)",
+          "url": "https://data.openstates.org/csv/latest/DC_26_csv_PLH6aTYUnaPLddsJW3CrY.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "Matches registry's 'Council Period 26 (2025-2026)'."
+    },
+    "DE": {
+      "current": [
+        {
+          "slug": "153",
+          "display_name": "Delaware 153rd General Assembly (2025-2026)",
+          "url": "https://data.openstates.org/csv/latest/DE_153_csv_6vxot9FL0szdGkcMWlCNVy.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "FL": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Florida 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/FL_2026_csv_6qRin3iU9eHlonOCsXhIKE.zip",
+          "kind": "regular"
+        },
+        {
+          "slug": "2026D",
+          "display_name": "Florida 2026 Special Session D",
+          "url": "https://data.openstates.org/csv/latest/FL_2026D_csv_39jqfQLcHkOCunISUX5lP3.zip",
+          "kind": "special"
+        },
+        {
+          "slug": "2026E",
+          "display_name": "Florida 2026 Special Session E",
+          "url": "https://data.openstates.org/csv/latest/FL_2026E_csv_1HOVIUSangmk0D5iguTrX.zip",
+          "kind": "special"
+        },
+        {
+          "slug": "2026F",
+          "display_name": "Florida 2026 Special Session F",
+          "url": "https://data.openstates.org/csv/latest/FL_2026F_csv_2SBPTkkqJdmVDrSURcyoPM.zip",
+          "kind": "special"
+        }
+      ],
+      "notes": "2026 Regular Session plus 2026 Special Sessions D/E/F (congressional districts/budget/taxation, Apr-Jul 2026) all included as current-cycle."
+    },
+    "GA": {
+      "current": [
+        {
+          "slug": "2025_26",
+          "display_name": "Georgia 2025-2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/GA_2025_26_csv_3M5mGgcY0kBxBjgAF8UlD9.zip",
+          "kind": "regular"
+        },
+        {
+          "slug": "2026_ss",
+          "display_name": "Georgia 2026 Special Session",
+          "url": "https://data.openstates.org/csv/latest/GA_2026_ss_csv_2gCM5ZmOxsg2I6i6HVpjKP.zip",
+          "kind": "special"
+        }
+      ],
+      "notes": ""
+    },
+    "HI": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Hawaii 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/HI_2026_csv_3nopASvSiN7owvJVLul7ZD.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "IA": {
+      "current": [
+        {
+          "slug": "2025-2026",
+          "display_name": "Iowa 2025-2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/IA_2025-2026_csv_5CzPYO8izowMKVp11G1Im6.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "ID": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Idaho 68th Legislature, 2nd Regular Session (2026)",
+          "url": "https://data.openstates.org/csv/latest/ID_2026_csv_3U1exsxKUMV9H2STEWKumy.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "IL": {
+      "current": [
+        {
+          "slug": "104th",
+          "display_name": "Illinois 104th Regular Session",
+          "url": "https://data.openstates.org/csv/latest/IL_104th_csv_4an5vvLuQgJ5FkLHYHkzwD.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "IN": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Indiana 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/IN_2026_csv_5BG0TsFSnSDRwJvk5hNWuX.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "KS": {
+      "current": [
+        {
+          "slug": "2025-2026",
+          "display_name": "Kansas 2025-2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/KS_2025-2026_csv_3vmg9z3MG3EGJjhBLX8oOX.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "KY": {
+      "current": [
+        {
+          "slug": "2026RS",
+          "display_name": "Kentucky 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/KY_2026RS_csv_67A08O5KROBmUyoXZEhtMw.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "LA": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Louisiana 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/LA_2026_csv_2yfBrNygIkMQlcePmH7UF1.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "MA": {
+      "current": [
+        {
+          "slug": "194th",
+          "display_name": "Massachusetts 194th Legislature (2025-2026)",
+          "url": "https://data.openstates.org/csv/latest/MA_194th_csv_1VC1TwTD8qnOjvu96uyJFN.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "MD": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Maryland 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/MD_2026_csv_1cI5cnmYeuBNhWKKszxfYl.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "Redistricting special session scheduled 8/3-8/5/2026 has not yet convened as of 7/23/2026 report date; no dump expected yet (see gaps only if scheduled date has passed)."
+    },
+    "ME": {
+      "current": [
+        {
+          "slug": "132",
+          "display_name": "Maine 132nd Legislature (2025-2026)",
+          "url": "https://data.openstates.org/csv/latest/ME_132_csv_BhjixHOFatMKZpHEz87w1.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "MI": {
+      "current": [
+        {
+          "slug": "2025-2026",
+          "display_name": "Michigan 2025-2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/MI_2025-2026_csv_3wKQdMu8ZfPF5SGysnbG86.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "MN": {
+      "current": [
+        {
+          "slug": "2025s1",
+          "display_name": "Minnesota 2025, First Special Session",
+          "url": "https://data.openstates.org/csv/latest/MN_2025s1_csv_2AWqQfVN8tDYpRVrjGeLqS.zip",
+          "kind": "special"
+        },
+        {
+          "slug": "2025-2026",
+          "display_name": "Minnesota 2025-2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/MN_2025-2026_csv_7LpKOihCR9Ewe6h9KiflsU.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "2025-2026 biennium regular session dump; also included the 2025 First Special Session dump (same biennium, closest available special-session data)."
+    },
+    "MO": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Missouri 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/MO_2026_csv_7e7aoHmtqmOvFHomc1NR9n.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "MS": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Mississippi 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/MS_2026_csv_3sHaOuEtESqCRWBJPDtUl6.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "Registry flags a youth-court special session convened 7/15/2026 as CURRENT; no MS 2026 Extraordinary Session dump exists on the bulk page yet -- see gaps."
+    },
+    "MT": {
+      "current": [
+        {
+          "slug": "2025",
+          "display_name": "Montana 2025 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/MT_2025_csv_2tFs3aq4MJGpmYQSp4zZE8.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "No 2026 regular session (Montana meets biennially in odd years); most recent available is 2025 Regular Session."
+    },
+    "NC": {
+      "current": [
+        {
+          "slug": "2025",
+          "display_name": "North Carolina 2025-2026 Session",
+          "url": "https://data.openstates.org/csv/latest/NC_2025_csv_66TD7GNGnqZC00bPoj9s85.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "ND": {
+      "current": [
+        {
+          "slug": "69",
+          "display_name": "North Dakota 69th Legislative Assembly (2025-26)",
+          "url": "https://data.openstates.org/csv/latest/ND_69_csv_2w6xLm2EMz6SJzwJ5N52QQ.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "No 2026 regular session (biennial, odd years only); 69th Legislative Assembly (2025-26) dump is the current biennium and includes the Jan 2026 Rural Health special session per Open States' per-assembly grouping."
+    },
+    "NE": {
+      "current": [
+        {
+          "slug": "109",
+          "display_name": "Nebraska 109th Legislature (2025-2026)",
+          "url": "https://data.openstates.org/csv/latest/NE_109_csv_4br7x3Ov694kf86P3IH3s9.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "NH": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "New Hampshire 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/NH_2026_csv_60L4ezLIFPihFyr82cCwCl.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "NJ": {
+      "current": [
+        {
+          "slug": "222",
+          "display_name": "New Jersey 2026-2027 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/NJ_222_csv_4Qn4L8IERbyYs2WbdDw7pU.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "New biennium (222nd Legislature) began Jan 2026 per NJ's numbering; registry's session_identifier straddles both '2024-2025' and 'new 2026-2027' -- the 2026-2027 dump is the current one."
+    },
+    "NM": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "New Mexico 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/NM_2026_csv_7S3xSwEkOlHEzmDDKHbwi1.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "NV": {
+      "current": [
+        {
+          "slug": "83",
+          "display_name": "Nevada 2025 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/NV_83_csv_5WS2OYXmexQQceQB0ojUij.zip",
+          "kind": "regular"
+        },
+        {
+          "slug": "2025Special36",
+          "display_name": "Nevada 36th (2026) Special Session",
+          "url": "https://data.openstates.org/csv/latest/NV_2025Special36_csv_5osOFZ803zQpOF2REPAgZ3.zip",
+          "kind": "special"
+        }
+      ],
+      "notes": "No 2026 regular session (Nevada meets biennially in odd years); most recent regular is 2025 Regular Session (83rd), plus the 36th (2026) Special Session dump which is current-cycle."
+    },
+    "NY": {
+      "current": [
+        {
+          "slug": "2025-2026",
+          "display_name": "New York 2025 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/NY_2025-2026_csv_5JioBnstMqJOzWs7ook68a.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "NY bulk dumps use the odd starting year of the biennium as the slug; '2025 Regular Session' = the 2025-2026 biennium, matching registry's session_identifier."
+    },
+    "OH": {
+      "current": [
+        {
+          "slug": "136",
+          "display_name": "Ohio 136th Legislature (2025-2026)",
+          "url": "https://data.openstates.org/csv/latest/OH_136_csv_6xDvwhMYtuCOpXB7AKXGyV.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "OK": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Oklahoma 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/OK_2026_csv_5UZb4J5M5yVxFAPfg0kq79.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "OR": {
+      "current": [
+        {
+          "slug": "2026R1",
+          "display_name": "Oregon 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/OR_2026R1_csv_4toAvgYSVZwgZpb1WtbRiD.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "PA": {
+      "current": [
+        {
+          "slug": "2025-2026",
+          "display_name": "Pennsylvania 2025-2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/PA_2025-2026_csv_4aFTm9G33JgYNkBVZEVHKR.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "RI": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Rhode Island 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/RI_2026_csv_4qjZH1kpPaPn53IPvW92Jr.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "SC": {
+      "current": [
+        {
+          "slug": "2025-2026",
+          "display_name": "South Carolina 2025-2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/SC_2025-2026_csv_1DVpUPEOYbSHQyGJBoWa7T.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "Congressional redistricting special session (started 5/15/2026) has no separate bulk dump; SC bulk CSVs are per-biennium only, so the 2025-2026 dump should include special-session bills once ingested."
+    },
+    "SD": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "South Dakota 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/SD_2026_csv_7Tw5cu2F76TrNlM0Rdw6jK.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "TN": {
+      "current": [
+        {
+          "slug": "114S1",
+          "display_name": "Tennessee 114th First Extraordinary Session (January 2025)",
+          "url": "https://data.openstates.org/csv/latest/TN_114S1_csv_7MKTOupjBJOy9DInlO4XuJ.zip",
+          "kind": "special"
+        },
+        {
+          "slug": "114",
+          "display_name": "Tennessee 114th Regular Session (2025-2026)",
+          "url": "https://data.openstates.org/csv/latest/TN_114_csv_4GzfKaydiAwaZlI4cwG5sV.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "114th Regular Session (2025-2026) plus 114th First Extraordinary Session (dated 'January 2025' on the page but last updated 2026-07-23 -- likely the vehicle Open States uses for the May 2026 congressional-maps special; included as current-cycle, ambiguous naming)."
+    },
+    "TX": {
+      "current": [
+        {
+          "slug": "89R",
+          "display_name": "Texas 89th Legislature (2025)",
+          "url": "https://data.openstates.org/csv/latest/TX_89R_csv_25vquaTbZyZZC8TASUWlTr.zip",
+          "kind": "regular"
+        },
+        {
+          "slug": "891",
+          "display_name": "Texas 89th Legislature, 1st Called Session (2025)",
+          "url": "https://data.openstates.org/csv/latest/TX_891_csv_4M2l9nf84zwoHGuj822YXw.zip",
+          "kind": "special"
+        },
+        {
+          "slug": "892",
+          "display_name": "Texas 89th Legislature, 2nd Called Session (2025)",
+          "url": "https://data.openstates.org/csv/latest/TX_892_csv_3yrOAA33iQvIWTUzhJpi98.zip",
+          "kind": "special"
+        }
+      ],
+      "notes": "No 2026 regular session (biennial, odd years only). Included 89th Legislature regular + 1st/2nd Called Sessions (2025). The 3rd called special session (convened 2026-07-21, current per registry) has NO bulk dump yet -- see gaps."
+    },
+    "UT": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Utah 2026 General Session",
+          "url": "https://data.openstates.org/csv/latest/UT_2026_csv_6hQote7jyYxq6SPl1018oA.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "VA": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Virginia 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/VA_2026_csv_2qUBs5DCT9OsfONOd03jx3.zip",
+          "kind": "regular"
+        },
+        {
+          "slug": "2026S1",
+          "display_name": "Virginia 2026, 1st Special Session",
+          "url": "https://data.openstates.org/csv/latest/VA_2026S1_csv_7aD43kK2bPoMvfw4KS5Txy.zip",
+          "kind": "special"
+        }
+      ],
+      "notes": "Included Virginia 2026 Regular Session + Virginia 2026 1st Special Session (budget, ran 4/23-6/29/2026), matching registry's current session_identifier ('2026 Regular Session') plus its special_sessions entry. NOTE: the bulk page also lists a 'Virginia 2027 Regular Session' dump (updated 2026-07-23) -- Virginia elects a new House every 2 years and Open States appears to have already opened the 2027 session shell; NOT included since registry's current cycle is still 2026."
+    },
+    "VT": {
+      "current": [
+        {
+          "slug": "2025-2026",
+          "display_name": "Vermont 2025-2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/VT_2025-2026_csv_45yGM5wswF4hwwGDdm9Xty.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "WA": {
+      "current": [
+        {
+          "slug": "2025-2026",
+          "display_name": "Washington 2025-2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/WA_2025-2026_csv_3M5zMeHyZR6EJAy1iONMVB.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "WI": {
+      "current": [
+        {
+          "slug": "2025",
+          "display_name": "Wisconsin 2025-2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/WI_2025_csv_4xNnoDlxbUaY7j68rfKYN7.zip",
+          "kind": "regular"
+        },
+        {
+          "slug": "2026S1",
+          "display_name": "Wisconsin May 2026 Special Session",
+          "url": "https://data.openstates.org/csv/latest/WI_2026S1_csv_FtHraxnGi2Hv74srJyG2n.zip",
+          "kind": "special"
+        }
+      ],
+      "notes": ""
+    },
+    "WV": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "West Virginia 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/WV_2026_csv_2haA1KPqralv1ERl8zkd7m.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": ""
+    },
+    "WY": {
+      "current": [
+        {
+          "slug": "2026",
+          "display_name": "Wyoming 2026 Regular Session",
+          "url": "https://data.openstates.org/csv/latest/WY_2026_csv_1QeF4dZUHF537VhAZTSpTt.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "Registry's session_identifier is '2026 Budget Session' (Wyoming's even-year short session); the bulk page labels the same dump 'Wyoming 2026 Regular Session'."
+    },
+    "PR": {
+      "current": [
+        {
+          "slug": "2025-2028",
+          "display_name": "Puerto Rico 2025-2028 Session",
+          "url": "https://data.openstates.org/csv/latest/PR_2025-2028_csv_1v87L0yHbj1fVylTqbcyXl.zip",
+          "kind": "regular"
+        }
+      ],
+      "notes": "Optional jurisdiction, not one of the 51.",
+      "optional": true
+    }
+  },
+  "gaps": [
+    {
+      "state": "AL",
+      "issue": "Special session on congressional maps (5/4/2026-6/3/2026) has no separate bulk CSV; only the 2026 Regular Session dump exists."
+    },
+    {
+      "state": "TX",
+      "issue": "3rd called special session (18-item agenda, convened 2026-07-21, still active per registry) not yet in bulk listing; latest available dump is the 2nd Called Session (2025)."
+    },
+    {
+      "state": "MS",
+      "issue": "Youth-court special session (convened 2026-07-15, active per registry) has no bulk CSV; MS extraordinary-session dumps only go up to 2025."
+    },
+    {
+      "state": "MD",
+      "issue": "Redistricting special session scheduled 2026-08-03 to 2026-08-05 has not yet convened as of report date (2026-07-23); no dump expected/exists yet."
+    }
+  ]
+}
