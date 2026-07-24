@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "billcommons-shared"
+version = "0.1.0"
+description = "Shared Python utilities for Bill Commons: bill-number normalization, rawstore, http client, db session factory"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "httpx",
+    "pydantic>=2",
+    "pydantic-settings",
+    "python-dateutil",
+    "sqlalchemy>=2.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["billcommons_shared"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
