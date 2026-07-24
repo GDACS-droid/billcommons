@@ -218,6 +218,19 @@ def _bill_checksum(row: dict) -> str:
     return hashlib.sha256("|".join(key_fields).encode("utf-8")).hexdigest()
 
 
+def _vote_event_checksum(row: dict) -> str:
+    """Checksum over the vote CSV fields we persist, used for the
+    idempotent unchanged-skip/update check (mirrors `_bill_checksum`)."""
+    key_fields = (
+        row.get("motion_text", ""),
+        row.get("motion_classification", ""),
+        row.get("start_date", ""),
+        row.get("result", ""),
+        row.get("organization_id", ""),
+    )
+    return hashlib.sha256("|".join(key_fields).encode("utf-8")).hexdigest()
+
+
 def _resolve_organization(db: OrmSession, org_cache: dict[str, Organization], openstates_id: str | None):
     if not openstates_id:
         return None
@@ -760,7 +773,7 @@ def ingest_session_csv_zip(
                 if introduction_actions:
                     first = min(
                         introduction_actions,
-                        key=lambda a: (a.action_date or date.max, -(a.order or 0)),
+                        key=lambda a: (a.action_date or date.max, a.order or 0),
                     )
                     bill.introduced_date = first.action_date
         db.flush()
@@ -958,6 +971,18 @@ def ingest_session_csv_zip(
         db.commit()
 
         # -- Votes --
+        # Idempotency key: the Open States bulk CSV's own `id` column (e.g.
+        # "ocd-vote/<uuid>") is stable across re-exports of the same vote and
+        # is stored as `vote_events.upstream_id` (via ProvenanceMixin) -- so
+        # it is the PRIMARY natural key here, exactly like every other
+        # entity in this module keys off its own upstream id where one
+        # exists. The coarser (bill_id, motion_text, start_date) tuple is
+        # only a FALLBACK for the rare row with no `id` (never fabricated),
+        # because real session zips legitimately contain multiple distinct
+        # votes on the same bill/day with identical generic motion_text
+        # (e.g. two chambers' votes both recorded as motion_text="SM" on the
+        # same start_date) -- collapsing on that tuple alone silently merges
+        # unrelated votes and their vote_records into one row.
         vote_rows = _read_csv_rows(zf, ["_votes.csv"])
         vote_count_rows = _read_csv_rows(zf, ["_vote_counts.csv"])
         vote_people_rows = _read_csv_rows(zf, ["_vote_people.csv"])
@@ -968,27 +993,38 @@ def ingest_session_csv_zip(
         for row in vote_people_rows:
             people_by_vote.setdefault(row.get("vote_event_id"), []).append(row)
 
-        existing_vote_events: dict[tuple, VoteEvent] = {}
+        existing_vote_events_by_upstream_id: dict[str, VoteEvent] = {}
+        existing_vote_events_by_fallback_key: dict[tuple, VoteEvent] = {}
         if touched_bill_ids:
             for ve in db.execute(
                 select(VoteEvent).where(VoteEvent.bill_id.in_(touched_bill_ids))
             ).scalars():
-                existing_vote_events[(ve.bill_id, ve.motion_text, ve.start_date)] = ve
+                if ve.upstream_id:
+                    existing_vote_events_by_upstream_id[ve.upstream_id] = ve
+                else:
+                    existing_vote_events_by_fallback_key[
+                        (ve.bill_id, ve.motion_text, ve.start_date, ve.organization_id)
+                    ] = ve
         # Vote events with no bill_id (bill is None) can't be preloaded by
         # bill_id; fall back to the old per-row lookup for that rare case
         # only (never the common path for a normal session zip).
 
         # Existing vote_records for every preloaded vote_event, keyed by
-        # vote_event_id -- avoids a per-vote_event SELECT for records.
-        vote_records_by_event: dict = {
+        # vote_event_id -- avoids a per-vote_event SELECT for records. The
+        # per-event membership set is keyed by (voter_name, option), not
+        # voter_name alone -- a voter_name could in principle appear twice
+        # on the same vote_event with different recorded options across
+        # re-exports/corrections, and (vote_event_id, voter_name, option) is
+        # the actual natural key for this child table.
+        vote_records_by_event: dict[uuid.UUID, set[tuple]] = {
             ve.id: set()
-            for ve in existing_vote_events.values()
+            for ve in [*existing_vote_events_by_upstream_id.values(), *existing_vote_events_by_fallback_key.values()]
         }
         if vote_records_by_event:
             for vr in db.execute(
                 select(VoteRecord).where(VoteRecord.vote_event_id.in_(vote_records_by_event.keys()))
             ).scalars():
-                vote_records_by_event[vr.vote_event_id].add(vr.voter_name)
+                vote_records_by_event[vr.vote_event_id].add((vr.voter_name, vr.option))
 
         vote_event_inserter = _BufferedInserter(db, VoteEvent)
         vote_record_inserter = _BufferedInserter(db, VoteRecord)
@@ -1002,10 +1038,24 @@ def ingest_session_csv_zip(
 
             motion_text = row.get("motion_text") or ""
             start_date = _parse_date_field(row.get("start_date"))
+            upstream_id = row.get("id") or None
+            checksum = _vote_event_checksum(row)
 
-            if bill is not None:
-                key = (bill.id, motion_text, start_date)
-                existing = existing_vote_events.get(key)
+            if upstream_id:
+                existing = existing_vote_events_by_upstream_id.get(upstream_id)
+                if existing is None and bill is None:
+                    # Vote events with no bill_id weren't preloaded above
+                    # (that preload is scoped to touched_bill_ids); fall
+                    # back to a direct lookup by upstream_id for this rare
+                    # case rather than assuming "not in the preloaded map"
+                    # means "doesn't exist in the DB at all".
+                    existing = db.execute(
+                        select(VoteEvent).where(VoteEvent.upstream_id == upstream_id)
+                    ).scalar_one_or_none()
+            elif bill is not None:
+                existing = existing_vote_events_by_fallback_key.get(
+                    (bill.id, motion_text, start_date, organization_id)
+                )
             else:
                 existing = db.execute(
                     select(VoteEvent).where(
@@ -1052,8 +1102,9 @@ def ingest_session_csv_zip(
                     no_count=no_count,
                     other_count=other_count,
                     source_name=SOURCE_NAME,
-                    upstream_id=row.get("id"),
+                    upstream_id=upstream_id,
                     retrieved_at=retrieved_at,
+                    checksum=checksum,
                 )
                 vote_event_inserter.add(
                     {
@@ -1068,29 +1119,55 @@ def ingest_session_csv_zip(
                         "no_count": no_count,
                         "other_count": other_count,
                         "source_name": SOURCE_NAME,
-                        "upstream_id": row.get("id"),
+                        "upstream_id": upstream_id,
                         "retrieved_at": retrieved_at,
+                        "checksum": checksum,
                     }
                 )
                 result.vote_events += 1
-                if bill is not None:
-                    existing_vote_events[(bill.id, motion_text, start_date)] = vote_event
+                if upstream_id:
+                    existing_vote_events_by_upstream_id[upstream_id] = vote_event
+                elif bill is not None:
+                    existing_vote_events_by_fallback_key[
+                        (bill.id, motion_text, start_date, organization_id)
+                    ] = vote_event
                 vote_records_by_event[vote_event.id] = set()
             else:
                 vote_event = existing
                 if vote_event.id not in vote_records_by_event:
                     vote_records_by_event[vote_event.id] = {
-                        vr.voter_name
+                        (vr.voter_name, vr.option)
                         for vr in db.execute(
                             select(VoteRecord).where(VoteRecord.vote_event_id == vote_event.id)
                         ).scalars()
                     }
+                # Unchanged checksum -> skip write, matching the bill-level
+                # short-circuit above; a changed checksum (e.g. corrected
+                # result/counts on a re-export) updates the existing row in
+                # place instead of leaving stale data or inserting a dupe.
+                if vote_event.checksum != checksum:
+                    vote_event.organization_id = organization_id
+                    vote_event.motion_text = motion_text
+                    classifications = _parse_pg_array_repr(row.get("motion_classification"))
+                    vote_event.motion_classification = (
+                        ",".join(classifications) if classifications else None
+                    )
+                    vote_event.start_date = start_date
+                    vote_event.result = row.get("result")
+                    vote_event.yes_count = yes_count
+                    vote_event.no_count = no_count
+                    vote_event.other_count = other_count
+                    vote_event.source_name = SOURCE_NAME
+                    vote_event.upstream_id = upstream_id or vote_event.upstream_id
+                    vote_event.retrieved_at = retrieved_at
+                    vote_event.checksum = checksum
 
             preloaded_records = vote_records_by_event[vote_event.id]
             for person_row in people_by_vote.get(row.get("id"), []):
                 voter_name = person_row.get("voter_name")
                 option = person_row.get("option") or "other"
-                if voter_name not in preloaded_records:
+                record_key = (voter_name, option)
+                if record_key not in preloaded_records:
                     vote_record_inserter.add(
                         {
                             "vote_event_id": vote_event.id,
@@ -1098,7 +1175,7 @@ def ingest_session_csv_zip(
                             "option": option,
                         }
                     )
-                    preloaded_records.add(voter_name)
+                    preloaded_records.add(record_key)
                     result.vote_records += 1
 
             if i % PROGRESS_CHUNK == 0:
