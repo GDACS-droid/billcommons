@@ -26,6 +26,7 @@ evaluated, or treated as instructions.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -44,6 +45,14 @@ from billcommons_shared.rawstore import RawStore
 
 SOURCE_NAME = "fulltext_fetch"
 FETCH_TEXT_KIND = "fetch_text"
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    """Parse a boolean env var; malformed/absent values fall back to default."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
 PARSER_VERSION = "fulltext/1"
 
 # Politeness: 1 request per 2s per host by default (SPEC "Refresh" /
@@ -534,15 +543,26 @@ def process_fetch_text_job(
         raise RuntimeError(f"fetch failed for {document.url}: {exc}") from exc
 
     raw = response.content
-    raw_ref = rawstore.put(
-        raw,
-        meta={
-            "source_name": SOURCE_NAME,
-            "document_id": str(document.id),
-            "url": document.url,
-            "retrieved_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+    # Raw-byte archival is best-effort. The full-document corpus (~730k docs)
+    # far exceeds a single Railway volume, so archival must never block text
+    # extraction: on a full/failed volume we keep extracted_text + source_url +
+    # checksum (sufficient, re-fetchable provenance) and move on. Set
+    # FULLTEXT_ARCHIVE_RAW=0 to skip archival entirely (recommended at scale;
+    # full raw archival belongs in S3-compatible object storage).
+    raw_ref: str | None = None
+    if _env_flag("FULLTEXT_ARCHIVE_RAW", default=False):
+        try:
+            raw_ref = rawstore.put(
+                raw,
+                meta={
+                    "source_name": SOURCE_NAME,
+                    "document_id": str(document.id),
+                    "url": document.url,
+                    "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except OSError as exc:  # e.g. ENOSPC — never fail extraction over archival
+            print(f"fulltext: raw archival skipped for {document.id}: {exc}", flush=True)
 
     content_type = sniff_content_type(response.headers.get("content-type"), document.url, raw)
     outcome = extract_document_text(content_type, raw)

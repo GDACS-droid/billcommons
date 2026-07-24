@@ -586,7 +586,10 @@ def test_rollback_then_reapply_status_persists_and_stops_reenqueue(db_session, r
 # ---------------------------------------------------------------------------
 
 
-def test_process_fetch_text_job_html_end_to_end(db_session, rawstore):
+def test_process_fetch_text_job_html_end_to_end(db_session, rawstore, monkeypatch):
+    # Archival is opt-in (FULLTEXT_ARCHIVE_RAW); enable it here to exercise the
+    # raw-store path end-to-end. Extraction + checksum must work regardless.
+    monkeypatch.setenv("FULLTEXT_ARCHIVE_RAW", "1")
     document = _make_bill_document(db_session, url="https://example-legislature.gov/bill.html")
     body = b"<html><body><p>Section 1. Hello legislature.</p></body></html>"
     client = _robots_client("User-agent: *\nAllow: /\n", doc_body=body, doc_content_type="text/html")
@@ -603,6 +606,23 @@ def test_process_fetch_text_job_html_end_to_end(db_session, rawstore):
     assert rawstore.get(document.raw_ref) == body
     assert document.checksum is not None
     assert document.parser_version == "fulltext/1"
+
+
+def test_process_fetch_text_job_extracts_without_archival_by_default(db_session, rawstore):
+    # Default (archival off): text + checksum must still land; raw_ref stays None
+    # and nothing is written to the raw store (the volume-full safety path).
+    document = _make_bill_document(db_session, url="https://example-legislature.gov/noarchive.html")
+    body = b"<html><body><p>Section 2. No archival needed.</p></body></html>"
+    client = _robots_client("User-agent: *\nAllow: /\n", doc_body=body, doc_content_type="text/html")
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    result = process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert result.status == STATUS_OK
+    db_session.refresh(document)
+    assert "No archival needed." in (document.extracted_text or "")
+    assert document.raw_ref is None
+    assert document.checksum is not None
 
 
 # ---------------------------------------------------------------------------
