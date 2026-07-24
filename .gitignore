@@ -43,3 +43,4 @@ data/registry/*.local.json
 .idea/
 .vscode/
 *.swp
+data/bulkzips/
