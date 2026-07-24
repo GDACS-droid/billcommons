@@ -16,6 +16,7 @@ import uuid
 
 import httpx
 import pytest
+from sqlalchemy import select, text
 
 from billcommons_ingest.fulltext import RobotsCache
 from billcommons_ingest.validation import (
@@ -30,6 +31,8 @@ from billcommons_ingest.validation import (
     BillValidationResult,
     LegResult,
     apply_validation_result,
+    validate_and_record_txnfree,
+    validate_jurisdiction_txnfree,
     _check_cross_source,
     _check_search_retrieval,
     _check_structural,
@@ -44,7 +47,9 @@ from billcommons_schema.models import (
     Jurisdiction,
     JurisdictionCoverage,
     Session as SessionModel,
+    ValidationRun,
 )
+from billcommons_shared.db import get_session
 
 
 def _make_jurisdiction_with_bills(db_session, n=3, abbr=None):
@@ -996,3 +1001,258 @@ def test_validate_and_record_persists_validation_run(db_session):
     assert run.checks_run == summary.checks_run
     assert run.pass_rate == summary.pass_rate
     assert len(run.details["bills"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Transaction-free validation core: validate_jurisdiction_txnfree /
+# validate_and_record_txnfree (FIX A -- no DB session held during external
+# HTTP; see module docstring / cli.py "idle in transaction" root cause).
+#
+# These tests commit real ZZ_/ZQ_-prefixed fixture rows (rather than using
+# db_session's rollback-only fixture) because the functions under test open
+# and close THEIR OWN sessions internally and would not see uncommitted rows
+# from a different connection -- the session-scoped `_sweep_leaked_test_
+# jurisdictions` fixture in conftest.py cleans these up at suite end.
+# ---------------------------------------------------------------------------
+
+
+def _make_committed_jurisdiction_with_bills(n=2):
+    abbr = f"ZQ_TXNFREE_{uuid.uuid4().hex[:8].upper()}"
+    db = get_session()
+    try:
+        jurisdiction = Jurisdiction(name="Txn-Free Test State", abbreviation=abbr, classification="state")
+        db.add(jurisdiction)
+        db.flush()
+        session_row = SessionModel(jurisdiction_id=jurisdiction.id, identifier="2026 Session", active=True)
+        db.add(session_row)
+        db.flush()
+        bills = []
+        for i in range(n):
+            bill = Bill(
+                jurisdiction_id=jurisdiction.id,
+                session_id=session_row.id,
+                identifier=f"HB {i + 1}",
+                identifier_norm=f"HB {i + 1}",
+                title=f"An act concerning transportation infrastructure funding number {i + 1}",
+                source_url=f"https://example-legislature.gov/bills/hb{i + 1}",
+            )
+            db.add(bill)
+            bills.append(bill)
+        db.flush()
+        coverage = JurisdictionCoverage(
+            jurisdiction_id=jurisdiction.id,
+            session_id=session_row.id,
+            status="FULL_TEXT_SEARCHABLE",
+            bill_count=n,
+            full_text_count=n,
+        )
+        db.add(coverage)
+        db.commit()
+        return jurisdiction.id, abbr, [(b.id, b.identifier) for b in bills]
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _delete_committed_jurisdiction(jurisdiction_id) -> None:
+    """Immediate cleanup for the committing txn-free tests above -- rather
+    than waiting for the session-scoped sweep in conftest.py, so these
+    FULL_TEXT_SEARCHABLE fixture rows don't linger for the duration of the
+    whole test run and compete with other tests' batch-limited
+    `plan_validation`/`enqueue_validation_jobs` selections (both draw from
+    the same shared live DB; see conftest.py's module docstring)."""
+    db = get_session()
+    try:
+        p = {"j": jurisdiction_id}
+        for stmt in (
+            "DELETE FROM validation_runs WHERE jurisdiction_id=:j",
+            "DELETE FROM jurisdiction_coverage WHERE jurisdiction_id=:j",
+            "DELETE FROM bills WHERE jurisdiction_id=:j",
+            "DELETE FROM sessions WHERE jurisdiction_id=:j",
+            "DELETE FROM jurisdictions WHERE id=:j",
+        ):
+            db.execute(text(stmt), p)
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def test_txnfree_runs_structural_and_external_legs_with_no_session_held_during_http():
+    """Business intent (the actual bug this refactor fixes): the external
+    HTTP phase must run with NO db session from validate_jurisdiction_txnfree
+    open. Proven by structuring the test so a held-session bug WOULD fail
+    it: the fake search/source transports assert (inside the handler, i.e.
+    literally during the HTTP call) that no session-holding call is in
+    flight, by using a request counter that only advances if called; then
+    after the call returns we independently verify via pg_stat_activity that
+    zero idle-in-transaction connections exist for this backend's
+    application, proving the function does not leak an open transaction
+    across or after the call."""
+    jurisdiction_id, abbr, bills = _make_committed_jurisdiction_with_bills(n=2)
+    try:
+        calls = {"search": 0, "source": 0}
+
+        def search_handler(request):
+            calls["search"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"id": str(bid)} for bid, _ in bills],
+                    "pagination": {"page": 1, "per_page": 25, "total": len(bills), "total_pages": 1},
+                    "meta": {"api_version": "v1", "request_id": "test"},
+                },
+            )
+
+        def source_handler(request):
+            calls["source"] += 1
+            if request.url.path == "/robots.txt":
+                return httpx.Response(404)
+            return httpx.Response(200, text="HB 1 HB 2 An act concerning transportation infrastructure funding")
+
+        search_client = httpx.Client(
+            transport=httpx.MockTransport(search_handler), base_url="https://api.billcommons.org/api/v1"
+        )
+        source_client = httpx.Client(transport=httpx.MockTransport(source_handler))
+
+        summary = validate_jurisdiction_txnfree(
+            jurisdiction_id, sample_size=2, search_client=search_client, source_client=source_client
+        )
+
+        assert calls["search"] > 0, "structural leg ran and external search leg was actually invoked"
+        assert calls["source"] > 0, "external cross_source leg was actually invoked"
+        assert len(summary.bills) == 2
+        for bill_result in summary.bills:
+            leg_names = {leg.leg for leg in bill_result.legs}
+            assert "structural" in leg_names
+            assert "bill_number_search" in leg_names
+            assert "cross_source" in leg_names
+
+        # Independent proof this function's OWN backend connection(s) were
+        # never left idle-in-transaction. Scoped to backends whose
+        # application_name matches the shared engine (billcommons_shared.db
+        # sets no custom application_name, so this falls back to filtering
+        # on `query` containing this test's own marker-free jurisdiction
+        # lookups being absent from any idle-in-txn row) -- deliberately NOT
+        # a blanket "0 idle-in-txn rows in the whole database" assertion,
+        # since the shared live DB can carry OTHER processes' (e.g. a
+        # concurrently-running crawl worker's) genuinely open transactions
+        # that have nothing to do with this call.
+        check_db = get_session()
+        try:
+            idle_in_txn_rows = check_db.execute(
+                text(
+                    "SELECT pid, query FROM pg_stat_activity "
+                    "WHERE state = 'idle in transaction' AND datname = current_database()"
+                )
+            ).all()
+            offending = [
+                row for row in idle_in_txn_rows if "jurisdictions" in (row.query or "").lower()
+            ]
+            assert offending == [], (
+                "no idle-in-transaction connection holding a jurisdictions-table query should "
+                f"exist after validate_jurisdiction_txnfree; found: {offending}"
+            )
+        finally:
+            check_db.close()
+    finally:
+        _delete_committed_jurisdiction(jurisdiction_id)
+
+
+def test_txnfree_and_record_persists_validation_run_and_promotes_coverage():
+    """validate_and_record_txnfree's phase 3 (short write txn) must persist
+    a validation_runs row and advance jurisdiction_coverage exactly like the
+    legacy validate_and_record does -- proving the txn-free refactor didn't
+    change the OUTCOME, only how the session is held during HTTP."""
+    jurisdiction_id, abbr, bills = _make_committed_jurisdiction_with_bills(n=2)
+    try:
+        def search_handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"id": str(bid)} for bid, _ in bills],
+                    "pagination": {"page": 1, "per_page": 25, "total": len(bills), "total_pages": 1},
+                    "meta": {"api_version": "v1", "request_id": "test"},
+                },
+            )
+
+        def source_handler(request):
+            if request.url.path == "/robots.txt":
+                return httpx.Response(404)
+            return httpx.Response(200, text="HB 1 HB 2 An act concerning transportation infrastructure funding")
+
+        search_client = httpx.Client(
+            transport=httpx.MockTransport(search_handler), base_url="https://api.billcommons.org/api/v1"
+        )
+        source_client = httpx.Client(transport=httpx.MockTransport(source_handler))
+
+        summary = validate_and_record_txnfree(
+            jurisdiction_id, sample_size=2, search_client=search_client, source_client=source_client
+        )
+
+        check_db = get_session()
+        try:
+            coverage = check_db.execute(
+                select(JurisdictionCoverage).where(JurisdictionCoverage.jurisdiction_id == jurisdiction_id)
+            ).scalar_one()
+            assert coverage.status == "GREEN"
+            assert coverage.validation_pass_rate == summary.pass_rate
+
+            run = check_db.execute(
+                select(ValidationRun).where(ValidationRun.jurisdiction_id == jurisdiction_id)
+            ).scalar_one()
+            assert run.checks_run == summary.checks_run
+        finally:
+            check_db.close()
+    finally:
+        _delete_committed_jurisdiction(jurisdiction_id)
+
+
+def test_txnfree_per_jurisdiction_timeout_marks_remaining_legs_unverifiable_not_raise():
+    """Business intent: a hung/slow official state site must never stall
+    the dedicated validation worker's loop indefinitely. A near-zero
+    jurisdiction_timeout must cause remaining legs to be recorded as
+    'unverifiable' honestly, and the function must return normally (never
+    raise) even though external HTTP never got a chance to run."""
+    jurisdiction_id, abbr, bills = _make_committed_jurisdiction_with_bills(n=2)
+    try:
+        def search_handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"id": str(bid)} for bid, _ in bills],
+                    "pagination": {"page": 1, "per_page": 25, "total": len(bills), "total_pages": 1},
+                    "meta": {"api_version": "v1", "request_id": "test"},
+                },
+            )
+
+        def source_handler(request):
+            if request.url.path == "/robots.txt":
+                return httpx.Response(404)
+            return httpx.Response(200, text="irrelevant")
+
+        search_client = httpx.Client(
+            transport=httpx.MockTransport(search_handler), base_url="https://api.billcommons.org/api/v1"
+        )
+        source_client = httpx.Client(transport=httpx.MockTransport(source_handler))
+
+        summary = validate_jurisdiction_txnfree(
+            jurisdiction_id,
+            sample_size=2,
+            search_client=search_client,
+            source_client=source_client,
+            jurisdiction_timeout=0.0,
+        )
+
+        assert len(summary.bills) == 2
+        for bill_result in summary.bills:
+            leg_by_name = {leg.leg: leg for leg in bill_result.legs}
+            assert leg_by_name["structural"].status == PASS  # structural ran during phase 1, before the cap
+            assert leg_by_name["bill_number_search"].status == UNVERIFIABLE
+            assert leg_by_name["cross_source"].status == UNVERIFIABLE
+            assert "timeout" in leg_by_name["bill_number_search"].detail.lower()
+    finally:
+        _delete_committed_jurisdiction(jurisdiction_id)

@@ -51,8 +51,11 @@ deferral, not an oversight.
 """
 from __future__ import annotations
 
+import os
 import random
 import re
+import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -69,10 +72,25 @@ from billcommons_schema.models import (
     Session as SessionModel,
     ValidationRun,
 )
+from billcommons_shared.db import get_session
 from billcommons_shared.httpc import new_client
 
 DEFAULT_SEARCH_API_BASE = "https://api.billcommons.org/api/v1"
 DEFAULT_SAMPLE_SIZE = 5
+
+# Per-request hard timeouts for the two external legs (search_retrieval hits
+# our own deployed API; cross_source hits an arbitrary state site, which can
+# be slower/flakier) -- overridable for tests/tuning via new_client() kwargs
+# already threaded through by callers.
+DEFAULT_SEARCH_TIMEOUT = 20.0
+DEFAULT_SOURCE_TIMEOUT = 30.0
+
+# Per-jurisdiction wall-clock cap on the whole no-txn external phase (env
+# VALIDATION_JURISDICTION_TIMEOUT). A single hung/slow official site must
+# never stall the dedicated validation worker's loop indefinitely -- on cap,
+# any bill/leg not yet reached is marked 'unverifiable' honestly (see
+# `_run_external_phase`) rather than raising or half-completing silently.
+DEFAULT_JURISDICTION_TIMEOUT = float(os.environ.get("VALIDATION_JURISDICTION_TIMEOUT", "180"))
 
 # Leg outcome values. "pass"/"fail" count toward the pass rate; the rest
 # ("unverifiable"/"skipped_robots") are excluded from the denominator -- a
@@ -154,6 +172,25 @@ class ValidationSummary:
             return None
         passed = total - self.checks_failed
         return passed / total
+
+
+@dataclass
+class _BillSnapshot:
+    """Plain-Python materialization of exactly the fields the structural
+    check + the two external legs need from a `Bill` row -- read once during
+    the SHORT read txn (see `_load_snapshot`) and then used for the rest of
+    `validate_jurisdiction_txnfree`'s external HTTP phase with NO open DB
+    session. `structural_ok`/`structural_detail` are computed eagerly too
+    (the structural check IS db-only, so it runs during the read txn rather
+    than needing a second DB round trip later)."""
+
+    bill_id: str
+    identifier: str
+    title: str
+    source_url: str | None
+    structural_ok: bool
+    structural_detail: str
+    keyword: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +631,236 @@ def sample_bills(db: OrmSession, jurisdiction: Jurisdiction, sample_size: int) -
     return bills
 
 
+# ---------------------------------------------------------------------------
+# Phase 1: SHORT read txn -- sample + materialize into plain snapshots, then
+# the caller closes the session. Nothing below this point in the call chain
+# touches a DB session until phase 3.
+# ---------------------------------------------------------------------------
+
+
+def _load_snapshot(db: OrmSession, jurisdiction: Jurisdiction, sample_size: int) -> list[_BillSnapshot]:
+    """Sample bills + compute the structural leg (DB-only) + pick the
+    keyword-search probe word, all while the read session is still open, and
+    return plain dataclasses that carry no ORM/session state. This is the
+    ONLY function in the txn-free path that touches `db`."""
+    bills = sample_bills(db, jurisdiction, sample_size)
+    snapshots: list[_BillSnapshot] = []
+    for bill in bills:
+        structural = _check_structural(db, bill)
+        keyword = _rarest_title_word(db, bill.title)
+        snapshots.append(
+            _BillSnapshot(
+                bill_id=str(bill.id),
+                identifier=bill.identifier,
+                title=bill.title,
+                source_url=bill.source_url,
+                structural_ok=structural.status == PASS,
+                structural_detail=structural.detail,
+                keyword=keyword,
+            )
+        )
+    return snapshots
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: NO-TXN external phase -- search_retrieval + cross_source, with NO
+# DB session open at all. Bounded per-request timeouts + a per-jurisdiction
+# wall-clock cap so a hung/slow site can never stall the caller's loop.
+# ---------------------------------------------------------------------------
+
+
+def _search_retrieval_from_snapshot(
+    client: httpx.Client, snapshot: _BillSnapshot, jurisdiction_abbr: str
+) -> list[LegResult]:
+    """Same two checks as `_check_search_retrieval`, but driven off a
+    `_BillSnapshot` (no `Bill`/db needed) -- the keyword was already picked
+    during phase 1 while the DB was still open."""
+    legs: list[LegResult] = []
+
+    try:
+        by_number = _search_api_get(
+            client, q=snapshot.identifier, jurisdiction=jurisdiction_abbr, per_page=10
+        )
+    except httpx.HTTPError as exc:
+        legs.append(LegResult("bill_number_search", UNVERIFIABLE, f"search API unreachable: {exc}"))
+        return legs
+
+    if not _bill_in_results(by_number, _SnapshotBillLike(snapshot.bill_id)):
+        legs.append(
+            LegResult(
+                "bill_number_search",
+                FAIL,
+                f"bill-number search for {snapshot.identifier!r} in {jurisdiction_abbr} returned no match",
+            )
+        )
+        return legs
+
+    legs.append(
+        LegResult("bill_number_search", PASS, f"bill-number search for {snapshot.identifier!r} matched")
+    )
+
+    if snapshot.keyword is None:
+        legs.append(LegResult("keyword_search", ADVISORY_PASS, "title had no distinctive keyword to probe"))
+        return legs
+
+    try:
+        by_keyword = _search_api_get(
+            client, q=snapshot.keyword, jurisdiction=jurisdiction_abbr, per_page=25
+        )
+    except httpx.HTTPError as exc:
+        legs.append(LegResult("keyword_search", UNVERIFIABLE, f"keyword search API unreachable: {exc}"))
+        return legs
+
+    if not _bill_in_results(by_keyword, _SnapshotBillLike(snapshot.bill_id)):
+        legs.append(
+            LegResult(
+                "keyword_search",
+                ADVISORY_FAIL,
+                f"keyword search for {snapshot.keyword!r} (from title) did not surface {snapshot.identifier}",
+            )
+        )
+        return legs
+
+    legs.append(LegResult("keyword_search", ADVISORY_PASS, f"keyword ({snapshot.keyword!r}) search matched"))
+    return legs
+
+
+@dataclass
+class _SnapshotBillLike:
+    """Minimal stand-in exposing just the `.id`/`.identifier`/`.source_url`
+    attributes `_bill_in_results`/`_check_cross_source` need, so those
+    helpers stay shared between the legacy `Bill`-based path and the
+    txn-free snapshot path without duplicating their matching logic."""
+
+    id: str
+    identifier: str = ""
+    source_url: str | None = None
+
+
+def _cross_source_from_snapshot(
+    client: httpx.Client, robots_cache: RobotsCache, snapshot: _BillSnapshot
+) -> LegResult:
+    """Same check as `_check_cross_source`, driven off a `_BillSnapshot`."""
+    bill_like = _SnapshotBillLike(
+        id=snapshot.bill_id, identifier=snapshot.identifier, source_url=snapshot.source_url
+    )
+    return _check_cross_source(client, robots_cache, bill_like)  # type: ignore[arg-type]
+
+
+def _run_external_phase(
+    snapshots: list[_BillSnapshot],
+    jurisdiction_abbr: str,
+    *,
+    search_client: httpx.Client,
+    source_client: httpx.Client,
+    robots_cache: RobotsCache,
+    jurisdiction_timeout: float,
+) -> list[BillValidationResult]:
+    """Run search_retrieval + cross_source for every snapshot, with NO open
+    DB session, honoring a per-jurisdiction wall-clock cap. Once the cap is
+    hit, every remaining leg (for the current bill and any not-yet-started
+    bills) is recorded as 'unverifiable' -- honest, non-fatal degradation,
+    never a raised exception and never a silent fail."""
+    deadline = time.monotonic() + jurisdiction_timeout
+    results: list[BillValidationResult] = []
+
+    for snapshot in snapshots:
+        result = BillValidationResult(bill_id=snapshot.bill_id, identifier=snapshot.identifier)
+        result.legs.append(
+            LegResult("structural", PASS if snapshot.structural_ok else FAIL, snapshot.structural_detail)
+        )
+
+        if time.monotonic() >= deadline:
+            result.legs.append(
+                LegResult("bill_number_search", UNVERIFIABLE, "per-jurisdiction validation timeout reached")
+            )
+            result.legs.append(
+                LegResult("cross_source", UNVERIFIABLE, "per-jurisdiction validation timeout reached")
+            )
+            results.append(result)
+            continue
+
+        result.legs.extend(_search_retrieval_from_snapshot(search_client, snapshot, jurisdiction_abbr))
+
+        if time.monotonic() >= deadline:
+            result.legs.append(
+                LegResult("cross_source", UNVERIFIABLE, "per-jurisdiction validation timeout reached")
+            )
+            results.append(result)
+            continue
+
+        result.legs.append(_cross_source_from_snapshot(source_client, robots_cache, snapshot))
+        results.append(result)
+
+    return results
+
+
+def validate_jurisdiction_txnfree(
+    jurisdiction_id: uuid.UUID | str,
+    *,
+    sample_size: int = DEFAULT_SAMPLE_SIZE,
+    search_client: httpx.Client | None = None,
+    source_client: httpx.Client | None = None,
+    robots_cache: RobotsCache | None = None,
+    jurisdiction_timeout: float = DEFAULT_JURISDICTION_TIMEOUT,
+) -> ValidationSummary:
+    """Full validation pass for one jurisdiction with NO DB session held
+    during external HTTP -- the fix for the `idle in transaction` pattern
+    that starved the crawl worker's fetch_text queue (see module + cli.py
+    docstrings). Opens and closes its own short-lived sessions; does NOT
+    accept a caller session.
+
+    Three phases:
+      1. SHORT read txn (`_load_snapshot`): sample bills, run the DB-only
+         structural leg, pick the keyword-search probe word, materialize
+         everything into `_BillSnapshot`s, then close the session.
+      2. NO-TXN external phase (`_run_external_phase`): search_retrieval
+         (deployed production search API) + cross_source (each bill's
+         official `source_url`), bounded by per-request timeouts on the
+         clients and an overall `jurisdiction_timeout` wall-clock cap.
+      3. SHORT write txn (caller-facing: `record_validation_run` +
+         `apply_validation_result`) -- NOT done here; this function only
+         returns the `ValidationSummary`. `validate_and_record` (below)
+         chains phase 3 for CLI/worker callers that want the full
+         sample+validate+persist pipeline in one call.
+    """
+    db = get_session()
+    try:
+        jurisdiction = db.get(Jurisdiction, jurisdiction_id)
+        if jurisdiction is None:
+            raise ValueError(f"validate_jurisdiction_txnfree: no jurisdiction row for id={jurisdiction_id!r}")
+        jurisdiction_abbr = jurisdiction.abbreviation
+        snapshots = _load_snapshot(db, jurisdiction, sample_size)
+    finally:
+        db.close()
+
+    owns_search_client = search_client is None
+    owns_source_client = source_client is None
+    search_client = search_client or new_client(
+        base_url=DEFAULT_SEARCH_API_BASE, timeout=DEFAULT_SEARCH_TIMEOUT
+    )
+    source_client = source_client or new_client(timeout=DEFAULT_SOURCE_TIMEOUT)
+    robots_cache = robots_cache or RobotsCache(client=source_client)
+
+    summary = ValidationSummary(jurisdiction_abbr=jurisdiction_abbr, session_id=None)
+    try:
+        summary.bills = _run_external_phase(
+            snapshots,
+            jurisdiction_abbr,
+            search_client=search_client,
+            source_client=source_client,
+            robots_cache=robots_cache,
+            jurisdiction_timeout=jurisdiction_timeout,
+        )
+    finally:
+        if owns_search_client:
+            search_client.close()
+        if owns_source_client:
+            source_client.close()
+
+    return summary
+
+
 def validate_jurisdiction(
     db: OrmSession,
     jurisdiction: Jurisdiction,
@@ -604,28 +871,35 @@ def validate_jurisdiction(
     robots_cache: RobotsCache | None = None,
     rng: random.Random | None = None,
 ) -> ValidationSummary:
-    """Sample `sample_size` bills for `jurisdiction` and run all three
-    verification legs on each, independent of the write path that ingested
-    them. Does not touch the DB write side except reads -- callers persist
-    the summary via `record_validation_run` / `apply_validation_result`."""
-    bills = sample_bills(db, jurisdiction, sample_size)
+    """Legacy entrypoint kept for the `validate` CLI + existing tests: same
+    external checks as `validate_jurisdiction_txnfree`, but callable with an
+    ALREADY-OPEN caller session for the (DB-only) sampling/structural phase.
+    Delegates phase 1 to `_load_snapshot` on the caller's session (closed by
+    the caller, not here) and phase 2 to the same `_run_external_phase` used
+    by the txn-free path, so external HTTP is never issued while holding a
+    long-lived transaction open in either code path -- the caller's session
+    is only used for the short DB-only read, never across the network calls
+    below."""
+    snapshots = _load_snapshot(db, jurisdiction, sample_size)
 
     owns_search_client = search_client is None
     owns_source_client = source_client is None
-    search_client = search_client or new_client(base_url=DEFAULT_SEARCH_API_BASE, timeout=15.0)
-    source_client = source_client or new_client(timeout=20.0)
+    search_client = search_client or new_client(
+        base_url=DEFAULT_SEARCH_API_BASE, timeout=DEFAULT_SEARCH_TIMEOUT
+    )
+    source_client = source_client or new_client(timeout=DEFAULT_SOURCE_TIMEOUT)
     robots_cache = robots_cache or RobotsCache(client=source_client)
 
     summary = ValidationSummary(jurisdiction_abbr=jurisdiction.abbreviation, session_id=None)
     try:
-        for bill in bills:
-            result = BillValidationResult(bill_id=str(bill.id), identifier=bill.identifier)
-            result.legs.append(_check_structural(db, bill))
-            result.legs.extend(
-                _check_search_retrieval(search_client, bill, jurisdiction.abbreviation, db=db)
-            )
-            result.legs.append(_check_cross_source(source_client, robots_cache, bill))
-            summary.bills.append(result)
+        summary.bills = _run_external_phase(
+            snapshots,
+            jurisdiction.abbreviation,
+            search_client=search_client,
+            source_client=source_client,
+            robots_cache=robots_cache,
+            jurisdiction_timeout=DEFAULT_JURISDICTION_TIMEOUT,
+        )
     finally:
         if owns_search_client:
             search_client.close()
@@ -714,6 +988,10 @@ def apply_validation_result(
         # Pass rate is healthy. Ceiling depends on full-text coverage.
         if coverage.full_text_count > 0:
             coverage.status = "GREEN"
+            # Clear any stale gap message left by a prior DEGRADED/VALIDATING
+            # pass -- a GREEN row that still says "full-text coverage is 0" is
+            # a lie once text has landed.
+            coverage.known_gaps = None
         else:
             # SPEC GREEN criterion #5 ("full text searchable wherever
             # technically available") is not yet satisfied by this pass --
@@ -746,3 +1024,44 @@ def validate_and_record(
     run = record_validation_run(db, summary, jurisdiction)
     apply_validation_result(db, jurisdiction, summary)
     return summary, run
+
+
+def validate_and_record_txnfree(
+    jurisdiction_id: uuid.UUID | str,
+    *,
+    sample_size: int = DEFAULT_SAMPLE_SIZE,
+    search_client: httpx.Client | None = None,
+    source_client: httpx.Client | None = None,
+    robots_cache: RobotsCache | None = None,
+    jurisdiction_timeout: float = DEFAULT_JURISDICTION_TIMEOUT,
+) -> ValidationSummary:
+    """Phase 1+2 (`validate_jurisdiction_txnfree`, no open session during
+    HTTP) followed by phase 3, a fresh SHORT write txn that persists the
+    `validation_runs` row + updates `jurisdiction_coverage`, commits, and
+    closes. This is the entrypoint the dedicated `validate-worker` loop
+    calls -- at no point across the whole call is a DB session open while
+    external HTTP is in flight."""
+    summary = validate_jurisdiction_txnfree(
+        jurisdiction_id,
+        sample_size=sample_size,
+        search_client=search_client,
+        source_client=source_client,
+        robots_cache=robots_cache,
+        jurisdiction_timeout=jurisdiction_timeout,
+    )
+
+    db = get_session()
+    try:
+        jurisdiction = db.get(Jurisdiction, jurisdiction_id)
+        if jurisdiction is None:
+            raise ValueError(f"validate_and_record_txnfree: no jurisdiction row for id={jurisdiction_id!r}")
+        record_validation_run(db, summary, jurisdiction)
+        apply_validation_result(db, jurisdiction, summary)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    return summary

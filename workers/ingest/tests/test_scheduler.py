@@ -26,6 +26,7 @@ from billcommons_ingest.scheduler import (
     SCHEDULE_PASS_ADVISORY_LOCK_KEY,
     VALIDATE_ENQUEUE_ADVISORY_LOCK_KEY,
     VALIDATE_KIND,
+    VALIDATE_WORKER_CYCLE_ADVISORY_LOCK_KEY,
     cadence_minutes,
     cadence_tier,
     enqueue_validation_jobs,
@@ -502,5 +503,50 @@ def test_enqueue_validation_jobs_skips_when_another_pass_holds_the_advisory_lock
     finally:
         blocking_connection.execute(
             text("SELECT pg_advisory_unlock(:key)"), {"key": VALIDATE_ENQUEUE_ADVISORY_LOCK_KEY}
+        )
+        blocking_connection.close()
+
+
+def test_validate_worker_cycle_lock_key_is_distinct_from_other_advisory_locks():
+    """Business intent: cli.py's dedicated `validate-worker` selection pass
+    guards itself with VALIDATE_WORKER_CYCLE_ADVISORY_LOCK_KEY, a DIFFERENT
+    64-bit key from both the crawl worker's schedule-pass key and the
+    validate-enqueue key -- if this ever collided with either, the dedicated
+    validation worker could deadlock against (or silently starve) the crawl
+    worker's own periodic passes, defeating the whole point of splitting them
+    into separate processes."""
+    keys = {
+        SCHEDULE_PASS_ADVISORY_LOCK_KEY,
+        VALIDATE_ENQUEUE_ADVISORY_LOCK_KEY,
+        VALIDATE_WORKER_CYCLE_ADVISORY_LOCK_KEY,
+    }
+    assert len(keys) == 3, "all three advisory lock keys must be distinct"
+
+
+def test_validate_worker_cycle_lock_blocks_a_second_concurrent_selection_pass(db_session):
+    """A second cycle attempting to acquire VALIDATE_WORKER_CYCLE_ADVISORY_LOCK_KEY
+    while another connection already holds it must fail to acquire (selects
+    nothing that cycle) rather than racing the concurrent holder -- this is
+    the exact guard cmd_validate_worker relies on to keep 2+ validate-worker
+    instances from double-validating the same jurisdiction in the same
+    cycle."""
+    engine = get_engine()
+    blocking_connection = engine.connect()
+    try:
+        acquired = blocking_connection.execute(
+            text("SELECT pg_try_advisory_lock(:key)"), {"key": VALIDATE_WORKER_CYCLE_ADVISORY_LOCK_KEY}
+        ).scalar_one()
+        assert acquired is True, "sanity check: the blocking connection must actually hold the lock"
+
+        second_attempt = db_session.execute(
+            text("SELECT pg_try_advisory_lock(:key)"), {"key": VALIDATE_WORKER_CYCLE_ADVISORY_LOCK_KEY}
+        ).scalar_one()
+        assert second_attempt is False, (
+            "a second concurrent validate-worker cycle must NOT acquire the lock while "
+            "another cycle's selection pass already holds it"
+        )
+    finally:
+        blocking_connection.execute(
+            text("SELECT pg_advisory_unlock(:key)"), {"key": VALIDATE_WORKER_CYCLE_ADVISORY_LOCK_KEY}
         )
         blocking_connection.close()

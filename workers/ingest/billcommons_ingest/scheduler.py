@@ -63,6 +63,15 @@ SCHEDULE_PASS_ADVISORY_LOCK_KEY = 847_291_003_615_882_001
 # validation-enqueue passes still serialize against each other.
 VALIDATE_ENQUEUE_ADVISORY_LOCK_KEY = 847_291_003_615_882_002
 
+# Separate, FIXED 64-bit key guarding the dedicated `validate-worker` process's
+# per-cycle SELECTION pass (cli.py cmd_validate_worker) -- DIFFERENT from both
+# keys above so running 2+ validate-worker instances never double-selects (and
+# never double-validates) the same jurisdiction in the same cycle, while still
+# being independent of the crawl worker's own schedule/validate-enqueue passes
+# (which enqueue `ingest_jobs` rows; the dedicated worker instead calls
+# `plan_validation` directly and validates in-process, see cli.py).
+VALIDATE_WORKER_CYCLE_ADVISORY_LOCK_KEY = 847_291_003_615_882_003
+
 DEFAULT_VALIDATE_BATCH = 3
 DEFAULT_DEGRADED_RECHECK_AGE_HOURS = 6
 

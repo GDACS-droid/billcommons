@@ -19,6 +19,13 @@ Subcommands (per BRIEF-wave2.md):
     worker                            Long-running loop: claim + process ingest_jobs,
                                        plus periodic schedule-refresh, fulltext top-up,
                                        coverage-recompute, and validate-schedule passes.
+    validate-worker                   DEDICATED long-running validation-only loop,
+                                       separate from `worker` -- never claims/touches
+                                       fetch_text/api_sync jobs. Calls the transaction-
+                                       free validation core directly (no DB session
+                                       held during external HTTP) so it can never
+                                       starve the crawl worker's connections. See
+                                       cmd_validate_worker's docstring.
 """
 from __future__ import annotations
 
@@ -31,7 +38,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from billcommons_ingest import api_sync as api_sync_mod
 from billcommons_ingest import coverage as coverage_mod
@@ -607,6 +614,166 @@ def cmd_worker(args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_validate_worker(args: argparse.Namespace) -> int:
+    """Dedicated, long-running validation-ONLY loop -- a separate process
+    from `cmd_worker` (the crawl worker) so validation's minutes-long
+    external HTTP (production search API + each bill's official state site)
+    can never hold open a DB session that starves the crawl worker's
+    fetch_text connections (the `idle in transaction` root cause this whole
+    subcommand exists to fix -- see module docstring + validation.py's
+    docstring).
+
+    This loop NEVER claims/touches `ingest_jobs` rows of kind fetch_text or
+    api_sync -- it doesn't go through the `ingest_jobs` queue at all for
+    validation work. Instead each cycle:
+
+      1. (optional) recompute coverage counts once, so full_text_count is
+         fresh before selecting FULL_TEXT_SEARCHABLE candidates (a
+         jurisdiction whose crawl just finished shouldn't wait up to
+         `--coverage-recompute-interval` for the OTHER worker's periodic
+         recompute pass to notice).
+      2. Acquire a dedicated pg advisory lock (a DIFFERENT key from every
+         other advisory lock in this codebase -- see
+         scheduler.VALIDATE_WORKER_CYCLE_ADVISORY_LOCK_KEY) for the
+         selection pass, so 2+ validate-worker instances never double-select
+         (and never double-validate) the same jurisdiction in the same
+         cycle.
+      3. Select up to `--batch` candidates via `scheduler.plan_validation`
+         (the SAME priority SQL the in-worker validate-scheduler already
+         used: FULL_TEXT_SEARCHABLE-not-yet-GREEN first, then stale
+         DEGRADED, then oldest-checked-other; GREEN and not-yet-searchable
+         rows are excluded by that query already).
+      4. For each candidate, call `validation.validate_and_record_txnfree`
+         (transaction-free: no session held during the external HTTP,
+         short write txn to persist). One try/except per jurisdiction so a
+         single bad jurisdiction (a hung site, a DB hiccup) never kills the
+         loop.
+      5. Sleep `--interval` seconds; repeat. Empty selection also sleeps and
+         retries -- never busy-loops.
+
+    A shared RobotsCache + rate-limited httpx clients persist across the
+    whole loop lifetime (mirrors `cmd_worker`'s `fulltext_fetcher` reuse
+    pattern), so per-host robots.txt caching and politeness pacing survive
+    across cycles instead of resetting on every jurisdiction.
+    """
+    worker_id = args.worker_id or f"{socket.gethostname()}-validate-worker"
+    batch = args.batch
+    interval = args.interval
+    sample_size = args.sample
+    jurisdiction_timeout = args.jurisdiction_timeout
+    degraded_recheck_age_hours = args.degraded_recheck_age_hours
+    print(
+        f"validate-worker {worker_id}: batch={batch} interval={interval}s "
+        f"sample={sample_size} jurisdiction_timeout={jurisdiction_timeout}s "
+        "(validation-only; never touches fetch_text/api_sync jobs)"
+    )
+
+    # Shared across the whole loop lifetime, same reuse pattern as
+    # cmd_worker's fulltext_fetcher -- per-host robots.txt caching and the
+    # search/source clients' connection pools persist across jurisdictions.
+    source_client = validation_mod.new_client(timeout=validation_mod.DEFAULT_SOURCE_TIMEOUT)
+    search_client = validation_mod.new_client(
+        base_url=validation_mod.DEFAULT_SEARCH_API_BASE, timeout=validation_mod.DEFAULT_SEARCH_TIMEOUT
+    )
+    robots_cache = fulltext_mod.RobotsCache(client=source_client)
+
+    try:
+        while True:
+            db = get_session()
+            try:
+                # Step 1: keep counts fresh before selecting, so a
+                # jurisdiction whose crawl just finished is immediately
+                # visible as FULL_TEXT_SEARCHABLE rather than waiting on the
+                # crawl worker's own (much longer) recompute cadence.
+                coverage_mod.recompute_all_coverage(db)
+                db.commit()
+            except Exception:
+                db.rollback()
+                traceback.print_exc()
+            finally:
+                db.close()
+
+            db = get_session()
+            try:
+                # Step 2+3: advisory-locked selection pass. A caller that
+                # can't acquire the lock immediately (another validate-worker
+                # instance's cycle is mid-selection) skips this cycle
+                # entirely -- safe, the next cycle will pick up whatever is
+                # still due.
+                acquired = db.execute(
+                    text("SELECT pg_try_advisory_lock(:key)"),
+                    {"key": scheduler_mod.VALIDATE_WORKER_CYCLE_ADVISORY_LOCK_KEY},
+                ).scalar_one()
+                if not acquired:
+                    db.commit()
+                    time.sleep(interval)
+                    continue
+                try:
+                    candidates = scheduler_mod.plan_validation(
+                        db,
+                        batch=batch,
+                        degraded_recheck_age_hours=degraded_recheck_age_hours,
+                    )
+                finally:
+                    db.execute(
+                        text("SELECT pg_advisory_unlock(:key)"),
+                        {"key": scheduler_mod.VALIDATE_WORKER_CYCLE_ADVISORY_LOCK_KEY},
+                    )
+                db.commit()
+            except Exception:
+                db.rollback()
+                traceback.print_exc()
+                candidates = []
+            finally:
+                db.close()
+
+            if not candidates:
+                time.sleep(interval)
+                continue
+
+            # Step 4: validate each candidate txn-free, one at a time
+            # (politely paced -- the shared clients above carry robots.txt
+            # caching, and DEFAULT_JURISDICTION_TIMEOUT bounds each one's
+            # external-HTTP wall clock so a single hung site can't stall the
+            # whole cycle).
+            for candidate in candidates:
+                try:
+                    summary = validation_mod.validate_and_record_txnfree(
+                        candidate.jurisdiction_id,
+                        sample_size=sample_size,
+                        search_client=search_client,
+                        source_client=source_client,
+                        robots_cache=robots_cache,
+                        jurisdiction_timeout=jurisdiction_timeout,
+                    )
+                    rate = f"{summary.pass_rate:.0%}" if summary.pass_rate is not None else "n/a"
+                    leg_rates: dict[str, list[str]] = {}
+                    for bill in summary.bills:
+                        for leg in bill.legs:
+                            leg_rates.setdefault(leg.leg, []).append(leg.status)
+                    leg_summary = ", ".join(
+                        f"{leg}={'/'.join(statuses)}" for leg, statuses in sorted(leg_rates.items())
+                    )
+                    print(
+                        f"validate-worker {worker_id}: {candidate.jurisdiction_abbr} "
+                        f"(was {candidate.status}) sampled={len(summary.bills)} "
+                        f"pass_rate={rate} legs=[{leg_summary}]"
+                    )
+                except Exception as exc:  # noqa: BLE001 - one bad jurisdiction must never kill the loop
+                    print(
+                        f"validate-worker {worker_id}: ERROR validating {candidate.jurisdiction_abbr}: {exc}"
+                    )
+                    traceback.print_exc()
+
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print(f"validate-worker {worker_id}: stopping")
+        return 0
+    finally:
+        search_client.close()
+        source_client.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m billcommons_ingest")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -714,6 +881,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="jurisdictions to enqueue a validate job for per scheduler pass (default 3)",
     )
     p_worker.set_defaults(func=cmd_worker)
+
+    p_validate_worker = sub.add_parser(
+        "validate-worker",
+        help=(
+            "dedicated, long-running validation-ONLY loop (never touches "
+            "fetch_text/api_sync jobs) -- runs validate_and_record_txnfree "
+            "on a priority-selected batch each cycle"
+        ),
+    )
+    p_validate_worker.add_argument("--worker-id", default=None)
+    p_validate_worker.add_argument(
+        "--batch",
+        type=int,
+        default=int(os.environ.get("VALIDATE_WORKER_BATCH", str(scheduler_mod.DEFAULT_VALIDATE_BATCH))),
+        help="jurisdictions to validate per cycle (default 3, env VALIDATE_WORKER_BATCH)",
+    )
+    p_validate_worker.add_argument(
+        "--interval",
+        type=float,
+        default=float(os.environ.get("VALIDATE_WORKER_INTERVAL", "300")),
+        help="seconds to sleep between cycles (default 300s/5min, env VALIDATE_WORKER_INTERVAL)",
+    )
+    p_validate_worker.add_argument(
+        "--sample",
+        type=int,
+        default=validation_mod.DEFAULT_SAMPLE_SIZE,
+        help="bills to sample per jurisdiction (default 5)",
+    )
+    p_validate_worker.add_argument(
+        "--jurisdiction-timeout",
+        type=float,
+        default=validation_mod.DEFAULT_JURISDICTION_TIMEOUT,
+        help=(
+            "per-jurisdiction wall-clock cap in seconds for the external-HTTP "
+            "phase (default 180s, env VALIDATION_JURISDICTION_TIMEOUT); on cap, "
+            "remaining legs are marked unverifiable rather than raising"
+        ),
+    )
+    p_validate_worker.add_argument(
+        "--degraded-recheck-age-hours",
+        type=int,
+        default=scheduler_mod.DEFAULT_DEGRADED_RECHECK_AGE_HOURS,
+        help="re-check a DEGRADED jurisdiction after this many hours (default 6)",
+    )
+    p_validate_worker.set_defaults(func=cmd_validate_worker)
 
     return parser
 
