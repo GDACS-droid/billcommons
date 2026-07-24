@@ -133,6 +133,22 @@ GREEN_PASS_RATE_THRESHOLD = 0.80
 # the limitation recorded in known_gaps.
 GREEN_FULLTEXT_COVERAGE_THRESHOLD = 0.80
 
+# Statuses a CLEAN validation sample may lift back to VALIDATING when
+# full-text coverage isn't there yet. DEGRADED is in the list because it is
+# set automatically by a failing sample, so it must clear automatically on a
+# passing one -- otherwise a jurisdiction that fails once can never recover,
+# which is what stranded 31 rows (several sitting at pass_rate 1.0) in
+# DEGRADED. BLOCKED is deliberately absent: an operator sets it, an operator
+# clears it.
+_RECOVERABLE_INTO_VALIDATING = (
+    "BOOTSTRAPPED",
+    "METADATA_SEARCHABLE",
+    "SOURCE_IDENTIFIED",
+    "FULL_TEXT_SEARCHABLE",
+    "DEGRADED",
+    "GREEN",
+)
+
 
 @dataclass
 class LegResult:
@@ -1017,20 +1033,27 @@ def apply_validation_result(
             )
             continue
 
+        # BLOCKED is operator-set and stays put in every branch below -- a
+        # passing sample must not silently un-block a jurisdiction someone
+        # deliberately took out of service.
+        blocked = coverage.status == "BLOCKED"
+
         if available == 0:
             # Nothing is obtainable (no documents published, or every one is
             # robots-disallowed / has no text layer). Criterion #5 is vacuous
             # here, so a clean sample earns GREEN -- but the limitation is
             # stated rather than papered over, because "GREEN" must not imply
             # full-text search a user won't actually get.
-            coverage.status = "GREEN"
+            if not blocked:
+                coverage.status = "GREEN"
             coverage.known_gaps = (
                 "no full text obtainable from source (no documents published, "
                 "or all are robots-disallowed / have no extractable text); "
                 "bills remain metadata-searchable"
             )
         elif coverage.full_text_count >= GREEN_FULLTEXT_COVERAGE_THRESHOLD * available:
-            coverage.status = "GREEN"
+            if not blocked:
+                coverage.status = "GREEN"
             # Clear any stale gap message left by a prior DEGRADED/VALIDATING
             # pass -- a GREEN row that still says "full-text coverage is 0" is
             # a lie once text has landed.
@@ -1041,13 +1064,7 @@ def apply_validation_result(
             # cap at METADATA_SEARCHABLE/VALIDATING rather than fabricate a
             # GREEN this harness can't actually back up. This is a crawl still
             # in progress, not a fault, so it must not read as DEGRADED.
-            if coverage.status in (
-                "BOOTSTRAPPED",
-                "METADATA_SEARCHABLE",
-                "SOURCE_IDENTIFIED",
-                "FULL_TEXT_SEARCHABLE",
-                "GREEN",
-            ):
+            if coverage.status in _RECOVERABLE_INTO_VALIDATING:
                 coverage.status = "VALIDATING"
             pct = 100.0 * coverage.full_text_count / available
             coverage.known_gaps = (

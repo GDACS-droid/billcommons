@@ -42,6 +42,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest import queue as queue_mod
+from billcommons_ingest.validation import GREEN_FULLTEXT_COVERAGE_THRESHOLD
 from billcommons_schema.models import IngestJob, Jurisdiction, Session as SessionModel
 
 API_SYNC_KIND = "api_sync"
@@ -276,9 +277,36 @@ _VALIDATION_PRIORITY_SQL = """
         SELECT jc.jurisdiction_id, j.abbreviation, jc.status, jc.last_attempt_at,
             CASE
                 WHEN jc.status = 'FULL_TEXT_SEARCHABLE' THEN 1
+                -- Clocked off the last actual VALIDATION run, not
+                -- jc.last_attempt_at. That column is written by three
+                -- different things (registry seed, coverage recompute,
+                -- validation), and the recompute pass restamps it every
+                -- cycle -- so a cutoff against it is never satisfied and
+                -- DEGRADED became unreachable here. Combined with DEGRADED's
+                -- exclusion from priority 3 below, that made DEGRADED a
+                -- terminal state no jurisdiction could recover from.
                 WHEN jc.status = 'DEGRADED'
-                     AND (jc.last_attempt_at IS NULL
-                          OR jc.last_attempt_at <= :recheck_cutoff) THEN 2
+                     AND (last_validated.at IS NULL
+                          OR last_validated.at <= :recheck_cutoff) THEN 2
+                -- A GREEN row whose measured full-text coverage has fallen
+                -- below the bar is STALE and must be rechecked, or it keeps
+                -- the badge forever: GREEN is otherwise excluded from
+                -- selection below, so nothing would ever re-evaluate it and
+                -- apply_validation_result's demotion could never fire. This
+                -- is how jurisdictions promoted under the old
+                -- `full_text_count > 0` rule get re-judged. NULL available
+                -- is "not yet measured" and deliberately does NOT qualify --
+                -- a recompute pass resolves that first.
+                -- Deliberately NOT gated on last_attempt_at: every coverage
+                -- recompute stamps that column, so the recheck cutoff would
+                -- never be satisfied and this tier would be dead. It is
+                -- self-limiting instead -- one pass demotes the row out of
+                -- GREEN, after which it no longer matches here.
+                WHEN jc.status = 'GREEN'
+                     AND jc.full_text_available_count IS NOT NULL
+                     AND jc.full_text_available_count > 0
+                     AND jc.full_text_count
+                         < :green_fulltext_threshold * jc.full_text_available_count THEN 2
                 -- Priority 3 is "anything else still in play" -- explicitly
                 -- excludes DEGRADED (a DEGRADED row not yet due for its 6h
                 -- recheck must be skipped entirely, not silently fall
@@ -289,6 +317,11 @@ _VALIDATION_PRIORITY_SQL = """
             END AS priority
         FROM jurisdiction_coverage jc
         JOIN jurisdictions j ON j.id = jc.jurisdiction_id
+        LEFT JOIN LATERAL (
+            SELECT max(vr.finished_at) AS at
+            FROM validation_runs vr
+            WHERE vr.jurisdiction_id = jc.jurisdiction_id
+        ) last_validated ON TRUE
         WHERE jc.bill_count > 0
           AND NOT EXISTS (
               SELECT 1 FROM ingest_jobs ij
@@ -335,6 +368,7 @@ def plan_validation(
         {
             "recheck_cutoff": recheck_cutoff,
             "validate_kind": VALIDATE_KIND,
+            "green_fulltext_threshold": GREEN_FULLTEXT_COVERAGE_THRESHOLD,
             # Over-fetch a little before per-jurisdiction dedup collapses
             # multi-session rows -- batch is a final cap applied after.
             "batch": batch * 4 + 10,

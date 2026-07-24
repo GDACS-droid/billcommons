@@ -995,6 +995,77 @@ def test_uncomputed_available_count_never_promotes_to_green(db_session):
     assert "not yet computed" in (coverage.known_gaps or "").lower()
 
 
+def test_degraded_recovers_when_validation_passes_again(db_session):
+    """DEGRADED must clear on a passing sample, or it is a roach motel.
+
+    Business intent: DEGRADED is set automatically by a failing sample, so it
+    has to clear automatically too. It didn't -- the promote list omitted it,
+    which stranded 31 production rows in DEGRADED, several sitting at
+    validation_pass_rate 1.0, unable to ever go GREEN again.
+    """
+    jurisdiction, session_row, bills = _make_jurisdiction_with_bills(db_session, n=1)
+    coverage = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        status="DEGRADED",
+        bill_count=10,
+        full_text_count=10,
+        full_text_available_count=10,
+    )
+    db_session.add(coverage)
+    db_session.flush()
+
+    apply_validation_result(db_session, jurisdiction, _clean_summary(jurisdiction, session_row, bills))
+    db_session.flush()
+    db_session.refresh(coverage)
+
+    assert coverage.status == "GREEN"
+
+
+def test_degraded_with_clean_sample_but_thin_fulltext_lifts_to_validating(db_session):
+    """Recovery is not all-or-nothing: a clean sample lifts DEGRADED out even
+    when full text is still landing -- to VALIDATING, not straight to GREEN."""
+    jurisdiction, session_row, bills = _make_jurisdiction_with_bills(db_session, n=1)
+    coverage = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        status="DEGRADED",
+        bill_count=100,
+        full_text_count=5,
+        full_text_available_count=100,
+    )
+    db_session.add(coverage)
+    db_session.flush()
+
+    apply_validation_result(db_session, jurisdiction, _clean_summary(jurisdiction, session_row, bills))
+    db_session.flush()
+    db_session.refresh(coverage)
+
+    assert coverage.status == "VALIDATING"
+
+
+def test_blocked_is_never_lifted_by_a_passing_sample(db_session):
+    """BLOCKED is operator-set; only an operator clears it. A clean sample
+    must not silently un-block a jurisdiction taken out of service."""
+    jurisdiction, session_row, bills = _make_jurisdiction_with_bills(db_session, n=1)
+    coverage = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        status="BLOCKED",
+        bill_count=10,
+        full_text_count=10,
+        full_text_available_count=10,
+    )
+    db_session.add(coverage)
+    db_session.flush()
+
+    apply_validation_result(db_session, jurisdiction, _clean_summary(jurisdiction, session_row, bills))
+    db_session.flush()
+    db_session.refresh(coverage)
+
+    assert coverage.status == "BLOCKED"
+
+
 def test_failing_validation_demotes_to_degraded(db_session):
     jurisdiction, session_row, bills = _make_jurisdiction_with_bills(db_session, n=1)
     coverage = JurisdictionCoverage(

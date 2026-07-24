@@ -35,7 +35,13 @@ from billcommons_ingest.scheduler import (
     plan_validation,
     run_schedule_pass,
 )
-from billcommons_schema.models import IngestJob, Jurisdiction, JurisdictionCoverage, Session as SessionModel
+from billcommons_schema.models import (
+    IngestJob,
+    Jurisdiction,
+    JurisdictionCoverage,
+    Session as SessionModel,
+    ValidationRun,
+)
 from billcommons_shared.db import get_engine
 
 # Fixed instant for pure (no-DB) cadence/is_due tests, where any timestamp
@@ -355,7 +361,16 @@ def test_run_schedule_pass_ignores_dead_jobs_for_due_check(db_session):
 # ---------------------------------------------------------------------------
 
 
-def _make_coverage_jurisdiction(db_session, *, status, bill_count=5, full_text_count=0, last_attempt_at=None, abbr=None):
+def _make_coverage_jurisdiction(
+    db_session,
+    *,
+    status,
+    bill_count=5,
+    full_text_count=0,
+    full_text_available_count=None,
+    last_attempt_at=None,
+    abbr=None,
+):
     if abbr is None:
         abbr = f"ZQ_VALSCHED_{uuid.uuid4().hex[:8].upper()}"
     jurisdiction = Jurisdiction(name="Validate Scheduler Test State", abbreviation=abbr, classification="state")
@@ -370,6 +385,7 @@ def _make_coverage_jurisdiction(db_session, *, status, bill_count=5, full_text_c
         status=status,
         bill_count=bill_count,
         full_text_count=full_text_count,
+        full_text_available_count=full_text_available_count,
         last_attempt_at=last_attempt_at,
     )
     db_session.add(coverage)
@@ -409,10 +425,27 @@ def test_plan_validation_skips_degraded_row_still_within_recheck_window(db_sessi
     again immediately (within the 6h recheck window) -- otherwise the
     scheduler would burn validate-job capacity re-hammering the same
     jurisdiction's official site instead of spreading coverage across all
-    51."""
+    51.
+
+    "Re-checked an hour ago" is a `validation_runs` row, NOT a recent
+    `last_attempt_at`: that column is also restamped by every coverage
+    recompute, so clocking the window off it made this window permanently
+    unsatisfiable and DEGRADED unreachable in production.
+    """
     now = _real_now()
-    fresh_degraded, _ = _make_coverage_jurisdiction(
+    fresh_degraded, coverage = _make_coverage_jurisdiction(
         db_session, status="DEGRADED", last_attempt_at=now - timedelta(hours=1)
+    )
+    db_session.add(
+        ValidationRun(
+            jurisdiction_id=fresh_degraded.id,
+            session_id=coverage.session_id,
+            started_at=now - timedelta(hours=1),
+            finished_at=now - timedelta(hours=1),
+            pass_rate=0.5,
+            checks_run=2,
+            checks_failed=1,
+        )
     )
     db_session.flush()
 
@@ -430,6 +463,59 @@ def test_plan_validation_skips_green_and_zero_bill_count_rows(db_session):
     abbrs = [c.jurisdiction_abbr for c in candidates]
     assert green.abbreviation not in abbrs
     assert empty.abbreviation not in abbrs
+
+
+def test_plan_validation_rechecks_green_row_below_fulltext_threshold(db_session):
+    """A GREEN row whose full-text coverage no longer meets the bar must be
+    re-selected, or it keeps the badge forever.
+
+    Business intent: GREEN is otherwise excluded from selection entirely, so
+    without this tier `apply_validation_result`'s demotion is dead code for
+    exactly the rows that need it -- the jurisdictions promoted under the old
+    `full_text_count > 0` rule (PA was GREEN at 51/4,876) would never be
+    re-judged. Deliberately not gated on `last_attempt_at`: every coverage
+    recompute stamps it, so a cutoff would make this tier unreachable.
+    """
+    now = _real_now()
+    stale, _ = _make_coverage_jurisdiction(
+        db_session,
+        status="GREEN",
+        bill_count=100,
+        full_text_count=2,  # 2% of obtainable
+        full_text_available_count=100,
+        last_attempt_at=now,  # just recomputed -- must still be picked
+    )
+    covered, _ = _make_coverage_jurisdiction(
+        db_session,
+        status="GREEN",
+        bill_count=100,
+        full_text_count=95,  # comfortably over the bar
+        full_text_available_count=100,
+        last_attempt_at=now,
+    )
+    db_session.flush()
+
+    abbrs = [c.jurisdiction_abbr for c in plan_validation(db_session, batch=50, now=now)]
+    assert stale.abbreviation in abbrs
+    assert covered.abbreviation not in abbrs
+
+
+def test_plan_validation_leaves_unmeasured_green_alone(db_session):
+    """NULL available is "not yet measured", not "coverage is bad" -- a
+    recompute pass must resolve it before validation re-judges the row."""
+    now = _real_now()
+    unmeasured, _ = _make_coverage_jurisdiction(
+        db_session,
+        status="GREEN",
+        bill_count=100,
+        full_text_count=2,
+        full_text_available_count=None,
+        last_attempt_at=now,
+    )
+    db_session.flush()
+
+    abbrs = [c.jurisdiction_abbr for c in plan_validation(db_session, batch=50, now=now)]
+    assert unmeasured.abbreviation not in abbrs
 
 
 def test_enqueue_validation_jobs_dedupes_against_existing_queued_validate_job(db_session):
