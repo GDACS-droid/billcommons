@@ -12,6 +12,7 @@ dependencies = [
     "sqlalchemy>=2.0",
     "psycopg[binary]",
     "httpx",
+    "pypdf",
     "billcommons-schema",
     "billcommons-shared",
 ]

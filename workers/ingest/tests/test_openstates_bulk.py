@@ -16,6 +16,7 @@ underlying semantics regress, not just if syntax breaks):
 """
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
@@ -38,7 +39,7 @@ from tests.fixtures.build_fixture_zip import build_fixture_zip_bytes
 
 def _make_session_row(db_session) -> SessionModel:
     jurisdiction = Jurisdiction(
-        name="Test State", abbreviation="ZZ_TEST", classification="state"
+        name="Test State", abbreviation=f"ZZ_TEST_{uuid.uuid4().hex[:8].upper()}", classification="state"
     )
     db_session.add(jurisdiction)
     db_session.flush()
@@ -172,23 +173,46 @@ def test_ingest_is_idempotent_on_repeat_run(db_session, rawstore):
     the SAME zip twice must yield identical final counts with zero
     duplicate rows, and the second pass must report bills as unchanged
     (proving the checksum short-circuit actually fired rather than
-    silently re-writing identical data)."""
+    silently re-writing identical data).
+
+    All counts below are scoped to `session_row.id` (via a join through
+    Bill where the child table has no direct session_id column) -- this
+    test runs against a real shared live DB (see conftest.py), which can
+    carry rows from concurrent real ingests (other jurisdictions/sessions);
+    an unscoped whole-table count would flake whenever that concurrent
+    activity changes the global count mid-test (FIX 3)."""
     session_row = _make_session_row(db_session)
     zip_bytes = build_fixture_zip_bytes()
+
+    def _scoped_count(model, join_bill: bool = True):
+        stmt = select(func.count(model.id))
+        if join_bill:
+            stmt = stmt.join(Bill, model.bill_id == Bill.id).where(Bill.session_id == session_row.id)
+        else:
+            stmt = stmt.where(model.session_id == session_row.id)
+        return db_session.execute(stmt).scalar_one()
 
     first = ingest_session_csv_zip(db_session, zip_bytes, session_row=session_row, rawstore=rawstore)
     db_session.flush()
 
-    bill_count_after_first = db_session.execute(
-        select(func.count(Bill.id)).where(Bill.session_id == session_row.id)
+    bill_count_after_first = _scoped_count(Bill, join_bill=False)
+    action_count_after_first = _scoped_count(BillAction)
+    sponsorship_count_after_first = _scoped_count(Sponsorship)
+    version_count_after_first = _scoped_count(BillVersion)
+    document_count_after_first = db_session.execute(
+        select(func.count(BillDocument.id))
+        .join(BillVersion, BillDocument.bill_version_id == BillVersion.id)
+        .join(Bill, BillVersion.bill_id == Bill.id)
+        .where(Bill.session_id == session_row.id)
     ).scalar_one()
-    action_count_after_first = db_session.execute(select(func.count(BillAction.id))).scalar_one()
-    sponsorship_count_after_first = db_session.execute(select(func.count(Sponsorship.id))).scalar_one()
-    version_count_after_first = db_session.execute(select(func.count(BillVersion.id))).scalar_one()
-    document_count_after_first = db_session.execute(select(func.count(BillDocument.id))).scalar_one()
-    subject_count_after_first = db_session.execute(select(func.count(BillSubject.id))).scalar_one()
-    vote_event_count_after_first = db_session.execute(select(func.count(VoteEvent.id))).scalar_one()
-    vote_record_count_after_first = db_session.execute(select(func.count(VoteRecord.id))).scalar_one()
+    subject_count_after_first = _scoped_count(BillSubject)
+    vote_event_count_after_first = _scoped_count(VoteEvent)
+    vote_record_count_after_first = db_session.execute(
+        select(func.count(VoteRecord.id))
+        .join(VoteEvent, VoteRecord.vote_event_id == VoteEvent.id)
+        .join(Bill, VoteEvent.bill_id == Bill.id)
+        .where(Bill.session_id == session_row.id)
+    ).scalar_one()
 
     second = ingest_session_csv_zip(
         db_session,
@@ -206,38 +230,31 @@ def test_ingest_is_idempotent_on_repeat_run(db_session, rawstore):
         "silently rewriting identical rows"
     )
 
-    bill_count_after_second = db_session.execute(
-        select(func.count(Bill.id)).where(Bill.session_id == session_row.id)
-    ).scalar_one()
+    bill_count_after_second = _scoped_count(Bill, join_bill=False)
     assert bill_count_after_second == bill_count_after_first
 
+    assert action_count_after_first == _scoped_count(BillAction)
+    assert sponsorship_count_after_first == _scoped_count(Sponsorship)
+    assert version_count_after_first == _scoped_count(BillVersion)
     assert (
-        db_session.execute(select(func.count(BillAction.id))).scalar_one()
-        == action_count_after_first
+        document_count_after_first
+        == db_session.execute(
+            select(func.count(BillDocument.id))
+            .join(BillVersion, BillDocument.bill_version_id == BillVersion.id)
+            .join(Bill, BillVersion.bill_id == Bill.id)
+            .where(Bill.session_id == session_row.id)
+        ).scalar_one()
     )
+    assert subject_count_after_first == _scoped_count(BillSubject)
+    assert vote_event_count_after_first == _scoped_count(VoteEvent)
     assert (
-        db_session.execute(select(func.count(Sponsorship.id))).scalar_one()
-        == sponsorship_count_after_first
-    )
-    assert (
-        db_session.execute(select(func.count(BillVersion.id))).scalar_one()
-        == version_count_after_first
-    )
-    assert (
-        db_session.execute(select(func.count(BillDocument.id))).scalar_one()
-        == document_count_after_first
-    )
-    assert (
-        db_session.execute(select(func.count(BillSubject.id))).scalar_one()
-        == subject_count_after_first
-    )
-    assert (
-        db_session.execute(select(func.count(VoteEvent.id))).scalar_one()
-        == vote_event_count_after_first
-    )
-    assert (
-        db_session.execute(select(func.count(VoteRecord.id))).scalar_one()
-        == vote_record_count_after_first
+        vote_record_count_after_first
+        == db_session.execute(
+            select(func.count(VoteRecord.id))
+            .join(VoteEvent, VoteRecord.vote_event_id == VoteEvent.id)
+            .join(Bill, VoteEvent.bill_id == Bill.id)
+            .where(Bill.session_id == session_row.id)
+        ).scalar_one()
     )
 
 

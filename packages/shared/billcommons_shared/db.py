@@ -62,10 +62,24 @@ _SessionLocal: sessionmaker[Session] | None = None
 
 
 def get_engine() -> Engine:
-    """Return a process-wide singleton SQLAlchemy engine."""
+    """Return a process-wide singleton SQLAlchemy engine.
+
+    Sets conservative server-side `statement_timeout` /
+    `idle_in_transaction_session_timeout` options so a worker process that
+    dies mid-transaction (SIGKILL/OOM/deploy restart -- anything that skips
+    Python's `finally: db.close()`) doesn't leave an orphaned "idle in
+    transaction" connection holding row locks indefinitely; Postgres itself
+    now terminates it after 5 minutes idle-in-transaction.
+    """
     global _engine
     if _engine is None:
-        _engine = create_engine(get_database_url(), pool_pre_ping=True)
+        _engine = create_engine(
+            get_database_url(),
+            pool_pre_ping=True,
+            connect_args={
+                "options": "-c statement_timeout=300000 -c idle_in_transaction_session_timeout=300000"
+            },
+        )
     return _engine
 
 

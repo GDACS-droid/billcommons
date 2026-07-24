@@ -8,6 +8,8 @@ matrix requires (jurisdiction, session, bill count, full-text %, status).
 """
 from __future__ import annotations
 
+import uuid
+
 from billcommons_ingest.coverage import (
     _next_status_for_counts,
     build_coverage_report,
@@ -17,7 +19,9 @@ from billcommons_ingest.coverage import (
 from billcommons_schema.models import Bill, Jurisdiction, JurisdictionCoverage, Session as SessionModel
 
 
-def _make_jurisdiction_with_session(db_session, abbr="ZQ_COV"):
+def _make_jurisdiction_with_session(db_session, abbr=None):
+    if abbr is None:
+        abbr = f"ZQ_COV_{uuid.uuid4().hex[:8].upper()}"
     jurisdiction = Jurisdiction(name="Coverage Test State", abbreviation=abbr, classification="state")
     db_session.add(jurisdiction)
     db_session.flush()
@@ -72,7 +76,8 @@ def test_recompute_coverage_row_updates_bill_count(db_session):
 
 
 def test_build_coverage_report_shape(db_session):
-    jurisdiction, session_row = _make_jurisdiction_with_session(db_session, abbr="ZQ_REPORT")
+    abbr = f"ZQ_REPORT_{uuid.uuid4().hex[:8].upper()}"
+    jurisdiction, session_row = _make_jurisdiction_with_session(db_session, abbr=abbr)
     coverage = JurisdictionCoverage(
         jurisdiction_id=jurisdiction.id, session_id=session_row.id, status="SOURCE_IDENTIFIED"
     )
@@ -84,7 +89,7 @@ def test_build_coverage_report_shape(db_session):
     assert "jurisdiction_count" in report
     assert "rows" in report
 
-    row = next(r for r in report["rows"] if r["jurisdiction"] == "ZQ_REPORT")
+    row = next(r for r in report["rows"] if r["jurisdiction"] == abbr)
     assert row["jurisdiction_name"] == "Coverage Test State"
     assert row["session"] == "2026 Session"
     assert row["status"] == "SOURCE_IDENTIFIED"

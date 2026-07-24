@@ -162,6 +162,31 @@ def _resolve_organization(db: OrmSession, org_cache: dict[str, Organization], op
     return org
 
 
+def peek_session_slug(zip_source: str | Path | BinaryIO | bytes) -> str | None:
+    """Return the `session_identifier` value the zip's own bills.csv rows
+    carry (e.g. "2026rs", "2026F", "89R") without doing a full ingest --
+    used by the bootstrap CLI to resolve which `sessions` row a zip
+    belongs to when `--session` wasn't passed explicitly (see FIX 1 /
+    cmd_bootstrap in cli.py). Returns None if the zip has no bill rows or
+    no `session_identifier` column (never raises -- caller falls back to
+    the jurisdiction's active session, same as before this existed)."""
+    if isinstance(zip_source, (str, Path)):
+        raw_bytes = Path(zip_source).read_bytes()
+    elif isinstance(zip_source, bytes):
+        raw_bytes = zip_source
+    else:
+        raw_bytes = zip_source.read()
+        if hasattr(zip_source, "seek"):
+            zip_source.seek(0)
+
+    with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+        bill_rows = _read_csv_rows(zf, ["_bills.csv"])
+        if not bill_rows:
+            return None
+        slug = bill_rows[0].get("session_identifier")
+        return slug.strip() if slug else None
+
+
 def ingest_session_csv_zip(
     db: OrmSession,
     zip_source: str | Path | BinaryIO | bytes,

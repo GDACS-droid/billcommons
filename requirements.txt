@@ -10,6 +10,7 @@ python-dateutil
 slowapi
 pytest
 mcp
+pypdf
 
 # workspace packages (editable installs, single source of truth for models/utils)
 -e packages/schema

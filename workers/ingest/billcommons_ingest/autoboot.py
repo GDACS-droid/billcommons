@@ -61,7 +61,9 @@ def bootstrap_state(state: str, entries: list[dict]) -> bool:
                     while chunk := r.read(1 << 20):
                         tmp.write(chunk)
                 tmp.flush()
-                rc = cli.main(["bootstrap", "--state", state, "--zip", tmp.name])
+                rc = cli.main(
+                    ["bootstrap", "--state", state, "--zip", tmp.name, "--source-url", url]
+                )
                 print(f"autoboot: {state} {label} rc={rc}", flush=True)
                 ok = ok and rc == 0
             except Exception as exc:  # noqa: BLE001 - keep the fleet moving
