@@ -45,6 +45,7 @@ from billcommons_ingest import queue as queue_mod
 from billcommons_schema.models import IngestJob, Jurisdiction, Session as SessionModel
 
 API_SYNC_KIND = "api_sync"
+VALIDATE_KIND = "validate"
 
 # Arbitrary but FIXED 64-bit key for the session-level Postgres advisory
 # lock `run_schedule_pass` holds for the duration of its read-then-insert
@@ -53,6 +54,17 @@ API_SYNC_KIND = "api_sync"
 # purpose (grepped: nothing else calls pg_advisory_lock in this repo as of
 # this writing).
 SCHEDULE_PASS_ADVISORY_LOCK_KEY = 847_291_003_615_882_001
+
+# Separate, FIXED 64-bit key for `enqueue_validation_jobs`'s own
+# read-then-insert pass -- must be DIFFERENT from
+# SCHEDULE_PASS_ADVISORY_LOCK_KEY so an api_sync schedule pass and a
+# validation enqueue pass can run concurrently without contending on the
+# same lock (they touch disjoint job kinds), while two concurrent
+# validation-enqueue passes still serialize against each other.
+VALIDATE_ENQUEUE_ADVISORY_LOCK_KEY = 847_291_003_615_882_002
+
+DEFAULT_VALIDATE_BATCH = 3
+DEFAULT_DEGRADED_RECHECK_AGE_HOURS = 6
 
 # Cadence tiers, in minutes.
 CADENCE_ACTIVE_MINUTES = 30
@@ -223,4 +235,162 @@ def run_schedule_pass(db: OrmSession, *, now: datetime | None = None) -> list[st
             continue
         queue_mod.enqueue(db, API_SYNC_KIND, {"state": decision.jurisdiction_abbr})
         enqueued.append(decision.jurisdiction_abbr)
+    return enqueued
+
+
+# ---------------------------------------------------------------------------
+# Validation scheduler: keep FULL_TEXT_SEARCHABLE/DEGRADED rows moving
+# through validation instead of sitting there forever (see cli.py cmd_worker
+# "PERIODIC RECOMPUTE"/"VALIDATION SCHEDULER" docstrings + coverage.py's
+# module docstring: recompute alone only ever reaches FULL_TEXT_SEARCHABLE;
+# validation.py's validate_and_record is the ONLY thing that can move a row
+# into/out of VALIDATING/GREEN/DEGRADED, so something has to keep calling it
+# for every jurisdiction, on its own schedule, without a human running
+# `validate --state XX` by hand for all 51).
+# ---------------------------------------------------------------------------
+
+# Priority tiers a jurisdiction_coverage row can fall into for the validation
+# queue, in enqueue order (lower number = enqueued first):
+#   1. FULL_TEXT_SEARCHABLE and not GREEN -- ready to be promoted, the
+#      highest-value thing this pass can do.
+#   2. DEGRADED whose last validation attempt is older than
+#      `degraded_recheck_age_hours` -- give a previously-failing jurisdiction
+#      a chance to recover (e.g. after the 6b/6e surface-form fixes) instead
+#      of leaving it degraded forever.
+#   3. everything else still in play (VALIDATING or any other non-terminal,
+#      non-NOT_STARTED status), oldest `last_attempt_at` first -- so a
+#      jurisdiction that's simply never been checked (or checked longest ago)
+#      gets priority over one that ran recently.
+_VALIDATION_PRIORITY_SQL = """
+    SELECT jurisdiction_id, abbreviation, status, last_attempt_at, priority
+    FROM (
+        SELECT jc.jurisdiction_id, j.abbreviation, jc.status, jc.last_attempt_at,
+            CASE
+                WHEN jc.status = 'FULL_TEXT_SEARCHABLE' THEN 1
+                WHEN jc.status = 'DEGRADED'
+                     AND (jc.last_attempt_at IS NULL
+                          OR jc.last_attempt_at <= :recheck_cutoff) THEN 2
+                -- Priority 3 is "anything else still in play" -- explicitly
+                -- excludes DEGRADED (a DEGRADED row not yet due for its 6h
+                -- recheck must be skipped entirely, not silently fall
+                -- through to priority 3) in addition to the terminal/
+                -- not-yet-started statuses already excluded below.
+                WHEN jc.status NOT IN ('NOT_STARTED', 'SOURCE_IDENTIFIED', 'GREEN', 'BLOCKED', 'DEGRADED') THEN 3
+                ELSE NULL
+            END AS priority
+        FROM jurisdiction_coverage jc
+        JOIN jurisdictions j ON j.id = jc.jurisdiction_id
+        WHERE jc.bill_count > 0
+          AND NOT EXISTS (
+              SELECT 1 FROM ingest_jobs ij
+              WHERE ij.kind = :validate_kind
+                AND ij.status IN ('queued', 'running')
+                AND ij.payload ->> 'jurisdiction' = j.abbreviation
+          )
+    ) ranked
+    WHERE priority IS NOT NULL
+    ORDER BY priority ASC, last_attempt_at ASC NULLS FIRST, abbreviation ASC
+    LIMIT :batch
+"""
+
+
+@dataclass
+class ValidationCandidate:
+    jurisdiction_id: object
+    jurisdiction_abbr: str
+    status: str
+    last_attempt_at: datetime | None
+    priority: int
+
+
+def plan_validation(
+    db: OrmSession,
+    *,
+    batch: int = DEFAULT_VALIDATE_BATCH,
+    degraded_recheck_age_hours: int = DEFAULT_DEGRADED_RECHECK_AGE_HOURS,
+    now: datetime | None = None,
+) -> list[ValidationCandidate]:
+    """Read-only pass: pick up to `batch` jurisdictions to validate next, by
+    priority (FULL_TEXT_SEARCHABLE-not-yet-GREEN, then stale DEGRADED, then
+    oldest-checked-other), deduped against any jurisdiction that already has
+    a queued/running `validate` job. One jurisdiction is only ever a
+    candidate once per DB row even if it has multiple jurisdiction_coverage
+    rows (e.g. multi-session); duplicates are collapsed keeping the
+    highest-priority (lowest number) row. Does not enqueue anything -- see
+    `enqueue_validation_jobs` for the write side."""
+    now = now or datetime.now(timezone.utc)
+    recheck_cutoff = now - timedelta(hours=degraded_recheck_age_hours)
+
+    rows = db.execute(
+        text(_VALIDATION_PRIORITY_SQL),
+        {
+            "recheck_cutoff": recheck_cutoff,
+            "validate_kind": VALIDATE_KIND,
+            # Over-fetch a little before per-jurisdiction dedup collapses
+            # multi-session rows -- batch is a final cap applied after.
+            "batch": batch * 4 + 10,
+        },
+    ).all()
+
+    seen: dict[str, ValidationCandidate] = {}
+    for jurisdiction_id, abbr, status, last_attempt_at, priority in rows:
+        candidate = ValidationCandidate(
+            jurisdiction_id=jurisdiction_id,
+            jurisdiction_abbr=abbr,
+            status=status,
+            last_attempt_at=last_attempt_at,
+            priority=priority,
+        )
+        existing = seen.get(abbr)
+        if existing is None or candidate.priority < existing.priority:
+            seen[abbr] = candidate
+
+    ordered = sorted(
+        seen.values(),
+        key=lambda c: (c.priority, c.last_attempt_at or datetime.min.replace(tzinfo=timezone.utc), c.jurisdiction_abbr),
+    )
+    return ordered[:batch]
+
+
+def enqueue_validation_jobs(
+    db: OrmSession,
+    batch: int = DEFAULT_VALIDATE_BATCH,
+    *,
+    degraded_recheck_age_hours: int = DEFAULT_DEGRADED_RECHECK_AGE_HOURS,
+    sample_size: int | None = None,
+    now: datetime | None = None,
+) -> list[str]:
+    """Enqueue up to `batch` `validate` ingest_jobs rows (payload
+    `{"jurisdiction": "XX"}` (+ `"sample": N` if `sample_size` given)),
+    chosen by `plan_validation`'s priority order, deduped against any
+    jurisdiction that already has a queued/running `validate` job. Caller
+    commits. Returns the list of jurisdiction abbreviations enqueued.
+
+    Guarded by `VALIDATE_ENQUEUE_ADVISORY_LOCK_KEY`
+    (`pg_try_advisory_xact_lock`, transaction-scoped) for the exact same
+    reason `run_schedule_pass` is guarded by its own key: this is a
+    read-then-insert with a gap in between, so two concurrent callers (two
+    worker processes' periodic validation-enqueue passes) could both read
+    "no queued validate job for XX yet" and both insert one, double-hitting
+    the production search API + the jurisdiction's official site for the
+    same sample. A caller that can't acquire the lock immediately skips this
+    pass entirely and returns an empty list -- safe, since the next
+    scheduled pass will pick up anything still due.
+    """
+    acquired = db.execute(
+        text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": VALIDATE_ENQUEUE_ADVISORY_LOCK_KEY}
+    ).scalar_one()
+    if not acquired:
+        return []
+
+    candidates = plan_validation(
+        db, batch=batch, degraded_recheck_age_hours=degraded_recheck_age_hours, now=now
+    )
+    enqueued = []
+    for candidate in candidates:
+        payload = {"jurisdiction": candidate.jurisdiction_abbr}
+        if sample_size is not None:
+            payload["sample"] = sample_size
+        queue_mod.enqueue(db, VALIDATE_KIND, payload)
+        enqueued.append(candidate.jurisdiction_abbr)
     return enqueued

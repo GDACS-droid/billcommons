@@ -17,7 +17,8 @@ Subcommands (per BRIEF-wave2.md):
     schedule-refresh                  Enqueue api_sync jobs for jurisdictions
                                        due per SPEC "Refresh targets" cadence.
     worker                            Long-running loop: claim + process ingest_jobs,
-                                       plus a periodic schedule-refresh pass.
+                                       plus periodic schedule-refresh, fulltext top-up,
+                                       coverage-recompute, and validate-schedule passes.
 """
 from __future__ import annotations
 
@@ -382,6 +383,18 @@ def cmd_worker(args: argparse.Namespace) -> int:
     fulltext_topup_interval = getattr(args, "fulltext_topup_interval", 600)
     fulltext_topup_batch = getattr(args, "fulltext_topup_batch", 5000)
     fulltext_topup_floor = getattr(args, "fulltext_topup_floor", 1000)
+    # Coverage-convergence loop (docs/SPEC.md "Coverage state machine + GREEN
+    # criteria"): recompute keeps bill_count/full_text_count fresh + advances
+    # non-terminal rows to FULL_TEXT_SEARCHABLE as the fulltext crawl lands
+    # text; the validation scheduler then keeps feeding the ONLY thing that
+    # can move a row into/out of VALIDATING/GREEN/DEGRADED (validation.py).
+    # Neither pass alone converges coverage to GREEN -- see cli.py module
+    # docstring / this function's surrounding periodic-pass comments.
+    last_coverage_recompute = 0.0
+    last_validate_schedule = 0.0
+    coverage_recompute_interval = getattr(args, "coverage_recompute_interval", 1200.0)
+    validate_schedule_interval = getattr(args, "validate_schedule_interval", 1800.0)
+    validate_batch = getattr(args, "validate_batch", scheduler_mod.DEFAULT_VALIDATE_BATCH)
 
     try:
         while True:
@@ -429,6 +442,60 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     db_ft.close()
                 last_fulltext_topup = now_monotonic
 
+            # Periodic coverage recompute: refreshes bill_count/full_text_count
+            # for every jurisdiction_coverage row from the actual bills/
+            # bill_documents tables and advances non-terminal rows toward
+            # FULL_TEXT_SEARCHABLE as extracted_text lands from the fulltext
+            # crawl. Cheap, set-based, no external calls -- never touches a
+            # row already at GREEN/DEGRADED/BLOCKED/VALIDATING (see
+            # coverage._TERMINAL_STATES_NOT_AUTO_ADVANCED).
+            if (
+                coverage_recompute_interval > 0
+                and now_monotonic - last_coverage_recompute >= coverage_recompute_interval
+            ):
+                db_cov = get_session()
+                try:
+                    rows = coverage_mod.recompute_all_coverage(db_cov)
+                    db_cov.commit()
+                    by_status: dict[str, int] = {}
+                    for row in rows:
+                        by_status[row.status] = by_status.get(row.status, 0) + 1
+                    print(
+                        f"worker {worker_id}: coverage-recompute {len(rows)} row(s) -> "
+                        f"{dict(sorted(by_status.items()))}"
+                    )
+                except Exception:
+                    db_cov.rollback()
+                    traceback.print_exc()
+                finally:
+                    db_cov.close()
+                last_coverage_recompute = now_monotonic
+
+            # Periodic validation scheduler: enqueues a small batch of
+            # `validate` jobs, prioritizing jurisdictions ready to be
+            # promoted to GREEN (FULL_TEXT_SEARCHABLE) or overdue for a
+            # DEGRADED recheck (see scheduler.enqueue_validation_jobs).
+            # Actual validation work (external HTTP to the search API + each
+            # jurisdiction's official site) happens when the queued job is
+            # claimed + dispatched below, paced by the queue's normal serial
+            # claim like any other job kind.
+            if (
+                validate_schedule_interval > 0
+                and now_monotonic - last_validate_schedule >= validate_schedule_interval
+            ):
+                db_val = get_session()
+                try:
+                    queued = scheduler_mod.enqueue_validation_jobs(db_val, validate_batch)
+                    db_val.commit()
+                    if queued:
+                        print(f"worker {worker_id}: validate-schedule enqueued {sorted(queued)}")
+                except Exception:
+                    db_val.rollback()
+                    traceback.print_exc()
+                finally:
+                    db_val.close()
+                last_validate_schedule = now_monotonic
+
             db = get_session()
             try:
                 job = queue_mod.claim_job(db, worker_id)
@@ -464,6 +531,23 @@ def cmd_worker(args: argparse.Namespace) -> int:
                             f"worker {worker_id}: api_sync {result.state} "
                             f"created={result.bills_created} updated={result.bills_updated} "
                             f"unchanged={result.bills_unchanged}"
+                        )
+                    elif job.kind == scheduler_mod.VALIDATE_KIND:
+                        abbr = job.payload.get("jurisdiction")
+                        jurisdiction = db.execute(
+                            select(Jurisdiction).where(Jurisdiction.abbreviation == abbr)
+                        ).scalar_one_or_none()
+                        if jurisdiction is None:
+                            raise ValueError(f"validate job: no jurisdiction row for {abbr!r}")
+                        sample_size = job.payload.get("sample") or validation_mod.DEFAULT_SAMPLE_SIZE
+                        summary, _run = validation_mod.validate_and_record(
+                            db, jurisdiction, sample_size=sample_size
+                        )
+                        rate = f"{summary.pass_rate:.0%}" if summary.pass_rate is not None else "n/a"
+                        print(
+                            f"worker {worker_id}: validate {abbr} sampled={len(summary.bills)} "
+                            f"checks_run={summary.checks_run} checks_failed={summary.checks_failed} "
+                            f"pass_rate={rate}"
                         )
                     else:
                         raise ValueError(f"unknown job kind: {job.kind!r}")
@@ -596,6 +680,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1000,
         help="top up the fetch_text queue when it falls below this many jobs (default 1000)",
+    )
+    p_worker.add_argument(
+        "--coverage-recompute-interval",
+        type=float,
+        default=1200.0,
+        help="seconds between coverage-recompute passes inside the worker loop (default 1200s/20min; 0 disables)",
+    )
+    p_worker.add_argument(
+        "--validate-schedule-interval",
+        type=float,
+        default=1800.0,
+        help="seconds between validation-scheduler enqueue passes (default 1800s/30min; 0 disables)",
+    )
+    p_worker.add_argument(
+        "--validate-batch",
+        type=int,
+        default=scheduler_mod.DEFAULT_VALIDATE_BATCH,
+        help="jurisdictions to enqueue a validate job for per scheduler pass (default 3)",
     )
     p_worker.set_defaults(func=cmd_worker)
 

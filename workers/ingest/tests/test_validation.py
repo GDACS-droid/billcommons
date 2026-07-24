@@ -913,6 +913,57 @@ def test_zero_bill_count_coverage_rows_are_left_untouched(db_session):
 # ---------------------------------------------------------------------------
 
 
+def test_validate_job_kind_dispatch_updates_jurisdiction_coverage_status(db_session):
+    """Business intent: cli.py's worker `validate` job-kind dispatch calls
+    exactly this function (validate_and_record) with the jurisdiction
+    resolved from the job payload -- if this stops updating
+    jurisdiction_coverage.status, the periodic validation scheduler could
+    enqueue jobs forever without ever actually promoting a jurisdiction to
+    GREEN (the whole point of wiring `validate` into the worker loop)."""
+    jurisdiction, session_row, bills = _make_jurisdiction_with_bills(db_session, n=2)
+    coverage = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        status="FULL_TEXT_SEARCHABLE",
+        bill_count=2,
+        full_text_count=2,
+    )
+    db_session.add(coverage)
+    db_session.flush()
+
+    def search_handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"id": str(b.id)} for b in bills],
+                "pagination": {"page": 1, "per_page": 25, "total": len(bills), "total_pages": 1},
+                "meta": {"api_version": "v1", "request_id": "test"},
+            },
+        )
+
+    def source_handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, text="HB 1 HB 2 An act concerning transportation infrastructure funding")
+
+    search_client = httpx.Client(
+        transport=httpx.MockTransport(search_handler), base_url="https://api.billcommons.org/api/v1"
+    )
+    source_client = httpx.Client(transport=httpx.MockTransport(source_handler))
+
+    # Mirrors cli.py cmd_worker's `validate` kind dispatch exactly: resolve
+    # jurisdiction from payload, call validate_and_record with the payload's
+    # sample size.
+    validate_and_record(
+        db_session, jurisdiction, sample_size=2, search_client=search_client, source_client=source_client
+    )
+    db_session.flush()
+    db_session.refresh(coverage)
+
+    assert coverage.status == "GREEN"
+    assert coverage.validation_pass_rate is not None
+
+
 def test_validate_and_record_persists_validation_run(db_session):
     jurisdiction, session_row, bills = _make_jurisdiction_with_bills(db_session, n=2)
 

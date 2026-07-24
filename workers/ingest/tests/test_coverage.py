@@ -16,7 +16,14 @@ from billcommons_ingest.coverage import (
     recompute_all_coverage,
     write_coverage_report,
 )
-from billcommons_schema.models import Bill, Jurisdiction, JurisdictionCoverage, Session as SessionModel
+from billcommons_schema.models import (
+    Bill,
+    BillDocument,
+    BillVersion,
+    Jurisdiction,
+    JurisdictionCoverage,
+    Session as SessionModel,
+)
 
 
 def _make_jurisdiction_with_session(db_session, abbr=None):
@@ -95,6 +102,74 @@ def test_build_coverage_report_shape(db_session):
     assert row["status"] == "SOURCE_IDENTIFIED"
     assert row["bill_count"] == 0
     assert row["full_text_pct"] == 0.0
+
+
+def test_periodic_recompute_advances_metadata_searchable_to_full_text_searchable(db_session):
+    """Business intent: the periodic recompute pass in cmd_worker exists
+    specifically to catch a jurisdiction's full_text_count going stale as
+    the fulltext crawl lands extracted_text over time -- if this regresses,
+    a jurisdiction with real full text sitting in bill_documents would never
+    advance past METADATA_SEARCHABLE on its own (the exact bug this whole
+    feature fixes)."""
+    jurisdiction, session_row = _make_jurisdiction_with_session(db_session)
+    coverage = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction.id, session_id=session_row.id, status="METADATA_SEARCHABLE", bill_count=1
+    )
+    db_session.add(coverage)
+
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 1",
+        identifier_norm="HB 1",
+        title="Bill 1",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    version = BillVersion(bill_id=bill.id)
+    db_session.add(version)
+    db_session.flush()
+
+    document = BillDocument(bill_version_id=version.id, extracted_text="the full text landed")
+    db_session.add(document)
+    db_session.flush()
+
+    recompute_all_coverage(db_session)
+    db_session.flush()
+    db_session.refresh(coverage)
+
+    assert coverage.full_text_count == 1
+    assert coverage.status == "FULL_TEXT_SEARCHABLE"
+
+
+def test_periodic_recompute_does_not_touch_green_or_degraded_rows(db_session):
+    """Business intent: recompute is a cheap, count-based pass that runs
+    every 20 minutes unattended -- it must never silently demote a row a
+    validation run already promoted to GREEN or demoted to DEGRADED, even
+    though the row it's re-scanning has zero bills/documents attached in
+    this test (a transient-looking zero count must not regress a terminal
+    status)."""
+    jurisdiction, session_row = _make_jurisdiction_with_session(db_session)
+    green = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction.id, session_id=session_row.id, status="GREEN", bill_count=5, full_text_count=5
+    )
+    db_session.add(green)
+
+    jurisdiction2, session_row2 = _make_jurisdiction_with_session(db_session)
+    degraded = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction2.id, session_id=session_row2.id, status="DEGRADED", bill_count=5
+    )
+    db_session.add(degraded)
+    db_session.flush()
+
+    recompute_all_coverage(db_session)
+    db_session.flush()
+    db_session.refresh(green)
+    db_session.refresh(degraded)
+
+    assert green.status == "GREEN"
+    assert degraded.status == "DEGRADED"
 
 
 def test_write_coverage_report_writes_valid_json(tmp_path):

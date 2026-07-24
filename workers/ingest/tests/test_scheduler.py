@@ -24,13 +24,17 @@ from billcommons_ingest.scheduler import (
     CADENCE_TIER_YEAR_ROUND,
     API_SYNC_KIND,
     SCHEDULE_PASS_ADVISORY_LOCK_KEY,
+    VALIDATE_ENQUEUE_ADVISORY_LOCK_KEY,
+    VALIDATE_KIND,
     cadence_minutes,
     cadence_tier,
+    enqueue_validation_jobs,
     is_due,
     plan_schedule,
+    plan_validation,
     run_schedule_pass,
 )
-from billcommons_schema.models import IngestJob, Jurisdiction, Session as SessionModel
+from billcommons_schema.models import IngestJob, Jurisdiction, JurisdictionCoverage, Session as SessionModel
 from billcommons_shared.db import get_engine
 
 # Fixed instant for pure (no-DB) cadence/is_due tests, where any timestamp
@@ -343,3 +347,160 @@ def test_run_schedule_pass_ignores_dead_jobs_for_due_check(db_session):
     decision = next(d for d in decisions if d.jurisdiction_abbr == jurisdiction.abbreviation)
     assert decision.due is True
     assert decision.last_enqueued_at is None
+
+
+# ---------------------------------------------------------------------------
+# Validation scheduler: plan_validation / enqueue_validation_jobs
+# ---------------------------------------------------------------------------
+
+
+def _make_coverage_jurisdiction(db_session, *, status, bill_count=5, full_text_count=0, last_attempt_at=None, abbr=None):
+    if abbr is None:
+        abbr = f"ZQ_VALSCHED_{uuid.uuid4().hex[:8].upper()}"
+    jurisdiction = Jurisdiction(name="Validate Scheduler Test State", abbreviation=abbr, classification="state")
+    db_session.add(jurisdiction)
+    db_session.flush()
+    session_row = SessionModel(jurisdiction_id=jurisdiction.id, identifier="2026 Session", active=True)
+    db_session.add(session_row)
+    db_session.flush()
+    coverage = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        status=status,
+        bill_count=bill_count,
+        full_text_count=full_text_count,
+        last_attempt_at=last_attempt_at,
+    )
+    db_session.add(coverage)
+    db_session.flush()
+    return jurisdiction, coverage
+
+
+def test_plan_validation_prioritizes_full_text_searchable_over_degraded_and_others(db_session):
+    """Business intent: a jurisdiction that's ready to be promoted to GREEN
+    (FULL_TEXT_SEARCHABLE) must be validated before anything else -- that's
+    the highest-value thing the scheduler can spend a validate job on. A
+    stale DEGRADED row (past the recheck window) comes next, and anything
+    else still in play comes last."""
+    now = _real_now()
+    ready, _ = _make_coverage_jurisdiction(db_session, status="FULL_TEXT_SEARCHABLE", last_attempt_at=now)
+    stale_degraded, _ = _make_coverage_jurisdiction(
+        db_session, status="DEGRADED", last_attempt_at=now - timedelta(hours=7)
+    )
+    other, _ = _make_coverage_jurisdiction(db_session, status="VALIDATING", last_attempt_at=now - timedelta(hours=1))
+    db_session.flush()
+
+    # batch is deliberately large: this suite runs against the shared live
+    # DB, which already carries dozens of real DEGRADED/VALIDATING rows that
+    # would otherwise crowd our three fixtures out of a small batch cap
+    # before we can even observe their relative order.
+    candidates = plan_validation(db_session, batch=500, degraded_recheck_age_hours=6, now=now)
+    abbrs_by_priority = [c.jurisdiction_abbr for c in candidates]
+
+    ready_idx = abbrs_by_priority.index(ready.abbreviation)
+    degraded_idx = abbrs_by_priority.index(stale_degraded.abbreviation)
+    other_idx = abbrs_by_priority.index(other.abbreviation)
+    assert ready_idx < degraded_idx < other_idx
+
+
+def test_plan_validation_skips_degraded_row_still_within_recheck_window(db_session):
+    """A DEGRADED jurisdiction re-checked an hour ago must NOT be re-queued
+    again immediately (within the 6h recheck window) -- otherwise the
+    scheduler would burn validate-job capacity re-hammering the same
+    jurisdiction's official site instead of spreading coverage across all
+    51."""
+    now = _real_now()
+    fresh_degraded, _ = _make_coverage_jurisdiction(
+        db_session, status="DEGRADED", last_attempt_at=now - timedelta(hours=1)
+    )
+    db_session.flush()
+
+    candidates = plan_validation(db_session, batch=10, degraded_recheck_age_hours=6, now=now)
+    assert fresh_degraded.abbreviation not in [c.jurisdiction_abbr for c in candidates]
+
+
+def test_plan_validation_skips_green_and_zero_bill_count_rows(db_session):
+    now = _real_now()
+    green, _ = _make_coverage_jurisdiction(db_session, status="GREEN", last_attempt_at=now - timedelta(days=30))
+    empty, _ = _make_coverage_jurisdiction(db_session, status="FULL_TEXT_SEARCHABLE", bill_count=0)
+    db_session.flush()
+
+    candidates = plan_validation(db_session, batch=10, now=now)
+    abbrs = [c.jurisdiction_abbr for c in candidates]
+    assert green.abbreviation not in abbrs
+    assert empty.abbreviation not in abbrs
+
+
+def test_enqueue_validation_jobs_dedupes_against_existing_queued_validate_job(db_session):
+    """The whole point of the WHERE NOT EXISTS dedupe: a jurisdiction that
+    already has a queued/running validate job must not get a second one
+    enqueued on top of it (would double-hit the production search API +
+    official site for the same jurisdiction)."""
+    now = _real_now()
+    ready, _ = _make_coverage_jurisdiction(db_session, status="FULL_TEXT_SEARCHABLE")
+    db_session.flush()
+
+    queue_mod.enqueue(db_session, VALIDATE_KIND, {"jurisdiction": ready.abbreviation})
+    db_session.flush()
+
+    enqueued = enqueue_validation_jobs(db_session, batch=10, now=now)
+    assert ready.abbreviation not in enqueued
+
+    jobs = db_session.execute(
+        select(IngestJob).where(
+            IngestJob.kind == VALIDATE_KIND,
+            IngestJob.payload["jurisdiction"].astext == ready.abbreviation,
+        )
+    ).scalars().all()
+    assert len(jobs) == 1
+
+
+def test_enqueue_validation_jobs_respects_batch_size(db_session):
+    now = _real_now()
+    made = [
+        _make_coverage_jurisdiction(db_session, status="FULL_TEXT_SEARCHABLE", last_attempt_at=now)[0]
+        for _ in range(5)
+    ]
+    db_session.flush()
+
+    enqueued = enqueue_validation_jobs(db_session, batch=2, now=now)
+    assert len(enqueued) == 2
+    assert set(enqueued).issubset({j.abbreviation for j in made})
+
+
+def test_enqueue_validation_jobs_skips_when_another_pass_holds_the_advisory_lock(db_session):
+    """Mirrors run_schedule_pass's own advisory-lock regression test: a
+    concurrent validation-enqueue pass holding
+    VALIDATE_ENQUEUE_ADVISORY_LOCK_KEY must make this pass enqueue NOTHING
+    rather than racing it (same read-then-insert gap as run_schedule_pass,
+    just for `validate` jobs instead of `api_sync`)."""
+    now = _real_now()
+    ready, _ = _make_coverage_jurisdiction(db_session, status="FULL_TEXT_SEARCHABLE")
+    db_session.flush()
+
+    engine = get_engine()
+    blocking_connection = engine.connect()
+    try:
+        acquired = blocking_connection.execute(
+            text("SELECT pg_try_advisory_lock(:key)"), {"key": VALIDATE_ENQUEUE_ADVISORY_LOCK_KEY}
+        ).scalar_one()
+        assert acquired is True, "sanity check: the blocking connection must actually hold the lock"
+
+        enqueued = enqueue_validation_jobs(db_session, batch=10, now=now)
+        assert enqueued == [], (
+            "enqueue_validation_jobs must skip the whole pass when it cannot acquire its "
+            "advisory lock, rather than racing the concurrent holder's own pass"
+        )
+
+        jobs = db_session.execute(
+            select(IngestJob).where(
+                IngestJob.kind == VALIDATE_KIND,
+                IngestJob.payload["jurisdiction"].astext == ready.abbreviation,
+            )
+        ).scalars().all()
+        assert jobs == [], "no validate job must have been enqueued while the lock was held elsewhere"
+    finally:
+        blocking_connection.execute(
+            text("SELECT pg_advisory_unlock(:key)"), {"key": VALIDATE_ENQUEUE_ADVISORY_LOCK_KEY}
+        )
+        blocking_connection.close()
