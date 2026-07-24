@@ -54,10 +54,10 @@ export default function AboutPage() {
         <p className="mt-3 text-slate-700">
           Repository:{" "}
           <a
-            href="https://github.com/billcommons/billcommons"
+            href="https://github.com/GDACS-droid/billcommons"
             className="underline"
           >
-            github.com/billcommons/billcommons
+            github.com/GDACS-droid/billcommons
           </a>{" "}
           <span className="text-sm text-slate-500">(placeholder — repo publishing in progress)</span>
         </p>

@@ -180,6 +180,6 @@ API docs live under `api.billcommons.org/docs` (no separate docs subdomain).
    automated nightly `pg_dump` to object storage.
 
 ---
-_Repository: pending publish to GitHub (push-ready; awaiting repo creation).
+_Repository: https://github.com/GDACS-droid/billcommons (public, Apache-2.0).
 Full ops runbooks in `docs/operations/`, coverage methodology in
 `docs/state-coverage/methodology.md`, API examples in `docs/api/examples.md`._

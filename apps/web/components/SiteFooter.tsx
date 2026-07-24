@@ -48,7 +48,7 @@ export default function SiteFooter() {
               <li>
                 <a
                   className="hover:underline"
-                  href="https://github.com/billcommons/billcommons"
+                  href="https://github.com/GDACS-droid/billcommons"
                 >
                   Source on GitHub
                 </a>
