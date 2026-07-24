@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -73,6 +74,15 @@ def _make_bill_document(db_session, *, url="https://example-legislature.gov/bill
     db_session.add(document)
     db_session.flush()
     return document
+
+
+def _add_version(db_session, bill) -> BillVersion:
+    """An extra BillVersion on an existing bill, for tests that need a bill
+    carrying more than one document."""
+    version = BillVersion(bill_id=bill.id, note="engrossed")
+    db_session.add(version)
+    db_session.flush()
+    return version
 
 
 def _fetch_text_jobs_for(db_session, document_ids) -> list[IngestJob]:
@@ -680,6 +690,68 @@ def test_enqueue_fulltext_jobs_respects_limit(db_session):
 
     count = enqueue_fulltext_jobs(db_session, limit=2, document_ids=[d.id for d in docs])
     assert count == 2
+
+
+def test_enqueue_prefers_a_bill_with_no_text_over_another_version_of_a_covered_one(db_session):
+    """A limited batch must spend its slots on bills that have NO text yet.
+
+    Business intent: a bill counts as covered once ANY of its documents has
+    text, and bills carry ~3.6 documents. Draining them in created_at order
+    spent ~3.6 fetches per bill of coverage gained, which is the difference
+    between reaching the GREEN full-text bar in ~2 days and ~8. Revert the
+    ordering to plain created_at and this fails: `covered_second` was created
+    first, so it would win the single slot.
+    """
+    # One jurisdiction so the round-robin partition can't decide this -- the
+    # only thing separating the two candidates is their bill's coverage.
+    covered_doc = _make_bill_document(db_session, url="https://example-legislature.gov/covered-v1.pdf")
+    covered_doc.extracted_text = "this bill already has text"
+    covered_version = db_session.get(BillVersion, covered_doc.bill_version_id)
+    covered_bill = db_session.get(Bill, covered_version.bill_id)
+
+    # Second version of the SAME (already covered) bill -- lowest value.
+    # created_at is set EXPLICITLY: Postgres now() is transaction-start time,
+    # so rows inserted by one test all share an identical created_at and any
+    # ordering assertion against it is a coin flip that passes either way.
+    covered_second = BillDocument(
+        bill_version_id=_add_version(db_session, covered_bill).id,
+        url="https://example-legislature.gov/covered-v2.pdf",
+        media_type=None,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    db_session.add(covered_second)
+    db_session.flush()
+
+    # A different bill in the same jurisdiction with no text at all -- the
+    # one a limited batch should actually spend its slot on.
+    uncovered_bill = Bill(
+        jurisdiction_id=covered_bill.jurisdiction_id,
+        session_id=covered_bill.session_id,
+        identifier="HB 2",
+        identifier_norm="HB 2",
+        title="A bill with no text yet",
+    )
+    db_session.add(uncovered_bill)
+    db_session.flush()
+    uncovered_doc = BillDocument(
+        bill_version_id=_add_version(db_session, uncovered_bill).id,
+        url="https://example-legislature.gov/uncovered-v1.pdf",
+        media_type=None,
+        # NEWER than covered_second, so plain created_at ordering would pass
+        # this over -- only the bill-coverage key promotes it.
+        created_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+    )
+    db_session.add(uncovered_doc)
+    db_session.flush()
+
+    count = enqueue_fulltext_jobs(
+        db_session, limit=1, document_ids=[covered_second.id, uncovered_doc.id]
+    )
+
+    assert count == 1
+    jobs = _fetch_text_jobs_for(db_session, [covered_second.id, uncovered_doc.id])
+    assert len(jobs) == 1
+    assert jobs[0].payload["document_id"] == str(uncovered_doc.id)
 
 
 def test_enqueue_fulltext_jobs_reenqueues_after_job_completes(db_session):

@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
-from sqlalchemy import Text, cast, exists, func, or_, select
+from sqlalchemy import Text, case, cast, exists, func, or_, select
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob
@@ -378,21 +378,39 @@ def enqueue_fulltext_jobs(
     )
 
     terminal_license_notes = [f"fulltext_status={status}" for status in TERMINAL_STATUSES]
-    # Round-robin across jurisdictions: rank each pending document within its
-    # jurisdiction by created_at, then order by that rank. A limited batch
-    # therefore pulls the 1st pending doc of every jurisdiction before the 2nd
-    # of any -- so full-text (and GREEN progress) spreads across all 51 states
-    # in parallel instead of draining one state entirely first (which the old
-    # global created_at ordering did).
-    rn = (
-        func.row_number()
-        .over(partition_by=Bill.jurisdiction_id, order_by=BillDocument.created_at)
-        .label("rn")
+
+    # A bill counts as covered once ANY of its documents has text, so a bill
+    # with no text at all is worth far more than the 2nd/3rd version of one
+    # already covered. Bills average ~3.6 documents, so draining them in
+    # created_at order spends ~3.6 fetches per bill of coverage gained.
+    #
+    # Computed ONCE as a set and LEFT JOINed, not as a correlated EXISTS per
+    # candidate row: the correlated form took >2min against ~676k pending
+    # documents, and this runs inside the worker's top-up loop, where a
+    # multi-minute query would hold a session open and stall the crawl (the
+    # exact `idle in transaction` failure this pipeline has hit twice). The
+    # join form measures ~2.6s.
+    covered_bills = (
+        select(BillVersion.bill_id.label("bill_id"))
+        .join(BillDocument, BillDocument.bill_version_id == BillVersion.id)
+        .where(BillDocument.extracted_text.is_not(None))
+        .distinct()
+        .subquery()
     )
-    stmt = (
-        select(BillDocument.id, rn)
+
+    pending = (
+        select(
+            BillDocument.id.label("doc_id"),
+            Bill.jurisdiction_id.label("jurisdiction_id"),
+            BillDocument.created_at.label("created_at"),
+            case((covered_bills.c.bill_id.is_(None), 0), else_=1).label("bill_covered"),
+            func.row_number()
+            .over(partition_by=BillVersion.bill_id, order_by=BillDocument.created_at)
+            .label("rn_in_bill"),
+        )
         .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
         .join(Bill, Bill.id == BillVersion.bill_id)
+        .outerjoin(covered_bills, covered_bills.c.bill_id == BillVersion.bill_id)
         .where(
             BillDocument.url.is_not(None),
             BillDocument.url != "",
@@ -407,10 +425,31 @@ def enqueue_fulltext_jobs(
             ),
             ~exists(already_queued),
         )
-        .order_by(rn, Bill.jurisdiction_id)
     )
     if document_ids is not None:
-        stmt = stmt.where(BillDocument.id.in_(document_ids))
+        pending = pending.where(BillDocument.id.in_(document_ids))
+    pending = pending.subquery()
+
+    # Round-robin across jurisdictions: rank each pending document within its
+    # jurisdiction, then order by that rank. A limited batch therefore pulls
+    # the 1st pending doc of every jurisdiction before the 2nd of any -- so
+    # full-text (and GREEN progress) spreads across all 51 states in parallel
+    # instead of draining one state entirely first (which the old global
+    # created_at ordering did).
+    #
+    # Within a jurisdiction the rank takes ONE document per not-yet-covered
+    # bill first (bill_covered, then rn_in_bill), so a pass converts the most
+    # bills per fetch. Nothing is skipped -- remaining versions simply sort
+    # after, and later passes pick them up.
+    rn = (
+        func.row_number()
+        .over(
+            partition_by=pending.c.jurisdiction_id,
+            order_by=(pending.c.bill_covered, pending.c.rn_in_bill, pending.c.created_at),
+        )
+        .label("rn")
+    )
+    stmt = select(pending.c.doc_id, rn).order_by(rn, pending.c.jurisdiction_id)
     if limit is not None:
         stmt = stmt.limit(limit)
 
