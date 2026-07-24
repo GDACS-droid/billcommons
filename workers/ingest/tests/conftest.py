@@ -56,6 +56,7 @@ def _purge_test_jurisdictions() -> None:
                 f"DELETE FROM bill_subjects WHERE bill_id IN {bsub}",
                 f"DELETE FROM bill_identifiers WHERE bill_id IN {bsub}",
                 f"DELETE FROM related_bills WHERE bill_id IN {bsub}",
+                "DELETE FROM ingestion_runs WHERE jurisdiction_id=:j",
                 "DELETE FROM validation_runs WHERE jurisdiction_id=:j",
                 "DELETE FROM jurisdiction_coverage WHERE jurisdiction_id=:j",
                 "DELETE FROM bills WHERE jurisdiction_id=:j",

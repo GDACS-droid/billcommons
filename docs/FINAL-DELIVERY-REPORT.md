@@ -32,7 +32,7 @@ vendored).
 2026 session/biennium; none is silently missing. Live matrix + per-jurisdiction
 provenance: https://api.billcommons.org/api/v1/coverage and the status page.
 
-- Jurisdictions in the matrix: **51 distinct** (77 coverage rows incl. current
+- Jurisdictions in the matrix: **51 distinct** (76 coverage rows incl. current
   special sessions; +Puerto Rico seeded as a future non-required territory).
 - Largest by bill count: NY 25,327 · MA 18,482 · TX 12,788 · IL 12,766 ·
   NJ 10,712 · MN 10,638.
@@ -43,13 +43,13 @@ provenance: https://api.billcommons.org/api/v1/coverage and the status page.
 
 | Metric | Value |
 |---|---|
-| Bills | **212,112** |
+| Bills | **209,612** |
 | Bill actions | 1,644,260 |
 | Sponsorships | 996,690 |
 | Bill versions | 439,744 |
 | Bill documents | 730,781 |
-| Vote events / records | 160,200 / 6,672,120 |
-| Sessions | 78 (incl. current specials) |
+| Vote events / records | 157,700 / 6,669,620 |
+| Sessions | 77 (incl. current specials) |
 | Duplicate canonical bills | **0** |
 | Schema migration | 0002 (head) |
 
