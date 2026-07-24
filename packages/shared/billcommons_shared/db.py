@@ -70,6 +70,10 @@ def get_engine() -> Engine:
     Python's `finally: db.close()`) doesn't leave an orphaned "idle in
     transaction" connection holding row locks indefinitely; Postgres itself
     now terminates it after 5 minutes idle-in-transaction.
+
+    Also sets TCP keepalives (30s idle / 10s interval / 5 probes) so a
+    long-running ingest job's connection doesn't go silently dead behind a
+    NAT/load balancer without either side noticing.
     """
     global _engine
     if _engine is None:
@@ -77,7 +81,11 @@ def get_engine() -> Engine:
             get_database_url(),
             pool_pre_ping=True,
             connect_args={
-                "options": "-c statement_timeout=300000 -c idle_in_transaction_session_timeout=300000"
+                "options": "-c statement_timeout=300000 -c idle_in_transaction_session_timeout=300000",
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 5,
             },
         )
     return _engine

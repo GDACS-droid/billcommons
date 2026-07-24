@@ -198,7 +198,11 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         rawstore = FilesystemRawStore()
         try:
             result = ingest_session_csv_zip(
-                db, args.zip, session_row=session_row, rawstore=rawstore
+                db,
+                args.zip,
+                session_row=session_row,
+                rawstore=rawstore,
+                progress_prefix=f"{args.state} {session_row.identifier}",
             )
             run.status = "success"
             run.finished_at = datetime.now(timezone.utc)

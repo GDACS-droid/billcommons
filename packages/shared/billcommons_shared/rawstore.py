@@ -36,6 +36,17 @@ def _sha256_key(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _default_rawstore_root() -> Path:
+    """Repo-root-anchored default for RAWSTORE_ROOT (`<repo-root>/data/rawstore`),
+    resolved off this package file's location rather than the process's cwd --
+    so behavior doesn't silently depend on which directory a script/worker was
+    invoked from (this file lives at packages/shared/billcommons_shared/, three
+    levels below the repo root). RAWSTORE_ROOT env var still overrides this
+    unconditionally (e.g. Railway sets RAWSTORE_ROOT=/data/rawstore for the
+    mounted volume)."""
+    return Path(__file__).resolve().parents[3] / "data" / "rawstore"
+
+
 class FilesystemRawStore:
     """Filesystem-backed RawStore.
 
@@ -46,7 +57,13 @@ class FilesystemRawStore:
     """
 
     def __init__(self, root: str | Path | None = None) -> None:
-        self.root = Path(root or os.environ.get("RAWSTORE_ROOT", "./data/rawstore"))
+        env_root = os.environ.get("RAWSTORE_ROOT")
+        if root is not None:
+            self.root = Path(root)
+        elif env_root:
+            self.root = Path(env_root)
+        else:
+            self.root = _default_rawstore_root()
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _paths(self, key: str) -> tuple[Path, Path]:

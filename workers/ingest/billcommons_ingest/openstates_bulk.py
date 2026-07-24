@@ -14,6 +14,21 @@ Idempotency contract (per BRIEF-wave2.md / ARCHITECTURE.md):
       write."
     - Running the same zip twice produces identical row counts (verified in
       tests/test_openstates_bulk.py).
+
+Performance / durability design (fix round 4, 2026-07):
+    - Per-row existence/idempotency SELECTs are replaced with in-memory maps
+      preloaded with ONE query per table, scoped to the touched bill ids for
+      this session/zip. The main loops are then pure dict lookups -- no
+      per-row round trips to the DB.
+    - The caller-owns-the-transaction contract is preserved (callers still
+      decide the outermost transaction boundary), but this function now
+      commits in batches at safe checkpoints -- after each CSV-file section,
+      and every ~PROGRESS_CHUNK rows within large sections -- so a crash
+      mid-zip loses at most one chunk of work, not the whole run. This is
+      safe *because* the pipeline is checksum-idempotent by design: a
+      restart simply re-derives the same rows and finds them unchanged.
+      Parents are always committed before any child section that
+      foreign-keys to them.
 """
 from __future__ import annotations
 
@@ -21,13 +36,14 @@ import ast
 import csv
 import hashlib
 import io
+import uuid
 import zipfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
 
-from sqlalchemy import select
+from sqlalchemy import insert, select
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_schema.models import (
@@ -48,6 +64,59 @@ from billcommons_shared.normalize import normalize_bill_number
 from billcommons_shared.rawstore import RawStore
 
 SOURCE_NAME = "openstates_bulk_csv"
+
+# Rows processed per intra-section commit/progress-log tick for large
+# sections (bills, actions, sponsorships, votes). Chosen so Railway logs
+# show liveness roughly every few seconds and a crash never loses more than
+# this many rows of otherwise-idempotent work.
+PROGRESS_CHUNK = 2000
+
+
+class _BufferedInserter:
+    """Buffers plain dict rows for a single ORM model and flushes them as one
+    Core `INSERT ... VALUES (...), (...), ...` statement (`db.execute(insert(Model),
+    rows)`), instead of `session.add(Model(**row))` + `session.flush()`.
+
+    This distinction matters a lot here: benchmarked against the live (WAN,
+    non-colocated) DB, ORM `add()`+`flush()` issues ONE INSERT round trip per
+    row even when many objects are pending (SQLAlchemy 2.0's insertmanyvalues
+    batching falls back to unbatched per-row RETURNING for this psycopg3/
+    Postgres combination -- confirmed via `echo=True`: "insertmanyvalues ...
+    (ordered; batch not supported)"), while Core bulk `insert()` genuinely
+    batches into a handful of multi-row statements regardless. At ~78ms WAN
+    RTT to the DB, that difference is the entire "2 hours vs minutes" gap
+    described in the fix-round-4 brief for child tables like vote_records.
+
+    Rows must include an `id` (assign a client-side `uuid.uuid4()` before
+    buffering) if anything downstream in the same ingest pass needs to
+    reference that id before the buffer is flushed.
+
+    IMPORTANT: this class does NOT auto-flush at any row-count threshold --
+    every call site is responsible for calling `.flush()` explicitly at its
+    own `i % PROGRESS_CHUNK == 0` checkpoint (matching the surrounding
+    section's commit cadence). An earlier version auto-flushed internally at
+    PROGRESS_CHUNK rows, which caused a real bug: a child inserter (e.g.
+    BillDocument, keyed on a parent BillVersion's client-side id) could hit
+    its own internal threshold and flush BEFORE the parent BillVersion
+    inserter had flushed the referenced rows, since the two buffers' internal
+    counters aren't synchronized -- a foreign-key violation in production.
+    Explicit, caller-controlled flush ordering (parents' `.flush()` called
+    before children's, at the same checkpoint) avoids that class of bug.
+    """
+
+    def __init__(self, db: OrmSession, model) -> None:
+        self.db = db
+        self.model = model
+        self._rows: list[dict] = []
+
+    def add(self, row: dict) -> None:
+        self._rows.append(row)
+
+    def flush(self) -> None:
+        if not self._rows:
+            return
+        self.db.execute(insert(self.model), self._rows)
+        self._rows = []
 
 
 @dataclass
@@ -194,6 +263,7 @@ def ingest_session_csv_zip(
     session_row: SessionModel,
     rawstore: RawStore,
     retrieved_at: datetime | None = None,
+    progress_prefix: str | None = None,
 ) -> BulkIngestResult:
     """Parse a session bulk-CSV zip and upsert its contents against
     `session_row` (caller resolves which `sessions` row this zip belongs to
@@ -202,10 +272,18 @@ def ingest_session_csv_zip(
     trusted blindly as the join key, since a zip could in principle be fed
     for the wrong session by operator error).
 
-    Caller is responsible for committing the transaction.
+    Commits in batches at internal checkpoints (see module docstring) --
+    caller is still responsible for the final commit/rollback of whatever
+    happens before/after this call (e.g. cli.py's IngestionRun bookkeeping),
+    but should not assume nothing was committed if this raises partway
+    through; that's the intended, idempotency-backed behavior.
+
+    `progress_prefix` (e.g. "DE 153") is prepended to progress log lines;
+    defaults to the session's identifier if not given.
     """
     retrieved_at = retrieved_at or datetime.now(timezone.utc)
     result = BulkIngestResult()
+    progress_prefix = progress_prefix or session_row.identifier
 
     if isinstance(zip_source, (str, Path)):
         raw_bytes = Path(zip_source).read_bytes()
@@ -231,32 +309,83 @@ def ingest_session_csv_zip(
             return result
 
         # -- Organizations first (bill actions/votes/sponsorships reference them) --
+        # New orgs are buffered + bulk-inserted (see _BufferedInserter); updates
+        # to already-existing orgs use plain ORM attribute assignment, which
+        # DOES batch fine as UPDATE (benchmarked separately from the INSERT
+        # path -- only INSERT-with-RETURNING is the slow case here).
         org_rows = _read_csv_rows(zf, ["_organizations.csv"])
         org_cache: dict[str, Organization] = {}
+        wanted_org_ids = {row.get("id") for row in org_rows if row.get("id")}
+        if wanted_org_ids:
+            for org in db.execute(
+                select(Organization).where(Organization.openstates_id.in_(wanted_org_ids))
+            ).scalars():
+                org_cache[org.openstates_id] = org
+        new_org_rows: list[dict] = []
         for row in org_rows:
             openstates_id = row.get("id")
             if not openstates_id:
                 continue
-            org = db.execute(
-                select(Organization).where(Organization.openstates_id == openstates_id)
-            ).scalar_one_or_none()
+            org = org_cache.get(openstates_id)
+            name = row.get("name") or (org.name if org else None) or "Unknown organization"
+            classification = row.get("classification") or None
+            checksum = hashlib.sha256(f"{name}|{classification}".encode("utf-8")).hexdigest()
             if org is None:
-                org = Organization(openstates_id=openstates_id)
-                db.add(org)
+                new_org_rows.append(
+                    {
+                        "id": uuid.uuid4(),
+                        "openstates_id": openstates_id,
+                        "name": name,
+                        "classification": classification,
+                        "source_name": SOURCE_NAME,
+                        "retrieved_at": retrieved_at,
+                        "checksum": checksum,
+                    }
+                )
                 result.organizations += 1
-            org.name = row.get("name") or org.name or "Unknown organization"
-            org.classification = row.get("classification") or None
-            org.source_name = SOURCE_NAME
-            org.retrieved_at = retrieved_at
-            org.checksum = hashlib.sha256(
-                f"{org.name}|{org.classification}".encode("utf-8")
-            ).hexdigest()
-            org_cache[openstates_id] = org
+            else:
+                org.name = name
+                org.classification = classification
+                org.source_name = SOURCE_NAME
+                org.retrieved_at = retrieved_at
+                org.checksum = checksum
+        if new_org_rows:
+            db.execute(insert(Organization), new_org_rows)
         db.flush()
+        db.commit()
+        # Reload the cache so newly-inserted orgs are visible as ORM objects
+        # to the rest of this function (sponsorships/actions/votes resolve
+        # organization_id via org_cache).
+        if wanted_org_ids:
+            org_cache = {
+                org.openstates_id: org
+                for org in db.execute(
+                    select(Organization).where(Organization.openstates_id.in_(wanted_org_ids))
+                ).scalars()
+            }
 
         # -- Bills --
+        # Preload every existing bill for this session keyed by
+        # identifier_norm -- one query instead of one SELECT per CSV row.
+        bill_by_identifier_norm: dict[str, Bill] = {
+            b.identifier_norm: b
+            for b in db.execute(select(Bill).where(Bill.session_id == session_row.id)).scalars()
+        }
         bill_by_openstates_id: dict[str, Bill] = {}
-        for row in bill_rows:
+        # Brand-new bills are transient (never `db.add()`-ed) ORM instances
+        # with a client-assigned id, held here until the buffered bulk
+        # INSERT below -- see _BufferedInserter's docstring for why: ORM
+        # add()+flush() does not batch INSERTs on this psycopg3/Postgres
+        # combination even with a client-side id (benchmarked), so a plain
+        # Core insert() with accumulated dict rows is used instead. The
+        # transient objects are still usable exactly like normal Python
+        # objects for all the child-entity sections below (bill.subjects,
+        # bill.id, bill.source_url, etc. are plain attribute reads/writes
+        # until something calls db.add()/flush() on them, which we never do
+        # for these -- they're inserted purely via the dict-row buffer).
+        new_bill_inserter = _BufferedInserter(db, Bill)
+
+        for i, row in enumerate(bill_rows, start=1):
             openstates_id = row.get("id")
             identifier_raw = (row.get("identifier") or "").strip()
             if not identifier_raw:
@@ -274,25 +403,56 @@ def ingest_session_csv_zip(
                 )
 
             checksum = _bill_checksum(row)
-
-            bill = db.execute(
-                select(Bill).where(
-                    Bill.session_id == session_row.id,
-                    Bill.identifier_norm == identifier_norm,
-                )
-            ).scalar_one_or_none()
+            bill = bill_by_identifier_norm.get(identifier_norm)
 
             if bill is None:
+                bill_id = uuid.uuid4()
+                classifications = _parse_pg_array_repr(row.get("classification"))
                 bill = Bill(
+                    id=bill_id,
                     jurisdiction_id=session_row.jurisdiction_id,
                     session_id=session_row.id,
                     identifier=identifier_raw,
                     identifier_norm=identifier_norm,
                     title=row.get("title") or "(untitled)",
+                    chamber=row.get("organization_classification") or None,
+                    bill_type=",".join(classifications) if classifications else None,
+                    openstates_id=openstates_id,
+                    source_name=SOURCE_NAME,
+                    upstream_id=openstates_id,
+                    retrieved_at=retrieved_at,
+                    raw_ref=result.raw_ref,
+                    checksum=checksum,
+                    parser_version="openstates_bulk_csv/1",
                 )
-                db.add(bill)
-                db.flush()
+                new_bill_inserter.add(
+                    {
+                        "id": bill_id,
+                        "jurisdiction_id": session_row.jurisdiction_id,
+                        "session_id": session_row.id,
+                        "identifier": identifier_raw,
+                        "identifier_norm": identifier_norm,
+                        "title": bill.title,
+                        "chamber": bill.chamber,
+                        "bill_type": bill.bill_type,
+                        "openstates_id": openstates_id,
+                        "source_name": SOURCE_NAME,
+                        "upstream_id": openstates_id,
+                        "retrieved_at": retrieved_at,
+                        "raw_ref": result.raw_ref,
+                        "checksum": checksum,
+                        "parser_version": "openstates_bulk_csv/1",
+                    }
+                )
+                bill_by_identifier_norm[identifier_norm] = bill
+                bill_by_openstates_id[openstates_id or identifier_norm] = bill
                 result.bills_created += 1
+                if i % PROGRESS_CHUNK == 0:
+                    new_bill_inserter.flush()
+                    db.flush()
+                    db.commit()
+                    print(f"{progress_prefix}: bills {i}/{len(bill_rows)}")
+                continue
             elif bill.checksum == checksum:
                 result.bills_unchanged += 1
                 bill_by_openstates_id[openstates_id or identifier_norm] = bill
@@ -300,6 +460,8 @@ def ingest_session_csv_zip(
                 # let child-entity upserts below run (they have their own
                 # per-row checksums / natural keys, and may legitimately
                 # have changed even if the bill's own core fields haven't).
+                if i % PROGRESS_CHUNK == 0:
+                    print(f"{progress_prefix}: bills {i}/{len(bill_rows)}")
                 continue
             else:
                 result.bills_updated += 1
@@ -315,18 +477,74 @@ def ingest_session_csv_zip(
             bill.raw_ref = result.raw_ref
             bill.checksum = checksum
             bill.parser_version = "openstates_bulk_csv/1"
-            db.flush()
 
             bill_by_openstates_id[openstates_id or identifier_norm] = bill
 
-            # Subjects: replace-by-diff (small lists; simplest correct approach).
+            # Subjects: replace-by-diff (small lists; simplest correct
+            # approach). Preloaded map below (after this loop) handles the
+            # "existing subjects" lookup; new bills have none yet.
+            if i % PROGRESS_CHUNK == 0:
+                db.flush()
+                db.commit()
+                print(f"{progress_prefix}: bills {i}/{len(bill_rows)}")
+
+        new_bill_inserter.flush()  # bulk-insert every buffered brand-new bill in one round trip
+        db.flush()
+        db.commit()
+        print(f"{progress_prefix}: bills {len(bill_rows)}/{len(bill_rows)} done "
+              f"(created={result.bills_created} updated={result.bills_updated} "
+              f"unchanged={result.bills_unchanged})")
+
+        # The brand-new bills above are transient Python `Bill` objects (never
+        # `db.add()`-ed -- they were written via the Core bulk-insert buffer,
+        # not the ORM unit-of-work). Every section below this point mutates
+        # `bill.description` / `bill.source_url` / `bill.latest_action_*` /
+        # `bill.introduced_date` on whatever object sits in
+        # `bill_by_openstates_id`/`bill_by_identifier_norm` and expects that
+        # mutation to be persisted -- so swap those transient placeholders
+        # for the real, session-attached rows now (one query for every new
+        # bill's id) before any child section runs.
+        new_bill_ids = [
+            b.id for b in bill_by_identifier_norm.values() if b not in db
+        ]
+        if new_bill_ids:
+            attached_by_id = {
+                b.id: b
+                for b in db.execute(select(Bill).where(Bill.id.in_(new_bill_ids))).scalars()
+            }
+            for key, b in list(bill_by_identifier_norm.items()):
+                if b.id in attached_by_id:
+                    bill_by_identifier_norm[key] = attached_by_id[b.id]
+            for key, b in list(bill_by_openstates_id.items()):
+                if b.id in attached_by_id:
+                    bill_by_openstates_id[key] = attached_by_id[b.id]
+
+        touched_bill_ids = [b.id for b in bill_by_openstates_id.values()]
+
+        # -- Subjects (preloaded existing (bill_id, subject) pairs) --
+        existing_subjects: set[tuple] = set()
+        if touched_bill_ids:
+            existing_subjects = {
+                (bs.bill_id, bs.subject)
+                for bs in db.execute(
+                    select(BillSubject).where(BillSubject.bill_id.in_(touched_bill_ids))
+                ).scalars()
+            }
+        subject_inserter = _BufferedInserter(db, BillSubject)
+        for row in bill_rows:
+            bill = bill_by_openstates_id.get(row.get("id"))
+            if bill is None:
+                continue
             subjects = _parse_pg_array_repr(row.get("subject"))
-            existing_subjects = {s.subject for s in bill.subjects}
             for subject in subjects:
-                if subject and subject not in existing_subjects:
-                    db.add(BillSubject(bill_id=bill.id, subject=subject))
+                key = (bill.id, subject)
+                if subject and key not in existing_subjects:
+                    subject_inserter.add({"bill_id": bill.id, "subject": subject})
+                    existing_subjects.add(key)
                     result.subjects += 1
-            db.flush()
+        subject_inserter.flush()
+        db.flush()
+        db.commit()
 
         # -- Abstracts (fallback description) --
         abstract_rows = _read_csv_rows(zf, ["_bill_abstracts.csv"])
@@ -342,6 +560,15 @@ def ingest_session_csv_zip(
         db.flush()
 
         # -- Bill identifiers (alternates) --
+        existing_bill_identifiers: set[tuple] = set()
+        if touched_bill_ids:
+            existing_bill_identifiers = {
+                (bi.bill_id, bi.identifier_norm)
+                for bi in db.execute(
+                    select(BillIdentifier).where(BillIdentifier.bill_id.in_(touched_bill_ids))
+                ).scalars()
+            }
+        bill_identifier_inserter = _BufferedInserter(db, BillIdentifier)
         for row in _read_csv_rows(zf, ["_bill_identifiers.csv"]):
             bill = bill_by_openstates_id.get(row.get("bill_id"))
             if bill is None:
@@ -353,20 +580,13 @@ def ingest_session_csv_zip(
                 alt_norm = normalize_bill_number(alt_identifier)
             except ValueError:
                 alt_norm = alt_identifier.upper().strip()
-            existing = db.execute(
-                select(BillIdentifier).where(
-                    BillIdentifier.bill_id == bill.id,
-                    BillIdentifier.identifier_norm == alt_norm,
+            key = (bill.id, alt_norm)
+            if key not in existing_bill_identifiers:
+                bill_identifier_inserter.add(
+                    {"bill_id": bill.id, "identifier": alt_identifier, "identifier_norm": alt_norm}
                 )
-            ).scalar_one_or_none()
-            if existing is None:
-                db.add(
-                    BillIdentifier(
-                        bill_id=bill.id,
-                        identifier=alt_identifier,
-                        identifier_norm=alt_norm,
-                    )
-                )
+                existing_bill_identifiers.add(key)
+        bill_identifier_inserter.flush()
         db.flush()
 
         # -- Bill sources (provenance + bill.source_url) --
@@ -380,65 +600,94 @@ def ingest_session_csv_zip(
         db.flush()
 
         # -- Related bills --
+        existing_related: set[tuple] = set()
+        if touched_bill_ids:
+            existing_related = {
+                (rb.bill_id, rb.related_identifier, rb.relation_type)
+                for rb in db.execute(
+                    select(RelatedBill).where(RelatedBill.bill_id.in_(touched_bill_ids))
+                ).scalars()
+            }
+        related_bill_inserter = _BufferedInserter(db, RelatedBill)
         for row in _read_csv_rows(zf, ["_bill_related_bills.csv"]):
             bill = bill_by_openstates_id.get(row.get("bill_id"))
             if bill is None:
                 continue
             related_identifier = row.get("identifier")
             relation_type = row.get("relation_type")
-            already = any(
-                r.related_identifier == related_identifier and r.relation_type == relation_type
-                for r in db.execute(
-                    select(RelatedBill).where(RelatedBill.bill_id == bill.id)
-                ).scalars()
-            )
-            if not already and related_identifier:
-                db.add(
-                    RelatedBill(
-                        bill_id=bill.id,
-                        related_identifier=related_identifier,
-                        relation_type=relation_type,
-                    )
+            key = (bill.id, related_identifier, relation_type)
+            if related_identifier and key not in existing_related:
+                related_bill_inserter.add(
+                    {
+                        "bill_id": bill.id,
+                        "related_identifier": related_identifier,
+                        "relation_type": relation_type,
+                    }
                 )
+                existing_related.add(key)
                 result.related_bills += 1
+        related_bill_inserter.flush()
         db.flush()
+        db.commit()
 
         # -- Sponsorships --
-        for row in _read_csv_rows(zf, ["_bill_sponsorships.csv"]):
+        existing_sponsorships: set[tuple] = set()
+        if touched_bill_ids:
+            existing_sponsorships = {
+                (s.bill_id, s.name, s.classification)
+                for s in db.execute(
+                    select(Sponsorship).where(Sponsorship.bill_id.in_(touched_bill_ids))
+                ).scalars()
+            }
+        sponsorship_rows = _read_csv_rows(zf, ["_bill_sponsorships.csv"])
+        sponsorship_inserter = _BufferedInserter(db, Sponsorship)
+        for i, row in enumerate(sponsorship_rows, start=1):
             bill = bill_by_openstates_id.get(row.get("bill_id"))
             if bill is None:
                 continue
             name = row.get("name")
             classification = row.get("classification")
-            existing = db.execute(
-                select(Sponsorship).where(
-                    Sponsorship.bill_id == bill.id,
-                    Sponsorship.name == name,
-                    Sponsorship.classification == classification,
-                )
-            ).scalar_one_or_none()
+            key = (bill.id, name, classification)
             organization_id = None
             org_openstates_id = row.get("organization_id")
             if org_openstates_id:
                 org = _resolve_organization(db, org_cache, org_openstates_id)
                 organization_id = org.id if org is not None else None
-            if existing is None:
-                db.add(
-                    Sponsorship(
-                        bill_id=bill.id,
-                        name=name,
-                        classification=classification,
-                        primary=_parse_bool_field(row.get("primary")),
-                        organization_id=organization_id,
-                        source_name=SOURCE_NAME,
-                        retrieved_at=retrieved_at,
-                    )
+            if key not in existing_sponsorships:
+                sponsorship_inserter.add(
+                    {
+                        "bill_id": bill.id,
+                        "name": name,
+                        "classification": classification,
+                        "primary": _parse_bool_field(row.get("primary")),
+                        "organization_id": organization_id,
+                        "source_name": SOURCE_NAME,
+                        "retrieved_at": retrieved_at,
+                    }
                 )
+                existing_sponsorships.add(key)
                 result.sponsorships += 1
+            if i % PROGRESS_CHUNK == 0:
+                sponsorship_inserter.flush()
+                db.flush()
+                db.commit()
+                print(f"{progress_prefix}: sponsorships {i}/{len(sponsorship_rows)}")
+        sponsorship_inserter.flush()
         db.flush()
+        db.commit()
 
         # -- Actions --
-        for row in _read_csv_rows(zf, ["_bill_actions.csv"]):
+        existing_actions: set[tuple] = set()
+        if touched_bill_ids:
+            existing_actions = {
+                (a.bill_id, a.description, a.order)
+                for a in db.execute(
+                    select(BillAction).where(BillAction.bill_id.in_(touched_bill_ids))
+                ).scalars()
+            }
+        action_rows = _read_csv_rows(zf, ["_bill_actions.csv"])
+        action_inserter = _BufferedInserter(db, BillAction)
+        for i, row in enumerate(action_rows, start=1):
             bill = bill_by_openstates_id.get(row.get("bill_id"))
             if bill is None:
                 continue
@@ -446,41 +695,51 @@ def ingest_session_csv_zip(
             action_date = _parse_date_field(row.get("date"))
             order_raw = row.get("order")
             order = int(order_raw) if order_raw not in (None, "") else None
-            existing = db.execute(
-                select(BillAction).where(
-                    BillAction.bill_id == bill.id,
-                    BillAction.description == description,
-                    BillAction.order == order,
-                )
-            ).scalar_one_or_none()
+            key = (bill.id, description, order)
             organization_id = None
             org_openstates_id = row.get("organization_id")
             if org_openstates_id:
                 org = _resolve_organization(db, org_cache, org_openstates_id)
                 organization_id = org.id if org is not None else None
-            if existing is None:
+            if key not in existing_actions:
                 classifications = _parse_pg_array_repr(row.get("classification"))
-                db.add(
-                    BillAction(
-                        bill_id=bill.id,
-                        organization_id=organization_id,
-                        description=description,
-                        action_date=action_date,
-                        classification=",".join(classifications) if classifications else None,
-                        order=order,
-                        source_name=SOURCE_NAME,
-                        retrieved_at=retrieved_at,
-                    )
+                action_inserter.add(
+                    {
+                        "bill_id": bill.id,
+                        "organization_id": organization_id,
+                        "description": description,
+                        "action_date": action_date,
+                        "classification": ",".join(classifications) if classifications else None,
+                        "order": order,
+                        "source_name": SOURCE_NAME,
+                        "retrieved_at": retrieved_at,
+                    }
                 )
+                existing_actions.add(key)
                 result.actions += 1
+            if i % PROGRESS_CHUNK == 0:
+                action_inserter.flush()
+                db.flush()
+                db.commit()
+                print(f"{progress_prefix}: actions {i}/{len(action_rows)}")
+        action_inserter.flush()
         db.flush()
+        db.commit()
 
         # Derive latest_action_text/date from the max-order action, per the
         # documented mapping (bulk CSV bills.csv has no status/date columns).
+        # Preload all actions for touched bills in one query and group in
+        # memory instead of one SELECT per bill.
+        actions_by_bill: dict = {}
+        if touched_bill_ids:
+            for action in db.execute(
+                select(BillAction)
+                .where(BillAction.bill_id.in_(touched_bill_ids))
+                .order_by(BillAction.bill_id, BillAction.order)
+            ).scalars():
+                actions_by_bill.setdefault(action.bill_id, []).append(action)
         for bill in bill_by_openstates_id.values():
-            actions = db.execute(
-                select(BillAction).where(BillAction.bill_id == bill.id).order_by(BillAction.order)
-            ).scalars().all()
+            actions = actions_by_bill.get(bill.id)
             if actions:
                 latest = actions[-1]
                 bill.latest_action_text = latest.description
@@ -489,6 +748,7 @@ def ingest_session_csv_zip(
                 if "introduction" in (first.classification or ""):
                     bill.introduced_date = first.action_date
         db.flush()
+        db.commit()
 
         # -- Versions + version links (as bill_documents) --
         version_rows = _read_csv_rows(zf, ["_bill_versions.csv"])
@@ -497,54 +757,92 @@ def ingest_session_csv_zip(
         for link in version_link_rows:
             links_by_version.setdefault(link.get("version_id"), []).append(link)
 
+        existing_versions: dict[tuple, BillVersion] = {}
+        if touched_bill_ids:
+            for v in db.execute(
+                select(BillVersion).where(BillVersion.bill_id.in_(touched_bill_ids))
+            ).scalars():
+                existing_versions[(v.bill_id, v.note, v.date)] = v
+
+        existing_documents: set[tuple] = set()
+        touched_version_ids_placeholder: list = list({v.id for v in existing_versions.values()})
+        if touched_version_ids_placeholder:
+            existing_documents = {
+                (d.bill_version_id, d.url)
+                for d in db.execute(
+                    select(BillDocument).where(
+                        BillDocument.bill_version_id.in_(touched_version_ids_placeholder)
+                    )
+                ).scalars()
+            }
+
         version_by_openstates_id: dict[str, BillVersion] = {}
-        for row in version_rows:
+        version_inserter = _BufferedInserter(db, BillVersion)
+        document_inserter = _BufferedInserter(db, BillDocument)
+        for i, row in enumerate(version_rows, start=1):
             bill = bill_by_openstates_id.get(row.get("bill_id"))
             if bill is None:
                 continue
             note = row.get("note") or ""
             version_date = _parse_date_field(row.get("date"))
-            existing = db.execute(
-                select(BillVersion).where(
-                    BillVersion.bill_id == bill.id,
-                    BillVersion.note == note,
-                    BillVersion.date == version_date,
-                )
-            ).scalar_one_or_none()
+            key = (bill.id, note, version_date)
+            existing = existing_versions.get(key)
             if existing is None:
+                # Client-side id (see the VoteEvent comment above) avoids a
+                # flush-per-row here too -- we need existing.id immediately
+                # below for the document key/link, but not from the DB. This
+                # is a transient object (never db.add()-ed -- see the Bill
+                # re-attachment note above); nothing mutates it by attribute
+                # after creation, only .id is read, so that's safe here.
                 existing = BillVersion(
+                    id=uuid.uuid4(),
                     bill_id=bill.id,
                     note=note,
                     date=version_date,
                     source_name=SOURCE_NAME,
                     retrieved_at=retrieved_at,
                 )
-                db.add(existing)
-                db.flush()
+                version_inserter.add(
+                    {
+                        "id": existing.id,
+                        "bill_id": bill.id,
+                        "note": note,
+                        "date": version_date,
+                        "source_name": SOURCE_NAME,
+                        "retrieved_at": retrieved_at,
+                    }
+                )
+                existing_versions[key] = existing
                 result.versions += 1
             version_by_openstates_id[row.get("id")] = existing
 
             for link in links_by_version.get(row.get("id"), []):
                 url = link.get("url")
                 media_type = link.get("media_type")
-                already = db.execute(
-                    select(BillDocument).where(
-                        BillDocument.bill_version_id == existing.id,
-                        BillDocument.url == url,
+                doc_key = (existing.id, url)
+                if doc_key not in existing_documents:
+                    document_inserter.add(
+                        {
+                            "bill_version_id": existing.id,
+                            "media_type": media_type,
+                            "url": url,
+                            "source_name": SOURCE_NAME,
+                            "retrieved_at": retrieved_at,
+                        }
                     )
-                ).scalar_one_or_none()
-                if already is None:
-                    db.add(
-                        BillDocument(
-                            bill_version_id=existing.id,
-                            media_type=media_type,
-                            url=url,
-                            source_name=SOURCE_NAME,
-                            retrieved_at=retrieved_at,
-                        )
-                    )
+                    existing_documents.add(doc_key)
                     result.documents += 1
+
+            if i % PROGRESS_CHUNK == 0:
+                version_inserter.flush()
+                document_inserter.flush()
+                db.flush()
+                db.commit()
+                print(f"{progress_prefix}: versions {i}/{len(version_rows)}")
+        version_inserter.flush()
+        document_inserter.flush()
         db.flush()
+        db.commit()
 
         # -- Documents + document links (documents not tied to a version get
         #    a synthetic placeholder version row per docs/sources mapping) --
@@ -554,52 +852,94 @@ def ingest_session_csv_zip(
         for link in document_link_rows:
             links_by_document.setdefault(link.get("document_id"), []).append(link)
 
+        existing_placeholder_versions: dict = {}
+        if touched_bill_ids:
+            for v in db.execute(
+                select(BillVersion).where(
+                    BillVersion.bill_id.in_(touched_bill_ids),
+                    BillVersion.note == "(document, no version)",
+                )
+            ).scalars():
+                existing_placeholder_versions[v.bill_id] = v
+
+        # Existing bill_documents on every already-loaded placeholder version,
+        # keyed by bill_id -- ONE query for all placeholder versions instead
+        # of one SELECT per bill-with-a-placeholder-version (that per-bill
+        # version was a real bug: at ~78ms WAN RTT, a session with hundreds
+        # of orphan-document bills cost tens of seconds here alone).
+        placeholder_version_id_to_bill_id = {v.id: v.bill_id for v in existing_placeholder_versions.values()}
+        placeholder_doc_urls_by_bill: dict = {bill_id: set() for bill_id in placeholder_version_id_to_bill_id.values()}
+        if placeholder_version_id_to_bill_id:
+            for d in db.execute(
+                select(BillDocument).where(
+                    BillDocument.bill_version_id.in_(placeholder_version_id_to_bill_id.keys())
+                )
+            ).scalars():
+                bill_id = placeholder_version_id_to_bill_id[d.bill_version_id]
+                placeholder_doc_urls_by_bill[bill_id].add(d.url)
+
         placeholder_version_by_bill: dict[str, BillVersion] = {}
-        for row in document_rows:
+        placeholder_inserter = _BufferedInserter(db, BillVersion)
+        orphan_document_inserter = _BufferedInserter(db, BillDocument)
+        for i, row in enumerate(document_rows, start=1):
             bill = bill_by_openstates_id.get(row.get("bill_id"))
             if bill is None:
                 continue
             placeholder = placeholder_version_by_bill.get(str(bill.id))
             if placeholder is None:
-                placeholder = db.execute(
-                    select(BillVersion).where(
-                        BillVersion.bill_id == bill.id,
-                        BillVersion.note == "(document, no version)",
-                    )
-                ).scalar_one_or_none()
+                placeholder = existing_placeholder_versions.get(bill.id)
                 if placeholder is None:
+                    # Client-side id -- see the VoteEvent comment above;
+                    # avoids a flush-per-bill-with-orphan-documents here.
                     placeholder = BillVersion(
+                        id=uuid.uuid4(),
                         bill_id=bill.id,
                         note="(document, no version)",
                         source_name=SOURCE_NAME,
                         retrieved_at=retrieved_at,
                         license_note="synthetic placeholder: doc had no matching version row",
                     )
-                    db.add(placeholder)
-                    db.flush()
+                    placeholder_inserter.add(
+                        {
+                            "id": placeholder.id,
+                            "bill_id": bill.id,
+                            "note": "(document, no version)",
+                            "source_name": SOURCE_NAME,
+                            "retrieved_at": retrieved_at,
+                            "license_note": "synthetic placeholder: doc had no matching version row",
+                        }
+                    )
+                    existing_placeholder_versions[bill.id] = placeholder
+                    placeholder_doc_urls_by_bill[bill.id] = set()
                 placeholder_version_by_bill[str(bill.id)] = placeholder
 
+            preloaded_urls = placeholder_doc_urls_by_bill.setdefault(bill.id, set())
             for link in links_by_document.get(row.get("id"), []):
                 url = link.get("url")
                 media_type = link.get("media_type")
-                already = db.execute(
-                    select(BillDocument).where(
-                        BillDocument.bill_version_id == placeholder.id,
-                        BillDocument.url == url,
+                if url not in preloaded_urls:
+                    orphan_document_inserter.add(
+                        {
+                            "bill_version_id": placeholder.id,
+                            "media_type": media_type,
+                            "url": url,
+                            "source_name": SOURCE_NAME,
+                            "retrieved_at": retrieved_at,
+                        }
                     )
-                ).scalar_one_or_none()
-                if already is None:
-                    db.add(
-                        BillDocument(
-                            bill_version_id=placeholder.id,
-                            media_type=media_type,
-                            url=url,
-                            source_name=SOURCE_NAME,
-                            retrieved_at=retrieved_at,
-                        )
-                    )
+                    preloaded_urls.add(url)
                     result.documents += 1
+
+            if i % PROGRESS_CHUNK == 0:
+                placeholder_inserter.flush()
+                orphan_document_inserter.flush()
+                db.flush()
+                db.commit()
+                print(f"{progress_prefix}: documents {i}/{len(document_rows)}")
+        placeholder_inserter.flush()
+        orphan_document_inserter.flush()
         db.flush()
+        db.commit()
 
         # -- Votes --
         vote_rows = _read_csv_rows(zf, ["_votes.csv"])
@@ -612,7 +952,31 @@ def ingest_session_csv_zip(
         for row in vote_people_rows:
             people_by_vote.setdefault(row.get("vote_event_id"), []).append(row)
 
-        for row in vote_rows:
+        existing_vote_events: dict[tuple, VoteEvent] = {}
+        if touched_bill_ids:
+            for ve in db.execute(
+                select(VoteEvent).where(VoteEvent.bill_id.in_(touched_bill_ids))
+            ).scalars():
+                existing_vote_events[(ve.bill_id, ve.motion_text, ve.start_date)] = ve
+        # Vote events with no bill_id (bill is None) can't be preloaded by
+        # bill_id; fall back to the old per-row lookup for that rare case
+        # only (never the common path for a normal session zip).
+
+        # Existing vote_records for every preloaded vote_event, keyed by
+        # vote_event_id -- avoids a per-vote_event SELECT for records.
+        vote_records_by_event: dict = {
+            ve.id: set()
+            for ve in existing_vote_events.values()
+        }
+        if vote_records_by_event:
+            for vr in db.execute(
+                select(VoteRecord).where(VoteRecord.vote_event_id.in_(vote_records_by_event.keys()))
+            ).scalars():
+                vote_records_by_event[vr.vote_event_id].add(vr.voter_name)
+
+        vote_event_inserter = _BufferedInserter(db, VoteEvent)
+        vote_record_inserter = _BufferedInserter(db, VoteRecord)
+        for i, row in enumerate(vote_rows, start=1):
             bill = bill_by_openstates_id.get(row.get("bill_id"))
             organization_id = None
             org_openstates_id = row.get("organization_id")
@@ -622,13 +986,18 @@ def ingest_session_csv_zip(
 
             motion_text = row.get("motion_text") or ""
             start_date = _parse_date_field(row.get("start_date"))
-            existing = db.execute(
-                select(VoteEvent).where(
-                    VoteEvent.bill_id == bill.id if bill is not None else VoteEvent.bill_id.is_(None),
-                    VoteEvent.motion_text == motion_text,
-                    VoteEvent.start_date == start_date,
-                )
-            ).scalar_one_or_none()
+
+            if bill is not None:
+                key = (bill.id, motion_text, start_date)
+                existing = existing_vote_events.get(key)
+            else:
+                existing = db.execute(
+                    select(VoteEvent).where(
+                        VoteEvent.bill_id.is_(None),
+                        VoteEvent.motion_text == motion_text,
+                        VoteEvent.start_date == start_date,
+                    )
+                ).scalar_one_or_none()
 
             yes_count = no_count = other_count = 0
             for count_row in counts_by_vote.get(row.get("id"), []):
@@ -646,7 +1015,17 @@ def ingest_session_csv_zip(
 
             if existing is None:
                 classifications = _parse_pg_array_repr(row.get("motion_classification"))
+                # Assign the PK client-side (server_default is a fallback,
+                # not DB-generated-always -- see UUIDPkMixin) so we can hand
+                # VoteRecord children this id below WITHOUT needing it back
+                # from the DB. Buffered via _BufferedInserter (Core bulk
+                # insert), not session.add()+flush() -- see that class's
+                # docstring: ORM add()+flush() issues one INSERT round trip
+                # per row on this psycopg3/Postgres combo even with a
+                # client-side id, which was the single biggest WAN-latency
+                # cost in this loop (thousands of votes per session).
                 vote_event = VoteEvent(
+                    id=uuid.uuid4(),
                     bill_id=bill.id if bill is not None else None,
                     organization_id=organization_id,
                     motion_text=motion_text,
@@ -660,31 +1039,62 @@ def ingest_session_csv_zip(
                     upstream_id=row.get("id"),
                     retrieved_at=retrieved_at,
                 )
-                db.add(vote_event)
-                db.flush()
+                vote_event_inserter.add(
+                    {
+                        "id": vote_event.id,
+                        "bill_id": vote_event.bill_id,
+                        "organization_id": organization_id,
+                        "motion_text": motion_text,
+                        "motion_classification": vote_event.motion_classification,
+                        "start_date": start_date,
+                        "result": row.get("result"),
+                        "yes_count": yes_count,
+                        "no_count": no_count,
+                        "other_count": other_count,
+                        "source_name": SOURCE_NAME,
+                        "upstream_id": row.get("id"),
+                        "retrieved_at": retrieved_at,
+                    }
+                )
                 result.vote_events += 1
+                if bill is not None:
+                    existing_vote_events[(bill.id, motion_text, start_date)] = vote_event
+                vote_records_by_event[vote_event.id] = set()
             else:
                 vote_event = existing
+                if vote_event.id not in vote_records_by_event:
+                    vote_records_by_event[vote_event.id] = {
+                        vr.voter_name
+                        for vr in db.execute(
+                            select(VoteRecord).where(VoteRecord.vote_event_id == vote_event.id)
+                        ).scalars()
+                    }
 
+            preloaded_records = vote_records_by_event[vote_event.id]
             for person_row in people_by_vote.get(row.get("id"), []):
                 voter_name = person_row.get("voter_name")
                 option = person_row.get("option") or "other"
-                already = db.execute(
-                    select(VoteRecord).where(
-                        VoteRecord.vote_event_id == vote_event.id,
-                        VoteRecord.voter_name == voter_name,
+                if voter_name not in preloaded_records:
+                    vote_record_inserter.add(
+                        {
+                            "vote_event_id": vote_event.id,
+                            "voter_name": voter_name,
+                            "option": option,
+                        }
                     )
-                ).scalar_one_or_none()
-                if already is None:
-                    db.add(
-                        VoteRecord(
-                            vote_event_id=vote_event.id,
-                            voter_name=voter_name,
-                            option=option,
-                        )
-                    )
+                    preloaded_records.add(voter_name)
                     result.vote_records += 1
+
+            if i % PROGRESS_CHUNK == 0:
+                vote_event_inserter.flush()
+                vote_record_inserter.flush()
+                db.flush()
+                db.commit()
+                print(f"{progress_prefix}: votes {i}/{len(vote_rows)}")
+        vote_event_inserter.flush()
+        vote_record_inserter.flush()
         db.flush()
+        db.commit()
 
     return result
 

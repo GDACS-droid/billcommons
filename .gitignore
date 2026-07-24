@@ -34,7 +34,7 @@ pnpm-debug.log*
 *.key
 
 # --- Data / local state ---
-data/rawstore/
+**/data/rawstore/
 data/registry/*.local.json
 *.sqlite3
 
@@ -43,4 +43,4 @@ data/registry/*.local.json
 .idea/
 .vscode/
 *.swp
-data/bulkzips/
+**/data/bulkzips/
