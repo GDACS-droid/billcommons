@@ -661,8 +661,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker.add_argument(
         "--reschedule-interval",
         type=float,
-        default=15 * 60.0,
-        help="seconds between schedule-refresh passes inside the worker loop (default 900s/15min; 0 disables)",
+        default=float(os.environ.get("RESCHEDULE_INTERVAL", "0")),
+        help=(
+            "seconds between schedule-refresh (api_sync) passes inside the worker "
+            "loop (default 0 = DISABLED, env RESCHEDULE_INTERVAL to enable). "
+            "Disabled by default: an api_sync job makes many rate-limited v3-API "
+            "calls while holding a DB txn open, starving the single worker's "
+            "fetch_text crawl (same reason as validate-schedule). Incremental "
+            "api_sync runs as a separate paced process once the crawl is caught up."
+        ),
     )
     p_worker.add_argument(
         "--fulltext-topup-interval",
