@@ -57,7 +57,13 @@ def test_coverage_per_page_allows_full_matrix(client):
     (SPEC: no jurisdiction silently missing) -- it clamps at 200, not 50."""
     resp = client.get("/api/v1/coverage", params={"per_page": 500})
     assert resp.status_code == 200
-    assert resp.json()["pagination"]["per_page"] == 200
+    body = resp.json()
+    assert body["pagination"]["per_page"] == 200
+    # the real invariant: when the registry is seeded, one page holds every
+    # jurisdiction -- silent truncation of the matrix is the failure mode
+    codes = {r["jurisdiction_code"] for r in body["data"]}
+    if body["pagination"]["total"] >= 51:
+        assert len(codes) >= 51, f"coverage page truncated: {len(codes)} jurisdictions"
 
 
 @pytest.mark.parametrize("path", LIST_ENDPOINTS)

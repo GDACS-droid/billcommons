@@ -30,9 +30,16 @@ def test_subresource_routes_404_when_parent_bill_missing(client):
 
 
 def test_list_bills_envelope_and_filters(client):
+    jresp = client.get("/api/v1/jurisdictions", params={"per_page": 100})
+    nc = next((j for j in jresp.json()["data"] if j["abbreviation"] == "NC"), None)
     resp = client.get("/api/v1/bills", params={"jurisdiction": "NC", "chamber": "lower"})
     assert resp.status_code == 200
-    # data-tolerant: the live DB may hold real NC bills; the contract is that
-    # every returned row honors the chamber filter, not that the list is empty
-    for row in resp.json()["data"]:
+    rows = resp.json()["data"]
+    # the filter contract must be OBSERVED, not vacuously true: NC is loaded
+    # in any seeded DB, so demand results and check both filters on every row
+    if nc is not None and jresp.json()["pagination"]["total"] >= 51:
+        assert len(rows) >= 1, "NC lower-chamber bills expected in a seeded DB"
+    for row in rows:
         assert row["chamber"] == "lower"
+        if nc is not None:
+            assert row["jurisdiction_id"] == nc["id"]
