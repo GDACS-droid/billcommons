@@ -36,10 +36,10 @@ from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
-from sqlalchemy import Text, cast, exists, or_, select
+from sqlalchemy import Text, cast, exists, func, or_, select
 from sqlalchemy.orm import Session as OrmSession
 
-from billcommons_schema.models import BillDocument, IngestJob
+from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob
 from billcommons_shared.httpc import USER_AGENT, RateLimiter, new_client
 from billcommons_shared.rawstore import RawStore
 
@@ -53,6 +53,8 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
     if val is None:
         return default
     return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 PARSER_VERSION = "fulltext/1"
 
 # Politeness: 1 request per 2s per host by default (SPEC "Refresh" /
@@ -376,8 +378,21 @@ def enqueue_fulltext_jobs(
     )
 
     terminal_license_notes = [f"fulltext_status={status}" for status in TERMINAL_STATUSES]
+    # Round-robin across jurisdictions: rank each pending document within its
+    # jurisdiction by created_at, then order by that rank. A limited batch
+    # therefore pulls the 1st pending doc of every jurisdiction before the 2nd
+    # of any -- so full-text (and GREEN progress) spreads across all 51 states
+    # in parallel instead of draining one state entirely first (which the old
+    # global created_at ordering did).
+    rn = (
+        func.row_number()
+        .over(partition_by=Bill.jurisdiction_id, order_by=BillDocument.created_at)
+        .label("rn")
+    )
     stmt = (
-        select(BillDocument.id)
+        select(BillDocument.id, rn)
+        .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
+        .join(Bill, Bill.id == BillVersion.bill_id)
         .where(
             BillDocument.url.is_not(None),
             BillDocument.url != "",
@@ -392,7 +407,7 @@ def enqueue_fulltext_jobs(
             ),
             ~exists(already_queued),
         )
-        .order_by(BillDocument.created_at)
+        .order_by(rn, Bill.jurisdiction_id)
     )
     if document_ids is not None:
         stmt = stmt.where(BillDocument.id.in_(document_ids))
