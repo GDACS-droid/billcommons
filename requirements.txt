@@ -1,0 +1,16 @@
+sqlalchemy>=2.0
+alembic
+psycopg[binary]
+fastapi
+uvicorn[standard]
+httpx
+pydantic>=2
+pydantic-settings
+python-dateutil
+slowapi
+pytest
+mcp
+
+# workspace packages (editable installs, single source of truth for models/utils)
+-e packages/schema
+-e packages/shared

@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+testpaths = ["packages/shared/tests", "packages/schema/tests"]
+
+[tool.uv.workspace]
+members = ["packages/schema", "packages/shared"]
