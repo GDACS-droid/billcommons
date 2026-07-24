@@ -374,6 +374,14 @@ def cmd_worker(args: argparse.Namespace) -> int:
     fulltext_fetcher = fulltext_mod.FullTextFetcher()
     rawstore = FilesystemRawStore()
     last_schedule_pass = 0.0
+    last_fulltext_topup = 0.0
+    # Keep the fetch_text queue fed toward full-text coverage of the whole
+    # corpus. enqueue_fulltext_jobs is idempotent (skips already-queued and
+    # terminal-status documents), so topping up when the queue runs low
+    # steadily drains all ~730k documents without re-enqueuing finished work.
+    fulltext_topup_interval = getattr(args, "fulltext_topup_interval", 600)
+    fulltext_topup_batch = getattr(args, "fulltext_topup_batch", 5000)
+    fulltext_topup_floor = getattr(args, "fulltext_topup_floor", 1000)
 
     try:
         while True:
@@ -394,6 +402,32 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 finally:
                     db_sched.close()
                 last_schedule_pass = now_monotonic
+
+            # Periodic full-text queue top-up: when the fetch_text backlog
+            # falls below the floor, enqueue another batch so extraction
+            # progresses across the whole corpus over time.
+            if (
+                fulltext_topup_interval > 0
+                and now_monotonic - last_fulltext_topup >= fulltext_topup_interval
+            ):
+                db_ft = get_session()
+                try:
+                    queued = queue_mod.count_queued(db_ft, fulltext_mod.FETCH_TEXT_KIND)
+                    if queued < fulltext_topup_floor:
+                        added = fulltext_mod.enqueue_fulltext_jobs(
+                            db_ft, limit=fulltext_topup_batch
+                        )
+                        db_ft.commit()
+                        if added:
+                            print(f"worker {worker_id}: fulltext top-up enqueued {added}")
+                    else:
+                        db_ft.commit()
+                except Exception:
+                    db_ft.rollback()
+                    traceback.print_exc()
+                finally:
+                    db_ft.close()
+                last_fulltext_topup = now_monotonic
 
             db = get_session()
             try:
@@ -544,6 +578,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=15 * 60.0,
         help="seconds between schedule-refresh passes inside the worker loop (default 900s/15min; 0 disables)",
+    )
+    p_worker.add_argument(
+        "--fulltext-topup-interval",
+        type=float,
+        default=10 * 60.0,
+        help="seconds between full-text queue top-up checks (default 600s/10min; 0 disables)",
+    )
+    p_worker.add_argument(
+        "--fulltext-topup-batch",
+        type=int,
+        default=5000,
+        help="documents to enqueue per full-text top-up when the queue is low (default 5000)",
+    )
+    p_worker.add_argument(
+        "--fulltext-topup-floor",
+        type=int,
+        default=1000,
+        help="top up the fetch_text queue when it falls below this many jobs (default 1000)",
     )
     p_worker.set_defaults(func=cmd_worker)
 

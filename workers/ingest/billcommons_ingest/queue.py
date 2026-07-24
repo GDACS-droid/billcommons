@@ -15,7 +15,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from billcommons_schema.models import IngestJob
@@ -132,3 +132,13 @@ def queue_depth(db: Session, status: str = "queued") -> int:
     """Count of jobs currently in `status` (default: queued-and-eligible-or-not)."""
     stmt = select(IngestJob).where(IngestJob.status == status)
     return len(db.execute(stmt).scalars().all())
+
+
+def count_queued(db: Session, kind: str, status: str = "queued") -> int:
+    """Efficient count of jobs of a given kind in `status` (default queued)."""
+    stmt = (
+        select(func.count())
+        .select_from(IngestJob)
+        .where(IngestJob.kind == kind, IngestJob.status == status)
+    )
+    return int(db.execute(stmt).scalar_one())
