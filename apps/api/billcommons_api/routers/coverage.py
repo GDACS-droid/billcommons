@@ -61,7 +61,7 @@ def list_coverage(
     per_page: int = Query(DEFAULT_PER_PAGE, ge=1),
     db: OrmSession = Depends(get_db),
 ) -> Page[CoverageRowOut]:
-    per_page = clamp_per_page(per_page)
+    per_page = clamp_per_page(per_page, maximum=200)
     stmt = select(JurisdictionCoverage, Jurisdiction, Session).join(
         Jurisdiction, Jurisdiction.id == JurisdictionCoverage.jurisdiction_id
     ).outerjoin(Session, Session.id == JurisdictionCoverage.session_id)

@@ -14,7 +14,7 @@ export const metadata: Metadata = {
 
 async function getCoverage() {
   return apiGet<ListEnvelope<CoverageRow>>("/api/v1/coverage", {
-    per_page: 51,
+    per_page: 200,
   });
 }
 

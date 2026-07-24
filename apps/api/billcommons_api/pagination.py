@@ -33,8 +33,8 @@ class Page(BaseModel, Generic[T]):
     meta: ResponseMeta
 
 
-def clamp_per_page(per_page: int) -> int:
-    return max(1, min(per_page, MAX_PER_PAGE))
+def clamp_per_page(per_page: int, maximum: int = MAX_PER_PAGE) -> int:
+    return max(1, min(per_page, maximum))
 
 
 def total_pages(total: int, per_page: int) -> int:
