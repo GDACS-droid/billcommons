@@ -34,14 +34,14 @@ def states_needing_bootstrap() -> set[str]:
         rows = db.execute(
             text(
                 """
-                SELECT j.state_code
+                SELECT j.abbreviation
                 FROM jurisdiction_coverage c
                 JOIN jurisdictions j ON j.id = c.jurisdiction_id
-                GROUP BY j.state_code
-                HAVING bool_and(c.status = ANY(:below)) OR sum(coalesce(c.bill_count,0)) = 0
+                GROUP BY j.abbreviation
+                HAVING bool_and(c.status IN ('NOT_STARTED','SOURCE_IDENTIFIED'))
+                    OR sum(coalesce(c.bill_count,0)) = 0
                 """
-            ),
-            {"below": list(STATES_BELOW_BOOTSTRAPPED)},
+            )
         ).fetchall()
         return {r[0] for r in rows}
     finally:
