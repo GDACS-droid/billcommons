@@ -87,6 +87,8 @@ def main() -> int:
         cli.main(["recompute-coverage"])
     if failures:
         print(f"autoboot: FAILURES (will retry on next restart): {failures}", flush=True)
+    print("autoboot: running initial schedule-refresh pass", flush=True)
+    cli.main(["schedule-refresh"])
     print("autoboot: entering worker loop", flush=True)
     return cli.main(["worker"])
 

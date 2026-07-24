@@ -10,7 +10,14 @@ Subcommands (per BRIEF-wave2.md):
                                        docs/state-coverage/coverage-latest.json.
     enqueue-fulltext [--limit N]      Enqueue fetch_text jobs for bill_documents
                                        lacking extracted_text (idempotent).
-    worker                            Long-running loop: claim + process ingest_jobs.
+    validate --state XX [--sample N]  QA-sample bills against source-of-truth
+                                       (search API + official source_url) and
+                                       record validation_runs + coverage.
+    validate --all                    Validate every loaded jurisdiction.
+    schedule-refresh                  Enqueue api_sync jobs for jurisdictions
+                                       due per SPEC "Refresh targets" cadence.
+    worker                            Long-running loop: claim + process ingest_jobs,
+                                       plus a periodic schedule-refresh pass.
 """
 from __future__ import annotations
 
@@ -24,10 +31,13 @@ from pathlib import Path
 
 from sqlalchemy import select
 
+from billcommons_ingest import api_sync as api_sync_mod
 from billcommons_ingest import coverage as coverage_mod
 from billcommons_ingest import fulltext as fulltext_mod
 from billcommons_ingest import queue as queue_mod
 from billcommons_ingest import registry as registry_mod
+from billcommons_ingest import scheduler as scheduler_mod
+from billcommons_ingest import validation as validation_mod
 from billcommons_ingest.openstates_bulk import ingest_session_csv_zip, peek_session_slug
 from billcommons_ingest.session_match import (
     MatchPath,
@@ -236,12 +246,86 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
 
 
 def cmd_api_sync(args: argparse.Namespace) -> int:
-    print(
-        "api-sync: not yet wired to a live OPENSTATES_API_KEY-driven incremental "
-        f"pass for {args.state!r} in this environment; openstates_api.OpenStatesClient "
-        "is available for scripting incremental syncs once a key is provisioned."
-    )
-    return 0
+    db = get_session()
+    try:
+        result = api_sync_mod.run_api_sync_job(db, args.state)
+        db.commit()
+        print(
+            f"api-sync {args.state}: pages={result.pages_fetched} "
+            f"created={result.bills_created} updated={result.bills_updated} "
+            f"unchanged={result.bills_unchanged} actions={result.actions} "
+            f"sponsorships={result.sponsorships}"
+        )
+        if result.warnings:
+            print(f"api-sync {args.state}: {len(result.warnings)} warning(s):")
+            for warning in result.warnings[:20]:
+                print(f"  - {warning}")
+        return 0
+    except Exception:
+        db.rollback()
+        traceback.print_exc()
+        return 1
+    finally:
+        db.close()
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    if not args.all and not args.state:
+        print("validate: one of --state XX or --all is required")
+        return 1
+
+    db = get_session()
+    try:
+        if args.all:
+            jurisdictions = db.execute(select(Jurisdiction).order_by(Jurisdiction.abbreviation)).scalars().all()
+        else:
+            jurisdiction = db.execute(
+                select(Jurisdiction).where(Jurisdiction.abbreviation == args.state.upper())
+            ).scalar_one_or_none()
+            if jurisdiction is None:
+                print(f"validate: no jurisdiction row for state {args.state!r}; run seed-registry first")
+                return 1
+            jurisdictions = [jurisdiction]
+
+        exit_code = 0
+        for jurisdiction in jurisdictions:
+            summary, run = validation_mod.validate_and_record(
+                db, jurisdiction, sample_size=args.sample
+            )
+            db.commit()
+            rate = f"{summary.pass_rate:.0%}" if summary.pass_rate is not None else "n/a"
+            print(
+                f"validate {jurisdiction.abbreviation}: sampled={len(summary.bills)} "
+                f"checks_run={summary.checks_run} checks_failed={summary.checks_failed} "
+                f"pass_rate={rate}"
+            )
+            for bill in summary.bills:
+                for leg in bill.legs:
+                    print(f"  {jurisdiction.abbreviation} {bill.identifier}: {leg.leg}={leg.status} ({leg.detail})")
+                if any(leg.status == "fail" for leg in bill.legs):
+                    exit_code = 1
+        return exit_code
+    except Exception:
+        db.rollback()
+        traceback.print_exc()
+        return 1
+    finally:
+        db.close()
+
+
+def cmd_schedule_refresh(args: argparse.Namespace) -> int:
+    db = get_session()
+    try:
+        enqueued = scheduler_mod.run_schedule_pass(db)
+        db.commit()
+        print(f"schedule-refresh: enqueued api_sync for {len(enqueued)} jurisdiction(s): {sorted(enqueued)}")
+        return 0
+    except Exception:
+        db.rollback()
+        traceback.print_exc()
+        return 1
+    finally:
+        db.close()
 
 
 def cmd_recompute_coverage(args: argparse.Namespace) -> int:
@@ -280,6 +364,7 @@ def cmd_enqueue_fulltext(args: argparse.Namespace) -> int:
 def cmd_worker(args: argparse.Namespace) -> int:
     worker_id = args.worker_id or f"{socket.gethostname()}-{sys.argv[0]}"
     poll_interval = args.poll_interval
+    reschedule_interval = args.reschedule_interval
     print(f"worker {worker_id}: polling every {poll_interval}s (Ctrl-C to stop)")
 
     # Shared across the whole worker-loop lifetime so per-host robots.txt
@@ -287,9 +372,28 @@ def cmd_worker(args: argparse.Namespace) -> int:
     # instead of resetting on every claim.
     fulltext_fetcher = fulltext_mod.FullTextFetcher()
     rawstore = FilesystemRawStore()
+    last_schedule_pass = 0.0
 
     try:
         while True:
+            # Periodic re-scheduling pass (SPEC "Refresh targets"): runs
+            # inside this same loop rather than a second process, at its own
+            # cadence independent of the job-claim poll_interval.
+            now_monotonic = time.monotonic()
+            if reschedule_interval > 0 and now_monotonic - last_schedule_pass >= reschedule_interval:
+                db_sched = get_session()
+                try:
+                    enqueued = scheduler_mod.run_schedule_pass(db_sched)
+                    db_sched.commit()
+                    if enqueued:
+                        print(f"worker {worker_id}: schedule-refresh enqueued {sorted(enqueued)}")
+                except Exception:
+                    db_sched.rollback()
+                    traceback.print_exc()
+                finally:
+                    db_sched.close()
+                last_schedule_pass = now_monotonic
+
             db = get_session()
             try:
                 job = queue_mod.claim_job(db, worker_id)
@@ -318,6 +422,13 @@ def cmd_worker(args: argparse.Namespace) -> int:
                         print(
                             f"worker {worker_id}: fetch_text {result.document_id} "
                             f"status={result.status} chars={result.extracted_chars}"
+                        )
+                    elif job.kind == scheduler_mod.API_SYNC_KIND:
+                        result = api_sync_mod.run_api_sync_job(db, job.payload.get("state"))
+                        print(
+                            f"worker {worker_id}: api_sync {result.state} "
+                            f"created={result.bills_created} updated={result.bills_updated} "
+                            f"unchanged={result.bills_unchanged}"
                         )
                     else:
                         raise ValueError(f"unknown job kind: {job.kind!r}")
@@ -387,9 +498,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_enqueue_fulltext.set_defaults(func=cmd_enqueue_fulltext)
 
+    p_validate = sub.add_parser("validate", help="QA-sample bills against source-of-truth and record validation_runs")
+    p_validate.add_argument("--state", default=None, help="two-letter state code, e.g. AK")
+    p_validate.add_argument("--all", action="store_true", help="validate every jurisdiction in the DB")
+    p_validate.add_argument(
+        "--sample", type=int, default=validation_mod.DEFAULT_SAMPLE_SIZE, help="bills to sample (default 5)"
+    )
+    p_validate.set_defaults(func=cmd_validate)
+
+    p_schedule = sub.add_parser(
+        "schedule-refresh", help="enqueue api_sync jobs for jurisdictions due per SPEC refresh cadence"
+    )
+    p_schedule.set_defaults(func=cmd_schedule_refresh)
+
     p_worker = sub.add_parser("worker", help="run the long-lived job-queue worker loop")
     p_worker.add_argument("--worker-id", default=None)
     p_worker.add_argument("--poll-interval", type=float, default=5.0)
+    p_worker.add_argument(
+        "--reschedule-interval",
+        type=float,
+        default=15 * 60.0,
+        help="seconds between schedule-refresh passes inside the worker loop (default 900s/15min; 0 disables)",
+    )
     p_worker.set_defaults(func=cmd_worker)
 
     return parser
