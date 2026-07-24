@@ -113,6 +113,47 @@ def build_fixture_zip_bytes() -> bytes:
             "classification": "['introduction']",
             "order": 1,
         },
+        # Out-of-order rows for SB 22 (bill-2): the CSV's `order` column does
+        # NOT match chronological action_date order here, mirroring the
+        # real-world bug (WY/NE/NC/ME/LA/KS/HI/CO bulk exports list actions
+        # out of date order). `order` 2 is dated BEFORE `order` 3, which is
+        # itself dated BEFORE the true latest action at `order` 0. Deriving
+        # latest_action_date from "last row by `order`" would wrongly pick
+        # order 3 (2026-02-05) instead of the actual max action_date
+        # (2026-03-01, at order 0).
+        {
+            "id": "action-4",
+            "created_at": "2026-02-01",
+            "updated_at": "2026-02-01",
+            "bill_id": "ocd-bill/bill-2",
+            "organization_id": "",
+            "description": "Referred to committee",
+            "date": "2026-02-01",
+            "classification": "['referral-committee']",
+            "order": 2,
+        },
+        {
+            "id": "action-5",
+            "created_at": "2026-02-05",
+            "updated_at": "2026-02-05",
+            "bill_id": "ocd-bill/bill-2",
+            "organization_id": "",
+            "description": "Committee report",
+            "date": "2026-02-05",
+            "classification": "['committee-passage']",
+            "order": 3,
+        },
+        {
+            "id": "action-6",
+            "created_at": "2026-03-01",
+            "updated_at": "2026-03-01",
+            "bill_id": "ocd-bill/bill-2",
+            "organization_id": "",
+            "description": "Passed Senate",
+            "date": "2026-03-01",
+            "classification": "['passage']",
+            "order": 0,
+        },
     ]
 
     bill_sponsorships = [

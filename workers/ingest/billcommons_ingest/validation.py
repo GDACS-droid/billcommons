@@ -9,7 +9,7 @@ DB write path did not just populate from: the deployed production search API
 (proves index == db) and the bill's own official `source_url` (proves the
 stored link is live and actually names this bill).
 
-Three verification legs per bill, each recorded independently:
+Four verification legs per bill, each recorded independently:
 
     1. structural  -- internal consistency of the already-ingested row
        (identifier/title/session/source_url present; latest_action_date
@@ -17,17 +17,28 @@ Three verification legs per bill, each recorded independently:
        This does not "trust the same row" for its OWN correctness -- it
        checks the row's internal consistency, which is a different failure
        mode than a wrong value slipping in during ingest.
-    2. search_retrieval -- calls the DEPLOYED production /api/v1/search
-       endpoint (a real external HTTP round trip, independent of whatever
-       DB session this process holds) with the bill's number and asserts
-       the bill comes back, plus a keyword probe built from a distinctive
-       word in the title.
-    3. cross_source -- fetches the bill's official `source_url` (politely:
+    2. bill_number_search (MANDATORY) -- calls the DEPLOYED production
+       /api/v1/search endpoint (a real external HTTP round trip, independent
+       of whatever DB session this process holds) with the bill's own
+       identifier and asserts the bill comes back. A miss here is a real
+       search-index bug and fails the leg.
+    3. keyword_search (ADVISORY) -- a second, weaker probe: searches by the
+       rarest non-boilerplate word in the bill's title (by DB frequency, see
+       `_rarest_title_word`) and records whether that surfaces the bill too.
+       Recorded as 'advisory_pass'/'advisory_fail' -- excluded from the
+       pass-rate denominator and never fails the leg on its own, because a
+       single generic title word can legitimately miss even a healthy
+       search index (relevance ranking, many other bills sharing the word).
+    4. cross_source -- fetches the bill's official `source_url` (politely:
        robots-aware, rate-limited, honest UA -- reuses fulltext.py's
        RobotsCache) and checks the identifier appears on the page. Network
-       failures are recorded as 'unverifiable' (not pass, not fail) and
-       robots-disallow as 'skipped_robots' -- neither counts against the
-       pass rate denominator (see `checkable_legs`/`pass_rate`).
+       failures are recorded as 'unverifiable' (not pass, not fail),
+       robots-disallow as 'skipped_robots', and a fetched-200-but-no-real-
+       content page (JS-rendered app shell, e.g. wyoleg.gov) as
+       'unverifiable_js_page' -- none of these three count against the
+       pass rate denominator (see `checkable_legs`/`pass_rate`). A page with
+       substantial visible text AND other bill-number tokens present, just
+       not ours, stays a genuine 'fail'.
 
 GREEN-criteria honesty (per SPEC "Coverage state machine + GREEN criteria"):
 full-text/OCR coverage is a SEPARATE, not-yet-built pipeline stage from this
@@ -70,7 +81,22 @@ PASS = "pass"
 FAIL = "fail"
 UNVERIFIABLE = "unverifiable"
 SKIPPED_ROBOTS = "skipped_robots"
-_NON_CHECKABLE = {UNVERIFIABLE, SKIPPED_ROBOTS}
+# ADVISORY_FAIL/ADVISORY_PASS: recorded outcomes for a check whose failure is
+# informative but not authoritative enough to fail the leg on its own (see
+# `keyword_search` below -- picking ANY single title word as a probe can
+# legitimately miss even a healthy search index, e.g. relevance ranking
+# pushing the target bill past the page size). Excluded from the pass-rate
+# denominator like UNVERIFIABLE/SKIPPED_ROBOTS, but distinguishable in
+# `details` from a genuine network/robots non-result.
+ADVISORY_PASS = "advisory_pass"
+ADVISORY_FAIL = "advisory_fail"
+# UNVERIFIABLE_JS_PAGE: the cross_source fetch succeeded (200) but the page
+# is a JS-rendered app shell with no server-rendered bill content -- the
+# identifier's absence proves nothing about our data being wrong, only that
+# this particular legislature site can't be cross-checked via a plain HTTP
+# GET. Excluded from the pass-rate denominator, same as UNVERIFIABLE.
+UNVERIFIABLE_JS_PAGE = "unverifiable_js_page"
+_NON_CHECKABLE = {UNVERIFIABLE, SKIPPED_ROBOTS, ADVISORY_PASS, ADVISORY_FAIL, UNVERIFIABLE_JS_PAGE}
 
 # GREEN requires full-text coverage to exist (SPEC GREEN criterion #5); a
 # jurisdiction with 0 full-text documents can be VALIDATING-clean but its
@@ -165,19 +191,59 @@ def _check_structural(db: OrmSession, bill: Bill) -> LegResult:
 # Leg 2: search retrieval (deployed production API)
 # ---------------------------------------------------------------------------
 
-_WORD_RE = re.compile(r"[A-Za-z]{5,}")
+_WORD_RE = re.compile(r"[A-Za-z]{6,}")
+# Legislative boilerplate: words that show up in huge swaths of titles across
+# a jurisdiction (generic verbs/nouns of bill drafting), so they're bad
+# keyword-search probes even though they pass the length filter -- a search
+# for one of these will legitimately surface dozens of OTHER bills instead of
+# (or ahead of) the one under test, which is a false alarm about the search
+# index, not a real bug.
 _STOPWORDS = {
     "shall", "which", "relating", "concerning", "amending", "regarding",
     "provide", "provides", "providing", "establish", "establishes",
     "requiring", "require", "section", "sections", "chapter", "provisions",
+    "amend", "amendment", "amendments", "exemption", "exemptions",
+    "act", "relate", "related", "revise", "revising", "revision", "code",
+    "state", "certain", "general", "further", "matters", "purposes",
+    "recognize", "recognizing", "designating", "designate",
 }
 
 
 def _distinctive_title_word(title: str) -> str | None:
-    """Pick a distinctive (long, non-stopword) word from a bill title for
-    the keyword search probe. None if the title has no such word."""
+    """Pick the LONGEST candidate (long, non-stopword) word from a bill
+    title as a first-pass keyword search probe. None if the title has no
+    such word. `_rarest_title_word` below is the DB-frequency-aware
+    upgrade used by the actual search_retrieval check; this function is
+    kept for the length-only fallback (no db session available) and for
+    existing callers/tests."""
     words = [w for w in _WORD_RE.findall(title) if w.lower() not in _STOPWORDS]
     return max(words, key=len) if words else None
+
+
+def _rarest_title_word(db: OrmSession, title: str) -> str | None:
+    """Pick the title candidate word (>=6 letters, not legislative
+    boilerplate) that is RAREST across all ingested bill titles, via one
+    cheap COUNT-per-candidate query. A generic word like 'amendments' can
+    appear in hundreds of titles in a jurisdiction, so a keyword-search
+    probe built from it can legitimately fail to surface any ONE specific
+    bill in the results page even though the search index is fine -- that's
+    a bad probe, not a search bug. Falls back to the longest-word heuristic
+    if no candidates exist or the DB has no bills yet (empty case)."""
+    candidates = sorted({
+        w for w in _WORD_RE.findall(title) if w.lower() not in _STOPWORDS
+    })
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    count_columns = [
+        func.count().filter(Bill.title.ilike(f"%{word}%")).label(f"c{i}")
+        for i, word in enumerate(candidates)
+    ]
+    counts = db.execute(select(*count_columns)).one()
+    counts_by_word = dict(zip(candidates, counts))
+    return min(candidates, key=lambda w: (counts_by_word[w], -len(w)))
 
 
 def _search_api_get(client: httpx.Client, **params) -> dict:
@@ -196,49 +262,83 @@ def _bill_in_results(payload: dict, bill: Bill) -> bool:
 
 
 def _check_search_retrieval(
-    client: httpx.Client, bill: Bill, jurisdiction_abbr: str
-) -> LegResult:
+    client: httpx.Client, bill: Bill, jurisdiction_abbr: str, db: OrmSession | None = None
+) -> list[LegResult]:
+    """Two independently-recorded checks against the deployed search API:
+
+    - `bill_number_search` (MANDATORY): searching by the bill's own
+      identifier must surface it. A failure here is a real, authoritative
+      search-index bug and fails the leg.
+    - `keyword_search` (ADVISORY): searching by a word pulled from the
+      title is a much weaker signal -- even a healthy search index can fail
+      to surface one specific bill for a single-word query (relevance
+      ranking, a common word shared by many other bills, pagination). Its
+      outcome is recorded (`advisory_pass`/`advisory_fail`) but never fails
+      the leg or counts toward the pass-rate denominator on its own.
+    """
+    legs: list[LegResult] = []
+
     try:
         by_number = _search_api_get(
             client, q=bill.identifier, jurisdiction=jurisdiction_abbr, per_page=10
         )
     except httpx.HTTPError as exc:
-        return LegResult("search_retrieval", UNVERIFIABLE, f"search API unreachable: {exc}")
+        legs.append(LegResult("bill_number_search", UNVERIFIABLE, f"search API unreachable: {exc}"))
+        return legs
 
     if not _bill_in_results(by_number, bill):
-        return LegResult(
-            "search_retrieval",
-            FAIL,
-            f"bill-number search for {bill.identifier!r} in {jurisdiction_abbr} returned no match",
+        legs.append(
+            LegResult(
+                "bill_number_search",
+                FAIL,
+                f"bill-number search for {bill.identifier!r} in {jurisdiction_abbr} returned no match",
+            )
         )
+        return legs
 
-    keyword = _distinctive_title_word(bill.title)
-    if keyword is None:
-        return LegResult(
-            "search_retrieval",
+    legs.append(
+        LegResult(
+            "bill_number_search",
             PASS,
-            "bill-number search matched (title had no distinctive keyword to probe)",
+            f"bill-number search for {bill.identifier!r} matched",
         )
+    )
+
+    keyword = _rarest_title_word(db, bill.title) if db is not None else _distinctive_title_word(bill.title)
+    if keyword is None:
+        legs.append(
+            LegResult(
+                "keyword_search",
+                ADVISORY_PASS,
+                "title had no distinctive keyword to probe",
+            )
+        )
+        return legs
 
     try:
         by_keyword = _search_api_get(
             client, q=keyword, jurisdiction=jurisdiction_abbr, per_page=25
         )
     except httpx.HTTPError as exc:
-        return LegResult(
-            "search_retrieval", UNVERIFIABLE, f"keyword search API unreachable: {exc}"
+        legs.append(
+            LegResult("keyword_search", UNVERIFIABLE, f"keyword search API unreachable: {exc}")
         )
+        return legs
 
     if not _bill_in_results(by_keyword, bill):
-        return LegResult(
-            "search_retrieval",
-            FAIL,
-            f"keyword search for {keyword!r} (from title) did not surface {bill.identifier}",
+        legs.append(
+            LegResult(
+                "keyword_search",
+                ADVISORY_FAIL,
+                f"keyword search for {keyword!r} (from title) did not surface {bill.identifier}",
+            )
         )
+        return legs
 
-    return LegResult(
-        "search_retrieval", PASS, f"bill-number + keyword ({keyword!r}) search both matched"
+    legs.append(
+        LegResult("keyword_search", ADVISORY_PASS, f"keyword ({keyword!r}) search matched")
     )
+    return legs
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +360,32 @@ def _normalize_for_page_match(identifier: str) -> list[str]:
     return list(forms)
 
 
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+# Any surface form a bill number might take elsewhere on the page ("SB 42",
+# "HB123", "H.B. 4" for SOME other bill) -- used to tell "this is a real
+# legislature content page that simply doesn't mention OUR bill" (a genuine
+# mismatch) apart from "this page has no bill-number tokens at all" (a
+# JS-app shell that never got a chance to render anything).
+_BILL_NUMBER_TOKEN_RE = re.compile(r"\b[A-Z]{1,4}\s?\d+\b")
+_MIN_VISIBLE_TEXT_CHARS = 500
+
+
+def _visible_text(html: str) -> str:
+    """Strip tags (and, crucially, <script>/<style> BLOCK CONTENTS -- not
+    just the tags) to approximate what a human sees rendered. A JS app
+    shell's <style> block alone (inline font-face CSS, etc.) can be
+    thousands of bytes despite having zero visible bill content, so
+    stripping only the tag delimiters and leaving that CSS/JS text in place
+    would make an empty shell look like a substantial content page and
+    silently defeat this whole heuristic (confirmed against a real
+    wyoleg.gov response during the 51-state sweep: an 11KB page collapsed
+    to 26 visible chars once <style> contents were removed too)."""
+    without_script_style = _SCRIPT_STYLE_RE.sub(" ", html)
+    return _WHITESPACE_RE.sub(" ", _TAG_RE.sub(" ", without_script_style)).strip()
+
+
 def _check_cross_source(client: httpx.Client, robots_cache: RobotsCache, bill: Bill) -> LegResult:
     if not bill.source_url:
         return LegResult("cross_source", FAIL, "no source_url to verify against")
@@ -278,6 +404,25 @@ def _check_cross_source(client: httpx.Client, robots_cache: RobotsCache, bill: B
     candidates = _normalize_for_page_match(bill.identifier)
     if any(candidate in page_text for candidate in candidates):
         return LegResult("cross_source", PASS, f"source_url page contains identifier match")
+
+    # Genuine 200 but the identifier isn't on the page. Before calling this a
+    # real mismatch, rule out a JS-rendered app shell: the fetched HTML's
+    # visible (tag-stripped) text is either near-empty, or contains no
+    # bill-number-like token at all -- either way, there's no real content
+    # for the identifier to have been absent FROM. A page with substantial
+    # visible text AND other bill-number tokens present (just not ours) is a
+    # genuine mismatch and stays a real fail.
+    visible = _visible_text(page_text)
+    if len(visible) < _MIN_VISIBLE_TEXT_CHARS or not _BILL_NUMBER_TOKEN_RE.search(visible):
+        return LegResult(
+            "cross_source",
+            UNVERIFIABLE_JS_PAGE,
+            f"source_url page fetched 200 but has no substantive bill content "
+            f"({len(visible)} visible chars, "
+            f"{'no' if not _BILL_NUMBER_TOKEN_RE.search(visible) else 'some'} bill-number tokens) "
+            f"-- likely a JS-rendered app shell",
+        )
+
     return LegResult(
         "cross_source",
         FAIL,
@@ -333,8 +478,8 @@ def validate_jurisdiction(
         for bill in bills:
             result = BillValidationResult(bill_id=str(bill.id), identifier=bill.identifier)
             result.legs.append(_check_structural(db, bill))
-            result.legs.append(
-                _check_search_retrieval(search_client, bill, jurisdiction.abbreviation)
+            result.legs.extend(
+                _check_search_retrieval(search_client, bill, jurisdiction.abbreviation, db=db)
             )
             result.legs.append(_check_cross_source(source_client, robots_cache, bill))
             summary.bills.append(result)

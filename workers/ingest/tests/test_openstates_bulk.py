@@ -17,7 +17,7 @@ underlying semantics regress, not just if syntax breaks):
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import func, select
 
@@ -124,6 +124,38 @@ def test_ingest_populates_actions_sponsorships_versions_sources(db_session, raws
         select(BillSubject.subject).where(BillSubject.bill_id == bill_hb1.id)
     ).scalars().all()
     assert set(subjects) == {"testing", "fixtures"}
+
+
+def test_ingest_derives_latest_action_from_max_date_not_csv_order(db_session, rawstore):
+    """Regression for the 51-state validation sweep finding (WY/NE/NC/ME/
+    LA/KS/HI/CO, 5/5 sampled bills each failing structural validation):
+    some states' bulk CSVs do not list bill_actions rows in chronological
+    order, so latest_action_date/text must be derived from
+    max(action_date) -- NOT from the last row by CSV `order` column. The
+    fixture's SB 22 (bill-2) actions are deliberately out of `order` vs.
+    `date` order to prove this."""
+    session_row = _make_session_row(db_session)
+    zip_bytes = build_fixture_zip_bytes()
+    ingest_session_csv_zip(db_session, zip_bytes, session_row=session_row, rawstore=rawstore)
+    db_session.flush()
+
+    bill_sb22 = db_session.execute(
+        select(Bill).where(Bill.session_id == session_row.id, Bill.identifier_norm == "SB 22")
+    ).scalar_one()
+
+    # True max(action_date) is 2026-03-01 ("Passed Senate", at `order` 0 --
+    # the LOWEST order value, proving order-position is not being used as
+    # a proxy for recency).
+    max_action_date = db_session.execute(
+        select(func.max(BillAction.action_date)).where(BillAction.bill_id == bill_sb22.id)
+    ).scalar_one()
+    assert max_action_date == date(2026, 3, 1)
+    assert bill_sb22.latest_action_date == date(2026, 3, 1)
+    assert bill_sb22.latest_action_text == "Passed Senate"
+
+    # introduced_date still correctly picks the min-dated introduction
+    # action (2026-01-10), unaffected by the later out-of-order rows.
+    assert bill_sb22.introduced_date == date(2026, 1, 10)
 
 
 def test_ingest_populates_vote_events_and_records(db_session, rawstore):

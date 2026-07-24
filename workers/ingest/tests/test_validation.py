@@ -19,10 +19,13 @@ import pytest
 
 from billcommons_ingest.fulltext import RobotsCache
 from billcommons_ingest.validation import (
+    ADVISORY_FAIL,
+    ADVISORY_PASS,
     FAIL,
     PASS,
     SKIPPED_ROBOTS,
     UNVERIFIABLE,
+    UNVERIFIABLE_JS_PAGE,
     ValidationSummary,
     BillValidationResult,
     LegResult,
@@ -31,6 +34,7 @@ from billcommons_ingest.validation import (
     _check_search_retrieval,
     _check_structural,
     _distinctive_title_word,
+    _rarest_title_word,
     sample_bills,
     validate_and_record,
 )
@@ -137,11 +141,15 @@ def test_search_retrieval_passes_when_bill_found_both_queries(db_session):
         )
 
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.billcommons.org/api/v1")
-    result = _check_search_retrieval(client, bill, "ZQ")
-    assert result.status == PASS
+    legs = _check_search_retrieval(client, bill, "ZQ", db=db_session)
+    by_leg = {leg.leg: leg for leg in legs}
+    assert by_leg["bill_number_search"].status == PASS
+    assert by_leg["keyword_search"].status == ADVISORY_PASS
 
 
 def test_search_retrieval_fails_when_bill_number_search_empty(db_session):
+    """bill_number_search is MANDATORY -- its failure is a real leg FAIL,
+    unlike keyword_search (advisory, see test above/below)."""
     _, _, bills = _make_jurisdiction_with_bills(db_session, n=1)
     bill = bills[0]
 
@@ -153,8 +161,47 @@ def test_search_retrieval_fails_when_bill_number_search_empty(db_session):
         )
 
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.billcommons.org/api/v1")
-    result = _check_search_retrieval(client, bill, "ZQ")
-    assert result.status == FAIL
+    legs = _check_search_retrieval(client, bill, "ZQ", db=db_session)
+    assert len(legs) == 1
+    assert legs[0].leg == "bill_number_search"
+    assert legs[0].status == FAIL
+
+
+def test_search_retrieval_keyword_miss_is_advisory_not_fail(db_session):
+    """Business intent (Finding 3): a keyword-search miss must NOT fail the
+    leg by itself -- it's recorded as advisory_fail, distinct from a real
+    FAIL, and excluded from the pass-rate denominator."""
+    _, _, bills = _make_jurisdiction_with_bills(db_session, n=1)
+    bill = bills[0]
+
+    def handler(request):
+        q = request.url.params.get("q")
+        if q == bill.identifier:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"id": str(bill.id)}],
+                    "pagination": {"page": 1, "per_page": 10, "total": 1, "total_pages": 1},
+                    "meta": {"api_version": "v1", "request_id": "test"},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"data": [], "pagination": {"page": 1, "per_page": 25, "total": 0, "total_pages": 0},
+                  "meta": {"api_version": "v1", "request_id": "test"}},
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.billcommons.org/api/v1")
+    legs = _check_search_retrieval(client, bill, "ZQ", db=db_session)
+    by_leg = {leg.leg: leg for leg in legs}
+    assert by_leg["bill_number_search"].status == PASS
+    assert by_leg["keyword_search"].status == ADVISORY_FAIL
+
+    summary = ValidationSummary(jurisdiction_abbr="ZQ", session_id=None)
+    bill_result = BillValidationResult(bill_id=str(bill.id), identifier=bill.identifier)
+    bill_result.legs = legs
+    summary.bills.append(bill_result)
+    assert summary.checks_failed == 0, "advisory_fail must not count toward checks_failed"
 
 
 def test_search_retrieval_is_unverifiable_on_network_error(db_session):
@@ -165,8 +212,39 @@ def test_search_retrieval_is_unverifiable_on_network_error(db_session):
         raise httpx.ConnectTimeout("timed out")
 
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.billcommons.org/api/v1")
-    result = _check_search_retrieval(client, bill, "ZQ")
-    assert result.status == UNVERIFIABLE
+    legs = _check_search_retrieval(client, bill, "ZQ", db=db_session)
+    assert len(legs) == 1
+    assert legs[0].leg == "bill_number_search"
+    assert legs[0].status == UNVERIFIABLE
+
+
+def test_rarest_title_word_prefers_less_common_over_longer(db_session):
+    """Business intent (Finding 3): the keyword probe should prefer a word
+    that is RARE across ingested titles, not just the longest candidate --
+    a common word like 'amendments' can appear in many titles and produce a
+    false-alarm advisory_fail even when the search index is fine."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    from billcommons_schema.models import Bill as BillModel
+
+    common_titles = [
+        f"An act concerning amendments to statute number {i}" for i in range(5)
+    ]
+    for i, t in enumerate(common_titles):
+        db_session.add(
+            BillModel(
+                jurisdiction_id=jurisdiction.id,
+                session_id=session_row.id,
+                identifier=f"SB {100 + i}",
+                identifier_norm=f"SB {100 + i}",
+                title=t,
+                source_url=f"https://example-legislature.gov/bills/sb{100 + i}",
+            )
+        )
+    db_session.flush()
+
+    word = _rarest_title_word(db_session, "An act concerning amendments to cryptocurrency taxation")
+    assert word == "cryptocurrency" or word == "taxation"
+    assert word != "amendments"
 
 
 # ---------------------------------------------------------------------------
@@ -189,19 +267,88 @@ def test_cross_source_passes_when_identifier_on_page(db_session):
     assert result.status == PASS
 
 
-def test_cross_source_fails_when_identifier_absent(db_session):
+def test_cross_source_fails_when_identifier_absent_but_page_has_real_content(db_session):
+    """A genuine mismatch: substantial visible text AND other bill-number
+    tokens present, just not ours -- this must stay a real FAIL, not get
+    reclassified as a JS-page false-negative (Finding 2 says the heuristic
+    should only catch near-empty/no-bill-number-token pages)."""
+    _, _, bills = _make_jurisdiction_with_bills(db_session, n=1)
+    bill = bills[0]
+
+    page = (
+        "<html><body><h1>Legislature Bill Tracker</h1>"
+        + "<p>This session includes SB 42, HB 200, and SR 7 among the bills "
+        "under consideration by the committee this term. " * 8
+        + "</p></body></html>"
+    )
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, text=page)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == FAIL
+
+
+def test_cross_source_js_page_heuristic_strips_style_block_contents(db_session):
+    """Regression for a real gap found live against wyoleg.gov during the
+    51-state sweep: a JS app shell's <style> block (inline font-face CSS)
+    can be several KB on its own, which would make a near-empty page look
+    "substantial" if only the <style> TAGS were stripped and not their
+    contents -- silently defeating the whole unverifiable_js_page
+    heuristic and leaving it a real (wrong) fail."""
+    _, _, bills = _make_jurisdiction_with_bills(db_session, n=1)
+    bill = bills[0]
+
+    huge_css = "@font-face{font-family:'Roboto';src:url(x.woff2);} " * 60
+    page = (
+        "<!doctype html><html><head><title>Legislative Service Office</title>"
+        f"<style>{huge_css}</style></head>"
+        '<body><div id="app"></div></body></html>'
+    )
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, text=page)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == UNVERIFIABLE_JS_PAGE
+
+
+def test_cross_source_is_unverifiable_js_page_when_shell_has_no_content(db_session):
+    """Finding 2: a JS-rendered legislature site (e.g. wyoleg.gov) returns
+    200 with an app shell that has no server-rendered bill text -- the
+    identifier's absence proves nothing about our data, so this must be
+    classified as unverifiable_js_page, not a real fail, and excluded from
+    the pass-rate denominator."""
     _, _, bills = _make_jurisdiction_with_bills(db_session, n=1)
     bill = bills[0]
 
     def handler(request):
         if request.url.path == "/robots.txt":
             return httpx.Response(404)
-        return httpx.Response(200, text="<html>Some unrelated legislature page</html>")
+        return httpx.Response(
+            200,
+            text='<html><body><div id="app"></div>'
+            '<script src="/static/app.js"></script></body></html>',
+        )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     robots_cache = RobotsCache(client=client)
     result = _check_cross_source(client, robots_cache, bill)
-    assert result.status == FAIL
+    assert result.status == UNVERIFIABLE_JS_PAGE
+
+    summary = ValidationSummary(jurisdiction_abbr="ZQ", session_id=None)
+    bill_result = BillValidationResult(bill_id=str(bill.id), identifier=bill.identifier)
+    bill_result.legs = [result]
+    summary.bills.append(bill_result)
+    assert summary.checks_run == 0, "unverifiable_js_page must be excluded from the denominator"
 
 
 def test_cross_source_skips_when_robots_disallows(db_session):

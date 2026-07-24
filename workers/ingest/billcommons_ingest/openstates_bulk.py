@@ -726,26 +726,42 @@ def ingest_session_csv_zip(
         db.flush()
         db.commit()
 
-        # Derive latest_action_text/date from the max-order action, per the
-        # documented mapping (bulk CSV bills.csv has no status/date columns).
+        # Derive latest_action_text/date from the action with the max
+        # action_date (tie-break: highest `order` among that date), and
+        # introduced_date from the action with the min action_date among
+        # actions classified "introduction" (tie-break: lowest `order`).
+        # Bulk CSV bills.csv has no status/date columns, so these are always
+        # derived from bill_actions, never trusted from the source order the
+        # CSV rows happened to arrive in -- some states' export CSVs do not
+        # list actions in chronological order, so sorting by `order` alone
+        # (or taking the first/last row as-read) silently picks a stale
+        # action instead of the actual latest/earliest one.
         # Preload all actions for touched bills in one query and group in
         # memory instead of one SELECT per bill.
         actions_by_bill: dict = {}
         if touched_bill_ids:
             for action in db.execute(
-                select(BillAction)
-                .where(BillAction.bill_id.in_(touched_bill_ids))
-                .order_by(BillAction.bill_id, BillAction.order)
+                select(BillAction).where(BillAction.bill_id.in_(touched_bill_ids))
             ).scalars():
                 actions_by_bill.setdefault(action.bill_id, []).append(action)
         for bill in bill_by_openstates_id.values():
             actions = actions_by_bill.get(bill.id)
             if actions:
-                latest = actions[-1]
+                latest = max(
+                    actions,
+                    key=lambda a: (a.action_date or date.min, a.order or 0),
+                )
                 bill.latest_action_text = latest.description
                 bill.latest_action_date = latest.action_date
-                first = actions[0]
-                if "introduction" in (first.classification or ""):
+
+                introduction_actions = [
+                    a for a in actions if "introduction" in (a.classification or "")
+                ]
+                if introduction_actions:
+                    first = min(
+                        introduction_actions,
+                        key=lambda a: (a.action_date or date.max, -(a.order or 0)),
+                    )
                     bill.introduced_date = first.action_date
         db.flush()
         db.commit()
