@@ -46,6 +46,7 @@ from billcommons_ingest.session_match import (
     resolve_session,
 )
 from billcommons_schema.models import (
+    BillDocument,
     IngestionRun,
     Jurisdiction,
     JurisdictionCoverage,
@@ -439,9 +440,24 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     # URL, missing row) -- retrying won't change the answer,
                     # so dead-letter immediately instead of consuming the
                     # normal backoff/retry budget.
+                    #
+                    # db.rollback() below undoes the bill_documents status
+                    # write (license_note='fulltext_status=...') that
+                    # process_fetch_text_job already flushed before raising
+                    # -- rollback discards uncommitted work in this
+                    # transaction, status write included. Left undone, the
+                    # document would keep looking "never attempted" and
+                    # enqueue_fulltext_jobs would re-enqueue it forever even
+                    # though the job itself is dead-lettered. So re-apply the
+                    # SAME status in the fresh session used for
+                    # dead-lettering, durably, before that commit.
                     db.rollback()
                     db2 = get_session()
                     try:
+                        if exc.document_id and exc.status:
+                            document2 = db2.get(BillDocument, exc.document_id)
+                            if document2 is not None:
+                                document2.license_note = f"fulltext_status={exc.status}"
                         job2 = db2.get(type(job), job.id)
                         queue_mod.dead_letter_job(db2, job2, str(exc))
                         db2.commit()

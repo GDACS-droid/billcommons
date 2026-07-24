@@ -11,12 +11,13 @@ incremental sync actually did.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 import pytest
 from sqlalchemy import select
 
-from billcommons_ingest.api_sync import run_api_sync_job, sync_state
+from billcommons_ingest.api_sync import _bill_checksum, run_api_sync_job, sync_state
 from billcommons_ingest.openstates_api import OpenStatesClient
 from billcommons_schema.models import (
     Bill,
@@ -41,8 +42,16 @@ def _make_jurisdiction_with_active_session(db_session, abbr=None):
     return jurisdiction, session_row
 
 
-def _v3_bill_payload(*, openstates_id, identifier, title, action_description="Introduced", action_date="2026-01-05"):
-    return {
+def _v3_bill_payload(
+    *,
+    openstates_id,
+    identifier,
+    title,
+    action_description="Introduced",
+    action_date="2026-01-05",
+    session=None,
+):
+    payload = {
         "id": openstates_id,
         "identifier": identifier,
         "title": title,
@@ -54,6 +63,9 @@ def _v3_bill_payload(*, openstates_id, identifier, title, action_description="In
         "sponsorships": [{"name": "Jane Doe", "classification": "primary", "primary": True}],
         "sources": [{"url": "https://example-legislature.gov/bill/1"}],
     }
+    if session is not None:
+        payload["session"] = session
+    return payload
 
 
 def _client_with_pages(pages: dict) -> OpenStatesClient:
@@ -134,6 +146,78 @@ def test_sync_state_updates_changed_bill_title(db_session):
     assert bill.title == "Amended title"
 
 
+def test_sync_state_does_not_conflate_same_bill_number_across_sessions(db_session):
+    """Regression for Finding A: keying the in-memory bill lookup by
+    identifier_norm ALONE (jurisdiction-wide, ignoring session) meant a
+    current-session "HB 1" sync could silently overwrite a DIFFERENT,
+    historical session's "HB 1" row -- corrupting old sessions' data every
+    time a new session reused a low bill number (which is normal;
+    legislatures restart numbering every session).
+
+    Two session rows sharing the identifier "HB 1": one seeded as an OLD,
+    inactive session (simulating a bill already ingested by a prior bulk
+    bootstrap), the other seeded as the CURRENT active session. Syncing a v3
+    payload for "HB 1" tagged with the OLD session's identifier must update
+    ONLY the old session's bill row, leaving the (as-yet-nonexistent, in
+    this test) current-session "HB 1" untouched -- and must NOT create a
+    duplicate current-session row keyed by identifier alone.
+    """
+    abbr = f"ZQ_XSESSION_{uuid.uuid4().hex[:8].upper()}"
+    jurisdiction = Jurisdiction(name="Cross-Session Test State", abbreviation=abbr, classification="state")
+    db_session.add(jurisdiction)
+    db_session.flush()
+
+    old_session = SessionModel(jurisdiction_id=jurisdiction.id, identifier="2024 Session", active=False)
+    current_session = SessionModel(jurisdiction_id=jurisdiction.id, identifier="2026 Session", active=True)
+    db_session.add(old_session)
+    db_session.add(current_session)
+    db_session.flush()
+
+    # A bill already ingested (e.g. by a prior bulk-CSV bootstrap) in the OLD
+    # session, sharing the identifier "HB 1" with whatever the new session's
+    # own "HB 1" will eventually be.
+    old_bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=old_session.id,
+        identifier="HB 1",
+        identifier_norm="HB 1",
+        title="Old session's HB 1 -- historical text",
+        openstates_id="ocd-bill/old-session-hb1",
+    )
+    db_session.add(old_bill)
+    db_session.flush()
+    old_bill_id = old_bill.id
+
+    # v3 payload for the SAME openstates_id, tagged with the OLD session's
+    # identifier and an updated title -- a real incremental update to the
+    # historical bill, not a new current-session bill.
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/old-session-hb1",
+        identifier="HB 1",
+        title="Old session's HB 1 -- corrected text",
+        session="2024 Session",
+    )
+    client = _client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}})
+
+    result = sync_state(db_session, jurisdiction, client=client)
+    db_session.flush()
+
+    assert result.bills_created == 0, "the old session's existing HB 1 must be UPDATED, not duplicated as a new bill"
+    assert result.bills_updated == 1
+
+    all_hb1_rows = db_session.execute(
+        select(Bill).where(Bill.jurisdiction_id == jurisdiction.id, Bill.identifier_norm == "HB 1")
+    ).scalars().all()
+    assert len(all_hb1_rows) == 1, "no duplicate current-session HB 1 row must be created"
+
+    updated_old_bill = db_session.get(Bill, old_bill_id)
+    assert updated_old_bill.title == "Old session's HB 1 -- corrected text"
+    assert updated_old_bill.session_id == old_session.id, (
+        "the update must land on the OLD session's row -- a session-blind identifier_norm "
+        "key would have created/updated a row under the (wrong) active/current session instead"
+    )
+
+
 def test_sync_state_skips_new_bill_without_active_session(db_session):
     abbr = f"ZQ_NOACTIVE_{uuid.uuid4().hex[:8].upper()}"
     jurisdiction = Jurisdiction(name="No Active Session State", abbreviation=abbr, classification="state")
@@ -146,7 +230,7 @@ def test_sync_state_skips_new_bill_without_active_session(db_session):
 
     result = sync_state(db_session, jurisdiction, client=client)
     assert result.bills_created == 0
-    assert any("no active session" in w for w in result.warnings)
+    assert any("no session row resolved" in w for w in result.warnings)
 
 
 def test_sync_state_respects_max_pages_cap(db_session):
@@ -192,3 +276,194 @@ def test_run_api_sync_job_records_ingestion_run(db_session):
 def test_run_api_sync_job_raises_for_unknown_state(db_session):
     with pytest.raises(ValueError):
         run_api_sync_job(db_session, "ZZ_NOT_A_REAL_STATE")
+
+
+def _client_recording_updated_since(pages: dict, seen_updated_since: list) -> OpenStatesClient:
+    def handler(request):
+        seen_updated_since.append(dict(request.url.params).get("updated_since"))
+        page = int(dict(request.url.params).get("page", "1"))
+        return httpx.Response(200, json=pages.get(page, {"results": [], "pagination": {"max_page": page}}))
+
+    transport = httpx.MockTransport(handler)
+    http_client = httpx.Client(transport=transport, base_url="https://v3.openstates.org")
+    return OpenStatesClient(client=http_client, api_key="test-key")
+
+
+def test_sync_state_watermark_ignores_coverage_recompute_stamps(db_session):
+    """Regression for Finding B: the watermark api_sync uses for
+    `updated_since` must be THIS pipeline's own last-successful-sync time
+    (ingestion_runs), never `jurisdiction_coverage.last_success_at` --
+    `coverage.recompute_coverage_row` stamps that field on EVERY
+    recompute-coverage pass whenever bill_count > 0, regardless of whether
+    an actual sync happened. If api_sync derived updated_since from it, a
+    recompute pass running between two real syncs would silently advance
+    the watermark and cause upstream changes in that window to be skipped
+    forever.
+
+    Simulates exactly that collision: seed a JurisdictionCoverage row with
+    `last_success_at` stamped to a time AFTER a real api_sync run actually
+    completed (as a mere recompute pass would do), then run api_sync again
+    and assert the `updated_since` sent to the API is the REAL last sync
+    time from ingestion_runs, not the later, spurious coverage timestamp.
+    """
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+
+    real_sync_finished_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    db_session.add(
+        IngestionRun(
+            jurisdiction_id=jurisdiction.id,
+            session_id=session_row.id,
+            source_name="openstates_api_sync",
+            started_at=real_sync_finished_at,
+            finished_at=real_sync_finished_at,
+            status="success",
+        )
+    )
+    # A coverage recompute pass that ran LATER, with no real sync involved --
+    # stamps last_success_at to a time strictly after the real sync.
+    spurious_recompute_stamp = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    db_session.add(
+        JurisdictionCoverage(
+            jurisdiction_id=jurisdiction.id,
+            session_id=session_row.id,
+            status="BOOTSTRAPPED",
+            bill_count=1,
+            last_success_at=spurious_recompute_stamp,
+        )
+    )
+    db_session.flush()
+
+    seen_updated_since: list = []
+    client = _client_recording_updated_since(
+        {1: {"results": [], "pagination": {"max_page": 1}}}, seen_updated_since
+    )
+
+    sync_state(db_session, jurisdiction, client=client)
+
+    assert len(seen_updated_since) == 1
+    assert seen_updated_since[0] == real_sync_finished_at.isoformat(), (
+        "updated_since must come from the last SUCCESSFUL api_sync ingestion_runs row, "
+        "not the (later, spurious) jurisdiction_coverage.last_success_at stamp"
+    )
+
+
+def test_sync_state_first_run_has_no_updated_since_watermark(db_session):
+    """No prior successful api_sync ingestion_runs row for this jurisdiction
+    -- updated_since must be None (a full pull), even if a coverage row
+    happens to carry a last_success_at stamp from an unrelated bulk
+    bootstrap/recompute pass."""
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+    db_session.add(
+        JurisdictionCoverage(
+            jurisdiction_id=jurisdiction.id,
+            session_id=session_row.id,
+            status="BOOTSTRAPPED",
+            bill_count=1,
+            last_success_at=datetime(2026, 3, 1, tzinfo=timezone.utc),
+        )
+    )
+    db_session.flush()
+
+    seen_updated_since: list = []
+    client = _client_recording_updated_since(
+        {1: {"results": [], "pagination": {"max_page": 1}}}, seen_updated_since
+    )
+
+    sync_state(db_session, jurisdiction, client=client)
+
+    assert len(seen_updated_since) == 1
+    assert seen_updated_since[0] is None
+
+
+def test_sync_state_continues_past_unchanged_page_when_later_page_has_changes(db_session):
+    """Regression for the one-page-cap bug: the old all_unchanged_this_page
+    check re-derived "unchanged" AFTER each bill's checksum had already been
+    overwritten to match the incoming payload, so a page containing ANY
+    created/updated bill still could look "all unchanged" in some runs and,
+    worse, a genuinely all-unchanged page could mask real changes further
+    on if the sync logic were ever asked to keep going regardless. The
+    concrete failure this guards against: pagination silently capping at
+    page 1 (~20 bills) on every incremental sync regardless of what's on
+    page 1, because the post-mutation re-derivation of "unchanged" could
+    never actually observe a changed bill.
+
+    Canned 3-page fixture: page 1 has a bill with a REAL change (must be
+    reached and counted as updated -- and per-page mutation must not make
+    the early-exit check see it as "unchanged", which is exactly the bug:
+    with it, sync would have stopped after page 1 on EVERY run regardless
+    of content). Page 2 is genuinely unchanged, which correctly stops
+    pagination there by design (v3 sorts newest-updated-first, so an
+    all-unchanged page means everything further back is stale) -- page 3's
+    brand-new bill is intentionally never reached, proving the early-exit
+    still fires on a REAL all-unchanged page and isn't simply disabled by
+    this fix.
+    """
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+
+    # Pre-seed a bill on page 1 with a STALE checksum -- the incoming page-1
+    # payload has a different title, so this must be picked up as a real
+    # change. This is the exact case the bug broke: right after this bill's
+    # checksum field is reassigned to match the new payload (as part of
+    # applying the update), a naive post-hoc recheck of
+    # "bill.checksum == _bill_checksum(payload)" is trivially true again,
+    # making a page that had a real change look "all unchanged".
+    stale_payload_for_seed = _v3_bill_payload(
+        openstates_id="ocd-bill/page1", identifier="HB 100", title="Original title"
+    )
+    changed_bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 100",
+        identifier_norm="HB 100",
+        title="Original title",
+        checksum=_bill_checksum(stale_payload_for_seed),
+    )
+    db_session.add(changed_bill)
+    db_session.flush()
+
+    page1_payload = _v3_bill_payload(
+        openstates_id="ocd-bill/page1", identifier="HB 100", title="Amended title"
+    )
+
+    # Pre-seed a bill on page 2 whose checksum already matches its payload
+    # (genuinely unchanged).
+    unchanged_payload = _v3_bill_payload(
+        openstates_id="ocd-bill/page2", identifier="HB 101", title="Unchanged bill"
+    )
+    unchanged_bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 101",
+        identifier_norm="HB 101",
+        title="Unchanged bill",
+        checksum=_bill_checksum(unchanged_payload),
+    )
+    db_session.add(unchanged_bill)
+    db_session.flush()
+
+    page3_payload = _v3_bill_payload(
+        openstates_id="ocd-bill/page3", identifier="HB 102", title="Brand new bill on page 3"
+    )
+
+    pages = {
+        1: {"results": [page1_payload], "pagination": {"max_page": 3}},
+        2: {"results": [unchanged_payload], "pagination": {"max_page": 3}},
+        3: {"results": [page3_payload], "pagination": {"max_page": 3}},
+    }
+    client = _client_with_pages(pages)
+
+    result = sync_state(db_session, jurisdiction, client=client, max_pages=10)
+
+    assert result.pages_fetched == 2, (
+        "page 1 had a real change so it must be fetched and applied (the one-page-cap bug would "
+        "have made page 1 look all-unchanged regardless); page 2 is genuinely all-unchanged so "
+        "the early-exit correctly stops there without wasting quota on page 3"
+    )
+    assert result.bills_updated == 1
+    assert result.bills_unchanged == 1
+    assert result.bills_created == 0, "page 3's new bill must NOT be reached -- the genuine early-exit still works"
+
+    updated = db_session.execute(
+        select(Bill).where(Bill.jurisdiction_id == jurisdiction.id, Bill.identifier_norm == "HB 100")
+    ).scalar_one()
+    assert updated.title == "Amended title", "page 1's real change must actually be applied"

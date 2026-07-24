@@ -346,18 +346,121 @@ def _check_search_retrieval(
 # ---------------------------------------------------------------------------
 
 
+def _normalize_page_text_for_match(text: str) -> str:
+    """Strip punctuation (but NOT whitespace) and casefold, so literal
+    substring matching is tolerant of the page's own punctuation noise
+    around a bill number (e.g. "H.B. 1057", "HB-1057") without having to
+    enumerate every possible separator as a distinct candidate string --
+    while still leaving whitespace in place as real token boundaries so
+    adjacency checks (the alpha prefix immediately next to its number,
+    required below) can't be fooled by unrelated digits/letters that just
+    happen to run together once ALL separators are removed."""
+    collapsed = re.sub(r"[^a-z0-9\s]", "", text.casefold())
+    return re.sub(r"\s+", " ", collapsed)
+
+
+# Common two/three-letter bill-type prefixes, spelled out in full -- some
+# state sites (NC, PA -- confirmed live during the 51-state validation
+# sweep; www.ncleg.gov titles pages "Senate Bill 362", www.palegis.us titles
+# "Senate Resolution 14") never render the abbreviated "SB"/"SR" form at
+# all, only the spelled-out one. Deliberately a SMALL, conservative fixed
+# map of the standard legislative abbreviations (not a guess-based
+# expansion) -- an unrecognized prefix just skips this candidate family
+# rather than inventing a wrong expansion.
+_PREFIX_SPELLOUTS: dict[str, str] = {
+    "hb": "house bill",
+    "sb": "senate bill",
+    "hr": "house resolution",
+    "sr": "senate resolution",
+    "hjr": "house joint resolution",
+    "sjr": "senate joint resolution",
+    "hcr": "house concurrent resolution",
+    "scr": "senate concurrent resolution",
+}
+
+
 def _normalize_for_page_match(identifier: str) -> list[str]:
-    """A handful of surface forms the identifier might appear as on an
-    official legislature/Open States page (state sites are inconsistent
-    about spacing/punctuation): "HB 123", "HB123", "H.B. 123", "H. B. 123"."""
-    compact = re.sub(r"[^A-Za-z0-9]", "", identifier)
-    m = re.match(r"^([A-Za-z]+)(\d+)$", compact)
-    forms = {identifier, compact}
-    if m:
-        prefix, number = m.groups()
-        forms.add(f"{prefix} {number}")
-        forms.add(".".join(prefix) + f". {number}")
-    return list(forms)
+    """Cross-source surface forms an identifier might appear as on an
+    official legislature/Open States page. State sites vary wildly in
+    spacing/punctuation/year-prefixing conventions -- real fails from the
+    51-state sweep clustered around a handful of state-specific renderings
+    that a plain "HB 123"/"HB123"/"H.B. 123" set doesn't cover:
+
+        - CO: "HB26-1057" -- a 2-digit session-year prefix inserted between
+          the letter prefix and the number ("HB 1057" -> "HB26-1057").
+        - NJ/MA/NH/AL/MD/NC/ID/NM: bare, zero-padded, or letter-concatenated
+          forms like "S907"/"H0914" -- often just the FIRST letter of a
+          multi-letter prefix (e.g. "HB 914" rendered as "H0914", not
+          "HB0914"), sometimes zero-padded to a fixed width.
+        - NC/AL/PA: the prefix spelled out in full instead of abbreviated
+          ("SB 362" -> page titled "Senate Bill 362"; "SR 14" -> "Senate
+          Resolution 14") -- a real fail from the 51-state sweep against
+          www.ncleg.gov and www.palegis.us, whose page titles never render
+          the abbreviated form at all.
+
+    Every returned candidate is matched against a page text that has ALSO
+    been punctuation-stripped and casefolded, with whitespace COLLAPSED but
+    preserved as real token separators (see `_normalize_page_text_for_match`)
+    via `_check_cross_source` -- so candidates here are lowercase and
+    punctuation-free, but a candidate with a space (e.g. "hb 1057") only
+    matches a page that itself has that separator; callers must not compare
+    these against a raw, un-normalized page string.
+
+    Every candidate still requires the alpha prefix (or its first letter)
+    immediately adjacent to the number -- this deliberately does NOT loosen
+    to "any 3-4 digit number matches", which would false-positive on page
+    furniture like zip codes, years, or other bills' numbers.
+    """
+    compact = re.sub(r"[^A-Za-z0-9]", "", identifier).lower()
+    m = re.match(r"^([a-z]+)(\d+)$", compact)
+    forms = {compact}
+    if not m:
+        return list(forms)
+
+    prefix, number = m.groups()
+    first_letter = prefix[0]
+    padded_number_3 = number.zfill(3)
+    padded_number_4 = number.zfill(4)
+
+    forms.update(
+        {
+            f"{prefix}{number}",
+            f"{prefix} {number}",
+            # First-letter-only concatenation, the NJ/MA/NH/AL/MD/NC/ID/NM
+            # pattern ("HB 914" -> "H914"), plain and zero-padded to common
+            # state-site widths.
+            f"{first_letter}{number}",
+            f"{first_letter}{padded_number_3}",
+            f"{first_letter}{padded_number_4}",
+            # Full-prefix zero-padded variants too, since some sites pad
+            # after the full letter prefix rather than just its first letter.
+            f"{prefix}{padded_number_3}",
+            f"{prefix}{padded_number_4}",
+        }
+    )
+
+    spellout = _PREFIX_SPELLOUTS.get(prefix)
+    if spellout:
+        forms.add(f"{spellout} {number}")
+
+    # CO-style 2-digit-year insert between prefix and number: "HB26-1057",
+    # or "SB26-024" for a lower/zero-padded bill number (identifier "SB 24"
+    # -> real page renders the number zero-padded to 3 digits EVEN in the
+    # year-prefixed form -- a real fail from the 51-state validation sweep:
+    # "SB 24" on leg.colorado.gov/bills/SB26-024 is literally titled
+    # "SB26-024", not "SB2624"). The exact year isn't known at match time
+    # (this function has no session date to work from and guessing one year
+    # would miss every other one), so this is expressed as a REGEX candidate
+    # rather than a literal string -- checked with re.search against the
+    # punctuation-stripped (but whitespace-preserving) normalized page text,
+    # still anchored on the alpha prefix immediately before the 2-digit year
+    # and the number immediately after (a real word boundary exists here
+    # since whitespace is preserved, not stripped), so it can't drift into
+    # matching an unrelated number. `\d*` before the number allows the
+    # optional zero-padding without requiring it.
+    year_insert_pattern = re.compile(rf"\b{re.escape(prefix)}\d{{2}}0*{re.escape(number)}\b")
+
+    return [f for f in forms] + [year_insert_pattern]
 
 
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
@@ -401,8 +504,22 @@ def _check_cross_source(client: httpx.Client, robots_cache: RobotsCache, bill: B
         return LegResult("cross_source", UNVERIFIABLE, f"fetch failed for {bill.source_url}: {exc}")
 
     page_text = response.text
+    # Match against VISIBLE (tag-stripped) text, not the raw HTML -- matching
+    # raw markup risks a short surface-form candidate (e.g. a first-letter
+    # concatenation like "h1" for identifier "HB 1") colliding with an
+    # unrelated HTML tag/attribute token (a real collision found during this
+    # round's own test suite: "h1" matched inside a stripped-of-punctuation
+    # "<h1>" heading tag).
+    visible = _visible_text(page_text)
+    normalized_page_text = _normalize_page_text_for_match(visible)
     candidates = _normalize_for_page_match(bill.identifier)
-    if any(candidate in page_text for candidate in candidates):
+    matched = any(
+        candidate.search(normalized_page_text)
+        if isinstance(candidate, re.Pattern)
+        else candidate in normalized_page_text
+        for candidate in candidates
+    )
+    if matched:
         return LegResult("cross_source", PASS, f"source_url page contains identifier match")
 
     # Genuine 200 but the identifier isn't on the page. Before calling this a
@@ -412,7 +529,6 @@ def _check_cross_source(client: httpx.Client, robots_cache: RobotsCache, bill: B
     # for the identifier to have been absent FROM. A page with substantial
     # visible text AND other bill-number tokens present (just not ours) is a
     # genuine mismatch and stays a real fail.
-    visible = _visible_text(page_text)
     if len(visible) < _MIN_VISIBLE_TEXT_CHARS or not _BILL_NUMBER_TOKEN_RE.search(visible):
         return LegResult(
             "cross_source",

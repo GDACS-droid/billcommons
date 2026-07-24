@@ -293,6 +293,191 @@ def test_cross_source_fails_when_identifier_absent_but_page_has_real_content(db_
     assert result.status == FAIL
 
 
+def test_cross_source_passes_co_year_insert_surface_form(db_session):
+    """CO real-world rendering: 'HB 1057' shows up on the official page as
+    'HB26-1057' -- a 2-digit session-year inserted between the letter prefix
+    and the number."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 1057",
+        identifier_norm="HB 1057",
+        title="An act",
+        source_url="https://leg.colorado.gov/bills/hb26-1057",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, text="<html><body>See HB26-1057 for the full text of this bill.</body></html>")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == PASS
+
+
+def test_cross_source_passes_co_year_insert_with_zero_padded_number(db_session):
+    """Regression for a real fail found running `validate --all` after this
+    round's initial fix: CO's year-insert form ALSO zero-pads the bill
+    number when it's below the site's fixed display width, even in the
+    year-prefixed form -- "SB 24" (identifier, no leading zeros) renders on
+    leg.colorado.gov as literally "SB26-024" (3-digit zero-padded), not
+    "SB2624". The initial year-insert regex only matched the EXACT digit
+    string with no padding allowance and missed this real page."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="SB 24",
+        identifier_norm="SB 24",
+        title="An act",
+        source_url="https://leg.colorado.gov/bills/sb26-024",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, text="<html><body>SB26-024 State &amp; Local Unmanned Aircraft Regulation</body></html>")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == PASS
+
+
+def test_cross_source_passes_spelled_out_prefix_surface_form(db_session):
+    """Regression for real fails found running `validate --all`: NC
+    (www.ncleg.gov) and PA (www.palegis.us) page titles never render the
+    abbreviated prefix at all, only the spelled-out form -- "SB 362" shows
+    up as "Senate Bill 362", "SR 14" as "Senate Resolution 14"."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="SB 362",
+        identifier_norm="SB 362",
+        title="An act",
+        source_url="https://www.ncleg.gov/BillLookUp/2025/S362",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(
+            200, text="<html><body>Senate Bill 362 (2025-2026 Session) - North Carolina General Assembly</body></html>"
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == PASS
+
+
+def test_cross_source_passes_nj_bare_surface_form(db_session):
+    """NJ real-world rendering: 'S 907' shows up bare/concatenated as 'S907'."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="S 907",
+        identifier_norm="S 907",
+        title="An act",
+        source_url="https://www.njleg.state.nj.us/bill/s907",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, text="<html><body>Bill S907 was introduced in the Senate.</body></html>")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == PASS
+
+
+def test_cross_source_passes_nh_zero_padded_first_letter_surface_form(db_session):
+    """NH/MA real-world rendering: 'HB 914' shows up zero-padded using just
+    the FIRST letter of the (multi-letter) prefix, as 'H0914' -- not
+    'HB0914'."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 914",
+        identifier_norm="HB 914",
+        title="An act",
+        source_url="https://www.gencourt.state.nh.us/bill_status/h0914",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, text="<html><body>Bill status for H0914 as of today.</body></html>")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == PASS
+
+
+def test_cross_source_does_not_match_bare_number_without_alpha_prefix(db_session):
+    """The tolerant surface-form matching must NOT loosen so far that any
+    bare 3-4 digit number on the page counts as a match -- the alpha prefix
+    (or its first letter) must be immediately adjacent. A page containing
+    an unrelated 4-digit number (e.g. a year, zip code, or another bill's
+    number with a DIFFERENT prefix) must not false-positive a match for our
+    bill."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 1057",
+        identifier_norm="HB 1057",
+        title="An act",
+        source_url="https://example-legislature.gov/other-page",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    page = (
+        "<html><body><h1>Legislature Bill Tracker</h1>"
+        "<p>This session includes SB 1057 and AB 1057 among the bills "
+        "under consideration by the committee. Filed in session 1057. "
+        "Zip code 10571057 on the letterhead. This page has substantial "
+        "visible content well past the minimum-length threshold so it is "
+        "not misclassified as a JS app shell, repeated several more times "
+        "to be safe about length requirements for this specific check. "
+        * 4
+        + "</p></body></html>"
+    )
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, text=page)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == FAIL, (
+        "a bare '1057' or a DIFFERENT prefix's '1057' (SB/AB, not HB) must never satisfy "
+        "the match for HB 1057 -- the alpha prefix must be adjacent to the number"
+    )
+
+
 def test_cross_source_js_page_heuristic_strips_style_block_contents(db_session):
     """Regression for a real gap found live against wyoleg.gov during the
     51-state sweep: a JS app shell's <style> block (inline font-face CSS)

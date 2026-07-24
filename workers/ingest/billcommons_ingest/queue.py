@@ -43,17 +43,27 @@ def enqueue(
     return job
 
 
-def claim_job(db: Session, worker_id: str) -> IngestJob | None:
+def claim_job(db: Session, worker_id: str, *, kind: str | None = None) -> IngestJob | None:
     """Atomically claim the oldest eligible queued job for `worker_id`.
 
     Uses `FOR UPDATE SKIP LOCKED` so concurrent workers never block on each
     other or double-claim the same row. Returns None if nothing is eligible.
     Caller must commit (or rollback) the transaction this ran in.
+
+    `kind`, if given, restricts the claim to jobs of that kind -- production
+    callers (cli.py's worker loop) never pass it, so the real dispatch loop
+    is unaffected; it exists so tests can scope claim_job to a unique
+    per-test kind and get deterministic results even though this test suite
+    runs against a live, shared `ingest_jobs` table the production worker is
+    concurrently claiming from (see tests/test_queue.py).
     """
     now = datetime.now(timezone.utc)
+    conditions = [IngestJob.status == "queued", IngestJob.run_after <= now]
+    if kind is not None:
+        conditions.append(IngestJob.kind == kind)
     stmt = (
         select(IngestJob)
-        .where(IngestJob.status == "queued", IngestJob.run_after <= now)
+        .where(*conditions)
         .order_by(IngestJob.run_after)
         .limit(1)
         .with_for_update(skip_locked=True)

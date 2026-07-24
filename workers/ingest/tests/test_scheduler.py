@@ -12,7 +12,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from billcommons_ingest import queue as queue_mod
 from billcommons_ingest.scheduler import (
@@ -21,6 +21,7 @@ from billcommons_ingest.scheduler import (
     CADENCE_TIER_RECENTLY_ADJOURNED,
     CADENCE_TIER_YEAR_ROUND,
     API_SYNC_KIND,
+    SCHEDULE_PASS_ADVISORY_LOCK_KEY,
     cadence_minutes,
     cadence_tier,
     is_due,
@@ -28,6 +29,7 @@ from billcommons_ingest.scheduler import (
     run_schedule_pass,
 )
 from billcommons_schema.models import IngestJob, Jurisdiction, Session as SessionModel
+from billcommons_shared.db import get_engine
 
 # Fixed instant for pure (no-DB) cadence/is_due tests, where any timestamp
 # works equally well.
@@ -202,6 +204,57 @@ def test_run_schedule_pass_reenqueues_once_active_cadence_elapses(db_session):
     later = _real_now() + timedelta(minutes=31)
     second_pass = run_schedule_pass(db_session, now=later)
     assert jurisdiction.abbreviation in second_pass
+
+
+def test_run_schedule_pass_skips_when_another_pass_holds_the_advisory_lock(db_session):
+    """Regression for Finding D: `run_schedule_pass` is a read-then-insert
+    (plan_schedule reads the latest ingest_jobs row per state, THEN the
+    caller loops inserting) with a real gap in between -- two concurrent
+    callers (two worker processes' periodic schedule-refresh passes, or a
+    worker's pass racing a manual `schedule-refresh` CLI run) could both
+    read "not yet enqueued" for the same jurisdiction and both insert an
+    api_sync job, burning the shared Open States API quota on a duplicate
+    sync.
+
+    Simulates a genuinely concurrent second holder using a SEPARATE, real
+    Postgres connection (session-level advisory locks are tied to the
+    backend connection, not a SQLAlchemy ORM transaction/savepoint, so this
+    can't be faked with just `db_session`): that second connection acquires
+    the SAME advisory lock key `run_schedule_pass` uses and holds it, then
+    `run_schedule_pass` on `db_session` must find the lock unavailable and
+    return an empty list WITHOUT enqueueing anything -- proving the
+    read-then-insert gap can no longer be raced.
+    """
+    now = _real_now()
+    jurisdiction, _ = _make_jurisdiction_with_session(db_session, active=True, end_date=now.date())
+    db_session.flush()
+
+    engine = get_engine()
+    blocking_connection = engine.connect()
+    try:
+        acquired = blocking_connection.execute(
+            text("SELECT pg_try_advisory_lock(:key)"), {"key": SCHEDULE_PASS_ADVISORY_LOCK_KEY}
+        ).scalar_one()
+        assert acquired is True, "sanity check: the blocking connection must actually hold the lock"
+
+        enqueued = run_schedule_pass(db_session, now=now)
+        assert enqueued == [], (
+            "run_schedule_pass must skip the whole pass (enqueue nothing) when it cannot "
+            "acquire the advisory lock, rather than racing the concurrent holder's own pass"
+        )
+
+        jobs = db_session.execute(
+            select(IngestJob).where(
+                IngestJob.kind == API_SYNC_KIND,
+                IngestJob.payload["state"].astext == jurisdiction.abbreviation,
+            )
+        ).scalars().all()
+        assert jobs == [], "no api_sync job must have been enqueued while the lock was held elsewhere"
+    finally:
+        blocking_connection.execute(
+            text("SELECT pg_advisory_unlock(:key)"), {"key": SCHEDULE_PASS_ADVISORY_LOCK_KEY}
+        )
+        blocking_connection.close()
 
 
 def test_run_schedule_pass_ignores_dead_jobs_for_due_check(db_session):

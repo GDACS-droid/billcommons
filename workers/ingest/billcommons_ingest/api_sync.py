@@ -37,7 +37,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest.openstates_api import OpenStatesClient
@@ -46,7 +46,6 @@ from billcommons_schema.models import (
     BillAction,
     IngestionRun,
     Jurisdiction,
-    JurisdictionCoverage,
     Session as SessionModel,
     Sponsorship,
 )
@@ -101,6 +100,29 @@ def _resolve_source_url(payload: dict) -> str | None:
     return None
 
 
+def _resolve_session_row(
+    bill_payload: dict,
+    sessions_by_identifier: dict[str, SessionModel],
+    active_session: SessionModel | None,
+) -> SessionModel | None:
+    """Resolve a v3 bill payload's `session` string to OUR local session
+    row. v3's `session` field is a string session identifier (the same kind
+    of value stored in `Session.identifier`), so an exact match against this
+    jurisdiction's known sessions is the correct, non-guessing resolution --
+    falling back to the jurisdiction's active session only when the
+    payload's session string doesn't (yet) match any session row we know
+    about (e.g. a brand-new session the registry/bootstrap hasn't seeded
+    yet). This is what actually prevents a same-numbered bill in a
+    DIFFERENT session from being conflated with the current session's bill
+    of the same number (see `bill_by_session_and_identifier_norm`'s key)."""
+    session_identifier = bill_payload.get("session")
+    if session_identifier:
+        matched = sessions_by_identifier.get(session_identifier)
+        if matched is not None:
+            return matched
+    return active_session
+
+
 def sync_state(
     db: OrmSession,
     jurisdiction: Jurisdiction,
@@ -111,31 +133,71 @@ def sync_state(
 ) -> ApiSyncResult:
     """Incrementally sync one jurisdiction via the v3 API. Caller commits.
 
-    `updated_since` is the jurisdiction's most recent
-    `jurisdiction_coverage.last_success_at` (falls back to None -- a full
-    `per_page`*`max_pages` pull -- only the first time a jurisdiction is
-    api-synced with no prior successful bulk/api run recorded)."""
+    `updated_since` is THIS sync pipeline's own watermark: the `finished_at`
+    of the jurisdiction's most recent SUCCESSFUL `ingestion_runs` row with
+    `source_name == SOURCE_NAME` ("openstates_api_sync") -- i.e. the last
+    time an api_sync run actually completed. Falls back to None (a full
+    `per_page`*`max_pages` pull) only the first time a jurisdiction is
+    api-synced with no prior successful api_sync run recorded.
+
+    Deliberately NOT derived from `jurisdiction_coverage.last_success_at`:
+    that field is stamped by `coverage.recompute_coverage_row` on every
+    recompute-coverage pass whenever bill_count > 0 -- a read-only counting
+    pass that runs on its own schedule, independent of whether an actual
+    sync happened. Using it as `updated_since` meant a recompute pass
+    between two real syncs would silently advance the watermark past
+    upstream changes that occurred in that window, and api_sync would never
+    ask the API about them again."""
     client = client or OpenStatesClient()
     result = ApiSyncResult(state=jurisdiction.abbreviation)
     retrieved_at = datetime.now(timezone.utc)
 
-    coverage_rows = db.execute(
-        select(JurisdictionCoverage).where(JurisdictionCoverage.jurisdiction_id == jurisdiction.id)
-    ).scalars().all()
-    updated_since = None
-    success_times = [c.last_success_at for c in coverage_rows if c.last_success_at is not None]
-    if success_times:
-        updated_since = min(success_times).isoformat()
+    last_successful_run_finished_at = db.execute(
+        select(func.max(IngestionRun.finished_at)).where(
+            IngestionRun.jurisdiction_id == jurisdiction.id,
+            IngestionRun.source_name == SOURCE_NAME,
+            IngestionRun.status == "success",
+        )
+    ).scalar_one_or_none()
+    updated_since = (
+        last_successful_run_finished_at.isoformat() if last_successful_run_finished_at is not None else None
+    )
 
-    sessions_by_openstates_identifier: dict[str, SessionModel] = {}
+    # Every session row for this jurisdiction, keyed by its own `identifier`
+    # -- v3's bill `session` field is a string session identifier, and this
+    # is how a bill payload's session is resolved to OUR session row (see
+    # `_resolve_session_row` below). `active_session` remains the fallback
+    # for the (should-be-rare) case where a bill's session string doesn't
+    # match any session row we know about yet.
+    sessions_by_identifier: dict[str, SessionModel] = {
+        s.identifier: s
+        for s in db.execute(
+            select(SessionModel).where(SessionModel.jurisdiction_id == jurisdiction.id)
+        ).scalars()
+    }
     active_session = db.execute(
         select(SessionModel)
         .where(SessionModel.jurisdiction_id == jurisdiction.id, SessionModel.active.is_(True))
         .order_by(SessionModel.start_date.desc().nulls_last())
     ).scalars().first()
 
-    bill_by_identifier_norm: dict[str, Bill] = {
-        b.identifier_norm: b
+    # PRIMARY dedup key: openstates_id, which is unique across the whole
+    # `bills` table (not just this jurisdiction) and unambiguously identifies
+    # ONE bill regardless of which session it's in.
+    bill_by_openstates_id: dict[str, Bill] = {
+        b.openstates_id: b
+        for b in db.execute(
+            select(Bill).where(Bill.jurisdiction_id == jurisdiction.id, Bill.openstates_id.is_not(None))
+        ).scalars()
+    }
+    # SECONDARY dedup key for bills without an openstates_id yet (e.g.
+    # bulk-CSV-bootstrapped rows the API sync hasn't touched before): keyed
+    # by (session_id, identifier_norm), NOT identifier_norm alone -- the same
+    # bill number is reused across different sessions/biennia, and keying by
+    # identifier_norm only meant a current-session bill could silently
+    # overwrite an unrelated historical session's row sharing that number.
+    bill_by_session_and_identifier_norm: dict[tuple, Bill] = {
+        (b.session_id, b.identifier_norm): b
         for b in db.execute(select(Bill).where(Bill.jurisdiction_id == jurisdiction.id)).scalars()
     }
 
@@ -154,6 +216,18 @@ def sync_state(
         if not bills_payload:
             break
 
+        # Recorded per-bill AT THE MOMENT each bill is classified
+        # created/updated/unchanged (before its checksum is overwritten to
+        # match the incoming payload) -- re-deriving "was this bill
+        # unchanged" AFTER the loop by comparing bill.checksum against
+        # _bill_checksum(payload) is always true by then for every bill on
+        # the page (created bills get the new checksum on creation, updated
+        # bills get it reassigned), so that comparison can never actually
+        # observe a "changed" bill and always trips true. Track it here
+        # instead, where "unchanged" genuinely means "not created, not
+        # updated".
+        page_unchanged_flags: list[bool] = []
+
         for bill_payload in bills_payload:
             identifier_raw = (bill_payload.get("identifier") or "").strip()
             if not identifier_raw:
@@ -170,17 +244,24 @@ def sync_state(
                 )
 
             checksum = _bill_checksum(bill_payload)
-            bill = bill_by_identifier_norm.get(identifier_norm)
-            session_row = active_session  # v3's `session` field is a string identifier; the
-            # jurisdiction's currently-active session row is the correct target for an
-            # incremental sync pass (bootstrap owns cross-session bill creation).
+            openstates_id = bill_payload.get("id")
+
+            # PRIMARY match: openstates_id, unique across the whole table --
+            # unambiguous regardless of session. Only falls back to the
+            # (session_id, identifier_norm) key for bills that don't have an
+            # openstates_id recorded yet (e.g. bulk-CSV-bootstrapped rows).
+            session_row = _resolve_session_row(bill_payload, sessions_by_identifier, active_session)
+            bill = bill_by_openstates_id.get(openstates_id) if openstates_id else None
+            if bill is None and session_row is not None:
+                bill = bill_by_session_and_identifier_norm.get((session_row.id, identifier_norm))
 
             if bill is None:
                 if session_row is None:
                     result.warnings.append(
-                        f"no active session row for {jurisdiction.abbreviation}; "
-                        f"skipped new bill {identifier_raw!r}"
+                        f"no session row resolved for {jurisdiction.abbreviation} bill "
+                        f"{identifier_raw!r} (session={bill_payload.get('session')!r}); skipped"
                     )
+                    page_unchanged_flags.append(False)
                     continue
                 bill = Bill(
                     jurisdiction_id=jurisdiction.id,
@@ -190,9 +271,9 @@ def sync_state(
                     title=bill_payload.get("title") or "(untitled)",
                     chamber=bill_payload.get("chamber"),
                     bill_type=",".join(bill_payload.get("classification") or []) or None,
-                    openstates_id=bill_payload.get("id"),
+                    openstates_id=openstates_id,
                     source_name=SOURCE_NAME,
-                    upstream_id=bill_payload.get("id"),
+                    upstream_id=openstates_id,
                     retrieved_at=retrieved_at,
                     checksum=checksum,
                     parser_version="openstates_api_sync/1",
@@ -200,10 +281,14 @@ def sync_state(
                 )
                 db.add(bill)
                 db.flush()
-                bill_by_identifier_norm[identifier_norm] = bill
+                if openstates_id:
+                    bill_by_openstates_id[openstates_id] = bill
+                bill_by_session_and_identifier_norm[(session_row.id, identifier_norm)] = bill
                 result.bills_created += 1
+                page_unchanged_flags.append(False)
             elif bill.checksum == checksum:
                 result.bills_unchanged += 1
+                page_unchanged_flags.append(True)
                 # Unchanged -- but v3 pagination is newest-updated-first, so
                 # once we've hit a batch of all-unchanged bills we've likely
                 # walked past the `updated_since` boundary; still let this
@@ -214,14 +299,17 @@ def sync_state(
                 bill.chamber = bill_payload.get("chamber") or bill.chamber
                 classifications = bill_payload.get("classification") or []
                 bill.bill_type = ",".join(classifications) if classifications else bill.bill_type
-                bill.openstates_id = bill_payload.get("id") or bill.openstates_id
+                bill.openstates_id = openstates_id or bill.openstates_id
                 bill.source_name = SOURCE_NAME
-                bill.upstream_id = bill_payload.get("id")
+                bill.upstream_id = openstates_id
                 bill.retrieved_at = retrieved_at
                 bill.checksum = checksum
                 bill.parser_version = "openstates_api_sync/1"
                 bill.source_url = bill.source_url or _resolve_source_url(bill_payload)
                 result.bills_updated += 1
+                page_unchanged_flags.append(False)
+                if bill.openstates_id:
+                    bill_by_openstates_id[bill.openstates_id] = bill
 
             _upsert_actions(db, bill, bill_payload.get("actions") or [], result, retrieved_at)
             _upsert_sponsorships(db, bill, bill_payload.get("sponsorships") or [], result, retrieved_at)
@@ -230,14 +318,7 @@ def sync_state(
         # seen a full page where every bill was already unchanged, further
         # pages are strictly older than what we've already synced -- no
         # point spending quota walking the rest of the state's bills.
-        all_unchanged_this_page = all(
-            bill_by_identifier_norm.get(
-                _safe_norm(b.get("identifier") or "")
-            ) is not None
-            and bill_by_identifier_norm[_safe_norm(b.get("identifier") or "")].checksum
-            == _bill_checksum(b)
-            for b in bills_payload
-        )
+        all_unchanged_this_page = bool(page_unchanged_flags) and all(page_unchanged_flags)
         pagination = payload.get("pagination", {})
         max_page = pagination.get("max_page", page)
         if all_unchanged_this_page or page >= max_page:
@@ -246,13 +327,6 @@ def sync_state(
 
     db.flush()
     return result
-
-
-def _safe_norm(identifier: str) -> str:
-    try:
-        return normalize_bill_number(identifier)
-    except ValueError:
-        return identifier.upper().strip()
 
 
 def _upsert_actions(

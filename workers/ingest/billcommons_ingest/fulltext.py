@@ -35,7 +35,7 @@ from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
-from sqlalchemy import Text, cast, exists, select
+from sqlalchemy import Text, cast, exists, or_, select
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_schema.models import BillDocument, IngestJob
@@ -68,11 +68,35 @@ STATUS_FETCH_ERROR = "fetch_error"
 STATUS_UNSUPPORTED_TYPE = "unsupported_type"
 STATUS_EMPTY_URL = "empty_url"
 
+# Statuses that will NEVER change on a retry -- the document's URL/robots.txt/
+# content shape is a fixed fact about that source, not a transient condition.
+# enqueue_fulltext_jobs skips documents already marked with one of these so a
+# permanently-unfetchable document isn't re-enqueued forever (see the
+# license_note-based skip in enqueue_fulltext_jobs below). STATUS_FETCH_ERROR
+# is deliberately excluded -- a network/HTTP error IS worth retrying.
+TERMINAL_STATUSES = frozenset(
+    {STATUS_ROBOTS_DISALLOWED, STATUS_EMPTY_URL, STATUS_SCANNED_PDF_NO_TEXT, STATUS_UNSUPPORTED_TYPE}
+)
+
 
 class UnfetchableDocument(RuntimeError):
     """Raised for conditions that should NOT be retried by the job queue's
     backoff (robots.txt disallow, empty/invalid URL) -- these are permanent
-    per-document outcomes, not transient failures."""
+    per-document outcomes, not transient failures.
+
+    Carries `document_id`/`status` so a caller that must roll back the
+    session this was raised in (see cli.py's worker loop, which rolls back
+    to clear any partial job-processing state before dead-lettering) can
+    durably re-apply the SAME terminal status in a fresh transaction --
+    otherwise the rollback would silently undo the status write that
+    `process_fetch_text_job` already flushed, leaving the document looking
+    "never attempted" and causing `enqueue_fulltext_jobs` to re-enqueue it
+    forever even though it is dead-lettered."""
+
+    def __init__(self, message: str, *, document_id: str | None = None, status: str | None = None) -> None:
+        super().__init__(message)
+        self.document_id = document_id
+        self.status = status
 
 
 # ---------------------------------------------------------------------------
@@ -329,12 +353,21 @@ def enqueue_fulltext_jobs(
         )
     )
 
+    terminal_license_notes = [f"fulltext_status={status}" for status in TERMINAL_STATUSES]
     stmt = (
         select(BillDocument.id)
         .where(
             BillDocument.url.is_not(None),
             BillDocument.url != "",
             BillDocument.extracted_text.is_(None),
+            # NOT IN would evaluate to NULL (excluding the row) for a
+            # never-attempted document whose license_note IS NULL, so guard
+            # with an explicit OR-is-NULL instead of relying on SQL's
+            # NULL-propagating NOT IN semantics.
+            or_(
+                BillDocument.license_note.is_(None),
+                BillDocument.license_note.not_in(terminal_license_notes),
+            ),
             ~exists(already_queued),
         )
         .order_by(BillDocument.created_at)
@@ -370,6 +403,9 @@ class FetchTextResult:
     raw_ref: str | None = None
 
 
+MAX_REDIRECT_HOPS = 5
+
+
 class FullTextFetcher:
     """Stateful fetcher holding the shared rate limiter + robots cache
     across calls to `process_fetch_text_job` (so a long-lived worker
@@ -389,13 +425,38 @@ class FullTextFetcher:
         self.robots_cache = robots_cache or RobotsCache(client=self.client)
 
     def fetch(self, url: str) -> httpx.Response:
-        host = urlparse(url).netloc
-        if not self.robots_cache.can_fetch(url):
-            raise UnfetchableDocument(f"robots.txt disallows fetching {url}")
-        self.rate_limiter.acquire(host)
-        response = self.client.get(url, follow_redirects=True)
-        response.raise_for_status()
-        return response
+        """Fetch `url`, following redirects HOP-BY-HOP (not via httpx's own
+        `follow_redirects=True`, which transparently chases a redirect chain
+        across hosts inside a single client.get() call). Politeness must be
+        re-checked for EVERY hop's own host -- a redirect from an allowed
+        origin to a DIFFERENT host (a real pattern: many state legislature
+        sites route bill-document URLs through a CDN or a short-link
+        redirector before landing on the actual host) must not silently
+        skip that second host's robots.txt or consume none of its rate-limit
+        budget just because the first hop was cleared."""
+        current_url = url
+        for _ in range(MAX_REDIRECT_HOPS + 1):
+            scheme = urlparse(current_url).scheme
+            if scheme not in ("http", "https"):
+                raise UnfetchableDocument(f"unsupported redirect scheme {scheme!r} for {current_url}")
+
+            host = urlparse(current_url).netloc
+            if not self.robots_cache.can_fetch(current_url):
+                raise UnfetchableDocument(f"robots.txt disallows fetching {current_url}")
+            self.rate_limiter.acquire(host)
+
+            response = self.client.get(current_url, follow_redirects=False)
+            if not response.is_redirect:
+                response.raise_for_status()
+                return response
+
+            location = response.headers.get("location")
+            if not location:
+                response.raise_for_status()
+                return response
+            current_url = str(response.request.url.join(location))
+
+        raise UnfetchableDocument(f"too many redirects (> {MAX_REDIRECT_HOPS}) fetching {url}")
 
 
 def process_fetch_text_job(
@@ -418,14 +479,20 @@ def process_fetch_text_job(
     if not document.url:
         _mark_status(document, STATUS_EMPTY_URL)
         db.flush()
-        raise UnfetchableDocument(f"document {document_id} has no url")
+        raise UnfetchableDocument(
+            f"document {document_id} has no url", document_id=str(document.id), status=STATUS_EMPTY_URL
+        )
 
     try:
         response = fetcher.fetch(document.url)
     except UnfetchableDocument:
         _mark_status(document, STATUS_ROBOTS_DISALLOWED)
         db.flush()
-        raise
+        raise UnfetchableDocument(
+            f"robots.txt disallows fetching {document.url}",
+            document_id=str(document.id),
+            status=STATUS_ROBOTS_DISALLOWED,
+        )
     except httpx.HTTPError as exc:
         _mark_status(document, STATUS_FETCH_ERROR)
         db.flush()

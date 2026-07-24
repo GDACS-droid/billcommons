@@ -38,13 +38,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest import queue as queue_mod
 from billcommons_schema.models import IngestJob, Jurisdiction, Session as SessionModel
 
 API_SYNC_KIND = "api_sync"
+
+# Arbitrary but FIXED 64-bit key for the session-level Postgres advisory
+# lock `run_schedule_pass` holds for the duration of its read-then-insert
+# pass (see `run_schedule_pass` below). Any 64-bit int works as long as it's
+# stable and not reused elsewhere in this codebase for a different lock
+# purpose (grepped: nothing else calls pg_advisory_lock in this repo as of
+# this writing).
+SCHEDULE_PASS_ADVISORY_LOCK_KEY = 847_291_003_615_882_001
 
 # Cadence tiers, in minutes.
 CADENCE_ACTIVE_MINUTES = 30
@@ -171,12 +179,34 @@ def plan_schedule(db: OrmSession, *, now: datetime | None = None) -> list[Schedu
 def run_schedule_pass(db: OrmSession, *, now: datetime | None = None) -> list[str]:
     """Enqueue one `api_sync` ingest_jobs row for every jurisdiction whose
     cadence tier is due. Caller commits. Returns the list of jurisdiction
-    abbreviations enqueued (for logging)."""
-    decisions = plan_schedule(db, now=now)
-    enqueued = []
-    for decision in decisions:
-        if not decision.due:
-            continue
-        queue_mod.enqueue(db, API_SYNC_KIND, {"state": decision.jurisdiction_abbr})
-        enqueued.append(decision.jurisdiction_abbr)
-    return enqueued
+    abbreviations enqueued (for logging).
+
+    `plan_schedule` (read: which jurisdictions are due, from the LATEST
+    ingest_jobs row per state) followed by a loop of inserts is a
+    read-then-insert with a gap in between -- two concurrent callers (e.g.
+    the worker loop's periodic schedule-refresh pass racing a manually
+    triggered `schedule-refresh` CLI run, or two worker processes) could
+    both read "not yet enqueued" for the same jurisdiction and both insert
+    an api_sync job, burning the shared Open States API quota on a
+    duplicate sync. A session-level Postgres advisory lock serializes the
+    WHOLE pass: a caller that can't acquire it immediately (another pass is
+    already running) skips this pass entirely and returns an empty list --
+    the next scheduled pass will pick up anything that's actually due by
+    then, so skipping is safe and never silently drops a jurisdiction."""
+    acquired = db.execute(
+        text("SELECT pg_try_advisory_lock(:key)"), {"key": SCHEDULE_PASS_ADVISORY_LOCK_KEY}
+    ).scalar_one()
+    if not acquired:
+        return []
+
+    try:
+        decisions = plan_schedule(db, now=now)
+        enqueued = []
+        for decision in decisions:
+            if not decision.due:
+                continue
+            queue_mod.enqueue(db, API_SYNC_KIND, {"state": decision.jurisdiction_abbr})
+            enqueued.append(decision.jurisdiction_abbr)
+        return enqueued
+    finally:
+        db.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": SCHEDULE_PASS_ADVISORY_LOCK_KEY})

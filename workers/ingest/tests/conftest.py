@@ -56,3 +56,19 @@ def unique_abbr():
 @pytest.fixture()
 def rawstore(tmp_path):
     return FilesystemRawStore(root=tmp_path / "rawstore")
+
+
+@pytest.fixture()
+def unique_kind():
+    """A fresh, collision-proof ingest_jobs `kind` string for queue tests
+    (test_queue.py) that need to scope `claim_job`/`enqueue` to just their
+    own fixture rows -- this test suite runs against a live, shared
+    `ingest_jobs` table the production worker is concurrently
+    enqueueing/claiming real jobs against (see test_queue.py's module
+    docstring), so a fixed kind like "bootstrap" is not enough isolation on
+    its own."""
+
+    def _make(prefix: str = "test_kind") -> str:
+        return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+    return _make
