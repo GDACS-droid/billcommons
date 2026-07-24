@@ -24,6 +24,60 @@ from billcommons_shared.rawstore import FilesystemRawStore
 # instead of hanging indefinitely.
 TEST_STATEMENT_TIMEOUT_MS = 30_000
 
+# Test-fixture jurisdiction abbreviations use these prefixes (see unique_abbr).
+# Most tests roll back via db_session, but any test that drives the REAL
+# `bootstrap`/ingest path opens its own committing sessions, so those rows
+# survive rollback and must be swept at end of the run — otherwise a
+# test jurisdiction (with bills/votes/coverage) leaks into the shared live DB.
+_TEST_ABBR_PREFIXES = ("ZZ_", "ZQ_")
+
+
+def _purge_test_jurisdictions() -> None:
+    from billcommons_shared.db import get_session
+
+    like = " OR ".join(f"abbreviation LIKE '{p}%'" for p in _TEST_ABBR_PREFIXES)
+    with get_session() as s:
+        ids = [
+            r[0]
+            for r in s.execute(text(f"SELECT id FROM jurisdictions WHERE {like}")).fetchall()
+        ]
+        for jid in ids:
+            p = {"j": jid}
+            bsub = "(SELECT id FROM bills WHERE jurisdiction_id=:j)"
+            ve = f"(SELECT id FROM vote_events WHERE bill_id IN {bsub})"
+            bv = f"(SELECT id FROM bill_versions WHERE bill_id IN {bsub})"
+            for stmt in (
+                f"DELETE FROM vote_records WHERE vote_event_id IN {ve}",
+                f"DELETE FROM vote_events WHERE bill_id IN {bsub}",
+                f"DELETE FROM bill_actions WHERE bill_id IN {bsub}",
+                f"DELETE FROM sponsorships WHERE bill_id IN {bsub}",
+                f"DELETE FROM bill_documents WHERE bill_version_id IN {bv}",
+                f"DELETE FROM bill_versions WHERE bill_id IN {bsub}",
+                f"DELETE FROM bill_subjects WHERE bill_id IN {bsub}",
+                f"DELETE FROM bill_identifiers WHERE bill_id IN {bsub}",
+                f"DELETE FROM related_bills WHERE bill_id IN {bsub}",
+                "DELETE FROM validation_runs WHERE jurisdiction_id=:j",
+                "DELETE FROM jurisdiction_coverage WHERE jurisdiction_id=:j",
+                "DELETE FROM bills WHERE jurisdiction_id=:j",
+                "DELETE FROM sessions WHERE jurisdiction_id=:j",
+                "DELETE FROM people WHERE jurisdiction_id=:j",
+                "DELETE FROM jurisdictions WHERE id=:j",
+            ):
+                try:
+                    s.execute(text(stmt), p)
+                    s.commit()
+                except Exception:
+                    s.rollback()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _sweep_leaked_test_jurisdictions():
+    """Belt-and-suspenders: sweep any ZZ_/ZQ_ test jurisdictions that a
+    committing bootstrap/ingest test left behind, at the end of the session,
+    so test data never accumulates in the shared live DB."""
+    yield
+    _purge_test_jurisdictions()
+
 
 @pytest.fixture()
 def db_session(tmp_path):
