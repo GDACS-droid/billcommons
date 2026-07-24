@@ -46,6 +46,42 @@ def test_claim_ignores_jobs_not_yet_due(db_session, unique_kind):
     assert claimed is None
 
 
+def test_claim_never_returns_an_excluded_kind(db_session, unique_kind):
+    """An excluded kind is unclaimable even when it is due and eligible.
+
+    Business intent: an api_sync job runs many rate-limited Open States calls
+    while the crawl loop holds its DB session, which stalls every fetch_text
+    behind it (the `idle in transaction` freeze). Claim ordering is purely by
+    run_after with no kind preference, so a due api_sync WOULD otherwise win
+    the claim; `exclude_kinds` is what keeps it out of the crawl loop.
+
+    Scoped to its own `kind` (see module docstring) so it can never claim --
+    or take a row lock on -- a real production job on the shared live DB.
+    """
+    excluded = unique_kind()
+    overdue = datetime.now(timezone.utc) - timedelta(hours=1)
+    enqueue(db_session, excluded, {"state": "NC"}, run_after=overdue)
+    db_session.flush()
+
+    # The exclusion check must run first: it claims nothing, so the job is
+    # still queued for the eligibility check below.
+    assert (
+        claim_job(db_session, "worker-1", kind=excluded, exclude_kinds=(excluded,))
+        is None
+    )
+    # ...and the job really was claimable all along, so the None above is the
+    # exclusion doing the work and not an unrelated ineligibility.
+    assert claim_job(db_session, "worker-1", kind=excluded) is not None
+
+
+def test_crawl_worker_excludes_api_sync(db_session, unique_kind):
+    """The production constant, not just the mechanism, must list api_sync."""
+    from billcommons_ingest.cli import CRAWL_WORKER_EXCLUDED_KINDS
+    from billcommons_ingest.scheduler import API_SYNC_KIND
+
+    assert API_SYNC_KIND in CRAWL_WORKER_EXCLUDED_KINDS
+
+
 def test_claim_skips_already_running_jobs(db_session, unique_kind):
     """Simulates the SKIP LOCKED guarantee at the application-state level:
     a job already in `running` status must not be claimable again by a

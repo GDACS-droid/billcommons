@@ -67,6 +67,15 @@ from billcommons_shared.rawstore import FilesystemRawStore
 DEFAULT_REGISTRY_PATH = "data/registry/sessions-2026.json"
 DEFAULT_COVERAGE_OUTPUT = "docs/state-coverage/coverage-latest.json"
 
+# Job kinds the crawl worker (`cmd_worker`) must never claim, no matter who
+# queued them. An api_sync job makes many rate-limited Open States v3 calls;
+# running it inside the crawl loop holds that loop's DB session open across
+# minutes of HTTP, which shows up as `idle in transaction` and stalls every
+# fetch_text behind it. This froze the crawl twice, so the rule is enforced
+# at the claim rather than left to whoever enqueues. api_sync is meant to run
+# as its own paced process/service (the validate-worker pattern).
+CRAWL_WORKER_EXCLUDED_KINDS = (scheduler_mod.API_SYNC_KIND,)
+
 
 def _record_run(db, jurisdiction_id, session_id, source_name: str):
     run = IngestionRun(
@@ -506,7 +515,9 @@ def cmd_worker(args: argparse.Namespace) -> int:
 
             db = get_session()
             try:
-                job = queue_mod.claim_job(db, worker_id)
+                job = queue_mod.claim_job(
+                    db, worker_id, exclude_kinds=CRAWL_WORKER_EXCLUDED_KINDS
+                )
                 if job is None:
                     db.commit()
                     time.sleep(poll_interval)

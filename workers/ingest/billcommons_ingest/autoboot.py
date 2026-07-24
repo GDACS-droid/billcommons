@@ -9,6 +9,7 @@ Idempotent by construction: bootstrap re-runs skip unchanged checksums, so a
 restart mid-way just resumes where it left off.
 """
 import json
+import os
 import pathlib
 import re
 import sys
@@ -87,8 +88,20 @@ def main() -> int:
         cli.main(["recompute-coverage"])
     if failures:
         print(f"autoboot: FAILURES (will retry on next restart): {failures}", flush=True)
-    print("autoboot: running initial schedule-refresh pass", flush=True)
-    cli.main(["schedule-refresh"])
+    # schedule-refresh enqueues api_sync jobs, which the crawl worker refuses
+    # to claim (cli.CRAWL_WORKER_EXCLUDED_KINDS). Running it unconditionally
+    # here just piled up permanently-unclaimable rows on every restart, so it
+    # follows the same switch as the in-loop scheduler: RESCHEDULE_INTERVAL=0
+    # (the default) means api_sync is off for this service entirely.
+    if float(os.environ.get("RESCHEDULE_INTERVAL", "0")) > 0:
+        print("autoboot: running initial schedule-refresh pass", flush=True)
+        cli.main(["schedule-refresh"])
+    else:
+        print(
+            "autoboot: skipping schedule-refresh (RESCHEDULE_INTERVAL=0; "
+            "api_sync does not run in the crawl worker)",
+            flush=True,
+        )
     print("autoboot: entering worker loop", flush=True)
     return cli.main(["worker"])
 

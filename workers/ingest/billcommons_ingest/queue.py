@@ -13,6 +13,7 @@ Status lifecycle: queued -> running -> done
 from __future__ import annotations
 
 import uuid
+from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select, text
@@ -43,7 +44,13 @@ def enqueue(
     return job
 
 
-def claim_job(db: Session, worker_id: str, *, kind: str | None = None) -> IngestJob | None:
+def claim_job(
+    db: Session,
+    worker_id: str,
+    *,
+    kind: str | None = None,
+    exclude_kinds: Collection[str] | None = None,
+) -> IngestJob | None:
     """Atomically claim the oldest eligible queued job for `worker_id`.
 
     Uses `FOR UPDATE SKIP LOCKED` so concurrent workers never block on each
@@ -56,11 +63,20 @@ def claim_job(db: Session, worker_id: str, *, kind: str | None = None) -> Ingest
     per-test kind and get deterministic results even though this test suite
     runs against a live, shared `ingest_jobs` table the production worker is
     concurrently claiming from (see tests/test_queue.py).
+
+    `exclude_kinds`, if given, skips jobs of those kinds entirely. The crawl
+    worker passes the slow-external kinds (api_sync) so a queued api_sync can
+    never be claimed into the crawl loop, where running it would hold this
+    session open across minutes of rate-limited HTTP and stall every
+    fetch_text behind it (the `idle in transaction` failure that froze the
+    crawl twice -- see cmd_worker + ARCHITECTURE.md).
     """
     now = datetime.now(timezone.utc)
     conditions = [IngestJob.status == "queued", IngestJob.run_after <= now]
     if kind is not None:
         conditions.append(IngestJob.kind == kind)
+    if exclude_kinds:
+        conditions.append(IngestJob.kind.notin_(tuple(exclude_kinds)))
     stmt = (
         select(IngestJob)
         .where(*conditions)
