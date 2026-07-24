@@ -1,0 +1,37 @@
+Bill Commons
+Copyright 2026 Bill Commons contributors
+
+This product includes software developed by the Bill Commons contributors,
+licensed under the Apache License, Version 2.0.
+
+------------------------------------------------------------------------------
+Data attribution
+------------------------------------------------------------------------------
+
+Bill Commons ingests and republishes legislative data that originates from:
+
+* Open States / Plural Policy (https://openstates.org) — bulk data and API
+  access to U.S. state legislative bill, sponsor, vote, and session data.
+  Open States is a project of Plural Policy. Open States' underlying data is
+  aggregated from official state legislature websites and other public
+  sources; see https://docs.openstates.org for details on source coverage
+  and licensing.
+
+* Official state and federal legislative websites and systems — the
+  underlying bill text, actions, votes, and metadata are, in general,
+  public-domain works of state and federal government bodies in the United
+  States and are not subject to copyright protection under U.S. law
+  (see 17 U.S.C. § 105 for federal works; most states apply an equivalent
+  public-domain treatment to legislative and statutory text, though
+  editorial annotations by third parties may not be).
+
+* LegiScan (https://legiscan.com), where used as an optional (key-gated)
+  supplementary source, per LegiScan's API terms of use.
+
+Bill Commons does not claim copyright over the underlying legislative text,
+actions, or votes obtained from these sources. Original code, schema design,
+search/indexing logic, and presentation in this repository are licensed
+under Apache-2.0 as described above.
+
+If you are a rights holder and believe material in this project is used
+improperly, please contact contact@billcommons.org.
