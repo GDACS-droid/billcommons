@@ -1,0 +1,138 @@
+"""Bill Commons MCP server entry point.
+
+Runs the 10 Bill Commons tools (see docs/SPEC.md "MCP" section) over
+Streamable HTTP, mounted at /mcp, stateless (no session affinity — safe
+behind a load balancer). Listens on env PORT (default 8400).
+
+Run directly: .venv/bin/python apps/mcp/server.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+# Allow running this file directly (python apps/mcp/server.py) as well as as
+# a module, by ensuring the apps/mcp dir is on sys.path for the local package.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from mcp.server.fastmcp import FastMCP
+
+from billcommons_mcp import tools
+
+mcp = FastMCP(
+    name="billcommons",
+    instructions=(
+        "Bill Commons: public, open-source legislative search for all 50 US "
+        "states + DC. Tools return structured JSON with canonical ids, "
+        "official source_url fields, retrieved_at freshness timestamps, and "
+        "explicit official-vs-derived labeling. Coverage is uneven while "
+        "ingestion is in progress -- call get_jurisdiction_coverage before "
+        "relying on an empty result to mean 'no such legislation exists'."
+    ),
+    host=os.environ.get("HOST", "0.0.0.0"),
+    port=int(os.environ.get("PORT", "8400")),
+    stateless_http=True,
+)
+
+
+@mcp.tool()
+def search_legislation(
+    q: str,
+    jurisdiction: str | None = None,
+    chamber: str | None = None,
+    status: str | None = None,
+    limit: int | None = None,
+) -> dict:
+    """Search bills by keyword/phrase (full-text) or normalized bill number
+    (e.g. "HB 123", "H.B. 123", "hb123" all match). Optionally filter by
+    jurisdiction (two-letter state code or name), chamber, and status."""
+    return tools.search_legislation(q, jurisdiction, chamber, status, limit)
+
+
+@mcp.tool()
+def get_bill_record(
+    bill_id: str | None = None,
+    jurisdiction: str | None = None,
+    session: str | None = None,
+    identifier: str | None = None,
+    include_full_text: bool = False,
+) -> dict:
+    """Fetch the full record for one bill: metadata, sponsors, subjects,
+    actions, versions, and vote-event summaries. Look up by canonical
+    bill_id (UUID), or by jurisdiction + identifier (+ optional session to
+    disambiguate)."""
+    return tools.get_bill_record(bill_id, jurisdiction, session, identifier, include_full_text)
+
+
+@mcp.tool()
+def compare_bill_versions(
+    bill_id: str,
+    version_id_a: str | None = None,
+    version_id_b: str | None = None,
+) -> dict:
+    """Deterministic diff (unified + structured) between two versions of a
+    bill's extracted text. Defaults to earliest vs. latest texted version if
+    version ids are omitted. Errors if fewer than 2 versions have extracted
+    text. Result is labeled 'derived' (computed by Bill Commons, not an
+    official document)."""
+    return tools.compare_bill_versions(bill_id, version_id_a, version_id_b)
+
+
+@mcp.tool()
+def find_similar_bills(bill_id: str, limit: int | None = None) -> dict:
+    """Find bills with similar titles via deterministic trigram similarity,
+    across jurisdictions. Labeled 'derived' -- not an official
+    cross-reference or companion-bill designation."""
+    return tools.find_similar_bills(bill_id, limit)
+
+
+@mcp.tool()
+def get_vote_details(vote_event_id: str | None = None, bill_id: str | None = None) -> dict:
+    """Fetch vote event(s) with member-level (yes/no/other/absent) vote
+    records. Provide vote_event_id for one vote, or bill_id for all recorded
+    votes on that bill."""
+    return tools.get_vote_details(vote_event_id, bill_id)
+
+
+@mcp.tool()
+def get_upcoming_hearings(
+    jurisdiction: str | None = None, bill_id: str | None = None, limit: int | None = None
+) -> dict:
+    """List upcoming (future-dated) legislative hearings/events, optionally
+    filtered by jurisdiction and/or bill."""
+    return tools.get_upcoming_hearings(jurisdiction, bill_id, limit)
+
+
+@mcp.tool()
+def trace_legislative_history(bill_id: str) -> dict:
+    """Full chronological legislative history for a bill: merged timeline of
+    actions, version publications, and votes, plus related-bill links."""
+    return tools.trace_legislative_history(bill_id)
+
+
+@mcp.tool()
+def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = False) -> dict:
+    """Compile a citation-ready evidence packet for a bill: full official
+    record, legislative history timeline, votes with member-level detail, and
+    hearings -- each explicitly labeled official vs. derived with source
+    URLs."""
+    return tools.build_legislative_evidence_packet(bill_id, include_full_text)
+
+
+@mcp.tool()
+def get_jurisdiction_coverage(state: str | None = None) -> dict:
+    """Return the jurisdiction_coverage state-machine status for one state
+    (abbreviation or name), or the full 51-jurisdiction coverage matrix if
+    state is omitted."""
+    return tools.get_jurisdiction_coverage(state)
+
+
+@mcp.tool()
+def get_active_sessions(jurisdiction: str | None = None) -> dict:
+    """List legislative sessions currently flagged active, optionally
+    filtered by jurisdiction (two-letter state code or name)."""
+    return tools.get_active_sessions(jurisdiction)
+
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")
