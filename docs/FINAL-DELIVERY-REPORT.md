@@ -71,9 +71,10 @@ incremental `api_sync` jobs per SPEC cadence: active/special sessions every
 30 min, year-round hourly, recently-adjourned daily, dormant weekly
 session-status check. Incremental sync keys bills by immutable Open States id
 then `(session_id, identifier_norm)`, uses its own success-watermark, and is
-idempotent. Texas (special convened 2026-07-21), Mississippi, South Carolina,
-and Alaska specials are tracked; the 4 brand-new specials with no bulk dump yet
-are covered by the API path.
+idempotent. Mississippi, South Carolina, and Alaska specials are tracked; the
+brand-new specials with no bulk dump yet are covered by the API path. (Texas is
+biennial with no 2026 session — its current cycle is the 89th Legislature's 2025
+regular + called sessions; there is no active Texas session in 2026.)
 
 ## 7. Test results
 

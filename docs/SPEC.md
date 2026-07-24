@@ -15,8 +15,8 @@ cycle. ALL bills in those sessions regardless of status (pending, enacted,
 vetoed, failed, withdrawn, carried over).
 
 Priority queue seed (recalculated continuously from NCSL + official sources;
-see data/registry/sessions-2026.json): active specials first — TX (special,
-convened 2026-07-21), MS (special, to 8/14), SC (redistricting special,
+see data/registry/sessions-2026.json): active specials first — MS (special,
+to 8/14), SC (redistricting special,
 reverify), AK (4th special convenes 7/27), MD (special 8/3) — then active
 regulars: CA, NC, PA, IL, MA, MI, NJ, NY, OH, WI, DC, DE, VA, AZ.
 
