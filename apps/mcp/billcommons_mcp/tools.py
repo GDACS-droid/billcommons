@@ -14,7 +14,6 @@ trigram similarity scores, diff results) and is always labeled as such.
 from __future__ import annotations
 
 import difflib
-import os
 import uuid
 from typing import Any
 
@@ -45,6 +44,7 @@ from billcommons_mcp.common import (
     to_str_id,
     utcnow,
 )
+from billcommons_mcp.rate_limit import _env_int
 from billcommons_mcp.serializers import (
     serialize_bill_full,
     serialize_bill_summary,
@@ -61,12 +61,18 @@ DEFAULT_LIMIT = 20
 # that can do O(n) or worse work over caller-influenced data must have a hard
 # ceiling, independent of the request-rate limiter, so a single request can't
 # pin a worker on a multi-MB quadratic diff or an unbounded fan-out.
-MAX_COMPARE_TEXT_BYTES = int(
-    os.environ.get("MCP_MAX_COMPARE_TEXT_BYTES", "1500000")
+# All three env-tunable via `_env_int` (rate_limit.py's defensive int
+# parser, reused here rather than re-implemented): a malformed/non-numeric
+# env value falls back to the default instead of crashing the whole MCP
+# server at import time (`int(os.environ.get(...))` would raise ValueError
+# straight out of the module body, before any tool could even be
+# registered).
+MAX_COMPARE_TEXT_BYTES = _env_int(
+    "MCP_MAX_COMPARE_TEXT_BYTES", 1_500_000
 )  # ~1.5MB combined text before refusing a diff; env-tunable for tests
-MAX_EVIDENCE_VOTES = 100
-MAX_EVIDENCE_HEARINGS = 100
-MAX_EVIDENCE_HISTORY_ITEMS = 500
+MAX_EVIDENCE_VOTES = _env_int("MCP_MAX_EVIDENCE_VOTES", 100)
+MAX_EVIDENCE_HEARINGS = _env_int("MCP_MAX_EVIDENCE_HEARINGS", 100)
+MAX_EVIDENCE_HISTORY_ITEMS = _env_int("MCP_MAX_EVIDENCE_HISTORY_ITEMS", 500)
 
 
 def _clamp_limit(limit: int | None) -> int:
@@ -767,7 +773,17 @@ def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = Fa
     output for downstream research/reporting. Votes/hearings/history are
     capped (MAX_EVIDENCE_VOTES / MAX_EVIDENCE_HEARINGS /
     MAX_EVIDENCE_HISTORY_ITEMS) so a data anomaly on one bill can't produce
-    an unbounded response on this public, anonymous-callable server.
+    an unbounded response on this public, anonymous-callable server. Finding
+    5 honesty requirement: a capped section's `data` list going silently
+    quiet at exactly the cap would look, to an AI/downstream consumer, like
+    "this bill genuinely only has N votes/hearings/history items" -- a
+    materially different (and false) claim from "there are MORE than N and
+    this packet only shows the first N". Each section therefore reports an
+    explicit `truncated` boolean + the `cap` applied (see the top-level
+    `truncated` block below), computed from a real COUNT of the underlying
+    rows, not inferred from "the capped list happens to be exactly N long"
+    (which would itself be a false positive whenever a bill legitimately has
+    exactly N records).
     """
 
     def body() -> dict[str, Any]:
@@ -783,6 +799,9 @@ def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = Fa
             if bill is None:
                 raise ToolError("bill_not_found", f"No bill found with id {bill_id!r}")
 
+            total_votes = db.execute(
+                select(func.count()).select_from(VoteEvent).where(VoteEvent.bill_id == bid)
+            ).scalar_one()
             vote_stmt = (
                 select(VoteEvent)
                 .options(selectinload(VoteEvent.vote_records))
@@ -791,7 +810,11 @@ def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = Fa
                 .limit(MAX_EVIDENCE_VOTES)
             )
             votes = list(db.execute(vote_stmt).unique().scalars().all())
+            votes_truncated = total_votes > MAX_EVIDENCE_VOTES
 
+            total_hearings = db.execute(
+                select(func.count()).select_from(LegislativeEvent).where(LegislativeEvent.bill_id == bid)
+            ).scalar_one()
             hearing_stmt = (
                 select(LegislativeEvent)
                 .where(LegislativeEvent.bill_id == bid)
@@ -799,10 +822,14 @@ def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = Fa
                 .limit(MAX_EVIDENCE_HEARINGS)
             )
             hearings = list(db.execute(hearing_stmt).unique().scalars().all())
+            hearings_truncated = total_hearings > MAX_EVIDENCE_HEARINGS
 
             history = trace_legislative_history(str(bid))
-            if isinstance(history.get("timeline"), list):
-                history["timeline"] = history["timeline"][:MAX_EVIDENCE_HISTORY_ITEMS]
+            full_timeline = history.get("timeline", [])
+            total_history_items = len(full_timeline) if isinstance(full_timeline, list) else 0
+            if isinstance(full_timeline, list):
+                history["timeline"] = full_timeline[:MAX_EVIDENCE_HISTORY_ITEMS]
+            history_truncated = total_history_items > MAX_EVIDENCE_HISTORY_ITEMS
 
             jr = db.get(Jurisdiction, bill.jurisdiction_id)
             warning = coverage_warning_for_jurisdiction(db, jr) if jr else None
@@ -832,6 +859,21 @@ def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = Fa
                     "version_source_urls": [
                         v.source_url for v in bill.versions if v.source_url
                     ],
+                },
+                # Finding 5: explicit, per-section truncation flags so an AI
+                # consumer of this packet knows when it's looking at a
+                # PARTIAL list rather than silently mistaking "the list ends
+                # at the cap" for "that's the whole history" -- each section
+                # also reports the cap actually applied.
+                "truncated": {
+                    "votes": votes_truncated,
+                    "hearings": hearings_truncated,
+                    "history": history_truncated,
+                },
+                "truncation_caps": {
+                    "votes": MAX_EVIDENCE_VOTES,
+                    "hearings": MAX_EVIDENCE_HEARINGS,
+                    "history": MAX_EVIDENCE_HISTORY_ITEMS,
                 },
                 "meta": meta_envelope(),
             }

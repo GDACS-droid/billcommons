@@ -379,7 +379,31 @@ _PREFIX_SPELLOUTS: dict[str, str] = {
 }
 
 
-def _normalize_for_page_match(identifier: str) -> list[str]:
+def _anchor_pattern(candidate: str) -> re.Pattern:
+    """Compile a bare surface-form candidate (e.g. "hb 1057", "h1", "senate
+    bill 362") into a boundary-anchored regex: a non-alphanumeric character
+    (or string start) must precede the leading alpha prefix, AND a non-digit
+    character (or string end) must follow the trailing number.
+
+    This is what closes Finding 2's false-PASS bugs: an un-anchored
+    substring search lets 'hb 1057' match inside 'shb 1057' (wrong bill
+    prefix, just happens to contain ours), 'h1' match inside 'graph1' or
+    'march1', 'senate bill 362' match inside 'senate bill 3625' (a DIFFERENT
+    bill number that merely starts with ours), and 'h0914' match inside
+    'h09140'. Requiring real boundaries on both ends makes every one of
+    those a genuine non-match while leaving true positives (a real,
+    boundary-delimited occurrence of the candidate) matching exactly as
+    before -- candidates are matched against `_normalize_page_text_for_match`
+    output, which casefolds + strips punctuation but PRESERVES whitespace as
+    a real separator, so `\\s` counts as a valid non-alphanumeric boundary
+    too.
+    """
+    return re.compile(
+        rf"(?<![a-z0-9]){re.escape(candidate)}(?!\d)"
+    )
+
+
+def _normalize_for_page_match(identifier: str) -> list[re.Pattern]:
     """Cross-source surface forms an identifier might appear as on an
     official legislature/Open States page. State sites vary wildly in
     spacing/punctuation/year-prefixing conventions -- real fails from the
@@ -398,8 +422,9 @@ def _normalize_for_page_match(identifier: str) -> list[str]:
           www.ncleg.gov and www.palegis.us, whose page titles never render
           the abbreviated form at all.
 
-    Every returned candidate is matched against a page text that has ALSO
-    been punctuation-stripped and casefolded, with whitespace COLLAPSED but
+    Every returned candidate is compiled to a boundary-ANCHORED regex (see
+    `_anchor_pattern`) and matched against a page text that has ALSO been
+    punctuation-stripped and casefolded, with whitespace COLLAPSED but
     preserved as real token separators (see `_normalize_page_text_for_match`)
     via `_check_cross_source` -- so candidates here are lowercase and
     punctuation-free, but a candidate with a space (e.g. "hb 1057") only
@@ -415,7 +440,7 @@ def _normalize_for_page_match(identifier: str) -> list[str]:
     m = re.match(r"^([a-z]+)(\d+)$", compact)
     forms = {compact}
     if not m:
-        return list(forms)
+        return [_anchor_pattern(f) for f in forms]
 
     prefix, number = m.groups()
     first_letter = prefix[0]
@@ -443,6 +468,8 @@ def _normalize_for_page_match(identifier: str) -> list[str]:
     if spellout:
         forms.add(f"{spellout} {number}")
 
+    patterns = [_anchor_pattern(f) for f in forms]
+
     # CO-style 2-digit-year insert between prefix and number: "HB26-1057",
     # or "SB26-024" for a lower/zero-padded bill number (identifier "SB 24"
     # -> real page renders the number zero-padded to 3 digits EVEN in the
@@ -454,13 +481,18 @@ def _normalize_for_page_match(identifier: str) -> list[str]:
     # rather than a literal string -- checked with re.search against the
     # punctuation-stripped (but whitespace-preserving) normalized page text,
     # still anchored on the alpha prefix immediately before the 2-digit year
-    # and the number immediately after (a real word boundary exists here
-    # since whitespace is preserved, not stripped), so it can't drift into
-    # matching an unrelated number. `\d*` before the number allows the
-    # optional zero-padding without requiring it.
-    year_insert_pattern = re.compile(rf"\b{re.escape(prefix)}\d{{2}}0*{re.escape(number)}\b")
+    # and the number immediately after (both boundary conditions -- a
+    # non-alphanumeric char/string-start before the prefix, a non-digit
+    # char/string-end after the number -- so it can't drift into matching an
+    # unrelated number or an unrelated prefix that just happens to end in
+    # these letters). `\d*` before the number allows the optional
+    # zero-padding without requiring it.
+    year_insert_pattern = re.compile(
+        rf"(?<![a-z0-9]){re.escape(prefix)}\d{{2}}0*{re.escape(number)}(?!\d)"
+    )
+    patterns.append(year_insert_pattern)
 
-    return [f for f in forms] + [year_insert_pattern]
+    return patterns
 
 
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
@@ -513,12 +545,7 @@ def _check_cross_source(client: httpx.Client, robots_cache: RobotsCache, bill: B
     visible = _visible_text(page_text)
     normalized_page_text = _normalize_page_text_for_match(visible)
     candidates = _normalize_for_page_match(bill.identifier)
-    matched = any(
-        candidate.search(normalized_page_text)
-        if isinstance(candidate, re.Pattern)
-        else candidate in normalized_page_text
-        for candidate in candidates
-    )
+    matched = any(candidate.search(normalized_page_text) for candidate in candidates)
     if matched:
         return LegResult("cross_source", PASS, f"source_url page contains identifier match")
 

@@ -436,10 +436,15 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     queue_mod.complete_job(db, job)
                     db.commit()
                 except fulltext_mod.UnfetchableDocument as exc:
-                    # Permanent per-document outcome (robots disallow, empty
-                    # URL, missing row) -- retrying won't change the answer,
-                    # so dead-letter immediately instead of consuming the
-                    # normal backoff/retry budget.
+                    # `exc.status` distinguishes PERMANENT per-document
+                    # outcomes (robots disallow, empty URL, malformed URL,
+                    # unsupported redirect scheme, missing row) -- retrying
+                    # won't change the answer, so dead-letter immediately --
+                    # from `too_many_redirects`, which IS transient (the
+                    # target site's redirect chain today doesn't guarantee
+                    # its redirect chain tomorrow) and must get the normal
+                    # fail/backoff/retry treatment instead of being
+                    # permanently dead-lettered on one bad hop.
                     #
                     # db.rollback() below undoes the bill_documents status
                     # write (license_note='fulltext_status=...') that
@@ -448,10 +453,11 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     # transaction, status write included. Left undone, the
                     # document would keep looking "never attempted" and
                     # enqueue_fulltext_jobs would re-enqueue it forever even
-                    # though the job itself is dead-lettered. So re-apply the
-                    # SAME status in the fresh session used for
-                    # dead-lettering, durably, before that commit.
+                    # though the job itself is dead-lettered/failed. So
+                    # re-apply the SAME status in the fresh session used for
+                    # dead-lettering/failing, durably, before that commit.
                     db.rollback()
+                    is_terminal = exc.status in fulltext_mod.TERMINAL_STATUSES
                     db2 = get_session()
                     try:
                         if exc.document_id and exc.status:
@@ -459,7 +465,10 @@ def cmd_worker(args: argparse.Namespace) -> int:
                             if document2 is not None:
                                 document2.license_note = f"fulltext_status={exc.status}"
                         job2 = db2.get(type(job), job.id)
-                        queue_mod.dead_letter_job(db2, job2, str(exc))
+                        if is_terminal:
+                            queue_mod.dead_letter_job(db2, job2, str(exc))
+                        else:
+                            queue_mod.fail_job(db2, job2, str(exc))
                         db2.commit()
                     finally:
                         db2.close()

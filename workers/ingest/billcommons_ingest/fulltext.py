@@ -67,15 +67,28 @@ STATUS_SCANNED_PDF_NO_TEXT = "scanned_pdf_no_text"
 STATUS_FETCH_ERROR = "fetch_error"
 STATUS_UNSUPPORTED_TYPE = "unsupported_type"
 STATUS_EMPTY_URL = "empty_url"
+STATUS_UNSUPPORTED_REDIRECT_SCHEME = "unsupported_redirect_scheme"
+STATUS_TOO_MANY_REDIRECTS = "too_many_redirects"
+STATUS_MALFORMED_URL = "malformed_url"
 
 # Statuses that will NEVER change on a retry -- the document's URL/robots.txt/
 # content shape is a fixed fact about that source, not a transient condition.
 # enqueue_fulltext_jobs skips documents already marked with one of these so a
 # permanently-unfetchable document isn't re-enqueued forever (see the
 # license_note-based skip in enqueue_fulltext_jobs below). STATUS_FETCH_ERROR
-# is deliberately excluded -- a network/HTTP error IS worth retrying.
+# and STATUS_TOO_MANY_REDIRECTS are deliberately excluded -- a network/HTTP
+# error and a redirect loop are both transient conditions worth retrying (the
+# target site's redirect chain today doesn't guarantee its redirect chain
+# tomorrow).
 TERMINAL_STATUSES = frozenset(
-    {STATUS_ROBOTS_DISALLOWED, STATUS_EMPTY_URL, STATUS_SCANNED_PDF_NO_TEXT, STATUS_UNSUPPORTED_TYPE}
+    {
+        STATUS_ROBOTS_DISALLOWED,
+        STATUS_EMPTY_URL,
+        STATUS_SCANNED_PDF_NO_TEXT,
+        STATUS_UNSUPPORTED_TYPE,
+        STATUS_UNSUPPORTED_REDIRECT_SCHEME,
+        STATUS_MALFORMED_URL,
+    }
 )
 
 
@@ -436,13 +449,23 @@ class FullTextFetcher:
         budget just because the first hop was cleared."""
         current_url = url
         for _ in range(MAX_REDIRECT_HOPS + 1):
-            scheme = urlparse(current_url).scheme
+            parsed = urlparse(current_url)
+            scheme = parsed.scheme
+            host = parsed.netloc
+            if not scheme or not host:
+                raise UnfetchableDocument(
+                    f"malformed/no-scheme URL {current_url!r}", status=STATUS_MALFORMED_URL
+                )
             if scheme not in ("http", "https"):
-                raise UnfetchableDocument(f"unsupported redirect scheme {scheme!r} for {current_url}")
+                raise UnfetchableDocument(
+                    f"unsupported redirect scheme {scheme!r} for {current_url}",
+                    status=STATUS_UNSUPPORTED_REDIRECT_SCHEME,
+                )
 
-            host = urlparse(current_url).netloc
             if not self.robots_cache.can_fetch(current_url):
-                raise UnfetchableDocument(f"robots.txt disallows fetching {current_url}")
+                raise UnfetchableDocument(
+                    f"robots.txt disallows fetching {current_url}", status=STATUS_ROBOTS_DISALLOWED
+                )
             self.rate_limiter.acquire(host)
 
             response = self.client.get(current_url, follow_redirects=False)
@@ -456,7 +479,10 @@ class FullTextFetcher:
                 return response
             current_url = str(response.request.url.join(location))
 
-        raise UnfetchableDocument(f"too many redirects (> {MAX_REDIRECT_HOPS}) fetching {url}")
+        raise UnfetchableDocument(
+            f"too many redirects (> {MAX_REDIRECT_HOPS}) fetching {url}",
+            status=STATUS_TOO_MANY_REDIRECTS,
+        )
 
 
 def process_fetch_text_job(
@@ -485,13 +511,22 @@ def process_fetch_text_job(
 
     try:
         response = fetcher.fetch(document.url)
-    except UnfetchableDocument:
-        _mark_status(document, STATUS_ROBOTS_DISALLOWED)
+    except UnfetchableDocument as exc:
+        # `fetcher.fetch` sets `.status` to the SPECIFIC condition it hit
+        # (robots_disallowed / malformed_url / unsupported_redirect_scheme /
+        # too_many_redirects) -- persist and re-raise that ACTUAL status
+        # rather than collapsing every raise site into
+        # STATUS_ROBOTS_DISALLOWED. Mislabeling a transient too-many-redirects
+        # loop as a terminal robots-disallow would both misreport the reason
+        # AND wrongly make it eligible for permanent dead-lettering (see
+        # TERMINAL_STATUSES: too_many_redirects is deliberately NOT terminal).
+        status = exc.status or STATUS_ROBOTS_DISALLOWED
+        _mark_status(document, status)
         db.flush()
         raise UnfetchableDocument(
-            f"robots.txt disallows fetching {document.url}",
+            str(exc),
             document_id=str(document.id),
-            status=STATUS_ROBOTS_DISALLOWED,
+            status=status,
         )
     except httpx.HTTPError as exc:
         _mark_status(document, STATUS_FETCH_ERROR)

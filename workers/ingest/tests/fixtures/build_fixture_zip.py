@@ -249,15 +249,38 @@ def build_fixture_zip_bytes() -> bytes:
             "jurisdiction": "Test State",
             "session_identifier": SESSION,
         },
+        # Regression fixture for the natural-key collision bug: a second,
+        # DISTINCT vote on the SAME bill/motion_text/start_date as vote-1
+        # (mirrors real Open States exports where two chambers' votes on the
+        # same bill/day both carry a generic motion_text like "SM"). Keying
+        # solely on (bill_id, motion_text, start_date) incorrectly merges
+        # this into vote-1; keying on the CSV's own `id` (upstream_id) keeps
+        # them as two separate vote_events with their own vote_records.
+        {
+            "id": "vote-1b",
+            "identifier": "Vote 1b",
+            "motion_text": "Passage",
+            "motion_classification": "['passage']",
+            "start_date": "2026-02-01",
+            "result": "pass",
+            "organization_id": "ocd-organization/org-house",
+            "bill_id": "ocd-bill/bill-1",
+            "bill_action_id": "action-2",
+            "jurisdiction": "Test State",
+            "session_identifier": SESSION,
+        },
     ]
 
     vote_counts = [
         {"id": "vc-1", "created_at": "2026-02-01", "updated_at": "2026-02-01", "vote_event_id": "vote-1", "option": "yes", "value": "60"},
         {"id": "vc-2", "created_at": "2026-02-01", "updated_at": "2026-02-01", "vote_event_id": "vote-1", "option": "no", "value": "40"},
+        {"id": "vc-3", "created_at": "2026-02-01", "updated_at": "2026-02-01", "vote_event_id": "vote-1b", "option": "yes", "value": "10"},
+        {"id": "vc-4", "created_at": "2026-02-01", "updated_at": "2026-02-01", "vote_event_id": "vote-1b", "option": "no", "value": "5"},
     ]
 
     vote_people = [
         {"id": "vp-1", "created_at": "2026-02-01", "updated_at": "2026-02-01", "vote_event_id": "vote-1", "option": "yes", "voter_name": "Jane Testperson", "voter_id": "", "note": ""},
+        {"id": "vp-2", "created_at": "2026-02-01", "updated_at": "2026-02-01", "vote_event_id": "vote-1b", "option": "yes", "voter_name": "John Fixtureman", "voter_id": "", "note": ""},
     ]
 
     buf = io.BytesIO()

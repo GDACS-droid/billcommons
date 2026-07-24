@@ -12,9 +12,11 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy import select, text
 
 from billcommons_ingest import queue as queue_mod
+from billcommons_ingest import scheduler as scheduler_mod
 from billcommons_ingest.scheduler import (
     CADENCE_TIER_ACTIVE,
     CADENCE_TIER_DORMANT,
@@ -255,6 +257,73 @@ def test_run_schedule_pass_skips_when_another_pass_holds_the_advisory_lock(db_se
             text("SELECT pg_advisory_unlock(:key)"), {"key": SCHEDULE_PASS_ADVISORY_LOCK_KEY}
         )
         blocking_connection.close()
+
+
+def test_run_schedule_pass_raising_enqueue_does_not_leak_the_lock(db_session, monkeypatch):
+    """Regression for Finding 3: the OLD implementation used a
+    session-scoped `pg_try_advisory_lock` + a `finally`-block
+    `pg_advisory_unlock` on the SAME session. If `queue_mod.enqueue` raised
+    mid-pass, the transaction would abort -- and the `finally` block's own
+    unlock statement, issued on that now-aborted transaction, would itself
+    fail (Postgres refuses further statements until rollback), leaking the
+    session-level lock on the pooled connection FOREVER. Every subsequent
+    `run_schedule_pass` reusing that connection would then silently return
+    `[]`, a total silent scheduling stall.
+
+    Proves the fix (xact-scoped lock, auto-released on commit OR rollback,
+    no manual unlock needed): force `queue_mod.enqueue` to raise on the
+    first pass, catch it, roll back (mirroring cli.py's real error-handling
+    contract for a raising DB call), and confirm a SECOND, completely fresh
+    session can still acquire the lock and run a pass -- i.e. nothing was
+    left behind holding it.
+    """
+    now = _real_now()
+    jurisdiction, _ = _make_jurisdiction_with_session(db_session, active=True, end_date=now.date())
+    db_session.flush()
+
+    real_enqueue = scheduler_mod.queue_mod.enqueue
+    call_count = {"n": 0}
+
+    def _raising_once_enqueue(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("simulated DB error mid-enqueue")
+        return real_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler_mod.queue_mod, "enqueue", _raising_once_enqueue)
+
+    with pytest.raises(RuntimeError, match="simulated DB error"):
+        run_schedule_pass(db_session, now=now)
+
+    # Mirrors the real caller contract (cli.py's cmd_schedule_refresh /
+    # cmd_worker both db.rollback() on any exception) -- this is what an
+    # xact-scoped lock needs to release; the OLD session-scoped lock would
+    # need an explicit (and, in this exact failure path, unreachable) unlock
+    # call instead.
+    db_session.rollback()
+
+    engine = get_engine()
+    fresh_connection = engine.connect()
+    try:
+        from sqlalchemy.orm import Session as OrmSession
+
+        fresh_trans = fresh_connection.begin()
+        fresh_session = OrmSession(bind=fresh_connection)
+        try:
+            second_jurisdiction, _ = _make_jurisdiction_with_session(
+                fresh_session, active=True, end_date=now.date()
+            )
+            fresh_session.flush()
+            enqueued = run_schedule_pass(fresh_session, now=now)
+            assert second_jurisdiction.abbreviation in enqueued, (
+                "a fresh session must still be able to acquire the advisory lock and "
+                "run a pass after a prior pass raised -- the lock must not have leaked"
+            )
+        finally:
+            fresh_session.close()
+            fresh_trans.rollback()
+    finally:
+        fresh_connection.close()
 
 
 def test_run_schedule_pass_ignores_dead_jobs_for_due_check(db_session):

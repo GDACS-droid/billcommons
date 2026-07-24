@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
+from billcommons_api.rate_limit import RateLimitMiddleware
 from slowapi.util import get_remote_address
 
 from billcommons_api.errors import register_exception_handlers
@@ -31,7 +31,11 @@ API_PREFIX = "/api/v1"
 def create_app() -> FastAPI:
     settings = get_settings()
 
+    # Keep a slowapi Limiter available for any future per-route decorators, but
+    # global enforcement is handled by RateLimitMiddleware below (slowapi's
+    # application_limits + middleware did not reliably throttle in practice).
     limiter = Limiter(key_func=get_remote_address, default_limits=[settings.rate_limit_default])
+    rate_limit_num = int(settings.rate_limit_default.split("/")[0])
 
     app = FastAPI(
         title=settings.title,
@@ -55,7 +59,7 @@ def create_app() -> FastAPI:
     app.add_middleware(GZipMiddleware, minimum_size=1000)
     app.add_middleware(SecureHeadersMiddleware, api_version=settings.api_version)
     app.add_middleware(RequestIDMiddleware)
-    app.add_middleware(SlowAPIMiddleware)
+    app.add_middleware(RateLimitMiddleware, limit=rate_limit_num, window=60.0)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allow_origins,

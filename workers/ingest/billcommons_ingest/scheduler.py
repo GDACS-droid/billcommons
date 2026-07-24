@@ -188,25 +188,39 @@ def run_schedule_pass(db: OrmSession, *, now: datetime | None = None) -> list[st
     triggered `schedule-refresh` CLI run, or two worker processes) could
     both read "not yet enqueued" for the same jurisdiction and both insert
     an api_sync job, burning the shared Open States API quota on a
-    duplicate sync. A session-level Postgres advisory lock serializes the
-    WHOLE pass: a caller that can't acquire it immediately (another pass is
-    already running) skips this pass entirely and returns an empty list --
-    the next scheduled pass will pick up anything that's actually due by
-    then, so skipping is safe and never silently drops a jurisdiction."""
+    duplicate sync. `pg_try_advisory_xact_lock` (TRANSACTION-scoped, not
+    session-scoped) serializes the WHOLE pass: a caller that can't acquire
+    it immediately (another pass is already running) skips this pass
+    entirely and returns an empty list -- the next scheduled pass will pick
+    up anything that's actually due by then, so skipping is safe and never
+    silently drops a jurisdiction.
+
+    Deliberately `_xact_lock`, not the plain session-scoped
+    `pg_try_advisory_lock` this used previously: the session-scoped lock is
+    released only by an EXPLICIT `pg_advisory_unlock` on that same backend
+    connection. If `queue_mod.enqueue` (or anything else in the `try` body)
+    raised a DB error, the whole transaction would be aborted -- and the
+    `finally`'s own `pg_advisory_unlock` call, running inside that same
+    now-aborted transaction, would itself fail (Postgres refuses further
+    statements on an aborted transaction until rollback), leaking the
+    session-level lock on the pooled connection. Every future
+    `run_schedule_pass` call that happened to reuse that same pooled
+    connection would then find the lock permanently held and silently
+    return `[]` forever -- a total, silent scheduling stall with no error
+    surfaced anywhere. The xact-scoped lock has no such failure mode: it is
+    automatically released the instant the transaction ends, by COMMIT *or*
+    ROLLBACK, with no explicit unlock statement required at all."""
     acquired = db.execute(
-        text("SELECT pg_try_advisory_lock(:key)"), {"key": SCHEDULE_PASS_ADVISORY_LOCK_KEY}
+        text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": SCHEDULE_PASS_ADVISORY_LOCK_KEY}
     ).scalar_one()
     if not acquired:
         return []
 
-    try:
-        decisions = plan_schedule(db, now=now)
-        enqueued = []
-        for decision in decisions:
-            if not decision.due:
-                continue
-            queue_mod.enqueue(db, API_SYNC_KIND, {"state": decision.jurisdiction_abbr})
-            enqueued.append(decision.jurisdiction_abbr)
-        return enqueued
-    finally:
-        db.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": SCHEDULE_PASS_ADVISORY_LOCK_KEY})
+    decisions = plan_schedule(db, now=now)
+    enqueued = []
+    for decision in decisions:
+        if not decision.due:
+            continue
+        queue_mod.enqueue(db, API_SYNC_KIND, {"state": decision.jurisdiction_abbr})
+        enqueued.append(decision.jurisdiction_abbr)
+    return enqueued

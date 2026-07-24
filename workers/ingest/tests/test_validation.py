@@ -551,6 +551,197 @@ def test_cross_source_skips_when_robots_disallows(db_session):
     assert result.status == SKIPPED_ROBOTS
 
 
+def test_cross_source_does_not_false_positive_on_shb_substring(db_session):
+    """Regression for Finding 2: un-anchored substring matching let 'hb 1057'
+    match inside 'shb 1057' (a DIFFERENT bill's prefix, e.g. a "Substitute
+    House Bill", that merely contains ours as a substring) -- a real false
+    PASS in the one tool whose job is exact verification."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 1057",
+        identifier_norm="HB 1057",
+        title="An act",
+        source_url="https://example-legislature.gov/other-bill",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            text="<html><body><h1>Legislature Bill Tracker</h1>"
+            "<p>SHB 1057 was substituted and passed the committee with amendments, "
+            "unrelated to the bill under test here today. This page has substantial "
+            "visible content well past the minimum-length threshold so it is not "
+            "misclassified as a JS app shell, repeated to be safe. " * 4
+            + "</p></body></html>",
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == FAIL, "'shb 1057' must NOT satisfy a match for 'hb 1057'"
+
+
+def test_cross_source_does_not_false_positive_on_h1_inside_graph1_or_march1(db_session):
+    """Regression for Finding 2: the single-digit-bill surface form 'h1' (for
+    identifier 'HB 1') must not match as a substring of unrelated words like
+    'graph1' or 'march1' on the page."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 1",
+        identifier_norm="HB 1",
+        title="An act",
+        source_url="https://example-legislature.gov/other-bill",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            text="<html><body><h1>Legislature Bill Tracker</h1>"
+            "<p>See graph1 in the appendix, filed on march1 2026, for unrelated "
+            "committee data such as SB 42 and HB 200, with substantial page content "
+            "well past the minimum-length threshold, repeated to be safe. " * 4
+            + "</p></body></html>",
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == FAIL, "'h1' must NOT match inside 'graph1'/'march1'"
+
+
+def test_cross_source_true_positive_single_digit_bill_h1(db_session):
+    """Same single-digit bill (HB 1) must still genuinely PASS when 'H1'
+    appears as its own real token, boundary-delimited."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 1",
+        identifier_norm="HB 1",
+        title="An act",
+        source_url="https://example-legislature.gov/hb1",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, text="<html><body>Bill H1 was introduced in the House.</body></html>")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == PASS
+
+
+def test_cross_source_does_not_false_positive_on_senate_bill_362_inside_3625(db_session):
+    """Regression for Finding 2: 'senate bill 362' must not match as a
+    substring of 'senate bill 3625' -- a genuinely different bill number that
+    merely starts with ours."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="SB 362",
+        identifier_norm="SB 362",
+        title="An act",
+        source_url="https://www.ncleg.gov/other-bill",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            text="<html><body><h1>North Carolina General Assembly</h1>"
+            "<p>Senate Bill 3625 (2025-2026 Session) status and history, along with "
+            "HB 200 and SR 14, substantial page content well "
+            "past the minimum-length threshold, repeated to be safe. " * 4
+            + "</p></body></html>",
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == FAIL, "'senate bill 362' must NOT match inside 'senate bill 3625'"
+
+
+def test_cross_source_true_positive_senate_bill_362(db_session):
+    """Same bill (SB 362) must still genuinely PASS against the real
+    boundary-delimited spelled-out surface form."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="SB 362",
+        identifier_norm="SB 362",
+        title="An act",
+        source_url="https://www.ncleg.gov/BillLookUp/2025/S362",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(
+            200, text="<html><body>Senate Bill 362 (2025-2026 Session) - North Carolina General Assembly</body></html>"
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == PASS
+
+
+def test_cross_source_does_not_false_positive_on_h0914_inside_h09140(db_session):
+    """Regression for Finding 2: 'h0914' must not match as a substring of
+    'h09140' -- a different, longer bill number on the page."""
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 914",
+        identifier_norm="HB 914",
+        title="An act",
+        source_url="https://www.gencourt.state.nh.us/other-bill",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            text="<html><body><h1>NH General Court Bill Status</h1>"
+            "<p>Bill status for H09140 as of today, along with SB 42 and HB 200, "
+            "substantial page content well past the minimum-length threshold, "
+            "repeated to be safe. " * 4
+            + "</p></body></html>",
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    robots_cache = RobotsCache(client=client)
+    result = _check_cross_source(client, robots_cache, bill)
+    assert result.status == FAIL, "'h0914' must NOT match inside 'h09140'"
+
+
 def test_cross_source_is_unverifiable_on_fetch_error(db_session):
     _, _, bills = _make_jurisdiction_with_bills(db_session, n=1)
     bill = bills[0]

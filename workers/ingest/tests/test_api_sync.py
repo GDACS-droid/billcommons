@@ -218,6 +218,48 @@ def test_sync_state_does_not_conflate_same_bill_number_across_sessions(db_sessio
     )
 
 
+def test_sync_state_warns_when_payload_session_does_not_match_any_known_session(db_session):
+    """Regression for Finding 6(b): falling back to the active session when
+    a payload's session string doesn't match any known session row used to
+    be completely silent -- a real misassignment risk (the bill may
+    actually belong to a different, not-yet-seeded session) with no
+    operator-visible trace. Must now emit a warning through the same
+    `result.warnings` channel the "no session row resolved" skip path
+    already uses."""
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/mismatch-1",
+        identifier="HB 60",
+        title="An act",
+        session="2099 Nonexistent Session",
+    )
+    client = _client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}})
+
+    result = sync_state(db_session, jurisdiction, client=client)
+
+    assert result.bills_created == 1, "the bill must still be created (falls back to active session)"
+    assert any(
+        "did not match any known" in w and "2099 Nonexistent Session" in w for w in result.warnings
+    ), "a session string that matches no known session row must produce a visible warning"
+
+
+def test_sync_state_does_not_warn_when_payload_session_matches(db_session):
+    """Sanity check the other direction: a payload session that DOES match a
+    known session row must not spuriously warn."""
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/match-1", identifier="HB 61", title="An act", session="2026 Session"
+    )
+    client = _client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}})
+
+    result = sync_state(db_session, jurisdiction, client=client)
+
+    assert result.bills_created == 1
+    assert not any("did not match any known" in w for w in result.warnings)
+
+
 def test_sync_state_skips_new_bill_without_active_session(db_session):
     abbr = f"ZQ_NOACTIVE_{uuid.uuid4().hex[:8].upper()}"
     jurisdiction = Jurisdiction(name="No Active Session State", abbreviation=abbr, classification="state")
@@ -467,3 +509,132 @@ def test_sync_state_continues_past_unchanged_page_when_later_page_has_changes(db
         select(Bill).where(Bill.jurisdiction_id == jurisdiction.id, Bill.identifier_norm == "HB 100")
     ).scalar_one()
     assert updated.title == "Amended title", "page 1's real change must actually be applied"
+
+
+# ---------------------------------------------------------------------------
+# Finding 6(a): watermark uses started_at, not finished_at
+# ---------------------------------------------------------------------------
+
+
+def test_sync_state_watermark_uses_started_at_not_finished_at(db_session):
+    """Regression for Finding 6(a): using `finished_at` as the `updated_since`
+    watermark creates a real gap-of-loss window. A run that takes real
+    wall-clock time to complete (paging through the v3 API) could have an
+    upstream bill update land ON THE OPEN STATES SIDE mid-run -- after this
+    run's own `search_bills` calls already fetched their pages, but before
+    `finished_at` is stamped. That update is newer than `started_at` (so a
+    NEXT run keyed on started_at would still ask about it) but older than
+    `finished_at` (so a next run keyed on finished_at would treat it as
+    already covered, even though this run's calls never actually saw it).
+
+    Seeds an ingestion_runs row with DISTINCT started_at/finished_at (a real
+    multi-minute run) and asserts the next sync's `updated_since` is the
+    EARLIER started_at value, not the later finished_at."""
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+
+    run_started_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    run_finished_at = datetime(2026, 1, 1, 12, 5, 0, tzinfo=timezone.utc)  # 5 minutes later
+    db_session.add(
+        IngestionRun(
+            jurisdiction_id=jurisdiction.id,
+            session_id=session_row.id,
+            source_name="openstates_api_sync",
+            started_at=run_started_at,
+            finished_at=run_finished_at,
+            status="success",
+        )
+    )
+    db_session.flush()
+
+    seen_updated_since: list = []
+    client = _client_recording_updated_since(
+        {1: {"results": [], "pagination": {"max_page": 1}}}, seen_updated_since
+    )
+
+    sync_state(db_session, jurisdiction, client=client)
+
+    assert len(seen_updated_since) == 1
+    assert seen_updated_since[0] == run_started_at.isoformat(), (
+        "updated_since must be the last successful run's started_at, not its finished_at -- "
+        "using finished_at would silently skip upstream changes that landed during the run"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Finding 6(c): unchanged-checksum branch backfills openstates_id
+# ---------------------------------------------------------------------------
+
+
+def test_sync_state_backfills_openstates_id_on_unchanged_bill(db_session):
+    """Regression for Finding 6(c): a bulk-CSV-bootstrapped bill (no
+    openstates_id yet, matched via the SECONDARY session+identifier_norm
+    key) whose core fields are checksum-identical to the incoming v3 payload
+    must still get openstates_id backfilled onto it -- otherwise a bill that
+    stops changing (a real, plausible steady state once it's enacted/dead)
+    NEVER graduates to the PRIMARY openstates_id dedup key, and every future
+    sync keeps falling back to the weaker secondary key indefinitely."""
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+
+    payload = _v3_bill_payload(openstates_id="ocd-bill/backfill-1", identifier="HB 55", title="A settled bill")
+    # Seed a bulk-CSV-bootstrapped row: same checksum-relevant fields as the
+    # payload (so this sync sees it as "unchanged"), but NO openstates_id --
+    # exactly the shape a bulk bootstrap produces before api_sync ever runs.
+    bootstrapped_bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 55",
+        identifier_norm="HB 55",
+        title="A settled bill",
+        checksum=_bill_checksum(payload),
+        openstates_id=None,
+    )
+    db_session.add(bootstrapped_bill)
+    db_session.flush()
+    bootstrapped_bill_id = bootstrapped_bill.id
+
+    client = _client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}})
+    result = sync_state(db_session, jurisdiction, client=client)
+    db_session.flush()
+
+    assert result.bills_unchanged == 1, "checksum-identical core fields must still classify as unchanged"
+    assert result.bills_created == 0
+    assert result.bills_updated == 0
+
+    refreshed = db_session.get(Bill, bootstrapped_bill_id)
+    assert refreshed.openstates_id == "ocd-bill/backfill-1", (
+        "openstates_id must be backfilled onto an unchanged bulk-bootstrapped row so it "
+        "graduates to the primary dedup key instead of staying on the secondary key forever"
+    )
+
+
+def test_sync_state_unchanged_backfill_does_not_touch_already_resolved_bill(db_session):
+    """An unchanged bill that ALREADY has an openstates_id (the normal
+    steady state for any bill api_sync has touched before) must not have it
+    overwritten to a different value from a payload that -- despite an
+    identical checksum -- claims a different id; this would only happen for
+    a genuinely different bill colliding on checksum, which should never
+    silently reassign an already-resolved bill's identity."""
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+
+    payload = _v3_bill_payload(openstates_id="ocd-bill/already-resolved", identifier="HB 56", title="A settled bill")
+    resolved_bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 56",
+        identifier_norm="HB 56",
+        title="A settled bill",
+        checksum=_bill_checksum(payload),
+        openstates_id="ocd-bill/already-resolved",
+    )
+    db_session.add(resolved_bill)
+    db_session.flush()
+    resolved_bill_id = resolved_bill.id
+
+    client = _client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}})
+    result = sync_state(db_session, jurisdiction, client=client)
+    db_session.flush()
+
+    assert result.bills_unchanged == 1
+
+    refreshed = db_session.get(Bill, resolved_bill_id)
+    assert refreshed.openstates_id == "ocd-bill/already-resolved"

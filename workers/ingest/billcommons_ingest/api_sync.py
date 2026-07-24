@@ -104,6 +104,7 @@ def _resolve_session_row(
     bill_payload: dict,
     sessions_by_identifier: dict[str, SessionModel],
     active_session: SessionModel | None,
+    result: ApiSyncResult,
 ) -> SessionModel | None:
     """Resolve a v3 bill payload's `session` string to OUR local session
     row. v3's `session` field is a string session identifier (the same kind
@@ -114,12 +115,30 @@ def _resolve_session_row(
     about (e.g. a brand-new session the registry/bootstrap hasn't seeded
     yet). This is what actually prevents a same-numbered bill in a
     DIFFERENT session from being conflated with the current session's bill
-    of the same number (see `bill_by_session_and_identifier_norm`'s key)."""
+    of the same number (see `bill_by_session_and_identifier_norm`'s key).
+
+    Falling back silently used to be a real misassignment risk with no
+    operator-visible trace: a payload session string that doesn't match any
+    known session row gets silently attributed to whatever session happens
+    to be `active` right now, which is WRONG whenever that's a different
+    session than the one the bill is actually in. This logs a warning to
+    `result.warnings` (the same operator-visible channel the "no session row
+    resolved" skip path a few lines up in `sync_state` already uses) any
+    time this fallback fires with a NON-empty session_identifier that
+    genuinely didn't match -- i.e. every case where we can't prove the
+    fallback is even correct, not merely every case where session is
+    entirely absent from the payload."""
     session_identifier = bill_payload.get("session")
     if session_identifier:
         matched = sessions_by_identifier.get(session_identifier)
         if matched is not None:
             return matched
+        result.warnings.append(
+            f"bill payload session={session_identifier!r} did not match any known "
+            f"session row for this jurisdiction; falling back to the active session "
+            f"({active_session.identifier if active_session else 'none'}) -- this bill "
+            f"may be misassigned if it actually belongs to a different, not-yet-seeded session"
+        )
     return active_session
 
 
@@ -133,12 +152,28 @@ def sync_state(
 ) -> ApiSyncResult:
     """Incrementally sync one jurisdiction via the v3 API. Caller commits.
 
-    `updated_since` is THIS sync pipeline's own watermark: the `finished_at`
-    of the jurisdiction's most recent SUCCESSFUL `ingestion_runs` row with
-    `source_name == SOURCE_NAME` ("openstates_api_sync") -- i.e. the last
-    time an api_sync run actually completed. Falls back to None (a full
-    `per_page`*`max_pages` pull) only the first time a jurisdiction is
-    api-synced with no prior successful api_sync run recorded.
+    `updated_since` is THIS sync pipeline's own watermark: the `started_at`
+    (NOT `finished_at`) of the jurisdiction's most recent SUCCESSFUL
+    `ingestion_runs` row with `source_name == SOURCE_NAME`
+    ("openstates_api_sync"). Falls back to None (a full `per_page`*`max_pages`
+    pull) only the first time a jurisdiction is api-synced with no prior
+    successful api_sync run recorded.
+
+    Deliberately `started_at`, not `finished_at`: a run takes real wall-clock
+    time to page through the v3 API (potentially minutes, given
+    MAX_PAGES_PER_RUN's quota-conscious pacing), and an upstream bill update
+    that lands ON THE OPEN STATES SIDE mid-run -- after this run's OWN
+    `search_bills` calls have already fetched their pages, but before this
+    run's `finished_at` is stamped -- would fall in the window
+    (run_start, run_finish) and be silently skipped forever: it's newer than
+    `started_at` (so a NEXT run using `started_at` would still ask about it)
+    but older than `finished_at` (so a next run using `finished_at` would
+    treat it as already covered by THIS run, even though this run's actual
+    API calls never saw it because it hadn't landed yet when they fired).
+    Using `started_at` accepts a small amount of guaranteed-safe overlap
+    (bills already synced this run get asked about again next run and are
+    filtered out by the checksum-unchanged branch) in exchange for never
+    missing a bill that changed upstream during the run.
 
     Deliberately NOT derived from `jurisdiction_coverage.last_success_at`:
     that field is stamped by `coverage.recompute_coverage_row` on every
@@ -152,15 +187,15 @@ def sync_state(
     result = ApiSyncResult(state=jurisdiction.abbreviation)
     retrieved_at = datetime.now(timezone.utc)
 
-    last_successful_run_finished_at = db.execute(
-        select(func.max(IngestionRun.finished_at)).where(
+    last_successful_run_started_at = db.execute(
+        select(func.max(IngestionRun.started_at)).where(
             IngestionRun.jurisdiction_id == jurisdiction.id,
             IngestionRun.source_name == SOURCE_NAME,
             IngestionRun.status == "success",
         )
     ).scalar_one_or_none()
     updated_since = (
-        last_successful_run_finished_at.isoformat() if last_successful_run_finished_at is not None else None
+        last_successful_run_started_at.isoformat() if last_successful_run_started_at is not None else None
     )
 
     # Every session row for this jurisdiction, keyed by its own `identifier`
@@ -250,7 +285,7 @@ def sync_state(
             # unambiguous regardless of session. Only falls back to the
             # (session_id, identifier_norm) key for bills that don't have an
             # openstates_id recorded yet (e.g. bulk-CSV-bootstrapped rows).
-            session_row = _resolve_session_row(bill_payload, sessions_by_identifier, active_session)
+            session_row = _resolve_session_row(bill_payload, sessions_by_identifier, active_session, result)
             bill = bill_by_openstates_id.get(openstates_id) if openstates_id else None
             if bill is None and session_row is not None:
                 bill = bill_by_session_and_identifier_norm.get((session_row.id, identifier_norm))
@@ -294,6 +329,20 @@ def sync_state(
                 # walked past the `updated_since` boundary; still let this
                 # bill's children get checked (an action list can genuinely
                 # have grown without the bill's own core fields differing).
+                #
+                # Backfill openstates_id even on this "nothing else changed"
+                # branch: a bulk-CSV-bootstrapped row (matched here via the
+                # SECONDARY session+identifier_norm key precisely because it
+                # had no openstates_id yet) would otherwise NEVER graduate to
+                # the PRIMARY openstates_id dedup key as long as its core
+                # fields stayed checksum-identical across every future sync --
+                # a real, plausible steady state for a bill that's done
+                # moving. Left unfixed, every future sync for that bill keeps
+                # falling back to the weaker secondary key indefinitely.
+                if openstates_id and not bill.openstates_id:
+                    bill.openstates_id = openstates_id
+                    bill.upstream_id = openstates_id
+                    bill_by_openstates_id[openstates_id] = bill
             else:
                 bill.title = bill_payload.get("title") or bill.title
                 bill.chamber = bill_payload.get("chamber") or bill.chamber

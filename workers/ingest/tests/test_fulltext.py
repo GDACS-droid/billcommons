@@ -20,9 +20,13 @@ import pytest
 from pypdf import PdfWriter
 
 from billcommons_ingest.fulltext import (
+    STATUS_MALFORMED_URL,
     STATUS_OK,
     STATUS_ROBOTS_DISALLOWED,
     STATUS_SCANNED_PDF_NO_TEXT,
+    STATUS_TOO_MANY_REDIRECTS,
+    STATUS_UNSUPPORTED_REDIRECT_SCHEME,
+    TERMINAL_STATUSES,
     FETCH_TEXT_KIND,
     FullTextFetcher,
     RobotsCache,
@@ -397,6 +401,93 @@ def test_fetcher_raises_on_too_many_redirects():
 
     with pytest.raises(UnfetchableDocument, match="too many redirects"):
         fetcher.fetch("https://origin.gov/hop0")
+
+
+# ---------------------------------------------------------------------------
+# Finding 1 regression: distinct status per raise site + honest terminal/
+# retriable classification (never all collapsed to STATUS_ROBOTS_DISALLOWED)
+# ---------------------------------------------------------------------------
+
+
+def test_fetcher_raises_too_many_redirects_carries_that_status():
+    routes = {"https://origin.gov/robots.txt": httpx.Response(200, text="User-agent: *\nAllow: /\n")}
+    hop_count = 10
+    for i in range(hop_count):
+        routes[f"https://origin.gov/hop{i}"] = httpx.Response(
+            302, headers={"location": f"https://origin.gov/hop{i + 1}"}
+        )
+    routes[f"https://origin.gov/hop{hop_count}"] = httpx.Response(200, content=b"never reached")
+
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    with pytest.raises(UnfetchableDocument) as excinfo:
+        fetcher.fetch("https://origin.gov/hop0")
+    assert excinfo.value.status == STATUS_TOO_MANY_REDIRECTS
+
+
+def test_fetcher_raises_unsupported_redirect_scheme_carries_that_status():
+    routes = {
+        "https://origin.gov/robots.txt": httpx.Response(200, text="User-agent: *\nAllow: /\n"),
+        "https://origin.gov/bill.pdf": httpx.Response(
+            302, headers={"location": "ftp://origin.gov/bill.pdf"}
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    with pytest.raises(UnfetchableDocument) as excinfo:
+        fetcher.fetch("https://origin.gov/bill.pdf")
+    assert excinfo.value.status == STATUS_UNSUPPORTED_REDIRECT_SCHEME
+
+
+def test_fetcher_raises_malformed_url_carries_that_status():
+    client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    with pytest.raises(UnfetchableDocument) as excinfo:
+        fetcher.fetch("not-a-url-at-all")
+    assert excinfo.value.status == STATUS_MALFORMED_URL
+
+
+def test_terminal_statuses_include_malformed_and_unsupported_scheme_but_not_redirects():
+    """Documents honest terminal-vs-retriable status classification:
+    robots/empty-url/malformed/unsupported-scheme are permanent facts about
+    the source and must be dead-lettered/skipped forever; too_many_redirects
+    is a transient condition (the target's redirect chain today doesn't
+    guarantee its chain tomorrow) and must NOT be treated as terminal, so a
+    transient redirect loop gets retried instead of permanently dead-lettered."""
+    assert STATUS_MALFORMED_URL in TERMINAL_STATUSES
+    assert STATUS_UNSUPPORTED_REDIRECT_SCHEME in TERMINAL_STATUSES
+    assert STATUS_TOO_MANY_REDIRECTS not in TERMINAL_STATUSES
+
+
+def test_process_fetch_text_job_persists_actual_status_not_always_robots_disallowed(db_session, rawstore):
+    """Regression for Finding 1: process_fetch_text_job's single `except
+    UnfetchableDocument` used to hardcode STATUS_ROBOTS_DISALLOWED for EVERY
+    fetch()-raised condition, mislabeling a too-many-redirects loop as a
+    robots disallow. The persisted license_note (and the re-raised
+    exception's .status) must reflect the ACTUAL condition fetcher.fetch hit."""
+    routes = {"https://origin.gov/robots.txt": httpx.Response(200, text="User-agent: *\nAllow: /\n")}
+    hop_count = 10
+    for i in range(hop_count):
+        routes[f"https://origin.gov/hop{i}"] = httpx.Response(
+            302, headers={"location": f"https://origin.gov/hop{i + 1}"}
+        )
+    routes[f"https://origin.gov/hop{hop_count}"] = httpx.Response(200, content=b"never reached")
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    document = _make_bill_document(db_session, url="https://origin.gov/hop0")
+
+    with pytest.raises(UnfetchableDocument) as excinfo:
+        process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert excinfo.value.status == STATUS_TOO_MANY_REDIRECTS, (
+        "a too-many-redirects loop must NOT be mislabeled as robots_disallowed"
+    )
+    db_session.refresh(document)
+    assert document.license_note == f"fulltext_status={STATUS_TOO_MANY_REDIRECTS}"
 
 
 def test_process_fetch_text_job_marks_robots_disallowed_not_bypassed(db_session, rawstore):

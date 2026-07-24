@@ -159,6 +159,11 @@ def test_ingest_derives_latest_action_from_max_date_not_csv_order(db_session, ra
 
 
 def test_ingest_populates_vote_events_and_records(db_session, rawstore):
+    """Also the regression case for the natural-key collision bug: the
+    fixture's vote-1 and vote-1b share (bill_id, motion_text, start_date)
+    but have distinct upstream `id`s -- if vote_events were still keyed on
+    that coarse tuple alone, this would wrongly collapse to ONE vote_event
+    (losing vote-1b's counts/vote_record entirely), instead of two."""
     session_row = _make_session_row(db_session)
     zip_bytes = build_fixture_zip_bytes()
     ingest_session_csv_zip(db_session, zip_bytes, session_row=session_row, rawstore=rawstore)
@@ -167,12 +172,21 @@ def test_ingest_populates_vote_events_and_records(db_session, rawstore):
     bill_hb1 = db_session.execute(
         select(Bill).where(Bill.session_id == session_row.id, Bill.identifier_norm == "HB 1")
     ).scalar_one()
-    vote_event = db_session.execute(
-        select(VoteEvent).where(VoteEvent.bill_id == bill_hb1.id)
-    ).scalar_one()
+    vote_events = db_session.execute(
+        select(VoteEvent).where(VoteEvent.bill_id == bill_hb1.id).order_by(VoteEvent.upstream_id)
+    ).scalars().all()
+    assert len(vote_events) == 2, (
+        "vote-1 and vote-1b share (bill_id, motion_text, start_date) but are "
+        "distinct upstream votes -- they must not collapse into one row"
+    )
+    vote_event, vote_event_b = vote_events
+    assert vote_event.upstream_id == "vote-1"
     assert vote_event.yes_count == 60
     assert vote_event.no_count == 40
     assert vote_event.result == "pass"
+    assert vote_event_b.upstream_id == "vote-1b"
+    assert vote_event_b.yes_count == 10
+    assert vote_event_b.no_count == 5
 
     vote_records = db_session.execute(
         select(VoteRecord).where(VoteRecord.vote_event_id == vote_event.id)
@@ -180,6 +194,12 @@ def test_ingest_populates_vote_events_and_records(db_session, rawstore):
     assert len(vote_records) == 1
     assert vote_records[0].voter_name == "Jane Testperson"
     assert vote_records[0].option == "yes"
+
+    vote_records_b = db_session.execute(
+        select(VoteRecord).where(VoteRecord.vote_event_id == vote_event_b.id)
+    ).scalars().all()
+    assert len(vote_records_b) == 1
+    assert vote_records_b[0].voter_name == "John Fixtureman"
 
 
 def test_ingest_provenance_columns_populated(db_session, rawstore):
