@@ -2,7 +2,7 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import DataUnavailable from "@/components/DataUnavailable";
 import { apiGet } from "@/lib/api";
-import type { Bill } from "@/lib/types";
+import type { BillVersion } from "@/lib/types";
 
 interface Props {
   params: Promise<{ id: string }>;
@@ -24,8 +24,10 @@ interface CompareResponse {
   meta: unknown;
 }
 
-async function getBill(id: string) {
-  return apiGet<{ data: Bill }>(`/api/v1/bills/${id}`);
+// GET /bills/{id}/versions returns a bare array (see
+// billcommons_api.routers.bills.list_bill_versions), not an envelope.
+async function getVersions(id: string) {
+  return apiGet<BillVersion[]>(`/api/v1/bills/${id}/versions`);
 }
 
 async function getCompare(id: string, from?: string, to?: string) {
@@ -41,8 +43,8 @@ export default async function ComparePage({ params, searchParams }: Props) {
   const { id } = await params;
   const sp = await searchParams;
 
-  const billResult = await getBill(id);
-  const versions = billResult.ok ? billResult.data.data.versions ?? [] : [];
+  const versionsResult = await getVersions(id);
+  const versions = versionsResult.ok ? versionsResult.data : [];
 
   const from = sp.from ?? versions[versions.length - 2]?.id;
   const to = sp.to ?? versions[versions.length - 1]?.id;
@@ -61,7 +63,7 @@ export default async function ComparePage({ params, searchParams }: Props) {
         Compare versions
       </h1>
 
-      {!billResult.ok ? (
+      {!versionsResult.ok ? (
         <div className="mt-6">
           <DataUnavailable message="Bill version data is temporarily unavailable." />
         </div>
@@ -145,7 +147,7 @@ function VersionSelect({
 }: {
   name: string;
   label: string;
-  versions: NonNullable<Bill["versions"]>;
+  versions: BillVersion[];
   selected?: string;
 }) {
   return (

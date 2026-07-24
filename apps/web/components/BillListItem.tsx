@@ -10,9 +10,6 @@ export default function BillListItem({ bill }: { bill: BillSummary }) {
           href={`/bills/${encodeURIComponent(bill.id)}`}
           className="font-medium text-slate-900 hover:underline"
         >
-          {bill.jurisdiction_code ? (
-            <span className="text-slate-500">{bill.jurisdiction_code}</span>
-          ) : null}{" "}
           {bill.identifier} — {bill.title}
         </Link>
         <BillStatusBadge status={bill.status} />
@@ -24,10 +21,9 @@ export default function BillListItem({ bill }: { bill: BillSummary }) {
         />
       ) : null}
       <p className="mt-2 text-xs text-slate-500">
-        {bill.session_identifier ? `${bill.session_identifier} · ` : ""}
         {bill.latest_action_date
           ? `Latest action ${bill.latest_action_date}: ${
-              bill.latest_action_description ?? ""
+              bill.latest_action_text ?? ""
             }`
           : "No recorded actions yet"}
       </p>

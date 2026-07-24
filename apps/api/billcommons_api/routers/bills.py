@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import difflib
 import uuid
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
+from sqlalchemy.orm import selectinload
 
 from billcommons_api.deps import get_db
-from billcommons_api.errors import not_found
+from billcommons_api.errors import conflict, not_found
 from billcommons_api.etag import make_etag
 from billcommons_api.pagination import (
     DEFAULT_PAGE,
@@ -18,10 +20,13 @@ from billcommons_api.pagination import (
 )
 from billcommons_api.schemas import (
     BillActionOut,
+    BillCompareEnvelope,
+    BillCompareOut,
     BillDetail,
     BillDocumentOut,
     BillSummary,
     BillVersionOut,
+    DiffLineOut,
     SponsorshipOut,
     VoteEventOut,
     VoteRecordOut,
@@ -195,3 +200,88 @@ def list_bill_documents(bill_id: uuid.UUID, db: OrmSession = Depends(get_db)) ->
         item.has_extracted_text = bool(r.extracted_text)
         out.append(item)
     return out
+
+
+@router.get("/{bill_id}/compare", response_model=BillCompareEnvelope)
+def compare_bill_versions(
+    bill_id: uuid.UUID,
+    request: Request,
+    from_: uuid.UUID = Query(..., alias="from", description="Bill version id to diff from"),
+    to: uuid.UUID = Query(..., description="Bill version id to diff to"),
+    db: OrmSession = Depends(get_db),
+) -> BillCompareEnvelope:
+    """Deterministic diff of extracted text between two versions of a bill.
+
+    Mirrors apps/mcp compare_bill_versions (difflib), reimplemented locally
+    per architecture: apps don't import across each other. DERIVED output,
+    not an official document -- see docs/SPEC.md "Version diffing".
+    """
+    bill = _get_bill_or_404(db, bill_id)
+
+    version_ids = {from_, to}
+    versions = (
+        db.execute(
+            select(BillVersion)
+            .options(selectinload(BillVersion.documents))
+            .where(BillVersion.bill_id == bill.id, BillVersion.id.in_(version_ids))
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {v.id: v for v in versions}
+    for vid in version_ids:
+        if vid not in by_id:
+            raise not_found(
+                "version_not_found", f"No version {vid} found for bill {bill_id}"
+            )
+
+    def extracted_text(version: BillVersion) -> str | None:
+        for doc in version.documents:
+            if doc.extracted_text:
+                return doc.extracted_text
+        return None
+
+    from_version = by_id[from_]
+    to_version = by_id[to]
+    text_from = extracted_text(from_version)
+    text_to = extracted_text(to_version)
+
+    missing = [
+        str(v.id) for v, t in ((from_version, text_from), (to_version, text_to)) if t is None
+    ]
+    if missing:
+        raise conflict(
+            "extracted_text_unavailable",
+            f"Version(s) {', '.join(missing)} have no extracted text yet.",
+        )
+
+    lines_from = text_from.splitlines()
+    lines_to = text_to.splitlines()
+
+    diff_lines: list[DiffLineOut] = []
+    for line in difflib.unified_diff(
+        lines_from,
+        lines_to,
+        fromfile=f"version:{from_version.note or from_version.id}",
+        tofile=f"version:{to_version.note or to_version.id}",
+        lineterm="",
+    ):
+        if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+            diff_lines.append(DiffLineOut(type="meta", text=line))
+        elif line.startswith("+"):
+            diff_lines.append(DiffLineOut(type="add", text=line))
+        elif line.startswith("-"):
+            diff_lines.append(DiffLineOut(type="remove", text=line))
+        else:
+            diff_lines.append(DiffLineOut(type="context", text=line))
+
+    result = BillCompareOut(
+        bill_id=bill.id,
+        from_version_id=from_version.id,
+        to_version_id=to_version.id,
+        diff_lines=diff_lines,
+    )
+    return BillCompareEnvelope(
+        data=result,
+        meta={"api_version": "v1", "request_id": request.state.request_id},
+    )

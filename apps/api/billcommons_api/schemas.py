@@ -167,18 +167,41 @@ class SourceRecordOut(OrmModel):
     retrieved_at: datetime | None = None
 
 
-class CoverageOut(OrmModel):
-    id: uuid.UUID
-    jurisdiction_id: uuid.UUID
-    session_id: uuid.UUID | None = None
-    status: str
+class CoverageRowOut(BaseModel):
+    """A row in the public coverage matrix (SPEC.md "Coverage"). Assembled by
+    joining jurisdiction_coverage + jurisdictions + sessions -- not a direct
+    ORM projection of any single table."""
+
+    jurisdiction_code: str
+    jurisdiction_name: str
+    session_identifier: str | None = None
+    session_status: str | None = None  # active | adjourned | special
     bill_count: int
     full_text_count: int
-    last_attempt_at: datetime | None = None
-    last_success_at: datetime | None = None
+    full_text_pct: float | None = None
+    last_update: str | None = None
+    source_name: str | None = None
+    validation_sample: int | None = None
     validation_pass_rate: float | None = None
-    known_gaps: str | None = None
-    notes: str | None = None
+    status: str
+    known_gaps: list[str] = []
+
+
+class DiffLineOut(BaseModel):
+    type: str  # add | remove | context | meta
+    text: str
+
+
+class BillCompareOut(BaseModel):
+    bill_id: uuid.UUID
+    from_version_id: uuid.UUID
+    to_version_id: uuid.UUID
+    diff_lines: list[DiffLineOut]
+
+
+class BillCompareEnvelope(BaseModel):
+    data: BillCompareOut
+    meta: dict
 
 
 class SearchResult(BillSummary):

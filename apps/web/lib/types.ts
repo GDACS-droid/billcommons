@@ -50,64 +50,59 @@ export interface Session {
   active?: boolean;
 }
 
+// Shape of GET /bills/{id}/sponsors (billcommons_api.schemas.SponsorshipOut).
+// The API does not join in party/chamber for sponsors today.
 export interface Sponsor {
   id: string;
+  bill_id: string;
   person_id?: string | null;
-  name: string;
-  classification?: string; // primary | cosponsor
-  party?: string | null;
-  chamber?: string | null;
-}
-
-export interface CommitteeRef {
-  id: string;
-  name: string;
-  chamber?: string | null;
+  name?: string | null;
+  classification?: string | null; // primary | cosponsor
+  primary: boolean;
 }
 
 export interface BillAction {
   id: string;
-  date: string;
+  bill_id: string;
   description: string;
-  chamber?: string | null;
-  classification?: string[] | string | null;
-  organization?: string | null;
+  action_date?: string | null;
+  classification?: string | null;
+  order?: number | null;
 }
 
 export interface BillVersion {
   id: string;
+  bill_id: string;
   note?: string | null;
   date?: string | null;
-  url?: string | null;
-  media_type?: string | null;
-  extracted_text_available?: boolean;
 }
 
 export interface BillDocument {
   id: string;
-  note?: string | null;
-  date?: string | null;
-  url?: string | null;
+  bill_version_id: string;
   media_type?: string | null;
+  url?: string | null;
+  has_extracted_text?: boolean;
 }
 
 export interface VoteRecord {
   id: string;
   option: string; // yes | no | abstain | absent | excused
-  voter_name: string;
+  voter_name?: string | null;
   person_id?: string | null;
 }
 
 export interface VoteEvent {
   id: string;
-  motion_text: string;
-  date?: string | null;
-  chamber?: string | null;
+  bill_id?: string | null;
+  motion_text?: string | null;
+  motion_classification?: string | null;
+  start_date?: string | null;
   result?: string | null;
-  yes_count?: number;
-  no_count?: number;
-  other_count?: number;
-  votes?: VoteRecord[];
+  yes_count?: number | null;
+  no_count?: number | null;
+  other_count?: number | null;
+  votes: VoteRecord[];
 }
 
 export interface RelatedBill {
@@ -125,51 +120,48 @@ export interface SourceRecord {
   license_note?: string | null;
 }
 
+// Shape of GET /bills/{id} -- a bare object, NOT a {data, meta} envelope
+// (unlike list endpoints). Only carries fields billcommons_api.schemas
+// .BillDetail actually returns; sponsors/actions/versions/documents/votes
+// are separate subresource endpoints the web page fetches in parallel.
 export interface Bill {
   id: string;
   jurisdiction_id: string;
-  jurisdiction_code?: string;
-  jurisdiction_name?: string;
-  session_id?: string;
-  session_identifier?: string;
+  session_id: string;
   chamber?: string | null;
   identifier: string; // as-published, e.g. "H.B. 123"
-  identifier_norm?: string; // "HB 123"
-  bill_type?: string | null;
+  identifier_norm: string; // "HB 123"
   title: string;
   short_title?: string | null;
-  description?: string | null;
-  subjects?: string[];
+  bill_type?: string | null;
   status?: string | null;
   status_date?: string | null;
   introduced_date?: string | null;
+  latest_action_text?: string | null;
   latest_action_date?: string | null;
-  latest_action_description?: string | null;
-  sponsors?: Sponsor[];
-  committees?: CommitteeRef[];
-  actions?: BillAction[];
-  versions?: BillVersion[];
-  documents?: BillDocument[];
-  votes?: VoteEvent[];
-  related_bills?: RelatedBill[];
-  sources?: SourceRecord[];
-  official_source_url?: string | null;
-  updated_at?: string | null;
-  known_limitations?: string[];
+  source_url?: string | null;
+  description?: string | null;
+  source_name?: string | null;
+  retrieved_at?: string | null;
+  upstream_updated_at?: string | null;
 }
 
 export interface BillSummary {
   id: string;
-  jurisdiction_code?: string;
-  jurisdiction_name?: string;
-  session_identifier?: string;
+  jurisdiction_id: string;
+  session_id: string;
   chamber?: string | null;
   identifier: string;
+  identifier_norm: string;
   title: string;
+  short_title?: string | null;
+  bill_type?: string | null;
   status?: string | null;
+  status_date?: string | null;
+  introduced_date?: string | null;
+  latest_action_text?: string | null;
   latest_action_date?: string | null;
-  latest_action_description?: string | null;
-  updated_at?: string | null;
+  source_url?: string | null;
   highlight?: string | null;
 }
 
