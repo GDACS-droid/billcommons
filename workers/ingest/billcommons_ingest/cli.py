@@ -22,6 +22,7 @@ Subcommands (per BRIEF-wave2.md):
 """
 from __future__ import annotations
 
+import os
 import argparse
 import socket
 import sys
@@ -690,8 +691,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker.add_argument(
         "--validate-schedule-interval",
         type=float,
-        default=1800.0,
-        help="seconds between validation-scheduler enqueue passes (default 1800s/30min; 0 disables)",
+        default=float(os.environ.get("VALIDATE_SCHEDULE_INTERVAL", "0")),
+        help=(
+            "seconds between validation-scheduler enqueue passes "
+            "(default 0 = DISABLED, env VALIDATE_SCHEDULE_INTERVAL to enable). "
+            "Disabled by default because a slow external validation job on the "
+            "single crawl worker starves the fetch_text queue; validation runs "
+            "as a separate paced process (see docs/operations)."
+        ),
     )
     p_worker.add_argument(
         "--validate-batch",
