@@ -56,24 +56,19 @@ export default async function HearingsPage({ searchParams }: Props) {
                 >
                   <p className="font-medium text-slate-900">{h.name}</p>
                   <p className="mt-1 text-sm text-slate-600">
-                    {h.start_date}
-                    {h.jurisdiction_code ? ` · ${h.jurisdiction_code}` : ""}
-                    {h.committee_name ? ` · ${h.committee_name}` : ""}
+                    {h.start_date ?? "Date not provided"}
+                    {h.jurisdiction_abbreviation ? ` · ${h.jurisdiction_abbreviation}` : ""}
                     {h.location ? ` · ${h.location}` : ""}
                   </p>
-                  {h.bills?.length ? (
-                    <ul className="mt-2 flex flex-wrap gap-2 text-xs">
-                      {h.bills.map((b) => (
-                        <li key={b.id}>
-                          <Link
-                            href={`/bills/${b.id}`}
-                            className="rounded-full border border-slate-300 px-2 py-0.5 hover:bg-slate-50"
-                          >
-                            {b.identifier}
-                          </Link>
-                        </li>
-                      ))}
-                    </ul>
+                  {h.bill_id ? (
+                    <p className="mt-2 text-xs">
+                      <Link
+                        href={`/bills/${h.bill_id}`}
+                        className="rounded-full border border-slate-300 px-2 py-0.5 hover:bg-slate-50"
+                      >
+                        View related bill
+                      </Link>
+                    </p>
                   ) : null}
                 </li>
               ))}

@@ -69,7 +69,7 @@ export default async function BillPage({ params }: Props) {
   }
 
   const bill = result.data;
-  const jurisdictionCode = jurisdiction?.ok ? jurisdiction.data.code : undefined;
+  const jurisdictionCode = jurisdiction?.ok ? jurisdiction.data.abbreviation : undefined;
   const jurisdictionName = jurisdiction?.ok ? jurisdiction.data.name : undefined;
 
   return (

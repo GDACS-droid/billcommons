@@ -6,6 +6,7 @@ import { CoverageBadge } from "@/components/StatusBadge";
 import { apiGet } from "@/lib/api";
 import type {
   BillSummary,
+  CoverageRow,
   Jurisdiction,
   ListEnvelope,
   Session,
@@ -34,6 +35,13 @@ async function getRecentBills(code: string) {
   });
 }
 
+async function getCoverage(code: string) {
+  return apiGet<ListEnvelope<CoverageRow>>("/api/v1/coverage", {
+    jurisdiction: code,
+    per_page: 1,
+  });
+}
+
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { code } = await params;
   const result = await getJurisdiction(code);
@@ -49,11 +57,17 @@ export default async function StatePage({ params }: Props) {
   const { code } = await params;
   const upperCode = code.toUpperCase();
 
-  const [jurisdictionResult, sessionsResult, billsResult] = await Promise.all([
-    getJurisdiction(upperCode),
-    getSessions(upperCode),
-    getRecentBills(upperCode),
-  ]);
+  const [jurisdictionResult, sessionsResult, billsResult, coverageResult] =
+    await Promise.all([
+      getJurisdiction(upperCode),
+      getSessions(upperCode),
+      getRecentBills(upperCode),
+      getCoverage(upperCode),
+    ]);
+
+  const coverageStatus = coverageResult.ok
+    ? coverageResult.data.data[0]?.status
+    : undefined;
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
@@ -68,9 +82,7 @@ export default async function StatePage({ params }: Props) {
         <h1 className="text-2xl font-semibold text-slate-900">
           {jurisdictionResult.ok ? jurisdictionResult.data.name : upperCode}
         </h1>
-        {jurisdictionResult.ok && jurisdictionResult.data.coverage_status ? (
-          <CoverageBadge status={jurisdictionResult.data.coverage_status} />
-        ) : null}
+        {coverageStatus ? <CoverageBadge status={coverageStatus} /> : null}
       </div>
 
       {!jurisdictionResult.ok ? (
@@ -102,7 +114,7 @@ export default async function StatePage({ params }: Props) {
                   )}`}
                   className="font-medium text-slate-900 hover:underline"
                 >
-                  {session.name}
+                  {session.name ?? session.identifier}
                 </Link>
                 <p className="mt-1 text-xs text-slate-500">
                   {session.classification ?? "session"}

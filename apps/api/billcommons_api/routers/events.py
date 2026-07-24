@@ -27,28 +27,30 @@ def list_events(
     db: OrmSession = Depends(get_db),
 ) -> Page[LegislativeEventOut]:
     per_page = clamp_per_page(per_page)
-    stmt = select(LegislativeEvent)
-    count_stmt = select(func.count()).select_from(LegislativeEvent)
+    stmt = select(LegislativeEvent, Jurisdiction).outerjoin(
+        Jurisdiction, Jurisdiction.id == LegislativeEvent.jurisdiction_id
+    )
+    count_stmt = (
+        select(func.count())
+        .select_from(LegislativeEvent)
+        .outerjoin(Jurisdiction, Jurisdiction.id == LegislativeEvent.jurisdiction_id)
+    )
 
     if jurisdiction:
-        stmt = stmt.join(
-            Jurisdiction, Jurisdiction.id == LegislativeEvent.jurisdiction_id
-        ).where(Jurisdiction.abbreviation == jurisdiction.upper())
-        count_stmt = count_stmt.join(
-            Jurisdiction, Jurisdiction.id == LegislativeEvent.jurisdiction_id
-        ).where(Jurisdiction.abbreviation == jurisdiction.upper())
+        stmt = stmt.where(Jurisdiction.abbreviation == jurisdiction.upper())
+        count_stmt = count_stmt.where(Jurisdiction.abbreviation == jurisdiction.upper())
 
     total = db.execute(count_stmt).scalar_one()
-    rows = (
-        db.execute(
-            stmt.order_by(LegislativeEvent.start_date.desc().nullslast())
-            .offset((page - 1) * per_page)
-            .limit(per_page)
-        )
-        .scalars()
-        .all()
-    )
-    items = [LegislativeEventOut.model_validate(r) for r in rows]
+    rows = db.execute(
+        stmt.order_by(LegislativeEvent.start_date.desc().nullslast())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+    ).all()
+    items = []
+    for event_row, jurisdiction_row in rows:
+        item = LegislativeEventOut.model_validate(event_row)
+        item.jurisdiction_abbreviation = jurisdiction_row.abbreviation if jurisdiction_row else None
+        items.append(item)
     return paginate(
         items,
         page=page,

@@ -27,27 +27,31 @@ export interface DetailEnvelope<T> {
   meta: ResponseMeta;
 }
 
+// Shape of GET /jurisdictions/{id} (billcommons_api.schemas.Jurisdiction) --
+// a bare object, not a {data, meta} envelope. Route also accepts either a
+// UUID or a 2-letter abbreviation.
 export interface Jurisdiction {
   id: string;
   name: string;
-  code: string; // e.g. "NC", "DC"
-  classification?: string;
-  current_session_id?: string | null;
-  current_session_name?: string | null;
-  coverage_status?: CoverageStatus;
-  updated_at?: string;
+  abbreviation: string; // e.g. "NC", "DC"
+  classification: string;
+  openstates_id?: string | null;
 }
 
+// Shape of a row in GET /sessions (billcommons_api.schemas.Session).
+// jurisdiction_abbreviation/name are joined in server-side for linking --
+// see apps/api/billcommons_api/routers/sessions.py.
 export interface Session {
   id: string;
   jurisdiction_id: string;
-  jurisdiction_code?: string;
-  name: string;
+  jurisdiction_abbreviation?: string | null;
+  jurisdiction_name?: string | null;
   identifier: string;
-  classification?: string; // regular | special
+  name?: string | null;
+  classification?: string | null; // regular | special
   start_date?: string | null;
   end_date?: string | null;
-  active?: boolean;
+  active: boolean;
 }
 
 // Shape of GET /bills/{id}/sponsors (billcommons_api.schemas.SponsorshipOut).
@@ -165,35 +169,43 @@ export interface BillSummary {
   highlight?: string | null;
 }
 
+// Shape of GET /people/{id} (billcommons_api.schemas.PersonDetail) -- a bare
+// object, not a {data, meta} envelope. No chamber/district/current/members
+// fields exist upstream yet; sponsored bills aren't a sub-resource of a
+// person today (see /people/[id]/page.tsx "not available yet" fallback).
 export interface Person {
   id: string;
   name: string;
   party?: string | null;
-  chamber?: string | null;
-  jurisdiction_code?: string;
-  district?: string | null;
-  current?: boolean;
-  sponsored_bills?: BillSummary[];
+  jurisdiction_id?: string | null;
+  openstates_id?: string | null;
 }
 
+// Shape of GET /committees/{id} (billcommons_api.schemas.CommitteeOut) -- a
+// bare object. No chamber/members/bills fields exist upstream yet (no
+// membership table, no committee->bills relation) -- see
+// /committees/[id]/page.tsx "not available yet" fallback.
 export interface Committee {
   id: string;
+  organization_id: string;
   name: string;
-  chamber?: string | null;
-  jurisdiction_code?: string;
-  members?: { person_id: string; name: string; role?: string | null }[];
-  bills?: BillSummary[];
+  classification?: string | null;
 }
 
+// Shape of a row in GET /events (billcommons_api.schemas.LegislativeEventOut).
+// jurisdiction_abbreviation is joined in server-side for display -- see
+// apps/api/billcommons_api/routers/events.py. No committee_name/status/bills
+// fields exist upstream yet (only committee_id/bill_id FKs, no join).
 export interface HearingEvent {
   id: string;
+  jurisdiction_id?: string | null;
+  jurisdiction_abbreviation?: string | null;
+  bill_id?: string | null;
+  committee_id?: string | null;
   name: string;
-  start_date: string;
-  jurisdiction_code?: string;
-  committee_name?: string | null;
+  description?: string | null;
+  start_date?: string | null;
   location?: string | null;
-  status?: string | null;
-  bills?: { id: string; identifier: string; title: string }[];
 }
 
 export type CoverageStatus =

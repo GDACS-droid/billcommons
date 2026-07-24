@@ -33,6 +33,8 @@ class LegislativeBody(OrmModel):
 class Session(OrmModel):
     id: uuid.UUID
     jurisdiction_id: uuid.UUID
+    jurisdiction_abbreviation: str | None = None
+    jurisdiction_name: str | None = None
     identifier: str
     name: str | None = None
     classification: str | None = None
@@ -149,6 +151,7 @@ class CommitteeOut(OrmModel):
 class LegislativeEventOut(OrmModel):
     id: uuid.UUID
     jurisdiction_id: uuid.UUID | None = None
+    jurisdiction_abbreviation: str | None = None
     bill_id: uuid.UUID | None = None
     committee_id: uuid.UUID | None = None
     name: str

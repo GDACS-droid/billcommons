@@ -54,11 +54,26 @@ def list_jurisdictions(
 
 @router.get("/{jurisdiction_id}", response_model=JurisdictionOut)
 def get_jurisdiction(
-    jurisdiction_id: uuid.UUID,
+    jurisdiction_id: str,
     response: Response,
     db: Session = Depends(get_db),
 ) -> JurisdictionOut:
-    row = db.get(Jurisdiction, jurisdiction_id)
+    """Accepts either a jurisdiction UUID or a 2-letter abbreviation
+    (case-insensitive), e.g. /jurisdictions/NC -- the web's /states/{code}
+    pages link by abbreviation, not UUID."""
+    row: Jurisdiction | None = None
+    try:
+        parsed_id = uuid.UUID(jurisdiction_id)
+    except ValueError:
+        parsed_id = None
+
+    if parsed_id is not None:
+        row = db.get(Jurisdiction, parsed_id)
+    elif len(jurisdiction_id) <= 8:
+        row = db.execute(
+            select(Jurisdiction).where(Jurisdiction.abbreviation == jurisdiction_id.upper())
+        ).scalar_one_or_none()
+
     if row is None:
         raise not_found("jurisdiction_not_found", f"No jurisdiction with id {jurisdiction_id}")
     response.headers["ETag"] = make_etag(row.id, row.updated_at)

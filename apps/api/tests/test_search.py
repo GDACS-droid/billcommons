@@ -135,3 +135,32 @@ def test_search_malformed_date_is_a_typed_422(client):
     resp = client.get("/api/v1/search", params={"date_from": "not-a-date"})
     assert resp.status_code == 422
     assert "error" in resp.json()
+
+
+def test_search_trigram_fallback_on_zero_fts_matches_returns_200(client):
+    """Regression for the trigram_fallback SQL bug: a misspelled query that
+    yields zero full-text matches must fall through to the pg_trgm fuzzy
+    branch and return a clean 200 envelope, not a 500 from malformed SQL
+    (the fallback used to append `, similarity(...)` after the JOIN clauses,
+    which is invalid SQL and 500'd on the live DB)."""
+    resp = client.get("/api/v1/search", params={"q": "educatoin fnding"})
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    for item in body["data"]:
+        _assert_result_item_shape(item)
+        assert item["match_type"] in {"fuzzy_title", "full_text", "bill_number"}
+
+
+def test_search_plain_nonsense_query_is_honest_empty_not_500(client):
+    """A query with no plausible fuzzy match anywhere (FTS misses, trigram
+    similarity misses) must still be a 200 with an empty/low result set --
+    never a 500 from any of the three search branches."""
+    resp = client.get(
+        "/api/v1/search", params={"q": "zzqxvbjklmwpfhq nonexistent gibberish token"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    for item in body["data"]:
+        _assert_result_item_shape(item)

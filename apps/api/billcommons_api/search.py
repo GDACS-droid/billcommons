@@ -226,8 +226,13 @@ def trigram_fallback(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
     params["threshold"] = 0.15
 
     sql = text(f"""
-        {_BASE_SELECT}
-        , similarity(b.title, :q) AS rank
+        SELECT b.id, b.jurisdiction_id, b.session_id, b.chamber, b.identifier,
+               b.identifier_norm, b.title, b.short_title, b.bill_type, b.status,
+               b.status_date, b.introduced_date, b.latest_action_text,
+               b.latest_action_date, b.source_url, similarity(b.title, :q) AS rank
+        FROM bills b
+        JOIN jurisdictions j ON j.id = b.jurisdiction_id
+        JOIN sessions s ON s.id = b.session_id
         WHERE similarity(b.title, :q) > :threshold{where_sql}
         ORDER BY rank DESC, b.id
         LIMIT :limit OFFSET :offset

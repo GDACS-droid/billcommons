@@ -1,22 +1,35 @@
-import Link from "next/link";
 import type { Metadata } from "next";
 import DataUnavailable from "@/components/DataUnavailable";
 import BillListItem from "@/components/BillListItem";
 import { apiGet } from "@/lib/api";
-import type { Person } from "@/lib/types";
+import type { BillSummary, ListEnvelope, Person } from "@/lib/types";
 
 interface Props {
   params: Promise<{ id: string }>;
 }
 
+// GET /people/{id} returns the bare PersonDetail object -- no {data, meta}
+// envelope (unlike list endpoints). See
+// apps/api/billcommons_api/routers/people.py.
 async function getPerson(id: string) {
-  return apiGet<{ data: Person }>(`/api/v1/people/${id}`);
+  return apiGet<Person>(`/api/v1/people/${id}`);
+}
+
+// There's no /people/{id}/sponsored-bills sub-resource yet; the closest real
+// signal is /search's `sponsor` filter, which does an ILIKE substring match
+// on the sponsorship name (not a person_id join) -- so results here are a
+// best-effort, name-based approximation, not a precise sponsorship record.
+async function getSponsoredBills(name: string) {
+  return apiGet<ListEnvelope<BillSummary>>("/api/v1/search", {
+    sponsor: name,
+    per_page: 20,
+  });
 }
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { id } = await params;
   const result = await getPerson(id);
-  const name = result.ok ? result.data.data.name : "Legislator";
+  const name = result.ok ? result.data.name : "Legislator";
   return {
     title: name,
     alternates: { canonical: `/people/${id}` },
@@ -35,43 +48,35 @@ export default async function PersonPage({ params }: Props) {
     );
   }
 
-  const person = result.data.data;
+  const person = result.data;
+  const sponsoredBills = await getSponsoredBills(person.name);
 
   return (
     <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
-      {person.jurisdiction_code ? (
-        <nav aria-label="Breadcrumb" className="text-sm text-slate-500">
-          <Link
-            href={`/states/${person.jurisdiction_code}`}
-            className="hover:underline"
-          >
-            {person.jurisdiction_code}
-          </Link>{" "}
-          / {person.name}
-        </nav>
-      ) : null}
-
       <h1 className="mt-2 text-2xl font-semibold text-slate-900">
         {person.name}
       </h1>
-      <p className="mt-1 text-sm text-slate-600">
-        {person.party ? `${person.party} · ` : ""}
-        {person.chamber ?? ""}
-        {person.district ? ` · District ${person.district}` : ""}
-        {person.current === false ? " · former member" : ""}
-      </p>
+      {person.party ? (
+        <p className="mt-1 text-sm text-slate-600">{person.party}</p>
+      ) : null}
 
       <section className="mt-8">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
-          Sponsored bills
+          Bills sponsored by this name
         </h2>
-        {!person.sponsored_bills || person.sponsored_bills.length === 0 ? (
+        <p className="mt-1 text-xs text-slate-400">
+          Matched by sponsor name, not a verified sponsorship record — a
+          precise per-person sponsorship link is not available yet.
+        </p>
+        {!sponsoredBills.ok ? (
+          <DataUnavailable message="Sponsored-bill data is temporarily unavailable." />
+        ) : sponsoredBills.data.data.length === 0 ? (
           <p className="mt-2 text-sm text-slate-600">
-            No sponsored bills on record.
+            No matching sponsored bills found.
           </p>
         ) : (
           <ul className="mt-3 space-y-3">
-            {person.sponsored_bills.map((bill) => (
+            {sponsoredBills.data.data.map((bill) => (
               <BillListItem key={bill.id} bill={bill} />
             ))}
           </ul>

@@ -115,12 +115,13 @@ export default async function HomePage() {
                 className="rounded-lg border border-slate-200 p-4"
               >
                 <Link
-                  href={`/states/${session.jurisdiction_code ?? ""}/sessions/${encodeURIComponent(
-                    session.identifier
-                  )}`}
+                  href={`/states/${
+                    session.jurisdiction_abbreviation ?? ""
+                  }/sessions/${encodeURIComponent(session.identifier)}`}
                   className="font-medium text-slate-900 hover:underline"
                 >
-                  {session.jurisdiction_code} — {session.name}
+                  {session.jurisdiction_abbreviation ?? ""} —{" "}
+                  {session.name ?? session.identifier}
                 </Link>
                 <p className="mt-1 text-xs text-slate-500">
                   {session.classification ?? "session"}

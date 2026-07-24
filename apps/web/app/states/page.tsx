@@ -46,14 +46,11 @@ export default async function StatesPage() {
                   className="rounded-lg border border-slate-200 p-4"
                 >
                   <Link
-                    href={`/states/${j.code}`}
+                    href={`/states/${j.abbreviation}`}
                     className="font-medium text-slate-900 hover:underline"
                   >
                     {j.name}
                   </Link>
-                  <p className="mt-1 text-xs text-slate-500">
-                    {j.current_session_name ?? "No active session on record"}
-                  </p>
                 </li>
               ))}
           </ul>

@@ -30,31 +30,34 @@ def list_sessions(
     db: OrmSession = Depends(get_db),
 ) -> Page[SessionOut]:
     per_page = clamp_per_page(per_page)
-    stmt = select(Session)
-    count_stmt = select(func.count()).select_from(Session)
+    stmt = select(Session, Jurisdiction).join(
+        Jurisdiction, Jurisdiction.id == Session.jurisdiction_id
+    )
+    count_stmt = (
+        select(func.count())
+        .select_from(Session)
+        .join(Jurisdiction, Jurisdiction.id == Session.jurisdiction_id)
+    )
 
     if jurisdiction:
-        stmt = stmt.join(Jurisdiction, Jurisdiction.id == Session.jurisdiction_id).where(
-            Jurisdiction.abbreviation == jurisdiction.upper()
-        )
-        count_stmt = count_stmt.join(
-            Jurisdiction, Jurisdiction.id == Session.jurisdiction_id
-        ).where(Jurisdiction.abbreviation == jurisdiction.upper())
+        stmt = stmt.where(Jurisdiction.abbreviation == jurisdiction.upper())
+        count_stmt = count_stmt.where(Jurisdiction.abbreviation == jurisdiction.upper())
     if active is not None:
         stmt = stmt.where(Session.active == active)
         count_stmt = count_stmt.where(Session.active == active)
 
     total = db.execute(count_stmt).scalar_one()
-    rows = (
-        db.execute(
-            stmt.order_by(Session.start_date.desc().nullslast())
-            .offset((page - 1) * per_page)
-            .limit(per_page)
-        )
-        .scalars()
-        .all()
-    )
-    items = [SessionOut.model_validate(r) for r in rows]
+    rows = db.execute(
+        stmt.order_by(Session.start_date.desc().nullslast())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+    ).all()
+    items = []
+    for session_row, jurisdiction_row in rows:
+        item = SessionOut.model_validate(session_row)
+        item.jurisdiction_abbreviation = jurisdiction_row.abbreviation
+        item.jurisdiction_name = jurisdiction_row.name
+        items.append(item)
     return paginate(
         items,
         page=page,
