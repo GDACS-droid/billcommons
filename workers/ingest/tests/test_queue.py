@@ -162,3 +162,107 @@ def test_dead_letter_job_is_immediate(db_session, unique_kind):
 
     assert claimed.status == "dead"
     assert claimed.last_error == "unrecoverable"
+
+
+def test_count_claimable_ignores_jobs_parked_on_backoff(db_session, unique_kind):
+    """The crawl's top-up gate asks "am I about to run out of work?" -- and a
+    job whose backoff puts it minutes in the future is NOT work available now.
+    Counting it anyway is what let a queue full of failing-and-backing-off jobs
+    read as a healthy backlog, so the top-up never fired and the crawl sat at
+    zero throughput with a full-looking queue.
+    """
+    from billcommons_ingest.queue import count_claimable, count_queued
+
+    kind = unique_kind()
+    ready = enqueue(db_session, kind, {"n": 1})
+    parked = enqueue(db_session, kind, {"n": 2})
+    parked.run_after = datetime.now(timezone.utc) + timedelta(minutes=30)
+    db_session.flush()
+
+    assert count_queued(db_session, kind) == 2, "both rows are queued"
+    assert count_claimable(db_session, kind) == 1, (
+        "only the job whose run_after has arrived is real, available backlog"
+    )
+    assert ready.status == "queued" and parked.status == "queued"
+
+
+def test_permanently_failing_job_dies_even_though_the_claim_is_rolled_back(unique_kind):
+    """A job that always fails must reach the dead-letter cap.
+
+    This walks the worker's REAL failure path: claim in one session, roll that
+    session back (which is what discards the claim's uncommitted attempts
+    increment), then record the failure in a fresh session via
+    record_job_failure. If the post-claim attempt count isn't carried across
+    that boundary, every retry re-reads attempts=0, the job requeues forever,
+    and -- because it stays `queued` -- it also keeps the queue above the
+    top-up floor so no new work is ever enqueued. That combination took the
+    crawl to exactly zero throughput on 2026-07-25 while the worker looked
+    busy. Uses committing sessions (not the rollback fixture) because the
+    session boundary is the thing under test.
+    """
+    from billcommons_ingest.cli import record_job_failure
+    from billcommons_schema.models import IngestJob
+    from billcommons_shared.db import get_session
+
+    kind = unique_kind()
+    setup = get_session()
+    try:
+        job = enqueue(setup, kind, {"doc": "always-fails"})
+        setup.commit()
+        job_id = job.id
+    finally:
+        setup.close()
+
+    try:
+        for _ in range(10):
+            claiming = get_session()
+            try:
+                claimed = claim_job(claiming, "worker-under-test", kind=kind)
+                if claimed is None:
+                    break
+                # Read the count while the uncommitted increment is still live,
+                # exactly as the worker loop does.
+                claimed_attempts = claimed.attempts
+                claiming.rollback()
+            finally:
+                claiming.close()
+
+            record_job_failure(
+                job_id,
+                IngestJob,
+                claimed_attempts=claimed_attempts,
+                error="permanent failure",
+                session_factory=get_session,
+            )
+
+            # Skip past the backoff so the next iteration can claim it.
+            bump = get_session()
+            try:
+                row = bump.get(IngestJob, job_id)
+                if row.status != "queued":
+                    break
+                row.run_after = datetime.now(timezone.utc)
+                bump.commit()
+            finally:
+                bump.close()
+
+        check = get_session()
+        try:
+            final = check.get(IngestJob, job_id)
+            assert final.status == "dead", (
+                f"a job that always fails must dead-letter, got status={final.status!r} "
+                f"attempts={final.attempts} -- if attempts is 0 the claim's increment "
+                f"was lost across the rollback and this job would retry forever"
+            )
+            assert final.attempts >= 5
+        finally:
+            check.close()
+    finally:
+        cleanup = get_session()
+        try:
+            row = cleanup.get(IngestJob, job_id)
+            if row is not None:
+                cleanup.delete(row)
+                cleanup.commit()
+        finally:
+            cleanup.close()

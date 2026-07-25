@@ -20,6 +20,7 @@ import httpx
 import pytest
 from pypdf import PdfWriter
 
+from billcommons_ingest import fulltext as fulltext_mod
 from billcommons_ingest.fulltext import (
     STATUS_MALFORMED_URL,
     STATUS_OK,
@@ -795,3 +796,143 @@ def test_enqueue_fulltext_jobs_reenqueues_after_job_completes(db_session):
 
     count = enqueue_fulltext_jobs(db_session, document_ids=[document.id])
     assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# TLS-intermediate repair (billcommons_shared.aia integration)
+# ---------------------------------------------------------------------------
+
+def _missing_issuer_error() -> httpx.ConnectError:
+    import ssl
+    inner = ssl.SSLCertVerificationError(
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+        "unable to get local issuer certificate (_ssl.c:1010)"
+    )
+    outer = httpx.ConnectError("connection failed")
+    outer.__cause__ = inner
+    return outer
+
+
+class _FakeClient:
+    """Client that raises `error` on the first N gets, then returns `response`."""
+
+    def __init__(self, error=None, response=None):
+        self.error = error
+        self.response = response
+        self.calls: list[str] = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(url)
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+class _AllowAllRobots:
+    def __init__(self, allow=True):
+        self.allow = allow
+        self.invalidated: list[str] = []
+
+    def can_fetch(self, url):
+        return self.allow
+
+    def invalidate(self, origin):
+        self.invalidated.append(origin)
+
+
+def test_missing_tls_intermediate_is_repaired_and_the_fetch_retried(monkeypatch):
+    """MI, MS and CT serve only their leaf certificate. Unhandled, that made
+    their ENTIRE full-text corpus permanently unfetchable (0 of 3,884 bills for
+    MI, 0 of 4,006 for MS) while looking like an ordinary transient network
+    error. A recovered intermediate must transparently rescue the fetch."""
+    import ssl as _ssl
+
+    url = "https://legislature.mi.gov/doc.htm"
+    ok = httpx.Response(200, content=b"<html>bill text</html>", request=httpx.Request("GET", url))
+    repaired_client = _FakeClient(response=ok)
+    monkeypatch.setattr(fulltext_mod, "new_client", lambda **kw: repaired_client)
+
+    fetcher = fulltext_mod.FullTextFetcher(
+        client=_FakeClient(error=_missing_issuer_error()),
+        rate_limiter=fulltext_mod.RateLimiter(rate_per_sec=1000.0, burst=1000),
+        robots_cache=_AllowAllRobots(),
+    )
+    fetcher.aia_cache = type(
+        "Cache", (), {"get": staticmethod(lambda host, port=443: _ssl.create_default_context())}
+    )()
+
+    response = fetcher.fetch(url)
+    assert response.status_code == 200
+    assert repaired_client.calls == [url]
+
+
+def test_unrepairable_tls_failure_keeps_failing(monkeypatch):
+    """When no genuine intermediate can be recovered, the original TLS error
+    must surface. Silently succeeding here would mean verification had been
+    downgraded rather than repaired."""
+    fetcher = fulltext_mod.FullTextFetcher(
+        client=_FakeClient(error=_missing_issuer_error()),
+        rate_limiter=fulltext_mod.RateLimiter(rate_per_sec=1000.0, burst=1000),
+        robots_cache=_AllowAllRobots(),
+    )
+    fetcher.aia_cache = type("Cache", (), {"get": staticmethod(lambda host, port=443: None)})()
+
+    with pytest.raises(httpx.HTTPError):
+        fetcher.fetch("https://broken.example/doc.htm")
+
+
+def test_expired_certificate_is_never_treated_as_repairable():
+    """Only a missing intermediate is repairable. An expired certificate is a
+    real trust failure and must not trigger a repair attempt at all."""
+    expired = httpx.ConnectError(
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate has expired (_ssl.c:1010)"
+    )
+    probed: list[str] = []
+    fetcher = fulltext_mod.FullTextFetcher(
+        client=_FakeClient(error=expired),
+        rate_limiter=fulltext_mod.RateLimiter(rate_per_sec=1000.0, burst=1000),
+        robots_cache=_AllowAllRobots(),
+    )
+    fetcher.aia_cache = type(
+        "Cache", (), {"get": staticmethod(lambda host, port=443: probed.append(host))}
+    )()
+
+    with pytest.raises(httpx.HTTPError):
+        fetcher.fetch("https://expired.example/doc.htm")
+    assert probed == [], "an expired certificate must not even be probed for repair"
+
+
+def test_robots_is_re_read_after_a_repair_and_still_obeyed(monkeypatch):
+    """The allow-all robots fallback fires when robots.txt itself can't be
+    fetched -- which is exactly what a broken cert chain causes. CT
+    (www.cga.ct.gov) publishes a REAL robots.txt with Disallow paths, so the
+    cert bug had us failing open on a host that genuinely restricts parts of
+    itself. Once the connection works, its rules must be re-read and honoured.
+    """
+    import ssl as _ssl
+
+    repaired_client = _FakeClient(response=httpx.Response(200, content=b"x"))
+    monkeypatch.setattr(fulltext_mod, "new_client", lambda **kw: repaired_client)
+
+    robots = _AllowAllRobots(allow=True)
+
+    class _DisallowAfterRepair(_AllowAllRobots):
+        def invalidate(self, origin):
+            self.invalidated.append(origin)
+            self.allow = False  # the real file, once readable, disallows this path
+
+    robots = _DisallowAfterRepair(allow=True)
+    fetcher = fulltext_mod.FullTextFetcher(
+        client=_FakeClient(error=_missing_issuer_error()),
+        rate_limiter=fulltext_mod.RateLimiter(rate_per_sec=1000.0, burst=1000),
+        robots_cache=robots,
+    )
+    fetcher.aia_cache = type(
+        "Cache", (), {"get": staticmethod(lambda host, port=443: _ssl.create_default_context())}
+    )()
+
+    with pytest.raises(fulltext_mod.UnfetchableDocument) as excinfo:
+        fetcher.fetch("https://www.cga.ct.gov/html/secret.htm")
+    assert excinfo.value.status == fulltext_mod.STATUS_ROBOTS_DISALLOWED
+    assert robots.invalidated == ["https://www.cga.ct.gov"]
+    assert repaired_client.calls == [], "must not fetch a disallowed URL after repair"

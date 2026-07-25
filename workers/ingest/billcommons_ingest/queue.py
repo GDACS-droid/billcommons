@@ -158,3 +158,25 @@ def count_queued(db: Session, kind: str, status: str = "queued") -> int:
         .where(IngestJob.kind == kind, IngestJob.status == status)
     )
     return int(db.execute(stmt).scalar_one())
+
+
+def count_claimable(db: Session, kind: str) -> int:
+    """Count queued jobs of `kind` that are eligible to run RIGHT NOW.
+
+    This is the honest measure of "is the worker about to run out of work",
+    and it is what the crawl's top-up gate must compare against its floor.
+    Counting every queued row instead lets jobs parked on a long backoff --
+    or, before the attempts fix, jobs stuck retrying forever -- masquerade as
+    available backlog: the queue reads as full, the top-up never fires, and
+    throughput sits at zero while the depth metric looks healthy.
+    """
+    stmt = (
+        select(func.count())
+        .select_from(IngestJob)
+        .where(
+            IngestJob.kind == kind,
+            IngestJob.status == "queued",
+            IngestJob.run_after <= datetime.now(timezone.utc),
+        )
+    )
+    return int(db.execute(stmt).scalar_one())

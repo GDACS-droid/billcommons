@@ -442,7 +442,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
             ):
                 db_ft = get_session()
                 try:
-                    queued = queue_mod.count_queued(db_ft, fulltext_mod.FETCH_TEXT_KIND)
+                    queued = queue_mod.count_claimable(db_ft, fulltext_mod.FETCH_TEXT_KIND)
                     if queued < fulltext_topup_floor:
                         added = fulltext_mod.enqueue_fulltext_jobs(
                             db_ft, limit=fulltext_topup_batch
@@ -522,7 +522,19 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     db.commit()
                     time.sleep(poll_interval)
                     continue
-                print(f"worker {worker_id}: claimed job {job.id} kind={job.kind}")
+                print(f"worker {worker_id}: claimed job {job.id} kind={job.kind}", flush=True)
+                # Read the post-claim attempt count NOW, while this session's
+                # uncommitted increment is still live in memory. Both failure
+                # handlers below call db.rollback(), which discards that
+                # increment AND expires `job`, so a later `job.attempts` would
+                # silently re-read the pre-claim value from the database and
+                # hand fail_job a count that never grows -- the job then
+                # requeues forever and can never reach the dead-letter cap.
+                # That is exactly what deadlocked the crawl on 2026-07-25: 1,215
+                # permanently-failing jobs all sitting at attempts=0, retried
+                # every 30s indefinitely, holding `queued` above the top-up
+                # floor so no new work could ever be enqueued either.
+                claimed_attempts = job.attempts
                 try:
                     # Dispatch by kind is intentionally minimal here; concrete
                     # job kinds (bootstrap/api-sync/recompute-coverage) are
@@ -594,35 +606,81 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     # re-apply the SAME status in the fresh session used for
                     # dead-lettering/failing, durably, before that commit.
                     db.rollback()
-                    is_terminal = exc.status in fulltext_mod.TERMINAL_STATUSES
-                    db2 = get_session()
-                    try:
-                        if exc.document_id and exc.status:
-                            document2 = db2.get(BillDocument, exc.document_id)
-                            if document2 is not None:
-                                document2.license_note = f"fulltext_status={exc.status}"
-                        job2 = db2.get(type(job), job.id)
-                        if is_terminal:
-                            queue_mod.dead_letter_job(db2, job2, str(exc))
-                        else:
-                            queue_mod.fail_job(db2, job2, str(exc))
-                        db2.commit()
-                    finally:
-                        db2.close()
+                    record_job_failure(
+                        job.id,
+                        type(job),
+                        claimed_attempts=claimed_attempts,
+                        error=str(exc),
+                        terminal=exc.status in fulltext_mod.TERMINAL_STATUSES,
+                        document_id=exc.document_id,
+                        document_status=exc.status,
+                    )
                 except Exception as exc:  # noqa: BLE001 - job-level failure isolation
                     db.rollback()
-                    db2 = get_session()
-                    try:
-                        job2 = db2.get(type(job), job.id)
-                        queue_mod.fail_job(db2, job2, str(exc))
-                        db2.commit()
-                    finally:
-                        db2.close()
+                    record_job_failure(
+                        job.id,
+                        type(job),
+                        claimed_attempts=claimed_attempts,
+                        error=str(exc),
+                    )
             finally:
                 db.close()
     except KeyboardInterrupt:
         print(f"worker {worker_id}: stopping")
         return 0
+
+
+def record_job_failure(
+    job_id,
+    job_cls,
+    *,
+    claimed_attempts: int,
+    error: str,
+    terminal: bool = False,
+    document_id: str | None = None,
+    document_status: str | None = None,
+    session_factory=get_session,
+) -> None:
+    """Record a claimed job's failure in a FRESH session, after the claiming
+    transaction has already been rolled back.
+
+    `claimed_attempts` MUST be the count read off the job after `claim_job`
+    incremented it and before that rollback. The rollback both discards the
+    uncommitted increment and expires the instance, so re-reading `attempts`
+    here would return the pre-claim value -- the job would then requeue with an
+    attempt count that never grows and could never reach `fail_job`'s
+    dead-letter cap.
+
+    That is precisely what deadlocked the crawl on 2026-07-25: 1,215
+    permanently-failing jobs all pinned at attempts=0, retried every 30
+    seconds forever, which also held `queued` above the top-up floor so no new
+    work could be enqueued either. Throughput was exactly zero for an hour
+    while the service reported healthy and the logs showed it busily claiming
+    jobs. Carrying the count across the session boundary is what makes
+    permanent failures terminal.
+
+    For an `UnfetchableDocument`, the caller also passes the document's status
+    so the `license_note` write that the rollback discarded is re-applied
+    durably here -- otherwise the document keeps looking never-attempted and
+    `enqueue_fulltext_jobs` re-enqueues it forever despite the dead-letter.
+    """
+    db = session_factory()
+    try:
+        if document_id and document_status:
+            document = db.get(BillDocument, document_id)
+            if document is not None:
+                document.license_note = f"fulltext_status={document_status}"
+        job = db.get(job_cls, job_id)
+        if job is None:
+            return
+        job.attempts = claimed_attempts
+        if terminal:
+            queue_mod.dead_letter_job(db, job, error)
+        else:
+            queue_mod.fail_job(db, job, error)
+        db.commit()
+    finally:
+        db.close()
 
 
 def cmd_validate_worker(args: argparse.Namespace) -> int:

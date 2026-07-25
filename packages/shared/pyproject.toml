@@ -9,6 +9,15 @@ description = "Shared Python utilities for Bill Commons: bill-number normalizati
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 dependencies = [
+    # certifi and cryptography are imported DIRECTLY by billcommons_shared.aia
+    # (TLS-intermediate recovery for state sites that omit their intermediate --
+    # see docs/sources/tls-intermediate-recovery.md). certifi arrives
+    # transitively via httpx and cryptography arrived only incidentally in the
+    # dev venv; both are declared explicitly because relying on a transitive or
+    # accidental install for a direct import means the worker image builds
+    # without cryptography and the crawl process dies at module import.
+    "certifi",
+    "cryptography>=42",
     "httpx",
     "pydantic>=2",
     "pydantic-settings",

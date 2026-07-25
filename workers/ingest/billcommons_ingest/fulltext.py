@@ -29,6 +29,7 @@ import hashlib
 import os
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -40,6 +41,7 @@ from sqlalchemy import Text, case, cast, exists, func, or_, select
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob
+from billcommons_shared.aia import AiaRepairCache, is_missing_issuer_error
 from billcommons_shared.httpc import USER_AGENT, RateLimiter, new_client
 from billcommons_shared.rawstore import RawStore
 
@@ -135,17 +137,41 @@ class RobotsCache:
     standard robots.txt semantics (absence of a robots.txt is not a
     disallow)."""
 
-    def __init__(self, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        client: httpx.Client | None = None,
+        *,
+        client_for: Callable[[str], httpx.Client] | None = None,
+    ) -> None:
         self._client = client or new_client(timeout=10.0)
+        # `client_for`, if given, resolves the client to use per origin. The
+        # crawl passes one so that a host whose TLS intermediate had to be
+        # recovered (see billcommons_shared.aia) has its robots.txt read over
+        # the WORKING connection. Without it, such a host's robots.txt fetch
+        # fails verification, falls through to the allow-all default below, and
+        # we would crawl it having never actually read its rules -- CT
+        # (www.cga.ct.gov) publishes a real robots.txt with Disallow paths, so
+        # this failed open on a host that genuinely restricts parts of itself.
+        self._client_for = client_for
         self._parsers: dict[str, RobotFileParser] = {}
+
+    def invalidate(self, origin: str) -> None:
+        """Drop the cached verdict for `origin` so it is re-read on next use.
+
+        Called after a TLS repair makes a previously unreachable robots.txt
+        readable, so the allow-all fallback cached during the broken period
+        cannot outlive the breakage it was standing in for.
+        """
+        self._parsers.pop(origin, None)
 
     def _get_parser(self, origin: str) -> RobotFileParser:
         if origin in self._parsers:
             return self._parsers[origin]
         parser = RobotFileParser()
         parser.set_url(f"{origin}/robots.txt")
+        client = self._client_for(origin) if self._client_for else self._client
         try:
-            response = self._client.get(f"{origin}/robots.txt")
+            response = client.get(f"{origin}/robots.txt")
             if response.status_code >= 400:
                 parser.parse([])  # no robots.txt -> allow-all
             else:
@@ -510,10 +536,59 @@ class FullTextFetcher:
         rate_limiter: RateLimiter | None = None,
         robots_cache: RobotsCache | None = None,
         rate_per_sec: float = DEFAULT_RATE_PER_SEC,
+        aia_cache: AiaRepairCache | None = None,
     ) -> None:
         self.client = client or new_client(timeout=DEFAULT_TIMEOUT)
         self.rate_limiter = rate_limiter or RateLimiter(rate_per_sec=rate_per_sec, burst=1)
-        self.robots_cache = robots_cache or RobotsCache(client=self.client)
+        self.aia_cache = aia_cache or AiaRepairCache()
+        # Hosts whose TLS intermediate we had to recover get a dedicated client
+        # holding the repaired SSL context; every other host keeps using the
+        # shared one.
+        self._repaired_clients: dict[str, httpx.Client] = {}
+        self.robots_cache = robots_cache or RobotsCache(
+            client=self.client, client_for=self._client_for_origin
+        )
+
+    def _client_for_origin(self, origin: str) -> httpx.Client:
+        return self._repaired_clients.get(urlparse(origin).netloc) or self.client
+
+    def _get(self, url: str, parsed) -> httpx.Response:
+        """GET `url`, transparently repairing a server that omitted its TLS
+        intermediate certificate.
+
+        Several state legislature hosts send only their leaf certificate.
+        Browsers paper over that by chasing the leaf's AIA extension; Python's
+        SSL stack does not, so every document on such a host fails verification
+        permanently -- this silently cost MI, MS and CT their ENTIRE full-text
+        corpus (0 of 3,884 / 0 of 4,006 / 7 of 1,283 bills) until it was
+        diagnosed. The repair never downgrades verification: the recovered
+        intermediate has to independently chain to a shipped root before it is
+        used at all (see billcommons_shared.aia), and an unrepairable host
+        keeps failing with its original error.
+        """
+        netloc = parsed.netloc
+        client = self._repaired_clients.get(netloc) or self.client
+        try:
+            return client.get(url, follow_redirects=False)
+        except httpx.HTTPError as exc:
+            already_repaired = netloc in self._repaired_clients
+            if already_repaired or parsed.scheme != "https" or not is_missing_issuer_error(exc):
+                raise
+            context = self.aia_cache.get(parsed.hostname, parsed.port or 443)
+            if context is None:
+                raise
+            repaired = new_client(timeout=DEFAULT_TIMEOUT, verify=context)
+            self._repaired_clients[netloc] = repaired
+            # The allow-all robots verdict cached while this host was
+            # unreachable was a fallback for a file we could not read; now that
+            # we can, re-read it before fetching anything else here.
+            self.robots_cache.invalidate(f"{parsed.scheme}://{netloc}")
+            print(f"fulltext: recovered missing TLS intermediate for {netloc}", flush=True)
+            if not self.robots_cache.can_fetch(url):
+                raise UnfetchableDocument(
+                    f"robots.txt disallows fetching {url}", status=STATUS_ROBOTS_DISALLOWED
+                )
+            return repaired.get(url, follow_redirects=False)
 
     def fetch(self, url: str) -> httpx.Response:
         """Fetch `url`, following redirects HOP-BY-HOP (not via httpx's own
@@ -546,7 +621,7 @@ class FullTextFetcher:
                 )
             self.rate_limiter.acquire(host)
 
-            response = self.client.get(current_url, follow_redirects=False)
+            response = self._get(current_url, parsed)
             if not response.is_redirect:
                 response.raise_for_status()
                 return response
