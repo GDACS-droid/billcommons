@@ -636,3 +636,93 @@ def test_validate_worker_cycle_lock_blocks_a_second_concurrent_selection_pass(db
             text("SELECT pg_advisory_unlock(:key)"), {"key": VALIDATE_WORKER_CYCLE_ADVISORY_LOCK_KEY}
         )
         blocking_connection.close()
+
+
+def test_plan_validation_round_robins_on_last_validation_not_last_attempt(db_session):
+    """Validation capacity must spread across all 51 jurisdictions.
+
+    The ordering key has to be the last ACTUAL validation, not
+    `last_attempt_at`. That column is restamped by every coverage recompute,
+    so in production every row carried a near-identical timestamp and the
+    ordering collapsed into the recompute's own write order -- a fixed
+    rotation whose head was re-validated forever while its tail starved.
+    Measured 2026-07-25: NV had 77 runs and SD 61, while DE, WY and AK sat at
+    100% of obtainable full text, eligible for promotion to GREEN, with 8-11
+    runs and nothing for 17 hours. Thirteen rows met the GREEN bar and could
+    not be promoted because the scheduler never looked at them.
+
+    This test pins the two apart deliberately: `starved` has the NEWER
+    last_attempt_at (so the broken ordering puts it last) but was validated
+    long ago, while `hammered` has the OLDER last_attempt_at and was validated
+    seconds ago. Correct behaviour is starved-first. A sort on last_attempt_at
+    -- in the SQL or re-imposed in Python afterwards, which is where this bug
+    actually survived its first fix -- puts hammered first and fails here.
+    """
+    now = _real_now()
+
+    hammered, hammered_cov = _make_coverage_jurisdiction(
+        db_session, status="VALIDATING", last_attempt_at=now - timedelta(hours=5)
+    )
+    starved, starved_cov = _make_coverage_jurisdiction(
+        db_session, status="VALIDATING", last_attempt_at=now - timedelta(minutes=1)
+    )
+    db_session.add(
+        ValidationRun(
+            jurisdiction_id=hammered.id,
+            session_id=hammered_cov.session_id,
+            started_at=now - timedelta(seconds=30),
+            finished_at=now - timedelta(seconds=30),
+            pass_rate=1.0,
+            checks_run=10,
+            checks_failed=0,
+        )
+    )
+    db_session.add(
+        ValidationRun(
+            jurisdiction_id=starved.id,
+            session_id=starved_cov.session_id,
+            started_at=now - timedelta(hours=17),
+            finished_at=now - timedelta(hours=17),
+            pass_rate=1.0,
+            checks_run=10,
+            checks_failed=0,
+        )
+    )
+    db_session.flush()
+
+    candidates = plan_validation(db_session, batch=100, now=now)
+    abbrs = [c.jurisdiction_abbr for c in candidates]
+    assert starved.abbreviation in abbrs and hammered.abbreviation in abbrs
+    assert abbrs.index(starved.abbreviation) < abbrs.index(hammered.abbreviation), (
+        "the jurisdiction validated 17 hours ago must be scheduled before the one "
+        "validated 30 seconds ago, even though its last_attempt_at is newer"
+    )
+
+
+def test_plan_validation_puts_never_validated_jurisdictions_first(db_session):
+    """A jurisdiction with no validation_runs at all is the most starved case
+    there is and must sort ahead of any jurisdiction that has been validated,
+    regardless of last_attempt_at."""
+    now = _real_now()
+    never, _ = _make_coverage_jurisdiction(
+        db_session, status="VALIDATING", last_attempt_at=now - timedelta(seconds=5)
+    )
+    once, once_cov = _make_coverage_jurisdiction(
+        db_session, status="VALIDATING", last_attempt_at=now - timedelta(days=2)
+    )
+    db_session.add(
+        ValidationRun(
+            jurisdiction_id=once.id,
+            session_id=once_cov.session_id,
+            started_at=now - timedelta(hours=2),
+            finished_at=now - timedelta(hours=2),
+            pass_rate=1.0,
+            checks_run=10,
+            checks_failed=0,
+        )
+    )
+    db_session.flush()
+
+    candidates = plan_validation(db_session, batch=100, now=now)
+    abbrs = [c.jurisdiction_abbr for c in candidates]
+    assert abbrs.index(never.abbreviation) < abbrs.index(once.abbreviation)

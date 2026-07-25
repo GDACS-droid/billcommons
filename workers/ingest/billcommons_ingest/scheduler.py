@@ -272,9 +272,10 @@ def run_schedule_pass(db: OrmSession, *, now: datetime | None = None) -> list[st
 #      jurisdiction that's simply never been checked (or checked longest ago)
 #      gets priority over one that ran recently.
 _VALIDATION_PRIORITY_SQL = """
-    SELECT jurisdiction_id, abbreviation, status, last_attempt_at, priority
+    SELECT jurisdiction_id, abbreviation, status, last_attempt_at, last_validated_at, priority
     FROM (
         SELECT jc.jurisdiction_id, j.abbreviation, jc.status, jc.last_attempt_at,
+            last_validated.at AS last_validated_at,
             CASE
                 WHEN jc.status = 'FULL_TEXT_SEARCHABLE' THEN 1
                 -- Clocked off the last actual VALIDATION run, not
@@ -331,7 +332,21 @@ _VALIDATION_PRIORITY_SQL = """
           )
     ) ranked
     WHERE priority IS NOT NULL
-    ORDER BY priority ASC, last_attempt_at ASC NULLS FIRST, abbreviation ASC
+    -- Round-robin on the LAST ACTUAL VALIDATION, not jc.last_attempt_at.
+    -- last_attempt_at is written by three different things, and the coverage
+    -- recompute restamps EVERY row on every cycle -- so it encodes "when did
+    -- recompute last touch this", not "when did we last validate this". All
+    -- rows therefore carry near-identical timestamps and the ordering
+    -- degenerates into the recompute's own write order: a fixed rotation
+    -- whose head is re-validated forever while its tail starves.
+    --
+    -- Measured on 2026-07-25: NV had 77 validation runs and SD 61, while DE,
+    -- WY and AK -- all sitting at 100% of obtainable full text and eligible
+    -- for promotion -- had 8-11 runs and had not been validated in 17 hours.
+    -- Thirteen rows met the GREEN full-text bar and could not be promoted
+    -- because the scheduler kept re-picking the same handful. The crawl was
+    -- not the bottleneck; this ordering was.
+    ORDER BY priority ASC, last_validated_at ASC NULLS FIRST, abbreviation ASC
     LIMIT :batch
 """
 
@@ -343,6 +358,11 @@ class ValidationCandidate:
     status: str
     last_attempt_at: datetime | None
     priority: int
+    # When this jurisdiction was ACTUALLY last validated (max
+    # validation_runs.finished_at), as distinct from last_attempt_at, which
+    # every coverage recompute restamps. This is what the round-robin must
+    # order on; see the comment on _VALIDATION_PRIORITY_SQL's ORDER BY.
+    last_validated_at: datetime | None = None
 
 
 def plan_validation(
@@ -376,21 +396,31 @@ def plan_validation(
     ).all()
 
     seen: dict[str, ValidationCandidate] = {}
-    for jurisdiction_id, abbr, status, last_attempt_at, priority in rows:
+    for jurisdiction_id, abbr, status, last_attempt_at, last_validated_at, priority in rows:
         candidate = ValidationCandidate(
             jurisdiction_id=jurisdiction_id,
             jurisdiction_abbr=abbr,
             status=status,
             last_attempt_at=last_attempt_at,
             priority=priority,
+            last_validated_at=last_validated_at,
         )
         existing = seen.get(abbr)
         if existing is None or candidate.priority < existing.priority:
             seen[abbr] = candidate
 
+    # Must mirror the SQL's ORDER BY exactly. Sorting here on last_attempt_at
+    # silently RE-IMPOSED the starvation the SQL ordering was fixed to remove:
+    # the query returned least-recently-validated first and this re-sorted it
+    # straight back into recompute-write order. Order on the real last
+    # validation, oldest (and never-validated) first.
     ordered = sorted(
         seen.values(),
-        key=lambda c: (c.priority, c.last_attempt_at or datetime.min.replace(tzinfo=timezone.utc), c.jurisdiction_abbr),
+        key=lambda c: (
+            c.priority,
+            c.last_validated_at or datetime.min.replace(tzinfo=timezone.utc),
+            c.jurisdiction_abbr,
+        ),
     )
     return ordered[:batch]
 
