@@ -197,6 +197,32 @@ def test_extract_text_from_plain_normalizes_line_endings():
     assert text.split("\n") == ["Line one", "Line two", "Line three"]
 
 
+@pytest.mark.parametrize(
+    "extractor, raw",
+    [
+        (extract_text_from_plain, b"An act concerning\x00 transportation"),
+        (extract_text_from_html, b"<p>An act concerning\x00 transportation</p>"),
+        (extract_text_from_xml, b"<section>An act concerning\x00 transportation</section>"),
+    ],
+)
+def test_extractors_strip_nul_bytes(extractor, raw):
+    """Extracted text must never contain NUL (0x00).
+
+    Business intent: Postgres text columns reject NUL outright, so a document
+    whose text carried one failed its `UPDATE bill_documents SET
+    extracted_text` with psycopg.DataError, got retried, and was
+    dead-lettered -- a fetchable document turned permanently dead, and its
+    bill never counted toward full-text coverage, capping the jurisdiction
+    below the GREEN bar forever. This happened in production: 215 jobs in 20
+    minutes, collapsing crawl throughput from ~2,718/hr to ~66/hr. The
+    surrounding text must survive; only the NUL is dropped.
+    """
+    text = extractor(raw)
+    assert "\x00" not in text
+    assert "An act concerning" in text
+    assert "transportation" in text
+
+
 # ---------------------------------------------------------------------------
 # Extraction: PDF
 # ---------------------------------------------------------------------------

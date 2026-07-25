@@ -260,8 +260,23 @@ def extract_text_from_pdf(raw: bytes) -> PdfExtractionResult:
 def _normalize_text(raw: str) -> str:
     """Normalize line endings + collapse excessive blank lines while
     preserving section/line structure as best-effort (no aggressive
-    reflow), per SPEC "Version diffing" -- diffs must stay meaningful."""
-    normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+    reflow), per SPEC "Version diffing" -- diffs must stay meaningful.
+
+    Also strips NUL (0x00). Postgres text columns reject NUL outright, so a
+    document whose extracted text contains one failed its
+    `UPDATE bill_documents SET extracted_text = ...` with
+    `psycopg.DataError`, retried, and eventually dead-lettered -- turning a
+    perfectly fetchable document into a permanently dead one and, because its
+    bill then never counts toward full-text coverage, capping the
+    jurisdiction below the GREEN bar forever. NULs appear in real bill text
+    from mis-encoded state HTML and from pypdf output on some PDFs; they
+    carry no meaning, so dropping them is lossless for search and diffing.
+
+    Every extractor (HTML/XML/plain/PDF) funnels through here, so this is the
+    single chokepoint where the guarantee "text we hand Postgres is
+    storable" belongs.
+    """
+    normalized = raw.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
     # Collapse runs of 3+ blank lines to a single blank line; strip
     # trailing whitespace per line. Never merges/reflows separate lines.
     lines = [line.rstrip() for line in normalized.split("\n")]
