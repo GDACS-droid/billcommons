@@ -27,13 +27,14 @@ class _FakeDb:
     each, so the test states the WORLD (what the DB contains) rather than
     mirroring the check's own SQL."""
 
-    def __init__(self, *, last_text_at, texted_last_hour, claimable, queued, dead):
+    def __init__(self, *, last_text_at, texted_last_hour, claimable, queued, dead, backlog):
         self.values = {
             "max(updated_at)": last_text_at,
             "and updated_at > :cutoff": texted_last_hour,
             "run_after <= :now": claimable,
             "status='queued'": queued,
             "status='dead'": dead,
+            "select exists": backlog,
         }
 
     def execute(self, stmt, params=None):
@@ -41,6 +42,7 @@ class _FakeDb:
         # Most specific fragments first: the queued/dead counts share text
         # with the claimable query.
         for fragment in (
+            "select exists",
             "max(updated_at)",
             "and updated_at > :cutoff",
             "run_after <= :now",
@@ -62,6 +64,7 @@ def _db(**kwargs):
         claimable=500,
         queued=500,
         dead=10,
+        backlog=True,
     )
     defaults.update(kwargs)
     return _FakeDb(**defaults)
@@ -90,11 +93,55 @@ def test_empty_queue_is_idle_not_stalled():
     Calling that STALLED would make the check fire permanently once the
     corpus is complete, which is how alerts get muted."""
     health = check_crawl_health(
-        _db(last_text_at=NOW - timedelta(days=3), texted_last_hour=0, claimable=0, queued=0),
+        _db(
+            last_text_at=NOW - timedelta(days=3),
+            texted_last_hour=0,
+            claimable=0,
+            queued=0,
+            backlog=False,
+        ),
         now=NOW,
     )
     assert health.healthy is True
     assert "idle, not stalled" in health.reason
+
+
+def test_empty_queue_with_backlog_remaining_is_stalled():
+    """The 2026-07-26 outage. The top-up query started failing, so no new
+    fetch_text jobs were created; the queue drained to zero and the crawl
+    stopped. Judging on the queue alone, this looks identical to a finished
+    corpus -- and the first version of this check called it healthy and sent
+    a RECOVERED alert while ~613k documents sat unfetched. The corpus, not
+    the queue, decides whether there is work left to do."""
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(minutes=131),
+            texted_last_hour=0,
+            claimable=0,
+            queued=0,
+            backlog=True,
+        ),
+        now=NOW,
+    )
+    assert health.healthy is False
+    assert "top-up is not producing" in health.reason
+
+
+def test_briefly_empty_queue_between_top_ups_is_not_stalled():
+    """The queue legitimately hits zero for a moment each time a batch is
+    consumed before the next top-up runs. Firing on that would alert several
+    times an hour, and an alert that noisy gets muted."""
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(minutes=2),
+            texted_last_hour=3000,
+            claimable=0,
+            queued=0,
+            backlog=True,
+        ),
+        now=NOW,
+    )
+    assert health.healthy is True
 
 
 def test_backed_off_queue_does_not_count_as_claimable():

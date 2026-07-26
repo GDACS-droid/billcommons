@@ -40,6 +40,8 @@ from sqlalchemy import text
 
 from billcommons_shared.db import get_session
 
+from .fulltext import TERMINAL_STATUSES
+
 # A document is extracted every few seconds when healthy, so 30 minutes of
 # complete silence is far outside normal variance -- including the slow tail
 # where a worker is grinding through large scanned PDFs. Tuned to be
@@ -65,6 +67,7 @@ class CrawlHealth:
     claimable_now: int
     queued_total: int
     dead_total: int
+    backlog_remains: bool = False
 
     def render(self) -> str:
         head = "HEALTHY" if self.healthy else "STALLED"
@@ -79,7 +82,8 @@ class CrawlHealth:
             f"  last text landed  : {self.last_text_at} ({since})\n"
             f"  texted last hour  : {self.texted_last_hour:,}\n"
             f"  claimable now     : {self.claimable_now:,}\n"
-            f"  queued / dead     : {self.queued_total:,} / {self.dead_total:,}"
+            f"  queued / dead     : {self.queued_total:,} / {self.dead_total:,}\n"
+            f"  backlog remains   : {self.backlog_remains}"
         )
 
 
@@ -116,14 +120,54 @@ def check_crawl_health(
     queued_total = scalar("select count(*) from ingest_jobs where kind='fetch_text' and status='queued'")
     dead_total = scalar("select count(*) from ingest_jobs where kind='fetch_text' and status='dead'")
 
+    # Is there fetchable text left in the corpus that no job covers? An empty
+    # queue only means "finished" if this is false. EXISTS with LIMIT 1 so the
+    # cost is a partial scan, not a count over ~700k rows.
+    terminal_notes = tuple(f"fulltext_status={status}" for status in TERMINAL_STATUSES)
+    backlog_remains = bool(
+        scalar(
+            "select exists (select 1 from bill_documents "
+            "where extracted_text is null and url is not null and url <> '' "
+            "and (license_note is null or license_note <> all(:terminal)) limit 1)",
+            terminal=list(terminal_notes),
+        )
+    )
+
     minutes_since = None
     if last_text_at is not None:
         if last_text_at.tzinfo is None:
             last_text_at = last_text_at.replace(tzinfo=timezone.utc)
         minutes_since = (now - last_text_at).total_seconds() / 60.0
 
-    if claimable_now == 0:
-        healthy, reason = True, "no claimable fetch_text work -- idle, not stalled"
+    starved = queued_total == 0 and backlog_remains
+    if starved and (minutes_since is None or minutes_since >= stall_minutes):
+        # An EMPTY queue with work still to do means the TOP-UP is broken,
+        # not that the crawl finished. This is the 2026-07-26 shape: the
+        # enqueue query began failing (DiskFull on a parallel worker's shared
+        # memory segment), the queue drained to zero, and the first version of
+        # this check read that as "idle, not stalled" -- it sent a RECOVERED
+        # alert while the crawl was dead, and the stall ran for two hours.
+        # An empty queue is only good news when there is nothing left to fetch.
+        #
+        # Keyed on queued_total, not claimable_now: a queue full of backed-off
+        # jobs is retrying, not starved, and must not read as a broken top-up.
+        healthy = False
+        reason = (
+            "fetch_text queue is EMPTY but unfetched documents remain -- "
+            "top-up is not producing jobs"
+            + (
+                f" (nothing extracted for {minutes_since:.0f} min)"
+                if minutes_since is not None
+                else " (nothing has EVER been extracted)"
+            )
+        )
+    elif claimable_now == 0:
+        healthy = True
+        reason = (
+            "no claimable fetch_text work, backlog pending -- top-up due, not stalled"
+            if backlog_remains
+            else "no claimable fetch_text work -- idle, not stalled"
+        )
     elif minutes_since is None:
         healthy, reason = False, f"{claimable_now:,} jobs claimable but no document has EVER been extracted"
     elif minutes_since >= stall_minutes:
@@ -146,6 +190,7 @@ def check_crawl_health(
         claimable_now=int(claimable_now or 0),
         queued_total=int(queued_total or 0),
         dead_total=int(dead_total or 0),
+        backlog_remains=backlog_remains,
     )
 
 

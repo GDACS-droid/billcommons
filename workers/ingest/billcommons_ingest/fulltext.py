@@ -37,7 +37,7 @@ from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
-from sqlalchemy import Text, case, cast, exists, func, or_, select
+from sqlalchemy import Text, case, cast, exists, func, or_, select, text
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob
@@ -493,6 +493,35 @@ def enqueue_fulltext_jobs(
     stmt = select(pending.c.doc_id, rn).order_by(rn, pending.c.jurisdiction_id)
     if limit is not None:
         stmt = stmt.limit(limit)
+
+    # Run this one query without parallel workers.
+    #
+    # The window function above sorts every pending document, and once the
+    # corpus passed ~600k pending rows Postgres started choosing a parallel
+    # plan for it. Each parallel worker allocates a dynamic shared memory
+    # segment under /dev/shm, which on the managed Postgres container is
+    # small (64 MB by default); the allocation then fails with
+    #
+    #   psycopg.errors.DiskFull: could not resize shared memory segment
+    #   ... No space left on device
+    #
+    # That is NOT a full disk -- the volume had plenty of room. It killed
+    # every top-up on 2026-07-26, which drained the fetch_text queue to zero
+    # and stopped the crawl for two hours while the service still reported
+    # Online. Serial execution needs no DSM segment at all and costs ~6s for
+    # a 5,000-row batch, which is irrelevant next to the fetches it feeds.
+    db.execute(text("SET LOCAL max_parallel_workers_per_gather = 0"))
+
+    # ...and give it more than the 300s default statement_timeout that
+    # billcommons_shared.db sets on every session. Serial execution of this
+    # sort costs ~400s at 730k documents and grows with the corpus, so the
+    # default would simply trade DiskFull for QueryCanceled -- same outcome,
+    # an empty queue and a dead crawl. Safe to extend here specifically: this
+    # runs in the worker's own short-lived top-up session, it is a read-only
+    # SELECT that takes no row locks, and the session is ACTIVE throughout
+    # rather than idle-in-transaction (the failure mode the 300s cap exists
+    # to bound).
+    db.execute(text("SET LOCAL statement_timeout = '900s'"))
 
     document_ids = db.execute(stmt).scalars().all()
     for document_id in document_ids:
