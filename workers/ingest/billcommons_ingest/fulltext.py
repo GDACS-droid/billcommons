@@ -508,20 +508,14 @@ def enqueue_fulltext_jobs(
     # That is NOT a full disk -- the volume had plenty of room. It killed
     # every top-up on 2026-07-26, which drained the fetch_text queue to zero
     # and stopped the crawl for two hours while the service still reported
-    # Online. Serial execution needs no DSM segment at all and costs ~6s for
-    # a 5,000-row batch, which is irrelevant next to the fetches it feeds.
+    # Online.
+    #
+    # Serial execution needs no DSM segment at all, and costs almost nothing:
+    # EXPLAIN ANALYZE in production puts the whole statement at 2.2s for a
+    # 5,000-row batch. (Timing it from a developer box instead reports ~400s,
+    # but that is 5,000 INSERT round-trips over the internet afterwards, not
+    # this SELECT -- measure this one server-side or not at all.)
     db.execute(text("SET LOCAL max_parallel_workers_per_gather = 0"))
-
-    # ...and give it more than the 300s default statement_timeout that
-    # billcommons_shared.db sets on every session. Serial execution of this
-    # sort costs ~400s at 730k documents and grows with the corpus, so the
-    # default would simply trade DiskFull for QueryCanceled -- same outcome,
-    # an empty queue and a dead crawl. Safe to extend here specifically: this
-    # runs in the worker's own short-lived top-up session, it is a read-only
-    # SELECT that takes no row locks, and the session is ACTIVE throughout
-    # rather than idle-in-transaction (the failure mode the 300s cap exists
-    # to bound).
-    db.execute(text("SET LOCAL statement_timeout = '900s'"))
 
     document_ids = db.execute(stmt).scalars().all()
     for document_id in document_ids:
