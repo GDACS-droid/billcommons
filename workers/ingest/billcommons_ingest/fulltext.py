@@ -494,27 +494,12 @@ def enqueue_fulltext_jobs(
     if limit is not None:
         stmt = stmt.limit(limit)
 
-    # Run this one query without parallel workers.
-    #
-    # The window function above sorts every pending document, and once the
-    # corpus passed ~600k pending rows Postgres started choosing a parallel
-    # plan for it. Each parallel worker allocates a dynamic shared memory
-    # segment under /dev/shm, which on the managed Postgres container is
-    # small (64 MB by default); the allocation then fails with
-    #
-    #   psycopg.errors.DiskFull: could not resize shared memory segment
-    #   ... No space left on device
-    #
-    # That is NOT a full disk -- the volume had plenty of room. It killed
-    # every top-up on 2026-07-26, which drained the fetch_text queue to zero
-    # and stopped the crawl for two hours while the service still reported
-    # Online.
-    #
-    # Serial execution needs no DSM segment at all, and costs almost nothing:
-    # EXPLAIN ANALYZE in production puts the whole statement at 2.2s for a
-    # 5,000-row batch. (Timing it from a developer box instead reports ~400s,
-    # but that is 5,000 INSERT round-trips over the internet afterwards, not
-    # this SELECT -- measure this one server-side or not at all.)
+    # Belt-and-braces: parallel query is already disabled for every session in
+    # billcommons_shared.db (see the /dev/shm DiskFull incident documented
+    # there), but this is the query whose failure emptied the queue and stopped
+    # the crawl for two hours, so it does not rely on connection setup to stay
+    # serial. Costs nothing -- EXPLAIN ANALYZE puts the statement at 2.2s in
+    # production for a 5,000-row batch.
     db.execute(text("SET LOCAL max_parallel_workers_per_gather = 0"))
 
     document_ids = db.execute(stmt).scalars().all()

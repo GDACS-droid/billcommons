@@ -81,7 +81,33 @@ def get_engine() -> Engine:
             get_database_url(),
             pool_pre_ping=True,
             connect_args={
-                "options": "-c statement_timeout=300000 -c idle_in_transaction_session_timeout=300000",
+                "options": (
+                    "-c statement_timeout=300000"
+                    " -c idle_in_transaction_session_timeout=300000"
+                    # Parallel query is disabled for every session, everywhere.
+                    #
+                    # Parallel workers coordinate through dynamic shared memory
+                    # allocated from the container's /dev/shm, which on managed
+                    # Postgres is small. Once the corpus grew past ~730k
+                    # documents the planner began choosing parallel plans and
+                    # they failed outright:
+                    #
+                    #   psycopg.errors.DiskFull: could not resize shared memory
+                    #   segment ... No space left on device
+                    #
+                    # Despite the name the disk is fine -- it is /dev/shm that
+                    # is exhausted. On 2026-07-26 this killed the crawl's queue
+                    # top-up for 2h, and by the end of the day even a bare
+                    # `select max(updated_at)` failed on a 192 KB allocation,
+                    # taking the healthcheck down with it. A per-query opt-out
+                    # only protected the one query we had already lost.
+                    #
+                    # Nothing here needs intra-query parallelism: the workers
+                    # are I/O-bound on external fetches and the API's search
+                    # path is GIN index lookups. Serial plans are strictly
+                    # better than plans that raise.
+                    " -c max_parallel_workers_per_gather=0"
+                ),
                 "keepalives": 1,
                 "keepalives_idle": 30,
                 "keepalives_interval": 10,
