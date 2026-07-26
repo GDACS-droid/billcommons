@@ -1459,3 +1459,91 @@ def test_txnfree_per_jurisdiction_timeout_marks_remaining_legs_unverifiable_not_
             assert "timeout" in leg_by_name["bill_number_search"].detail.lower()
     finally:
         _delete_committed_jurisdiction(jurisdiction_id)
+
+
+def test_cross_source_passes_sc_separated_zero_padded_surface_form(db_session):
+    """South Carolina renders identifier "S 537" as "S 0537" -- zero-padded
+    AND still separated from the prefix.
+
+    Note the near-miss: SC also renders some bills "S*0537", and THAT form
+    already worked, because normalization strips the asterisk to give
+    "s0537", which the existing concatenated candidate matches. Only the
+    space-separated form had no candidate, so a test written against the
+    asterisk form passes with or without this fix and proves nothing. This
+    gap is what held South Carolina at DEGRADED with 3,961 bills and a
+    healthy crawl.
+    """
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="S 537",
+        identifier_norm="S 537",
+        title="An act",
+        source_url="https://www.scstatehouse.gov/billsearch.php?billnumbers=537",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    page = (
+        "<html><body><h1>South Carolina Legislature</h1>"
+        "<p>Session 126 - (2025-2026) Printer Friendly (pdf format) "
+        "S 0537 General Bill, By Zell and Goldfinch</p>"
+        + "<p>Committee report and history follow below. " * 20
+        + "</body></html>"
+    )
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, text=page)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = _check_cross_source(client, RobotsCache(client=client), bill)
+    assert result.status == PASS
+
+
+def test_js_shell_guard_ignores_postal_address_in_footer(db_session):
+    """The JS-shell guard asks "does this page have ANY bill-number token?"
+    to tell an app shell apart from a real page missing our bill. Every
+    legislature site puts its mailing address in the footer, and the naive
+    token pattern read those as bill numbers:
+
+        NJ  "Room B50 State House Annex"      -> "B50"
+        SC  "Columbia, SC 29201"              -> "SC 29201"
+
+    One such match made an empty JS shell look like real content, so a bill
+    that was never rendered got reported as a genuine data mismatch. AL and
+    NJ sat at DEGRADED on exactly this.
+    """
+    jurisdiction, session_row, _ = _make_jurisdiction_with_bills(db_session, n=0)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="S 4400",
+        identifier_norm="S 4400",
+        title="An act",
+        source_url="https://www.njleg.state.nj.us/bill-search/2026/S4400",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    shell = (
+        "<html><body><div id='root'></div>"
+        "<footer>Office of Legislative Services, Office of Public Information, "
+        "Room B50 State House Annex, PO Box 068, Trenton, NJ 08625. "
+        "State House Annex, 1105 Pendleton Street, Columbia, SC 29201. "
+        + "Contact the Office of Public Information for assistance. " * 12
+        + "</footer></body></html>"
+    )
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, text=shell)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = _check_cross_source(client, RobotsCache(client=client), bill)
+    assert result.status == UNVERIFIABLE_JS_PAGE, (
+        f"address-only footer must read as an unrenderable shell, got {result.status}: {result.detail}"
+    )

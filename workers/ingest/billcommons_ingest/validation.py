@@ -525,6 +525,17 @@ def _normalize_for_page_match(identifier: str) -> list[re.Pattern]:
             # after the full letter prefix rather than just its first letter.
             f"{prefix}{padded_number_3}",
             f"{prefix}{padded_number_4}",
+            # SEPARATED zero-padded forms -- padding AND a separator between
+            # prefix and number. www.scstatehouse.gov renders identifier
+            # "S 537" as "S*0537", which normalizes to "s 0537": zero-padded
+            # like the concatenated forms above, but still separated. Without
+            # these, every South Carolina bill failed cross_source against a
+            # page that was plainly showing the right bill, which is what
+            # held SC at DEGRADED.
+            f"{first_letter} {padded_number_3}",
+            f"{first_letter} {padded_number_4}",
+            f"{prefix} {padded_number_3}",
+            f"{prefix} {padded_number_4}",
         }
     )
 
@@ -567,7 +578,29 @@ _WHITESPACE_RE = re.compile(r"\s+")
 # legislature content page that simply doesn't mention OUR bill" (a genuine
 # mismatch) apart from "this page has no bill-number tokens at all" (a
 # JS-app shell that never got a chance to render anything).
-_BILL_NUMBER_TOKEN_RE = re.compile(r"\b[A-Z]{1,4}\s?\d+\b")
+#
+# Two exclusions, both from false positives observed on real pages that held
+# AL, NJ and SC at DEGRADED for days. The naive pattern (`[A-Z]{1,4}\s?\d+`)
+# matches ordinary postal addresses, and every state site puts its address in
+# the page footer:
+#
+#   NJ  "Office of Public Information Room B50 State House Annex"  -> "B50"
+#   SC  "1105 Pendleton Street * Columbia, SC 29201"               -> "SC 29201"
+#
+# One such match convinced the JS-shell guard below that an app shell was a
+# real content page, so a missing identifier was reported as a genuine data
+# mismatch rather than an unverifiable one.
+#
+#   * `\d{1,4}` -- bill numbers are at most four digits; this alone excludes
+#     5-digit ZIP codes.
+#   * the lookbehind excludes address/room prefixes, which is what "B50"
+#     needs (a bare "B" prefix stays legal -- DC really does number its bills
+#     "B26-0187").
+_BILL_NUMBER_TOKEN_RE = re.compile(
+    r"(?<!\bRoom )(?<!\bSuite )(?<!\bSte )(?<!\bUnit )(?<!\bApt )"
+    r"(?<!\bBldg )(?<!\bFloor )(?<!\bBox )"
+    r"\b[A-Z]{1,4}[\s.*-]?\d{1,4}\b"
+)
 _MIN_VISIBLE_TEXT_CHARS = 500
 
 
