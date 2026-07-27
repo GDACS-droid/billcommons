@@ -4,6 +4,7 @@ import SearchBox from "@/components/SearchBox";
 import DataUnavailable from "@/components/DataUnavailable";
 import JsonLd from "@/components/JsonLd";
 import { apiGet } from "@/lib/api";
+import { fetchAllPages } from "@/lib/collections";
 import { API_DOCS_URL, MCP_URL, SITE_URL } from "@/lib/config";
 import type { CoverageRow, ListEnvelope, Session } from "@/lib/types";
 
@@ -23,12 +24,11 @@ async function getActiveSessions() {
   );
 }
 
+// Coverage rows are per (jurisdiction, SESSION) -- 77 of them, not 51 -- and
+// per_page clamps at 50. Asking for 51 returned 50 rows and made this page
+// advertise 150,276 bills against a real corpus of 209,612. Page properly.
 async function getCoverageSummary() {
-  return apiGet<ListEnvelope<CoverageRow>>(
-    "/api/v1/coverage",
-    { per_page: 51 },
-    { revalidate: HOME_REVALIDATE }
-  );
+  return fetchAllPages<CoverageRow>("/api/v1/coverage", {}, HOME_REVALIDATE);
 }
 
 export default async function HomePage() {
@@ -37,8 +37,15 @@ export default async function HomePage() {
     getCoverageSummary(),
   ]);
 
-  const coverageRows = coverageResult.ok ? coverageResult.data.data : [];
+  const coverageRows = coverageResult.items;
+  // Every stat below is stated in the unit it is actually measured in: bills
+  // are summed over all rows, GREEN is a count of jurisdiction-SESSIONS (a
+  // state can have a verified regular session and an unverified special one),
+  // and jurisdictions are counted distinctly rather than by row.
   const greenCount = coverageRows.filter((r) => r.status === "GREEN").length;
+  const jurisdictionCount = new Set(
+    coverageRows.map((r) => r.jurisdiction_code)
+  ).size;
   const totalBills = coverageRows.reduce(
     (sum, r) => sum + (r.bill_count ?? 0),
     0
@@ -47,7 +54,7 @@ export default async function HomePage() {
   return (
     <div>
       <JsonLd data={siteJsonLd()} />
-      <JsonLd data={datasetJsonLd(totalBills, coverageRows.length)} />
+      <JsonLd data={datasetJsonLd(totalBills, jurisdictionCount)} />
       <section className="border-b border-slate-200 bg-gradient-to-b from-slate-50 to-white">
         <div className="mx-auto max-w-4xl px-4 py-16 text-center sm:px-6 sm:py-24">
           <h1 className="text-3xl font-semibold tracking-tight text-slate-900 sm:text-5xl">
@@ -84,11 +91,15 @@ export default async function HomePage() {
         <div className="grid gap-6 sm:grid-cols-3">
           <StatCard
             label="Jurisdictions tracked"
-            value={coverageRows.length ? `${coverageRows.length} / 51` : "—"}
+            value={jurisdictionCount ? `${jurisdictionCount} / 51` : "—"}
           />
           <StatCard
-            label="Fully verified (GREEN)"
-            value={coverageResult.ok ? String(greenCount) : "—"}
+            label="Sessions fully verified"
+            value={
+              coverageResult.ok && coverageRows.length
+                ? `${greenCount} / ${coverageRows.length}`
+                : "—"
+            }
           />
           <StatCard
             label="Bills indexed"

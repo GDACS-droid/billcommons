@@ -1,6 +1,6 @@
 import { API_DOCS_URL, MCP_URL, SITE_URL } from "@/lib/config";
-import { apiGet } from "@/lib/api";
-import type { CoverageRow, ListEnvelope } from "@/lib/types";
+import { fetchAllPages } from "@/lib/collections";
+import type { CoverageRow } from "@/lib/types";
 
 // Not prerendered: the live counts below come from the API, and a build that
 // cannot reach it would otherwise bake the "counts unavailable" fallback in
@@ -19,18 +19,18 @@ export const dynamic = "force-dynamic";
  * from the live coverage endpoint so this file cannot drift into overclaiming.
  */
 export async function GET() {
-  const coverage = await apiGet<ListEnvelope<CoverageRow>>(
-    "/api/v1/coverage",
-    { per_page: 51 },
-    { revalidate: 3600 }
-  );
+  // Must page: there are 77 coverage rows (per jurisdiction-session) and the
+  // endpoint clamps per_page at 50.
+  const coverage = await fetchAllPages<CoverageRow>("/api/v1/coverage", {}, 3600);
 
-  const rows = coverage.ok ? coverage.data.data : [];
+  const rows = coverage.items;
   const green = rows.filter((r) => r.status === "GREEN").length;
   const bills = rows.reduce((sum, r) => sum + (r.bill_count ?? 0), 0);
+  const jurisdictions = new Set(rows.map((r) => r.jurisdiction_code)).size;
   const counts = coverage.ok
-    ? `${bills.toLocaleString("en-US")} bills across 51 jurisdictions (50 states + DC). ` +
-      `${green} jurisdiction-sessions have passed full validation.`
+    ? `${bills.toLocaleString("en-US")} bills across ${jurisdictions} jurisdictions ` +
+      `(50 states + DC). ${green} of ${rows.length} jurisdiction-sessions have ` +
+      `passed full validation; the rest are still being crawled or validated.`
     : "Live counts are published at /coverage and via GET /api/v1/coverage.";
 
   const body = `# Bill Commons

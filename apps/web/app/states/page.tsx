@@ -1,8 +1,8 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 import DataUnavailable from "@/components/DataUnavailable";
-import { apiGet } from "@/lib/api";
-import type { Jurisdiction, ListEnvelope } from "@/lib/types";
+import { fetchAllPages } from "@/lib/collections";
+import type { Jurisdiction } from "@/lib/types";
 
 export const metadata: Metadata = {
   title: "States & jurisdictions",
@@ -11,10 +11,11 @@ export const metadata: Metadata = {
   alternates: { canonical: "/states" },
 };
 
+// There are 51 jurisdictions and the endpoint clamps per_page to 50, so this
+// MUST page -- asking for 51 silently returned 50 and dropped a state off the
+// directory (and off the crawl path into that state's bills).
 async function getJurisdictions() {
-  return apiGet<ListEnvelope<Jurisdiction>>("/api/v1/jurisdictions", {
-    per_page: 51,
-  });
+  return fetchAllPages<Jurisdiction>("/api/v1/jurisdictions", {}, 1800);
 }
 
 export default async function StatesPage() {
@@ -33,11 +34,11 @@ export default async function StatesPage() {
       <div className="mt-8">
         {!result.ok ? (
           <DataUnavailable message="The jurisdiction directory is temporarily unavailable." />
-        ) : result.data.data.length === 0 ? (
+        ) : result.items.length === 0 ? (
           <p className="text-sm text-slate-600">No jurisdictions found.</p>
         ) : (
           <ul className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
-            {result.data.data
+            {result.items
               .slice()
               .sort((a, b) => a.name.localeCompare(b.name))
               .map((j) => (

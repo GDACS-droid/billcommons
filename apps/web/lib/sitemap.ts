@@ -1,7 +1,8 @@
 import { apiGet } from "./api";
 import { billPath, slugify } from "./billUrl";
+import { fetchAllPages } from "./collections";
 import { SITE_URL } from "./config";
-import type { Jurisdiction, ListEnvelope, Session } from "./types";
+import type { Jurisdiction, Session } from "./types";
 
 /**
  * XML sitemap construction.
@@ -115,38 +116,20 @@ export function billUrlsFor(rows: SitemapBillRow[]): SitemapUrl[] {
 
 /** Every state hub page plus every session index -- the crawl paths INTO bills. */
 export async function getStateAndSessionUrls(): Promise<SitemapUrl[]> {
-  const opts = { revalidate: SITEMAP_REVALIDATE };
-  // per_page is capped at 50 server-side and there are 51 jurisdictions, so the
-  // second page is not optional -- without it one state silently disappears.
-  const [page1, page2, sessions] = await Promise.all([
-    apiGet<ListEnvelope<Jurisdiction>>("/api/v1/jurisdictions", { per_page: 50, page: 1 }, opts),
-    apiGet<ListEnvelope<Jurisdiction>>("/api/v1/jurisdictions", { per_page: 50, page: 2 }, opts),
-    apiGet<ListEnvelope<Session>>("/api/v1/sessions", { per_page: 50, page: 1 }, opts),
+  // Both of these span more than one page (51 jurisdictions, 77 sessions,
+  // per_page clamped to 50), so both must be paged in full.
+  const [jurisdictionsResult, sessionsResult] = await Promise.all([
+    fetchAllPages<Jurisdiction>("/api/v1/jurisdictions", {}, SITEMAP_REVALIDATE),
+    fetchAllPages<Session>("/api/v1/sessions", {}, SITEMAP_REVALIDATE),
   ]);
 
-  const jurisdictions = [
-    ...(page1.ok ? page1.data.data : []),
-    ...(page2.ok ? page2.data.data : []),
-  ];
-
-  const urls: SitemapUrl[] = jurisdictions.map((j) => ({
+  const urls: SitemapUrl[] = jurisdictionsResult.items.map((j) => ({
     loc: `${SITE_URL}/states/${j.abbreviation.toUpperCase()}`,
     changefreq: "daily",
     priority: 0.8,
   }));
 
-  // Sessions span more than one page too (77 of them at 50 per page).
-  const sessionRows = sessions.ok ? [...sessions.data.data] : [];
-  if (sessions.ok && sessions.data.pagination.total > sessionRows.length) {
-    const rest = await apiGet<ListEnvelope<Session>>(
-      "/api/v1/sessions",
-      { per_page: 50, page: 2 },
-      opts
-    );
-    if (rest.ok) sessionRows.push(...rest.data.data);
-  }
-
-  for (const session of sessionRows) {
+  for (const session of sessionsResult.items) {
     const code = session.jurisdiction_abbreviation;
     if (!code) continue;
     urls.push({
