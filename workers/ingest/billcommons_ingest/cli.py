@@ -42,6 +42,7 @@ from sqlalchemy import select, text
 
 from billcommons_ingest import api_sync as api_sync_mod
 from billcommons_ingest import coverage as coverage_mod
+from billcommons_ingest import events as events_mod
 from billcommons_ingest import fulltext as fulltext_mod
 from billcommons_ingest import queue as queue_mod
 from billcommons_ingest import registry as registry_mod
@@ -687,6 +688,94 @@ def record_job_failure(
         db.close()
 
 
+def recompute_status_for_bills(
+    db, bill_ids: list, counts: dict[str, int] | None = None, *, stamp: bool = True
+) -> tuple[int, int]:
+    """Re-derive `bills.status` for a specific set of bills. Caller commits.
+
+    Returns (changed, cleared). Shared by the full `recompute-status` backfill
+    and the sync worker's per-cycle refresh so the two can never drift: a
+    status written by one and a status written by the other have to mean the
+    same thing.
+
+    `stamp` controls whether `updated_at` moves, and the two callers genuinely
+    want opposite answers:
+
+    * The sync worker stamps. A bill whose status moved because new actions
+      landed HAS changed, and consumers must see it in /changes.
+    * The full backfill does not. It re-derives all 209k bills, so any change
+      to the derivation logic itself would otherwise stamp tens of thousands
+      of rows at once and publish them as a wave of "changes" that no consumer
+      can tell apart from real legislative movement -- one maintenance re-run
+      would drown every watchlist on the platform. The bills did not move; our
+      reading of them improved.
+
+    That distinction is exactly what a real change-log table would carry as an
+    event kind. This flag is the honest stand-in until there is one.
+    """
+    if not bill_ids:
+        return (0, 0)
+    current = {
+        r.id: r.status
+        for r in db.execute(select(Bill.id, Bill.status).where(Bill.id.in_(bill_ids))).all()
+    }
+    actions_by_bill: dict[object, list[status_mod.ActionRow]] = {bid: [] for bid in bill_ids}
+    for a in db.execute(
+        select(
+            BillAction.bill_id,
+            BillAction.action_date,
+            BillAction.classification,
+            BillAction.description,
+        ).where(BillAction.bill_id.in_(bill_ids))
+    ).all():
+        actions_by_bill[a.bill_id].append(
+            status_mod.ActionRow(
+                action_date=a.action_date,
+                classification=a.classification,
+                description=a.description,
+            )
+        )
+
+    updates = []
+    cleared = 0
+    for bid in bill_ids:
+        derived = status_mod.derive_status(actions_by_bill[bid])
+        if counts is not None and derived is not None:
+            counts[derived] = counts.get(derived, 0) + 1
+        if derived != current.get(bid):
+            updates.append({"b_id": bid, "b_status": derived})
+            if derived is None:
+                cleared += 1
+            if stamp:
+                # Carries the transition itself, so a consumer can act on
+                # "in_committee -> enacted" without having cached the old
+                # value. Suppressed for wholesale backfills for the same
+                # reason the timestamp is: see this function's docstring.
+                events_mod.record_event(
+                    db,
+                    bid,
+                    events_mod.STATUS,
+                    f"{current.get(bid) or 'unknown'} -> {derived or 'unknown'}",
+                )
+    if updates:
+        # Bump updated_at on exactly the rows whose status MOVED. This is a raw
+        # UPDATE, so SQLAlchemy's client-side onupdate never fires -- without
+        # setting it here a bill could go introduced -> enacted while its
+        # updated_at stayed at the bulk-load timestamp, and /changes (which is
+        # a range scan over updated_at) would never report the single event
+        # consumers most want to hear about. Only changed rows are written, so
+        # this still does not churn the column on a no-op re-run.
+        db.execute(
+            text(
+                "UPDATE bills SET status = :b_status, updated_at = now() WHERE id = :b_id"
+                if stamp
+                else "UPDATE bills SET status = :b_status WHERE id = :b_id"
+            ),
+            updates,
+        )
+    return (len(updates), cleared)
+
+
 def cmd_recompute_status(args: argparse.Namespace) -> int:
     """Backfill/refresh `bills.status` from each bill's action record.
 
@@ -721,42 +810,14 @@ def cmd_recompute_status(args: argparse.Namespace) -> int:
                 break
             last_id = rows[-1].id
             bill_ids = [r.id for r in rows]
-            current = {r.id: r.status for r in rows}
 
-            actions_by_bill: dict[object, list[status_mod.ActionRow]] = {
-                bid: [] for bid in bill_ids
-            }
-            for a in db.execute(
-                select(
-                    BillAction.bill_id,
-                    BillAction.action_date,
-                    BillAction.classification,
-                    BillAction.description,
-                ).where(BillAction.bill_id.in_(bill_ids))
-            ).all():
-                actions_by_bill[a.bill_id].append(
-                    status_mod.ActionRow(
-                        action_date=a.action_date,
-                        classification=a.classification,
-                        description=a.description,
-                    )
-                )
-
-            updates = []
-            for bid in bill_ids:
-                derived = status_mod.derive_status(actions_by_bill[bid])
-                if derived is not None:
-                    counts[derived] = counts.get(derived, 0) + 1
-                if derived != current[bid]:
-                    updates.append({"b_id": bid, "b_status": derived})
-                    if derived is None:
-                        cleared += 1
-            if updates:
-                db.execute(
-                    text("UPDATE bills SET status = :b_status WHERE id = :b_id"),
-                    updates,
-                )
-                changed += len(updates)
+            # stamp=False: see recompute_status_for_bills. A wholesale
+            # re-derivation is a maintenance pass, not 209k bills moving.
+            chunk_changed, chunk_cleared = recompute_status_for_bills(
+                db, bill_ids, counts, stamp=False
+            )
+            changed += chunk_changed
+            cleared += chunk_cleared
             db.commit()
             processed += len(rows)
             print(
@@ -800,9 +861,12 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
          so running this alongside anything else is safe).
       2. Drain queued api_sync jobs, one short-lived session each, up to
          `--max-jobs` so one pathological state cannot spin a cycle forever.
-      3. Recompute coverage, because api_sync creates bills and the counts
+      3. Re-derive `bills.status` for every bill the cycle touched, so the
+         status field tracks the actions the sync just landed instead of
+         freezing at whatever the initial backfill computed.
+      4. Recompute coverage, because api_sync creates bills and the counts
          behind every coverage row would otherwise lag a full crawl cadence.
-      4. Sleep `--interval` (default 24h -- nightly is enough for consumers
+      5. Sleep `--interval` (default 24h -- nightly is enough for consumers
          doing a daily sync, and keeps us well inside the upstream API's
          rate limits).
 
@@ -820,8 +884,14 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
         flush=True,
     )
 
+    # Bills whose status still needs re-deriving, carried across cycles so a
+    # failed recompute is retried instead of being lost with the cycle.
+    pending_status_bills: set = set()
+
     try:
         while True:
+            touched_this_cycle: set = set()
+
             # Step 1: enqueue whatever is due.
             db = get_session()
             try:
@@ -862,6 +932,9 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                         result = api_sync_mod.run_api_sync_job(db, state)
                         queue_mod.complete_job(db, job)
                         db.commit()
+                        # Collected only after the commit succeeds: a rolled-back
+                        # sync wrote nothing, so its bills need no recompute.
+                        touched_this_cycle |= result.touched_bill_ids
                         processed += 1
                         print(
                             f"sync-worker {worker_id}: api_sync {result.state} "
@@ -890,7 +963,52 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                 flush=True,
             )
 
-            # Step 3: api_sync creates bills; refresh the counts every coverage
+            # Step 3: re-derive status for every bill this cycle touched.
+            #
+            # Without this, `bills.status` is frozen at whatever the one-off
+            # backfill computed: the sync happily lands the new actions that
+            # move a bill from in_committee to enacted, and the status field
+            # -- the thing consumers filter and alert on -- keeps reporting
+            # the old value indefinitely. A stale status is worse than a null
+            # one, because it reads as a current answer.
+            #
+            # Works off the bill ids the sync REPORTED touching, never a
+            # `updated_at >= cycle_started` window: that window compares a
+            # DB-written column to this host's clock, and skew, a run whose
+            # retrieved_at predates the cycle stamp, or a forward-only stamp
+            # that kept an older value all silently drop bills out of it.
+            #
+            # Ids that fail to recompute are carried into the next cycle
+            # rather than dropped. A window-based scheme cannot do this: once
+            # the window moves past a failed bill, nothing ever revisits it,
+            # and the bill serves a stale status until some unrelated edit
+            # happens to touch it again.
+            pending_status_bills |= touched_this_cycle
+            if pending_status_bills:
+                db = get_session()
+                try:
+                    batch = sorted(pending_status_bills)
+                    changed, cleared = recompute_status_for_bills(db, batch)
+                    db.commit()
+                    pending_status_bills = set()
+                    print(
+                        f"sync-worker {worker_id}: status recomputed for "
+                        f"{len(batch)} touched bill(s) -- {changed} changed, "
+                        f"{cleared} cleared",
+                        flush=True,
+                    )
+                except Exception:
+                    db.rollback()
+                    traceback.print_exc()
+                    print(
+                        f"sync-worker {worker_id}: status recompute FAILED for "
+                        f"{len(pending_status_bills)} bill(s); retrying next cycle",
+                        flush=True,
+                    )
+                finally:
+                    db.close()
+
+            # Step 4: api_sync creates bills; refresh the counts every coverage
             # row is derived from rather than waiting on the crawl worker.
             if processed:
                 db = get_session()

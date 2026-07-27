@@ -13,6 +13,7 @@ from billcommons_api.errors import register_exception_handlers
 from billcommons_api.middleware import RequestIDMiddleware, SecureHeadersMiddleware
 from billcommons_api.routers import (
     bills,
+    changes,
     committees,
     coverage,
     events,
@@ -77,6 +78,7 @@ def create_app() -> FastAPI:
         committees.router,
         events.router,
         search.router,
+        changes.router,
         sources.router,
         coverage.router,
         sitemap.router,

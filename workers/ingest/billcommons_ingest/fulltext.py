@@ -40,6 +40,7 @@ import httpx
 from sqlalchemy import Text, case, cast, exists, func, or_, select, text
 from sqlalchemy.orm import Session as OrmSession
 
+from billcommons_ingest import events
 from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob
 from billcommons_shared.aia import AiaRepairCache, is_missing_issuer_error
 from billcommons_shared.httpc import USER_AGENT, RateLimiter, new_client
@@ -719,6 +720,7 @@ def process_fetch_text_job(
     content_type = sniff_content_type(response.headers.get("content-type"), document.url, raw)
     outcome = extract_document_text(content_type, raw)
 
+    had_text_before = bool(document.extracted_text)
     document.extracted_text = outcome.extracted_text
     document.media_type = document.media_type or response.headers.get("content-type")
     document.source_name = SOURCE_NAME
@@ -728,6 +730,21 @@ def process_fetch_text_job(
     document.parser_version = PARSER_VERSION
     _mark_status(document, outcome.status)
     db.flush()
+
+    # A bill going from "we have no text" to "text available" is the moment it
+    # becomes searchable and diffable -- for a policy tracker, usually the most
+    # valuable event this system produces. It used to be completely invisible
+    # to consumers: this path writes a document row and never touched the bill,
+    # so nothing marked the bill as changed.
+    #
+    # Only on the transition. Re-fetching a document that already had text is
+    # crawler bookkeeping, not news.
+    if outcome.extracted_text and not had_text_before:
+        bill_id = db.execute(
+            select(BillVersion.bill_id).where(BillVersion.id == document.bill_version_id)
+        ).scalar_one_or_none()
+        if bill_id is not None:
+            events.record_event(db, bill_id, events.TEXT, "document text available")
 
     return FetchTextResult(
         document_id=str(document.id),

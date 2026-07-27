@@ -49,6 +49,7 @@ from billcommons_schema.models import (
     Session as SessionModel,
     Sponsorship,
 )
+from billcommons_ingest import events
 from billcommons_shared.normalize import normalize_bill_number
 
 SOURCE_NAME = "openstates_api_sync"
@@ -67,6 +68,14 @@ class ApiSyncResult:
     sponsorships: int = 0
     pages_fetched: int = 0
     warnings: list[str] = field(default_factory=list)
+    # Bills this run created or wrote actions to. Reported explicitly rather
+    # than re-derived afterwards from `updated_at >= <cycle start>`: that test
+    # compares a DB-written column against a worker-host clock, and any skew,
+    # any run whose `retrieved_at` predates the cycle stamp, or any bill
+    # stamped forward-only to an older value drops out of the window silently.
+    # A bill missing from that window never gets its status re-derived, so the
+    # field keeps serving a stale answer with no error anywhere.
+    touched_bill_ids: set = field(default_factory=set)
 
 
 def _bill_checksum(payload: dict) -> str:
@@ -320,6 +329,8 @@ def sync_state(
                     bill_by_openstates_id[openstates_id] = bill
                 bill_by_session_and_identifier_norm[(session_row.id, identifier_norm)] = bill
                 result.bills_created += 1
+                result.touched_bill_ids.add(bill.id)
+                events.record_event(db, bill.id, events.CREATED, identifier_raw)
                 page_unchanged_flags.append(False)
             elif bill.checksum == checksum:
                 result.bills_unchanged += 1
@@ -356,6 +367,8 @@ def sync_state(
                 bill.parser_version = "openstates_api_sync/1"
                 bill.source_url = bill.source_url or _resolve_source_url(bill_payload)
                 result.bills_updated += 1
+                result.touched_bill_ids.add(bill.id)
+                events.record_event(db, bill.id, events.METADATA)
                 page_unchanged_flags.append(False)
                 if bill.openstates_id:
                     bill_by_openstates_id[bill.openstates_id] = bill
@@ -389,6 +402,7 @@ def _upsert_actions(
     }
     latest_date = None
     latest_text = None
+    added = 0
     for i, action_payload in enumerate(action_payloads):
         description = action_payload.get("description") or ""
         order = i
@@ -408,12 +422,43 @@ def _upsert_actions(
             )
             existing.add(key)
             result.actions += 1
+            # A new action is a real change to this bill even when none of the
+            # bill's own columns move -- an action inserted anywhere but the
+            # end leaves latest_action_* identical, so the row would not be
+            # dirty, no UPDATE would be emitted, and updated_at would keep the
+            # bulk-load timestamp. The /changes feed reads this column, so a
+            # silently-unstamped bill is a bill whose new action nobody sees.
+            #
+            # Stamped forward-only. `retrieved_at` is captured once per sync
+            # run and can therefore be OLDER than a value already on the row
+            # (a status recompute writes the DB clock, this writes the worker's,
+            # and a long run is stamping with a timestamp minted at its start).
+            # Moving updated_at backwards would drop the bill behind cursors
+            # that have already passed it -- it would be published as changed
+            # to nobody. A change may be reported late; it must never be
+            # reported into the past.
+            if bill.updated_at is None or retrieved_at > bill.updated_at:
+                bill.updated_at = retrieved_at
+            # An action landed, so this bill's derived status may have moved
+            # even when the bill row itself was byte-identical (the "unchanged"
+            # branch above still reaches here -- an action list can grow
+            # without any core field differing).
+            result.touched_bill_ids.add(bill.id)
+            added += 1
         if action_date is not None:
             latest_date = action_date
             latest_text = description
     if latest_date is not None:
         bill.latest_action_date = latest_date
         bill.latest_action_text = latest_text
+    if added:
+        # One event per sync for the whole batch, not one per action: a
+        # consumer refetches the bill's action list either way, and a bill
+        # importing 40 historical actions should not occupy 40 pages of every
+        # subscriber's feed.
+        events.record_event(
+            db, bill.id, events.ACTIONS, f"{added} action(s) added"
+        )
     db.flush()
 
 
@@ -426,6 +471,7 @@ def _upsert_sponsorships(
         (s.name, s.classification)
         for s in db.execute(select(Sponsorship).where(Sponsorship.bill_id == bill.id)).scalars()
     }
+    added = 0
     for sponsorship_payload in sponsorship_payloads:
         name = sponsorship_payload.get("name")
         classification = sponsorship_payload.get("classification")
@@ -443,6 +489,14 @@ def _upsert_sponsorships(
             )
             existing.add(key)
             result.sponsorships += 1
+            added += 1
+    if added:
+        # This path wrote child rows and never touched the parent, so before
+        # the change log existed a new cosponsor on a watched bill was
+        # invisible to consumers -- one of the two gaps that motivated moving
+        # off `bills.updated_at`.
+        result.touched_bill_ids.add(bill.id)
+        events.record_event(db, bill.id, events.SPONSORS, f"{added} sponsor(s) added")
     db.flush()
 
 

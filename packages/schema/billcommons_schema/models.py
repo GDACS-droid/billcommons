@@ -16,6 +16,7 @@ import uuid
 from datetime import date, datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Computed,
@@ -153,6 +154,8 @@ class Bill(UUIDPkMixin, TimestampMixin, ProvenanceMixin, Base):
     __table_args__ = (
         UniqueConstraint("session_id", "identifier_norm", name="uq_bills_session_identifier_norm"),
         Index("ix_bills_identifier_norm", "identifier_norm"),
+        # Serves the /changes keyset scan; see migration 0004.
+        Index("ix_bills_updated_at_id", "updated_at", "id"),
     )
 
 
@@ -229,6 +232,37 @@ class BillAction(UUIDPkMixin, TimestampMixin, ProvenanceMixin, Base):
     order: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     bill: Mapped["Bill"] = relationship(back_populates="actions")
+
+
+class BillEvent(Base):
+    """One entry in the append-only change log that `/changes` serves.
+
+    Deliberately NOT a UUIDPkMixin/TimestampMixin row: the primary key IS the
+    feed cursor, so it has to be a gapless-ordered bigserial rather than a
+    random UUID, and it carries a single `changed_at` rather than the
+    created/updated pair (a log entry is never updated).
+
+    See migration 0005 for why this table exists and why readers must serve
+    from behind a watermark rather than from the head.
+    """
+
+    __tablename__ = "bill_events"
+
+    seq: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    bill_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bills.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_bill_events_seq", "seq"),
+        Index("ix_bill_events_changed_at", "changed_at"),
+        Index("ix_bill_events_bill_id_seq", "bill_id", "seq"),
+    )
 
 
 class BillSubject(UUIDPkMixin, TimestampMixin, Base):

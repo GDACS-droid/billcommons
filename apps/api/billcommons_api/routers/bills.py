@@ -11,8 +11,9 @@ from sqlalchemy.orm import selectinload
 from billcommons_shared.normalize import normalize_bill_number
 
 from billcommons_api.deps import get_db
-from billcommons_api.errors import conflict, not_found
+from billcommons_api.errors import bad_request, conflict, not_found
 from billcommons_api.etag import make_etag
+from billcommons_api.labels import attach_bill_labels
 from billcommons_api.pagination import (
     DEFAULT_PAGE,
     DEFAULT_PER_PAGE,
@@ -22,9 +23,12 @@ from billcommons_api.pagination import (
 )
 from billcommons_api.schemas import (
     BillActionOut,
+    BillBatchEnvelope,
     BillCompareEnvelope,
     BillCompareOut,
     BillDetail,
+    BillLookupKey,
+    BillLookupRequest,
     BillDocumentOut,
     BillSummary,
     BillVersionOut,
@@ -136,7 +140,7 @@ def list_bills(
         .scalars()
         .all()
     )
-    items = [BillSummary.model_validate(r) for r in rows]
+    items = attach_bill_labels(db, [BillSummary.model_validate(r) for r in rows])
     return paginate(
         items,
         page=page,
@@ -147,13 +151,224 @@ def list_bills(
     )
 
 
+MAX_BATCH_KEYS = 100
+
+
+@router.get("/batch", response_model=BillBatchEnvelope)
+def batch_lookup_bills(
+    request: Request,
+    ids: str | None = Query(
+        None, description="Comma-separated bill UUIDs, e.g. `ids=<uuid>,<uuid>`"
+    ),
+    keys: str | None = Query(
+        None,
+        description=(
+            "Comma-separated `JURISDICTION:BILL_NUMBER` pairs, e.g. "
+            "`keys=HI:SB2135,NY:S9417`. Bill numbers are normalized, so "
+            "`HI:sb 2135` resolves the same bill. Append a session to "
+            "disambiguate: `NY:S9417:2025-2026 Regular Session`."
+        ),
+    ),
+    db: OrmSession = Depends(get_db),
+) -> BillBatchEnvelope:
+    """Resolve up to 100 bills in one request.
+
+    Exists because watchlist monitoring -- the main reason to consume this API
+    -- was one HTTP round trip per bill. A caller tracking 160 bills spent 160
+    requests to answer "did anything move?", which is both slow for them and
+    the single easiest way to walk into the rate limit.
+
+    Anything requested but not resolved comes back in `not_found` rather than
+    being silently absent; see BillBatchEnvelope.
+    """
+    # De-duplicated, order preserved. Repeats are not an error (a watchlist
+    # assembled from several sources will contain them), but they must not
+    # produce the same bill twice in `data`, and a token that differs only by
+    # case from one already resolved must not be reported as missing.
+    requested: list[str] = []
+    seen_tokens: set[str] = set()
+    for raw in (ids or "").split(",") + (keys or "").split(","):
+        token = raw.strip()
+        if token and token.casefold() not in seen_tokens:
+            seen_tokens.add(token.casefold())
+            requested.append(token)
+    if not requested:
+        raise bad_request(
+            "no_keys", "Provide at least one lookup in `ids` or `keys`."
+        )
+    if len(requested) > MAX_BATCH_KEYS:
+        raise bad_request(
+            "too_many_keys",
+            f"Batch lookup accepts at most {MAX_BATCH_KEYS} entries per request, "
+            f"got {len(requested)}. Split the batch.",
+        )
+
+    parsed = []
+    for token in requested:
+        try:
+            parsed.append((token, BillLookupKey(id=uuid.UUID(token))))
+            continue
+        except ValueError:
+            pass
+        # maxsplit=2: session identifiers routinely contain colons of their own
+        # ("Alabama special: Congressional maps"), and a naive split would keep
+        # only the fragment before the first one, match nothing, and report a
+        # real bill as missing. 14 of this corpus's 77 sessions are affected.
+        parts = [p.strip() for p in token.split(":", 2)]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            parsed.append((token, None))
+            continue
+        parsed.append(
+            (
+                token,
+                BillLookupKey(
+                    jurisdiction=parts[0],
+                    identifier=parts[1],
+                    session=parts[2] if len(parts) > 2 and parts[2] else None,
+                ),
+            )
+        )
+    return _resolve_lookup(db, parsed, request)
+
+
+@router.post("/lookup", response_model=BillBatchEnvelope)
+def lookup_bills(
+    request: Request,
+    body: BillLookupRequest,
+    db: OrmSession = Depends(get_db),
+) -> BillBatchEnvelope:
+    """Batch lookup with a structured JSON body. Same response shape as
+    `GET /bills/batch`, which it supersedes for anything non-trivial.
+
+    The GET form encodes each lookup as `JUR:NUMBER:SESSION` in the query
+    string, which breaks in two ways that are not hypothetical: 100
+    session-qualified keys is 4-8KB of URL, past the default request-line limit
+    on common proxies (they return 414 before our own error can fire), and the
+    colon delimiter collides with session identifiers and OCD jurisdiction ids
+    that contain colons themselves.
+
+    Keys are echoed back on each result so callers can correlate without
+    re-implementing bill-number normalization.
+    """
+    if not body.keys:
+        raise bad_request("no_keys", "Provide at least one entry in `keys`.")
+    if len(body.keys) > MAX_BATCH_KEYS:
+        raise bad_request(
+            "too_many_keys",
+            f"Lookup accepts at most {MAX_BATCH_KEYS} entries per request, "
+            f"got {len(body.keys)}. Split the batch.",
+        )
+    parsed = []
+    seen: set[str] = set()
+    for key in body.keys:
+        token = _lookup_token(key)
+        if token.casefold() in seen:
+            continue
+        seen.add(token.casefold())
+        parsed.append((token, key if (key.id or key.identifier) else None))
+    return _resolve_lookup(db, parsed, request)
+
+
+def _lookup_token(key: BillLookupKey) -> str:
+    if key.id:
+        return str(key.id)
+    parts = [key.jurisdiction or "", key.identifier or ""]
+    if key.session:
+        parts.append(key.session)
+    return ":".join(parts)
+
+
+def _resolve_lookup(
+    db: OrmSession, parsed: list[tuple[str, "BillLookupKey | None"]], request: Request
+) -> BillBatchEnvelope:
+    """Resolve parsed lookup keys. Shared by the GET and POST forms so the two
+    can never answer the same question differently."""
+    found: dict[str, Bill] = {}
+    ambiguous: dict[str, list[str]] = {}
+
+    # UUID lookups: one query for all of them. Keyed by token, not by the
+    # parsed UUID -- two surface spellings of one id (case, formatting) would
+    # otherwise collapse in the dict and the loser would be reported missing
+    # while its own bill sat in `data`.
+    by_id = {token: key.id for token, key in parsed if key is not None and key.id}
+    if by_id:
+        rows = {
+            row.id: row
+            for row in db.execute(
+                select(Bill).where(Bill.id.in_(set(by_id.values())))
+            ).scalars()
+        }
+        for token, bill_id in by_id.items():
+            if bill_id in rows:
+                found[token] = rows[bill_id]
+
+    # Grouped by jurisdiction so a batch spanning n states costs n queries
+    # rather than one per bill.
+    by_jurisdiction: dict[str, list[tuple[str, str, str | None]]] = {}
+    for token, key in parsed:
+        if key is None or key.id or not key.jurisdiction or not key.identifier:
+            continue
+        try:
+            identifier_norm = normalize_bill_number(key.identifier)
+        except ValueError:
+            identifier_norm = key.identifier.upper().strip()
+        by_jurisdiction.setdefault(key.jurisdiction.upper().strip(), []).append(
+            (token, identifier_norm, key.session)
+        )
+
+    for abbreviation, entries in by_jurisdiction.items():
+        rows = db.execute(
+            select(Bill, Session.identifier)
+            .join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id)
+            .join(Session, Session.id == Bill.session_id)
+            .where(
+                Jurisdiction.abbreviation == abbreviation,
+                Bill.identifier_norm.in_({e[1] for e in entries}),
+            )
+        ).all()
+        for token, identifier_norm, session_identifier in entries:
+            matches = [
+                bill
+                for bill, session_id in rows
+                if bill.identifier_norm == identifier_norm
+                and (session_identifier is None or session_id == session_identifier)
+            ]
+            # A bill number matching more than one session is AMBIGUOUS, not
+            # missing, and the two demand opposite responses: "missing" means
+            # drop it from the watchlist, "ambiguous" means re-ask with a
+            # session. Collapsing them into not_found tells a consumer to
+            # delete a bill we actually hold. Measured on this corpus: 981
+            # ambiguous pairs covering 2,459 bills, 726 of them in Texas alone.
+            if len(matches) == 1:
+                found[token] = matches[0]
+            elif len(matches) > 1:
+                ambiguous[token] = sorted(
+                    {
+                        session_id
+                        for bill, session_id in rows
+                        if bill.identifier_norm == identifier_norm
+                    }
+                )
+
+    tokens = [token for token, _ in parsed]
+    items = attach_bill_labels(
+        db, [BillSummary.model_validate(found[t]) for t in tokens if t in found]
+    )
+    return BillBatchEnvelope(
+        data=items,
+        not_found=[t for t in tokens if t not in found and t not in ambiguous],
+        ambiguous=ambiguous,
+        meta={"api_version": "v1", "request_id": request.state.request_id},
+    )
+
+
 @router.get("/{bill_id}", response_model=BillDetail)
 def get_bill(
     bill_id: uuid.UUID, response: Response, db: OrmSession = Depends(get_db)
 ) -> BillDetail:
     row = _get_bill_or_404(db, bill_id)
     response.headers["ETag"] = make_etag(row.id, row.updated_at)
-    return BillDetail.model_validate(row)
+    return attach_bill_labels(db, [BillDetail.model_validate(row)])[0]
 
 
 @router.get("/{bill_id}/versions", response_model=list[BillVersionOut])

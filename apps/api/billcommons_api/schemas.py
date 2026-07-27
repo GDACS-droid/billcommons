@@ -49,6 +49,13 @@ class BillSummary(OrmModel):
     id: uuid.UUID
     jurisdiction_id: uuid.UUID
     session_id: uuid.UUID
+    # Human-readable labels for the two foreign keys above. Without these a
+    # caller cannot tell which state or which session a result belongs to
+    # without a second round trip per row -- the friction behind the reported
+    # "same bill number, different session" confusion. Filled in by
+    # billcommons_api.labels.attach_bill_labels, not by the ORM.
+    jurisdiction_abbreviation: str | None = None
+    session_identifier: str | None = None
     chamber: str | None = None
     identifier: str
     identifier_norm: str
@@ -61,6 +68,11 @@ class BillSummary(OrmModel):
     latest_action_text: str | None = None
     latest_action_date: date_ | None = None
     source_url: str | None = None
+    # When this bill's record last changed. Without it a batch lookup -- whose
+    # entire purpose is answering "did anything move?" -- shipped without the
+    # field that answers it, forcing callers to field-diff every row against a
+    # cached copy.
+    updated_at: datetime | None = None
 
 
 class BillDetail(BillSummary):
@@ -68,6 +80,96 @@ class BillDetail(BillSummary):
     source_name: str | None = None
     retrieved_at: datetime | None = None
     upstream_updated_at: datetime | None = None
+
+
+class BillBatchEnvelope(BaseModel):
+    """Response for the batch lookup.
+
+    `not_found` is the point of the shape. A batch endpoint that just returns
+    the rows it managed to resolve makes a typo, a renumbered bill and a
+    jurisdiction we do not cover all look identical to a caller diffing counts
+    -- and this project has already shipped two bugs where a short result was
+    read as a complete one. Every requested key is accounted for in exactly
+    one of the three fields.
+
+    `ambiguous` is kept separate from `not_found` because they call for
+    opposite actions. Not-found means the bill is not here; ambiguous means it
+    is here more than once (the same number in several sessions) and the
+    request needs a session to pick one. It maps the key to the session
+    identifiers that matched, so the caller can re-ask without a second query.
+    Folding these together would tell a consumer to drop a bill we hold.
+    """
+
+    data: list[BillSummary]
+    not_found: list[str]
+    ambiguous: dict[str, list[str]] = {}
+    meta: dict
+
+
+class BillLookupKey(BaseModel):
+    """One structured lookup in a POST /bills/lookup body.
+
+    Structured fields rather than a `JUR:NUMBER:SESSION` string. The colon
+    grammar cannot survive its own data: 14 of this corpus's 77 session
+    identifiers already contain colons ("Alabama special: Congressional
+    maps"), and OCD-style jurisdiction ids are colon-delimited throughout
+    (`ocd-jurisdiction/country:us/state:ca`). Anything beyond US states makes
+    the delimiter ambiguous, and by then it is a frozen public contract.
+    """
+
+    id: uuid.UUID | None = None
+    jurisdiction: str | None = None
+    identifier: str | None = None
+    session: str | None = None
+
+
+class BillLookupRequest(BaseModel):
+    keys: list[BillLookupKey]
+
+
+class ChangeEvent(BaseModel):
+    """One entry in the change feed.
+
+    Carries the KIND of change, so a consumer knows which of its cached
+    collections to refetch instead of diffing the whole bill. `bill` is the
+    current state of the bill, not its state at the time of the event -- this
+    is a change feed, not an audit log; several events for one bill in a page
+    all show the same current row.
+    """
+
+    cursor: str
+    kind: str = Field(
+        description=(
+            "created | status | actions | sponsors | text | metadata. "
+            "`text` means document text became available -- the bill is now "
+            "searchable and diffable."
+        )
+    )
+    changed_at: datetime
+    detail: str | None = Field(
+        default=None,
+        description="Human-readable specifics, e.g. 'in_committee -> enacted'.",
+    )
+    bill: BillSummary | None = None
+
+
+class ChangeFeedEnvelope(BaseModel):
+    """Response for `/changes`.
+
+    Pass `next_cursor` back verbatim to continue. It is opaque on purpose:
+    consumers persist cursors for months, so publishing the raw ordering key
+    would freeze it, and this way the ordering scheme can change later without
+    invalidating a single stored cursor.
+
+    On an empty page `next_cursor` echoes the cursor you sent, so a polling
+    loop can store the response unconditionally and never accidentally rewind
+    or skip.
+    """
+
+    data: list[ChangeEvent]
+    next_cursor: str
+    has_more: bool
+    meta: dict
 
 
 class BillIdentifierOut(OrmModel):

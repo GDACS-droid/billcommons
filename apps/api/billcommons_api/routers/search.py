@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_api.deps import get_db
 from billcommons_api.errors import bad_request
+from billcommons_api.labels import attach_bill_labels
 from billcommons_api.pagination import Page, clamp_per_page, paginate
 from billcommons_api.schemas import SearchResult
 from billcommons_api.search import VALID_SORTS, SearchFilters, run_search
@@ -54,7 +55,7 @@ def search(
         per_page=per_page,
     )
     rows, total = run_search(db, filters)
-    items = [SearchResult.model_validate(r) for r in rows]
+    items = attach_bill_labels(db, [SearchResult.model_validate(r) for r in rows])
     return paginate(
         items,
         page=page,
