@@ -45,6 +45,30 @@ export async function apiGet<T>(
     });
 
     if (!res.ok) {
+      // A FAILED response is cached exactly like a successful one, for the
+      // whole revalidate window, and Next's Data Cache persists across
+      // deployments -- so a single blip pins an error onto a page for an hour
+      // and redeploying does not clear it. That is not hypothetical: pages
+      // rendered against the API before /related and /subjects shipped cached
+      // those 404s and kept serving "temporarily unavailable" long after the
+      // endpoints were live.
+      //
+      // Retry once uncached so an error self-heals on the very next request
+      // instead of persisting. Only the failure path pays for this.
+      if (options?.revalidate !== undefined) {
+        const retry = await fetch(url.toString(), {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (retry.ok) {
+          return { ok: true, data: (await retry.json()) as T };
+        }
+        return {
+          ok: false,
+          error: `API returned ${retry.status} ${retry.statusText}`,
+          status: retry.status,
+        };
+      }
       return {
         ok: false,
         error: `API returned ${res.status} ${res.statusText}`,
