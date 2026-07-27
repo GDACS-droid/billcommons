@@ -98,8 +98,24 @@ class OpenStatesClient:
             params["classification"] = classification
         return self._request("GET", "/jurisdictions", params=params)
 
-    def get_jurisdiction(self, jurisdiction_id: str) -> dict:
-        return self._request("GET", f"/jurisdictions/{jurisdiction_id}")
+    def get_jurisdiction(self, jurisdiction_id: str, *, include: list[str] | None = None) -> dict:
+        params = {}
+        if include:
+            params["include"] = include
+        return self._request("GET", f"/jurisdictions/{jurisdiction_id}", params=params)
+
+    def get_legislative_sessions(self, jurisdiction_id: str) -> list[dict]:
+        """Session metadata including start_date/end_date.
+
+        The end date is the authority on whether a bill still has a chance:
+        anything short of the governor's desk in a session that has adjourned
+        is dead, however alive its own action record looks. Taken from
+        upstream rather than researched by hand because sine die dates move,
+        special sessions appear mid-year, and a hand-curated table would be
+        wrong within a month.
+        """
+        payload = self.get_jurisdiction(jurisdiction_id, include=["legislative_sessions"])
+        return payload.get("legislative_sessions") or []
 
     def search_bills(
         self,

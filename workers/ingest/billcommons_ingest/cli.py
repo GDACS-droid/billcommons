@@ -38,7 +38,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 
 from billcommons_ingest import api_sync as api_sync_mod
 from billcommons_ingest import coverage as coverage_mod
@@ -68,6 +68,17 @@ from billcommons_schema.models import (
 )
 from billcommons_shared.db import get_session
 from billcommons_shared.rawstore import FilesystemRawStore
+
+# Ceiling on one adjournment-sweep pass. A sine die can retire several thousand
+# bills at once; capping the pass keeps a single cycle bounded, and whatever is
+# left is picked up next cycle because the query is self-selecting.
+ADJOURNMENT_SWEEP_BATCH = 20000
+
+# Jurisdictions queried per cycle for missing session end dates. The upstream
+# free tier is 250 requests/day shared with the actual bill sync, so this stays
+# small -- starving the sync to fill a date would be a bad trade, and the set
+# shrinks to zero as dates land.
+SESSION_DATE_TOPUP_PER_CYCLE = 5
 
 DEFAULT_REGISTRY_PATH = "data/registry/sessions-2026.json"
 DEFAULT_COVERAGE_OUTPUT = "docs/state-coverage/coverage-latest.json"
@@ -715,10 +726,19 @@ def recompute_status_for_bills(
     """
     if not bill_ids:
         return (0, 0)
-    current = {
-        r.id: r.status
-        for r in db.execute(select(Bill.id, Bill.status).where(Bill.id.in_(bill_ids))).all()
-    }
+    # The session's end date is part of the derivation, not decoration: a bill
+    # short of the governor's desk in an adjourned session is dead however
+    # alive its own actions look. Joined here so it costs one query for the
+    # whole chunk. See status.apply_session_outcome.
+    current = {}
+    session_end = {}
+    for r in db.execute(
+        select(Bill.id, Bill.status, SessionModel.end_date)
+        .join(SessionModel, SessionModel.id == Bill.session_id)
+        .where(Bill.id.in_(bill_ids))
+    ).all():
+        current[r.id] = r.status
+        session_end[r.id] = r.end_date
     actions_by_bill: dict[object, list[status_mod.ActionRow]] = {bid: [] for bid in bill_ids}
     for a in db.execute(
         select(
@@ -739,7 +759,9 @@ def recompute_status_for_bills(
     updates = []
     cleared = 0
     for bid in bill_ids:
-        derived = status_mod.derive_status(actions_by_bill[bid])
+        derived = status_mod.apply_session_outcome(
+            status_mod.derive_status(actions_by_bill[bid]), session_end.get(bid)
+        )
         if counts is not None and derived is not None:
             counts[derived] = counts.get(derived, 0) + 1
         if derived != current.get(bid):
@@ -774,6 +796,153 @@ def recompute_status_for_bills(
             updates,
         )
     return (len(updates), cleared)
+
+
+def cmd_backfill_session_dates(args: argparse.Namespace) -> int:
+    """Fill `sessions.start_date`/`end_date` from the Open States v3 API.
+
+    The end date decides whether a bill still has a chance: anything short of
+    the governor's desk in an adjourned session is dead no matter how alive its
+    own action record looks (see status.apply_session_outcome). 18 of 77
+    sessions had no end date at all, which left every bill in them
+    unresolvable -- Georgia's biennium had adjourned on 2026-04-02 and 4,502
+    Georgia bills were still being reported as live.
+
+    Also corrects `active`, which is set once at seed time and never revisited:
+    six sessions were flagged active with an end date already in the past.
+
+    Read from upstream rather than curated by hand because sine die dates move,
+    special sessions appear mid-year, and a hardcoded table would be wrong
+    within a month and wrong silently.
+    """
+    db = get_session()
+    try:
+        jurisdictions = db.execute(
+            select(Jurisdiction).order_by(Jurisdiction.abbreviation)
+        ).scalars().all()
+        stats = refresh_session_dates(db, jurisdictions, delay=args.delay, verbose=True)
+        if args.dry_run:
+            db.rollback()
+            print(
+                f"backfill-session-dates: DRY RUN -- {stats['checked']} session(s) checked, "
+                f"{stats['filled']} would gain an end_date, {stats['corrected']} corrected, "
+                f"{stats['deactivated']} would be deactivated, {stats['failed']} failed"
+            )
+            return 0
+        db.commit()
+        print(
+            f"backfill-session-dates: {stats['checked']} session(s) checked, "
+            f"{stats['filled']} end_date(s) filled, {stats['corrected']} corrected, "
+            f"{stats['deactivated']} deactivated, {stats['failed']} failed"
+        )
+        return 1 if stats["failed"] and not stats["filled"] else 0
+    except Exception:
+        db.rollback()
+        traceback.print_exc()
+        return 1
+    finally:
+        db.close()
+
+
+def refresh_session_dates(
+    db, jurisdictions, *, delay: float = 11.0, verbose: bool = False
+) -> dict:
+    """Pull authoritative session start/end dates for `jurisdictions`.
+
+    Caller commits. Shared by the one-shot backfill command and the sync
+    worker's per-cycle top-up so the two cannot drift.
+    """
+    from billcommons_ingest.openstates_api import OpenStatesClient
+
+    client = OpenStatesClient()
+    today = datetime.now(timezone.utc).date()
+    checked = filled = corrected = deactivated = failed = 0
+
+    for jurisdiction in jurisdictions:
+        ocd_id = jurisdiction.openstates_id or _ocd_jurisdiction_id(jurisdiction)
+        if not ocd_id:
+            if verbose:
+                print(f"  {jurisdiction.abbreviation}: no resolvable id, skipped", flush=True)
+            continue
+        # Paced deliberately. The v3 free tier is ~6 req/min and 250/day, and
+        # this makes one call per jurisdiction, so firing all 51 back to back
+        # exhausts the client's 429 backoff and the sweep dies partway --
+        # leaving exactly the half-corrected session table it exists to
+        # prevent. Slower and complete beats faster and partial.
+        if checked or failed:
+            time.sleep(delay)
+        try:
+            upstream = client.get_legislative_sessions(ocd_id)
+        except Exception as exc:  # noqa: BLE001 - one bad state must not stop the sweep
+            failed += 1
+            print(f"  {jurisdiction.abbreviation}: FAILED {exc}", flush=True)
+            continue
+
+        by_identifier = {s.get("identifier"): s for s in upstream if s.get("identifier")}
+        rows = db.execute(
+            select(SessionModel).where(SessionModel.jurisdiction_id == jurisdiction.id)
+        ).scalars().all()
+        for row in rows:
+            checked += 1
+            match = by_identifier.get(row.identifier)
+            if match is None:
+                continue
+            end_date = _parse_iso_date(match.get("end_date"))
+            start_date = _parse_iso_date(match.get("start_date"))
+            if end_date is not None and row.end_date != end_date:
+                if row.end_date is None:
+                    filled += 1
+                else:
+                    corrected += 1
+                if verbose:
+                    print(
+                        f"  {jurisdiction.abbreviation} {row.identifier!r}: "
+                        f"end_date {row.end_date} -> {end_date}",
+                        flush=True,
+                    )
+                row.end_date = end_date
+            if start_date is not None and row.start_date != start_date:
+                row.start_date = start_date
+            # `active` is a derived fact, not an independent one. Left stale it
+            # silently contradicts the dates sitting beside it -- six sessions
+            # were flagged active with an end date already in the past.
+            should_be_active = row.end_date is None or row.end_date >= today
+            if row.active != should_be_active:
+                row.active = should_be_active
+                if not should_be_active:
+                    deactivated += 1
+
+    return {
+        "checked": checked,
+        "filled": filled,
+        "corrected": corrected,
+        "deactivated": deactivated,
+        "failed": failed,
+    }
+
+
+def _ocd_jurisdiction_id(jurisdiction) -> str | None:
+    """Build the OCD jurisdiction id Open States addresses by.
+
+    `jurisdictions.openstates_id` is null for all 51 rows (the bulk-CSV
+    bootstrap never populated it), so deriving it from the abbreviation is what
+    makes this command work at all. DC is a district, not a state -- the one
+    case where the pattern differs.
+    """
+    abbreviation = (jurisdiction.abbreviation or "").lower()
+    if not abbreviation:
+        return None
+    kind = "district" if abbreviation == "dc" else "state"
+    return f"ocd-jurisdiction/country:us/{kind}:{abbreviation}/government"
+
+
+def _parse_iso_date(value: str | None):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).date()
+    except ValueError:
+        return None
 
 
 def cmd_recompute_status(args: argparse.Namespace) -> int:
@@ -1007,6 +1176,91 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                     )
                 finally:
                     db.close()
+
+            # Step 3a: top up missing session end dates.
+            #
+            # The adjournment rule below is only as good as this column, and a
+            # session with no end date is invisible to it -- Georgia's biennium
+            # had adjourned and 4,502 Georgia bills were still being reported
+            # as live purely because nobody had recorded the date.
+            #
+            # Self-terminating: only jurisdictions that still have a session
+            # with a NULL end date are queried, so the set shrinks to zero and
+            # this becomes a single cheap SELECT. Capped per cycle because the
+            # upstream free tier is 250 requests/day shared with the actual
+            # sync, and starving that to fill a date would be a bad trade.
+            db = get_session()
+            try:
+                needy = db.execute(
+                    select(Jurisdiction)
+                    .join(SessionModel, SessionModel.jurisdiction_id == Jurisdiction.id)
+                    .where(SessionModel.end_date.is_(None))
+                    .distinct()
+                    .limit(SESSION_DATE_TOPUP_PER_CYCLE)
+                ).scalars().all()
+                if needy:
+                    stats = refresh_session_dates(db, needy, delay=11.0)
+                    db.commit()
+                    print(
+                        f"sync-worker {worker_id}: session-date top-up -- "
+                        f"{stats['filled']} filled, {stats['corrected']} corrected, "
+                        f"{stats['failed']} failed across {len(needy)} jurisdiction(s)",
+                        flush=True,
+                    )
+                else:
+                    db.commit()
+            except Exception:
+                db.rollback()
+                traceback.print_exc()
+            finally:
+                db.close()
+
+            # Step 3b: bills that died because their session ran out of clock.
+            #
+            # Unlike every other status transition, this one is triggered by
+            # the CALENDAR, not by an action. Nothing is filed when a session
+            # adjourns -- the bill just stops -- so no sync touches it, no
+            # event fires, and it would keep reporting `in_committee` forever.
+            # Without this sweep the adjournment rule would only ever reach
+            # bills that happened to be modified for some other reason.
+            #
+            # Self-limiting: the set is whatever has fallen off the calendar
+            # since the last pass, which is zero on most nights and a few
+            # thousand the day after a sine die. Batched so one adjournment
+            # cannot produce a single enormous IN list.
+            db = get_session()
+            try:
+                newly_dead = list(
+                    db.execute(
+                        select(Bill.id)
+                        .join(SessionModel, SessionModel.id == Bill.session_id)
+                        .where(
+                            SessionModel.end_date.is_not(None),
+                            SessionModel.end_date < datetime.now(timezone.utc).date(),
+                            or_(
+                                Bill.status.is_(None),
+                                Bill.status.in_(sorted(status_mod.LIVE_STATUSES)),
+                            ),
+                        )
+                        .limit(ADJOURNMENT_SWEEP_BATCH)
+                    ).scalars()
+                )
+                if newly_dead:
+                    for i in range(0, len(newly_dead), 2000):
+                        recompute_status_for_bills(db, newly_dead[i : i + 2000])
+                    db.commit()
+                    print(
+                        f"sync-worker {worker_id}: adjournment sweep closed "
+                        f"{len(newly_dead)} bill(s) whose session has ended",
+                        flush=True,
+                    )
+                else:
+                    db.commit()
+            except Exception:
+                db.rollback()
+                traceback.print_exc()
+            finally:
+                db.close()
 
             # Step 4: api_sync creates bills; refresh the counts every coverage
             # row is derived from rather than waiting on the crawl worker.
@@ -1350,6 +1604,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--limit", type=int, default=0, help="stop after N bills (0 = all)")
     p_status.add_argument("--chunk", type=int, default=2000, help="bills per batch (default 2000)")
     p_status.set_defaults(func=cmd_recompute_status)
+
+    p_session_dates = sub.add_parser(
+        "backfill-session-dates",
+        help="pull authoritative session start/end dates from the Open States v3 API",
+    )
+    p_session_dates.add_argument(
+        "--dry-run", action="store_true", help="report what would change without writing"
+    )
+    p_session_dates.add_argument(
+        "--delay",
+        type=float,
+        default=11.0,
+        help="seconds between jurisdictions (default 11 -- the v3 free tier is ~6 req/min)",
+    )
+    p_session_dates.set_defaults(func=cmd_backfill_session_dates)
 
     p_sync_worker = sub.add_parser(
         "sync-worker",

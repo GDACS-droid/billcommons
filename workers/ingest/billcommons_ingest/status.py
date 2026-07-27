@@ -35,6 +35,7 @@ ENACTED = "enacted"
 VETOED = "vetoed"
 DEAD = "dead"
 WITHDRAWN = "withdrawn"
+DIED_ON_ADJOURNMENT = "died_on_adjournment"
 
 ALL_STATUSES = (
     INTRODUCED,
@@ -46,11 +47,21 @@ ALL_STATUSES = (
     VETOED,
     DEAD,
     WITHDRAWN,
+    DIED_ON_ADJOURNMENT,
 )
 
 # A bill that reaches one of these has an OUTCOME; procedural noise filed
 # afterwards must not drag it back to an earlier stage.
-TERMINAL_STATUSES = frozenset({ENACTED, VETOED, DEAD, WITHDRAWN})
+TERMINAL_STATUSES = frozenset({ENACTED, VETOED, DEAD, WITHDRAWN, DIED_ON_ADJOURNMENT})
+
+# Statuses that mean "still in play", i.e. the bill needs the session to
+# continue in order to go anywhere. When the session adjourns, these die.
+#
+# ENROLLED is deliberately NOT here: a bill already on the governor's desk
+# survives sine die, and executives routinely sign for weeks afterwards (HI
+# SB 2135 adjourned 2026-05-08 and was signed 2026-07-07). Marking those dead
+# would be the same error in the opposite direction.
+LIVE_STATUSES = frozenset({INTRODUCED, IN_COMMITTEE, PASSED_ONE_CHAMBER, PASSED_BOTH})
 
 # Used only to break ties between statuses derived from the SAME date.
 _RANK = {
@@ -59,6 +70,9 @@ _RANK = {
     PASSED_ONE_CHAMBER: 3,
     PASSED_BOTH: 4,
     ENROLLED: 5,
+    # Below the affirmative endings: adjournment is never derived from an
+    # action, so it can only ever apply where nothing else concluded the bill.
+    DIED_ON_ADJOURNMENT: 5.5,
     WITHDRAWN: 6,
     DEAD: 7,
     VETOED: 8,
@@ -193,3 +207,41 @@ def derive_status(actions: list[ActionRow]) -> str | None:
     terminal = [entry for entry in derived if entry[1] in TERMINAL_STATUSES]
     pool = terminal or derived
     return max(pool, key=sort_key)[1]
+
+
+def apply_session_outcome(
+    status: str | None, session_end_date: date | None, today: date | None = None
+) -> str | None:
+    """Fold the session's fate into a bill's action-derived status.
+
+    A bill's own action record cannot express the most common way a bill
+    actually ends. Nothing is filed when a session adjourns -- the bill simply
+    stops, mid-committee, forever. Reading only the actions, `derive_status`
+    therefore reports the last thing that HAPPENED ("passed one chamber") and
+    a consumer reasonably reads that as momentum. Measured on this corpus:
+    54,547 bills, 26% of everything, sat at a live status in a session that had
+    already adjourned. That is the single largest source of false "still alive"
+    here, and "which of my bills are dead" is the question this field exists to
+    answer.
+
+    Applied only when the end date is KNOWN and PAST. An unknown end date
+    yields the action-derived status unchanged -- and that is load-bearing,
+    not laziness: the sessions missing an end date are overwhelmingly
+    two-year carryover biennia (NY, NJ, IL, MN, WI, DC) where a bill pending
+    at the end of year one is genuinely still alive and rolls into year two.
+    Guessing there would invent deaths rather than report them.
+
+    Never overrides a status the bill's own record establishes. Enactment,
+    veto, withdrawal and an explicit death all outrank adjournment, and
+    ENROLLED is excluded from LIVE_STATUSES because a bill on the governor's
+    desk survives sine die by design.
+    """
+    if session_end_date is None:
+        return status
+    if status is not None and status not in LIVE_STATUSES:
+        return status
+    if session_end_date >= (today or date.today()):
+        return status
+    # Reached for status=None too: whatever stage it got to, the session
+    # closed without it becoming law, and nothing further can happen to it.
+    return DIED_ON_ADJOURNMENT
