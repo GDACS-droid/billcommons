@@ -835,7 +835,20 @@ def cmd_backfill_session_dates(args: argparse.Namespace) -> int:
             f"{stats['filled']} end_date(s) filled, {stats['corrected']} corrected, "
             f"{stats['deactivated']} deactivated, {stats['failed']} failed"
         )
-        return 1 if stats["failed"] and not stats["filled"] else 0
+        # A run where nothing succeeded is a FAILED run, not a quiet no-op. The
+        # first paced attempt failed all 35 calls against an exhausted daily
+        # quota, changed nothing, and still looked like it had completed --
+        # which is the shape of bug that gets mistaken for "already done".
+        if stats["failed"] and not (stats["filled"] or stats["corrected"]):
+            print(
+                "backfill-session-dates: FAILED -- every upstream call errored and "
+                "nothing was written. The v3 free tier is 250 requests/day AND "
+                "~6/minute, shared with the bill sync; a same-day sync run can "
+                "exhaust it. Check for 429s above and retry after the quota resets.",
+                flush=True,
+            )
+            return 1
+        return 0
     except Exception:
         db.rollback()
         traceback.print_exc()
