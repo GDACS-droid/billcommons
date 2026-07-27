@@ -61,7 +61,7 @@ export default async function HomePage() {
             Free, open, nonpartisan legislative search
           </h1>
           <p className="mx-auto mt-4 max-w-2xl text-base text-slate-600 sm:text-lg">
-            Track bills, sponsors, votes, and hearings across all 50 states
+            Track bills, sponsors, votes, and full text across all 50 states
             and DC — sourced from official legislative records, with full
             attribution.
           </p>

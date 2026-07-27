@@ -128,6 +128,17 @@ export interface SourceRecord {
 // (unlike list endpoints). Only carries fields billcommons_api.schemas
 // .BillDetail actually returns; sponsors/actions/versions/documents/votes
 // are separate subresource endpoints the web page fetches in parallel.
+// GET /bills/{id}/related (billcommons_api.schemas.RelatedBillOut).
+// `related_bill_id` is null when the target is outside this corpus -- most
+// prior-session links are, since we hold only current sessions. The identifier
+// is still returned so the link remains actionable.
+export interface RelatedBill {
+  id: string;
+  relation_type?: string | null;
+  related_identifier?: string | null;
+  related_bill_id?: string | null;
+}
+
 export interface Bill {
   id: string;
   jurisdiction_id: string;

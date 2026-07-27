@@ -8,6 +8,7 @@ import type {
   BillVersion,
   Jurisdiction,
   ListEnvelope,
+  RelatedBill,
   Session,
   Sponsor,
   VoteEvent,
@@ -28,6 +29,8 @@ export interface BillPageData {
   sponsors: Awaited<ReturnType<typeof apiGet<Sponsor[]>>>;
   votes: Awaited<ReturnType<typeof apiGet<VoteEvent[]>>>;
   documents: Awaited<ReturnType<typeof apiGet<BillDocument[]>>>;
+  related: Awaited<ReturnType<typeof apiGet<RelatedBill[]>>>;
+  subjects: Awaited<ReturnType<typeof apiGet<string[]>>>;
   jurisdiction: Awaited<ReturnType<typeof apiGet<Jurisdiction>>> | null;
 }
 
@@ -41,13 +44,16 @@ export async function getBill(id: string) {
 
 export async function getBillData(id: string): Promise<BillPageData> {
   const opts = { revalidate: BILL_REVALIDATE };
-  const [bill, versions, actions, sponsors, votes, documents] = await Promise.all([
+  const [bill, versions, actions, sponsors, votes, documents, related, subjects] =
+    await Promise.all([
     getBill(id),
     apiGet<BillVersion[]>(`/api/v1/bills/${id}/versions`, undefined, opts),
     apiGet<BillAction[]>(`/api/v1/bills/${id}/actions`, undefined, opts),
     apiGet<Sponsor[]>(`/api/v1/bills/${id}/sponsors`, undefined, opts),
     apiGet<VoteEvent[]>(`/api/v1/bills/${id}/votes`, undefined, opts),
     apiGet<BillDocument[]>(`/api/v1/bills/${id}/documents`, undefined, opts),
+    apiGet<RelatedBill[]>(`/api/v1/bills/${id}/related`, undefined, opts),
+    apiGet<string[]>(`/api/v1/bills/${id}/subjects`, undefined, opts),
   ]);
 
   const jurisdiction = bill.ok
@@ -58,7 +64,17 @@ export async function getBillData(id: string): Promise<BillPageData> {
       )
     : null;
 
-  return { bill, versions, actions, sponsors, votes, documents, jurisdiction };
+  return {
+    bill,
+    versions,
+    actions,
+    sponsors,
+    votes,
+    documents,
+    related,
+    subjects,
+    jurisdiction,
+  };
 }
 
 export async function getJurisdiction(idOrCode: string) {

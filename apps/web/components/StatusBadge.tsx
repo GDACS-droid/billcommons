@@ -40,9 +40,12 @@ export function BillStatusBadge({ status }: { status?: string | null }) {
   } else if (lower.includes("committee") || lower.includes("introduc") || lower.includes("pending")) {
     style = "bg-amber-100 text-amber-900";
   }
+  // The API's controlled vocabulary is snake_case ("in_committee"); render it
+  // as prose so the page reads like English rather than like a database column.
+  const label = status.replaceAll("_", " ");
   return (
     <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${style}`}>
-      {status}
+      {label}
     </span>
   );
 }

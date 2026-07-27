@@ -5,6 +5,13 @@ import { BillStatusBadge } from "@/components/StatusBadge";
 import { SITE_URL } from "@/lib/config";
 import type { BillPageData } from "@/lib/bill";
 
+// Upstream relation vocabulary, rendered as something a reader understands.
+const RELATION_LABELS: Record<string, string> = {
+  "prior-session": "Prior session",
+  companion: "Companion bill",
+  replaces: "Replaces",
+};
+
 interface Props {
   data: BillPageData;
   /** Canonical path for this bill, used to anchor structured data. */
@@ -20,8 +27,17 @@ export default function BillDetailView({
   sessionSlug,
   sessionLabel,
 }: Props) {
-  const { bill: result, versions, actions, sponsors, votes, documents, jurisdiction } =
-    data;
+  const {
+    bill: result,
+    versions,
+    actions,
+    sponsors,
+    votes,
+    documents,
+    related,
+    subjects,
+    jurisdiction,
+  } = data;
 
   if (!result.ok) {
     return (
@@ -126,6 +142,23 @@ export default function BillDetailView({
         <Field label="Bill type" value={bill.bill_type} />
         <Field label="Last updated" value={bill.upstream_updated_at} />
       </dl>
+
+      {subjects.ok && subjects.data.length ? (
+        <Section title="Subjects">
+          <ul className="flex flex-wrap gap-2">
+            {subjects.data.map((subject) => (
+              <li key={subject}>
+                <Link
+                  href={`/search?subject=${encodeURIComponent(subject)}`}
+                  className="inline-flex rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-700 hover:bg-slate-200"
+                >
+                  {subject}
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </Section>
+      ) : null}
 
       <Section title="Sponsors">
         {!sponsors.ok ? (
@@ -286,7 +319,51 @@ export default function BillDetailView({
       </Section>
 
       <Section title="Related bills">
-        <p className="text-sm text-slate-500">Not provided by source.</p>
+        {!related.ok ? (
+          <DataUnavailable message="Related-bill data is temporarily unavailable." />
+        ) : related.data.length ? (
+          <ul className="space-y-2">
+            {related.data.map((link) => (
+              <li
+                key={link.id}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-slate-200 px-3 py-2 text-sm"
+              >
+                <span>
+                  <span className="text-slate-500">
+                    {RELATION_LABELS[link.relation_type ?? ""] ??
+                      link.relation_type ??
+                      "Related"}
+                    :{" "}
+                  </span>
+                  {link.related_bill_id ? (
+                    <Link
+                      href={`/bills/${link.related_bill_id}`}
+                      className="font-medium hover:underline"
+                    >
+                      {link.related_identifier ?? "View bill"}
+                    </Link>
+                  ) : (
+                    <span className="font-medium">
+                      {link.related_identifier ?? "Unnamed"}
+                    </span>
+                  )}
+                </span>
+                {!link.related_bill_id ? (
+                  // Being explicit beats a dead-looking row: most prior-session
+                  // targets sit in a session this corpus does not hold, and
+                  // saying so is more useful than silently rendering plain text.
+                  <span className="text-xs text-slate-400">
+                    not in this corpus
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-sm text-slate-500">
+            No related bills recorded for this bill.
+          </p>
+        )}
       </Section>
 
       <Section title="Official source">
@@ -336,7 +413,7 @@ export default function BillDetailView({
       <Section title="Known limitations">
         <ul className="list-inside list-disc space-y-1 text-sm text-amber-800">
           <li>Sponsor party and chamber affiliation are not yet captured by this API.</li>
-          <li>Committee referrals and related-bill cross-references are not yet available.</li>
+          <li>Committee referrals are not yet captured.</li>
           {documents.ok && documents.data.some((d) => !d.has_extracted_text) ? (
             <li>Some documents have no extracted text yet, so version comparison may be limited.</li>
           ) : null}

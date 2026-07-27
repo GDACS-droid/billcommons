@@ -38,6 +38,20 @@ export default async function HearingsPage({ searchParams }: Props) {
         Committee hearings and legislative events, sourced from official
         calendars where available.
       </p>
+      {/* Said plainly rather than shown as an empty list: no calendar source is
+          ingested yet, so this page holds zero events. An empty table with no
+          explanation reads as "no hearings scheduled anywhere", which is a
+          much stronger and completely false claim. */}
+      <p className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <strong>Not yet populated.</strong> Hearing and committee-calendar
+        ingestion is not built yet, so this page is empty — that is a gap in
+        Bill Commons, not an absence of scheduled hearings. Bill action
+        timelines, sponsors, votes and full text are unaffected; see{" "}
+        <Link href="/methodology" className="underline">
+          methodology
+        </Link>{" "}
+        for the current limitations.
+      </p>
 
       <div className="mt-8">
         {!result.ok ? (
