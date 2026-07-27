@@ -104,3 +104,83 @@ def test_list_bills_identifier_filter_is_normalization_insensitive(client):
     assert body["pagination"]["total"] <= 20, "identifier filter did not narrow the result set"
     assert found, f"{scrambled!r} must resolve to the same bill as {canonical!r}"
     assert any(row["id"] == target["id"] for row in found)
+
+
+def _find_bill_with(client, path_suffix, minimum=1):
+    """Find a real bill whose subresource is non-empty. The corpus is uneven --
+    only ~28% of bills have related-bill links and ~42% have subjects -- so a
+    test that grabs an arbitrary bill would pass vacuously on an empty list."""
+    for jur in ("AL", "NC", "GA", "TX", "CA"):
+        listing = client.get("/api/v1/bills", params={"jurisdiction": jur, "per_page": 50})
+        if listing.status_code != 200:
+            continue
+        for row in listing.json()["data"]:
+            resp = client.get(f"/api/v1/bills/{row['id']}/{path_suffix}")
+            if resp.status_code == 200 and len(resp.json()) >= minimum:
+                return row, resp.json()
+    return None, None
+
+
+def test_related_bills_are_exposed_with_identifier_and_type(client):
+    """~100k related-bill rows (47k of them prior-session) were collected and
+    never served. Cross-session linking is the hardest part of multi-year
+    policy tracking, so each link must carry enough to act on: what KIND of
+    relationship, and WHICH bill."""
+    bill, related = _find_bill_with(client, "related")
+    if bill is None:
+        pytest.skip("no bill with related-bill links found in this DB")
+    for link in related:
+        assert link["relation_type"], "a link with no relation_type is unusable"
+        # The identifier is what makes an UNRESOLVED link still actionable.
+        assert link["related_identifier"] or link["related_bill_id"]
+
+
+def test_related_bills_resolve_same_session_companions(client):
+    """Upstream stores only an identifier. Companions live in the same session,
+    so they should resolve to a real bill id -- otherwise the resolution step
+    is dead code and consumers must do the lookup themselves."""
+    for jur in ("AL", "NC", "GA"):
+        listing = client.get("/api/v1/bills", params={"jurisdiction": jur, "per_page": 50})
+        if listing.status_code != 200:
+            continue
+        for row in listing.json()["data"]:
+            links = client.get(f"/api/v1/bills/{row['id']}/related").json()
+            for link in links:
+                if link["relation_type"] == "companion" and link["related_bill_id"]:
+                    target = client.get(f"/api/v1/bills/{link['related_bill_id']}")
+                    assert target.status_code == 200, "resolved id must be fetchable"
+                    return
+    pytest.skip("no resolvable companion link found in this DB")
+
+
+def test_bill_subjects_are_exposed(client):
+    bill, subjects = _find_bill_with(client, "subjects")
+    if bill is None:
+        pytest.skip("no bill with subjects found in this DB")
+    assert all(isinstance(s, str) and s for s in subjects)
+
+
+def test_subject_filter_narrows_and_every_row_actually_has_the_subject(client):
+    """A filter that returns the whole corpus is worse than no filter."""
+    bill, subjects = _find_bill_with(client, "subjects")
+    if bill is None:
+        pytest.skip("no bill with subjects found in this DB")
+    subject = subjects[0]
+
+    unfiltered = client.get("/api/v1/bills", params={"per_page": 1}).json()["pagination"]["total"]
+    resp = client.get("/api/v1/bills", params={"subject": subject, "per_page": 25})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["pagination"]["total"] < unfiltered, "subject filter did not narrow anything"
+    assert body["data"], "the subject we read off a real bill must match at least that bill"
+    for row in body["data"]:
+        got = client.get(f"/api/v1/bills/{row['id']}/subjects").json()
+        assert any(s.lower() == subject.lower() for s in got), (
+            f"bill {row['id']} came back for subject {subject!r} but does not carry it"
+        )
+
+
+def test_related_and_subjects_404_for_a_missing_bill(client):
+    for suffix in ("related", "subjects"):
+        resp = client.get(f"/api/v1/bills/{NIL_UUID}/{suffix}")
+        assert resp.status_code == 404, f"{suffix} must 404 for a missing bill"

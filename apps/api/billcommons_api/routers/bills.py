@@ -28,6 +28,7 @@ from billcommons_api.schemas import (
     BillDocumentOut,
     BillSummary,
     BillVersionOut,
+    RelatedBillOut,
     DiffLineOut,
     SponsorshipOut,
     VoteEventOut,
@@ -38,7 +39,9 @@ from billcommons_schema.models import (
     BillAction,
     BillDocument,
     BillVersion,
+    BillSubject,
     Jurisdiction,
+    RelatedBill,
     Session,
     Sponsorship,
     VoteEvent,
@@ -70,6 +73,9 @@ def list_bills(
     ),
     chamber: str | None = Query(None),
     status: str | None = Query(None),
+    subject: str | None = Query(
+        None, description="Subject/topic tag, matched case-insensitively"
+    ),
     page: int = Query(DEFAULT_PAGE, ge=1),
     per_page: int = Query(DEFAULT_PER_PAGE, ge=1),
     db: OrmSession = Depends(get_db),
@@ -109,6 +115,16 @@ def list_bills(
     if status:
         stmt = stmt.where(Bill.status == status)
         count_stmt = count_stmt.where(Bill.status == status)
+    if subject:
+        # EXISTS rather than a join: a bill carries several subject tags and a
+        # join would return it once per matching tag, corrupting both the page
+        # and the total.
+        subject_match = select(BillSubject.id).where(
+            BillSubject.bill_id == Bill.id,
+            func.lower(BillSubject.subject) == subject.strip().lower(),
+        )
+        stmt = stmt.where(subject_match.exists())
+        count_stmt = count_stmt.where(subject_match.exists())
 
     total = db.execute(count_stmt).scalar_one()
     rows = (
@@ -202,6 +218,78 @@ def list_bill_votes(bill_id: uuid.UUID, db: OrmSession = Depends(get_db)) -> lis
         item.votes = [VoteRecordOut.model_validate(r) for r in records]
         out.append(item)
     return out
+
+
+@router.get("/{bill_id}/related", response_model=list[RelatedBillOut])
+def list_related_bills(
+    bill_id: uuid.UUID, db: OrmSession = Depends(get_db)
+) -> list[RelatedBillOut]:
+    """Companion, prior-session and superseded-bill cross-references.
+
+    These have been collected all along (~100k rows, of which ~47k are
+    `prior-session`) and were never exposed -- the single most-requested thing
+    for multi-year policy tracking, because a bill that dies and returns next
+    session under a new number is otherwise untrackable.
+
+    Upstream gives us only the related bill's IDENTIFIER, so the target is
+    resolved here, scoped to the same jurisdiction. Same-session companions
+    usually resolve; prior-session links usually do not, because that session
+    is outside this corpus. Unresolved links still return their identifier
+    rather than being dropped.
+    """
+    bill = _get_bill_or_404(db, bill_id)
+    rows = (
+        db.execute(select(RelatedBill).where(RelatedBill.bill_id == bill_id))
+        .scalars()
+        .all()
+    )
+
+    wanted = {
+        r.related_identifier.strip()
+        for r in rows
+        if r.related_bill_id is None and r.related_identifier
+    }
+    resolved: dict[str, uuid.UUID] = {}
+    if wanted:
+        norms = {}
+        for raw in wanted:
+            try:
+                norms[normalize_bill_number(raw)] = raw
+            except ValueError:
+                continue
+        if norms:
+            matches = db.execute(
+                select(Bill.id, Bill.identifier_norm).where(
+                    Bill.jurisdiction_id == bill.jurisdiction_id,
+                    Bill.session_id == bill.session_id,
+                    Bill.identifier_norm.in_(list(norms)),
+                )
+            ).all()
+            for match in matches:
+                resolved[norms[match.identifier_norm]] = match.id
+
+    out = []
+    for r in rows:
+        item = RelatedBillOut.model_validate(r)
+        if item.related_bill_id is None and r.related_identifier:
+            item.related_bill_id = resolved.get(r.related_identifier.strip())
+        out.append(item)
+    return out
+
+
+@router.get("/{bill_id}/subjects", response_model=list[str])
+def list_bill_subjects(bill_id: uuid.UUID, db: OrmSession = Depends(get_db)) -> list[str]:
+    """Subject/topic tags. 263,485 of these were already stored and reachable
+    only through /search?subject=; a consumer looking at one bill had no way to
+    ask what it is ABOUT."""
+    _get_bill_or_404(db, bill_id)
+    return list(
+        db.execute(
+            select(BillSubject.subject)
+            .where(BillSubject.bill_id == bill_id)
+            .order_by(BillSubject.subject)
+        ).scalars()
+    )
 
 
 @router.get("/{bill_id}/documents", response_model=list[BillDocumentOut])

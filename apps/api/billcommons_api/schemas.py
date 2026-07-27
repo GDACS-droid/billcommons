@@ -92,6 +92,23 @@ class BillDocumentOut(OrmModel):
     has_extracted_text: bool = False
 
 
+class RelatedBillOut(OrmModel):
+    """A cross-reference from one bill to another.
+
+    `related_bill_id` is resolved at read time where we can find the target in
+    this corpus, and is null otherwise -- most commonly for `prior-session`
+    links, whose target sits in a session we do not hold. Returning the
+    identifier regardless is deliberate: knowing a bill HAS a prior-session
+    predecessor called "A 4171" is the answer to a multi-year tracking question
+    even when we cannot serve that bill ourselves.
+    """
+
+    id: uuid.UUID
+    relation_type: str | None = None
+    related_identifier: str | None = None
+    related_bill_id: uuid.UUID | None = None
+
+
 class BillActionOut(OrmModel):
     id: uuid.UUID
     bill_id: uuid.UUID

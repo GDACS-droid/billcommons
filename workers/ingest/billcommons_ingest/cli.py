@@ -46,6 +46,7 @@ from billcommons_ingest import fulltext as fulltext_mod
 from billcommons_ingest import queue as queue_mod
 from billcommons_ingest import registry as registry_mod
 from billcommons_ingest import scheduler as scheduler_mod
+from billcommons_ingest import status as status_mod
 from billcommons_ingest import validation as validation_mod
 from billcommons_ingest.openstates_bulk import ingest_session_csv_zip, peek_session_slug
 from billcommons_ingest.session_match import (
@@ -55,6 +56,8 @@ from billcommons_ingest.session_match import (
     resolve_session,
 )
 from billcommons_schema.models import (
+    Bill,
+    BillAction,
     BillDocument,
     IngestJob,
     IngestionRun,
@@ -684,6 +687,98 @@ def record_job_failure(
         db.close()
 
 
+def cmd_recompute_status(args: argparse.Namespace) -> int:
+    """Backfill/refresh `bills.status` from each bill's action record.
+
+    Set-based SQL cannot do this: 42% of actions carry no classification, so
+    the derivation needs status.py's text fallback, in Python. Bills are walked
+    in id-ordered chunks and each chunk's actions are fetched in ONE query --
+    209k bills against 1.6M actions is fine that way and pathological
+    per-bill.
+
+    Only rows whose status actually CHANGES are written, so a re-run over an
+    already-correct corpus costs reads and no writes (and does not churn
+    `updated_at`, which consumers use to detect real movement).
+    """
+    db = get_session()
+    processed = 0
+    changed = 0
+    cleared = 0
+    counts: dict[str, int] = {}
+    try:
+        last_id = None
+        while True:
+            if args.limit and processed >= args.limit:
+                break
+            chunk = args.chunk
+            if args.limit:
+                chunk = min(chunk, args.limit - processed)
+            q = select(Bill.id, Bill.status).order_by(Bill.id).limit(chunk)
+            if last_id is not None:
+                q = q.where(Bill.id > last_id)
+            rows = db.execute(q).all()
+            if not rows:
+                break
+            last_id = rows[-1].id
+            bill_ids = [r.id for r in rows]
+            current = {r.id: r.status for r in rows}
+
+            actions_by_bill: dict[object, list[status_mod.ActionRow]] = {
+                bid: [] for bid in bill_ids
+            }
+            for a in db.execute(
+                select(
+                    BillAction.bill_id,
+                    BillAction.action_date,
+                    BillAction.classification,
+                    BillAction.description,
+                ).where(BillAction.bill_id.in_(bill_ids))
+            ).all():
+                actions_by_bill[a.bill_id].append(
+                    status_mod.ActionRow(
+                        action_date=a.action_date,
+                        classification=a.classification,
+                        description=a.description,
+                    )
+                )
+
+            updates = []
+            for bid in bill_ids:
+                derived = status_mod.derive_status(actions_by_bill[bid])
+                if derived is not None:
+                    counts[derived] = counts.get(derived, 0) + 1
+                if derived != current[bid]:
+                    updates.append({"b_id": bid, "b_status": derived})
+                    if derived is None:
+                        cleared += 1
+            if updates:
+                db.execute(
+                    text("UPDATE bills SET status = :b_status WHERE id = :b_id"),
+                    updates,
+                )
+                changed += len(updates)
+            db.commit()
+            processed += len(rows)
+            print(
+                f"recompute-status: {processed:,} bills scanned, {changed:,} updated",
+                flush=True,
+            )
+
+        print(f"recompute-status: DONE scanned={processed:,} updated={changed:,} cleared={cleared:,}")
+        for name in status_mod.ALL_STATUSES:
+            if counts.get(name):
+                print(f"  {name:20} {counts[name]:>8,}")
+        undetermined = processed - sum(counts.values())
+        print(f"  {'(undetermined)':20} {undetermined:>8,}")
+        return 0
+    except Exception:
+        db.rollback()
+        traceback.print_exc()
+        return 1
+    finally:
+        db.close()
+
+
 def cmd_sync_worker(args: argparse.Namespace) -> int:
     """Dedicated, long-running METADATA-refresh loop -- the only thing in this
     system that claims `api_sync` jobs.
@@ -1129,6 +1224,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-check a DEGRADED jurisdiction after this many hours (default 6)",
     )
     p_validate_worker.set_defaults(func=cmd_validate_worker)
+
+    p_status = sub.add_parser(
+        "recompute-status",
+        help="derive bills.status from each bill's action record (see status.py)",
+    )
+    p_status.add_argument("--limit", type=int, default=0, help="stop after N bills (0 = all)")
+    p_status.add_argument("--chunk", type=int, default=2000, help="bills per batch (default 2000)")
+    p_status.set_defaults(func=cmd_recompute_status)
 
     p_sync_worker = sub.add_parser(
         "sync-worker",
