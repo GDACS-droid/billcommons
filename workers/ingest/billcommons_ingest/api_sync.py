@@ -396,54 +396,55 @@ def _upsert_actions(
 ) -> None:
     if not action_payloads:
         return
+    # Keyed to the ROW, not just its identity, so a corrected action can be
+    # detected. Upstream routinely revises actions in place: 42% arrive with
+    # no classification at all and get one later, which is precisely the event
+    # that moves a bill's derived status. Matching on existence alone meant an
+    # action reclassified to `executive-signature` was never written, never
+    # re-derived, and never announced -- the bill kept reporting `introduced`
+    # after it had been signed, permanently, with nothing logged anywhere.
     existing = {
-        (a.description, a.order)
+        (a.description, a.order): a
         for a in db.execute(select(BillAction).where(BillAction.bill_id == bill.id)).scalars()
     }
     latest_date = None
     latest_text = None
     added = 0
+    revised = 0
     for i, action_payload in enumerate(action_payloads):
         description = action_payload.get("description") or ""
         order = i
         key = (description, order)
         action_date = _parse_date(action_payload.get("date"))
-        if key not in existing:
-            db.add(
-                BillAction(
-                    bill_id=bill.id,
-                    description=description,
-                    action_date=action_date,
-                    classification=",".join(action_payload.get("classification") or []) or None,
-                    order=order,
-                    source_name=SOURCE_NAME,
-                    retrieved_at=retrieved_at,
-                )
+        classification = ",".join(action_payload.get("classification") or []) or None
+        current = existing.get(key)
+        if current is not None:
+            # Only the two fields the status derivation actually reads. A
+            # no-op assignment would still leave the row clean, so this cannot
+            # churn updated_at on an unchanged sync.
+            changed_fields = []
+            if current.action_date != action_date:
+                current.action_date = action_date
+                changed_fields.append("date")
+            if current.classification != classification:
+                current.classification = classification
+                changed_fields.append("classification")
+            if changed_fields:
+                current.retrieved_at = retrieved_at
+                revised += 1
+        else:
+            new_action = BillAction(
+                bill_id=bill.id,
+                description=description,
+                action_date=action_date,
+                classification=classification,
+                order=order,
+                source_name=SOURCE_NAME,
+                retrieved_at=retrieved_at,
             )
-            existing.add(key)
+            db.add(new_action)
+            existing[key] = new_action
             result.actions += 1
-            # A new action is a real change to this bill even when none of the
-            # bill's own columns move -- an action inserted anywhere but the
-            # end leaves latest_action_* identical, so the row would not be
-            # dirty, no UPDATE would be emitted, and updated_at would keep the
-            # bulk-load timestamp. The /changes feed reads this column, so a
-            # silently-unstamped bill is a bill whose new action nobody sees.
-            #
-            # Stamped forward-only. `retrieved_at` is captured once per sync
-            # run and can therefore be OLDER than a value already on the row
-            # (a status recompute writes the DB clock, this writes the worker's,
-            # and a long run is stamping with a timestamp minted at its start).
-            # Moving updated_at backwards would drop the bill behind cursors
-            # that have already passed it -- it would be published as changed
-            # to nobody. A change may be reported late; it must never be
-            # reported into the past.
-            if bill.updated_at is None or retrieved_at > bill.updated_at:
-                bill.updated_at = retrieved_at
-            # An action landed, so this bill's derived status may have moved
-            # even when the bill row itself was byte-identical (the "unchanged"
-            # branch above still reaches here -- an action list can grow
-            # without any core field differing).
-            result.touched_bill_ids.add(bill.id)
             added += 1
         if action_date is not None:
             latest_date = action_date
@@ -451,14 +452,28 @@ def _upsert_actions(
     if latest_date is not None:
         bill.latest_action_date = latest_date
         bill.latest_action_text = latest_text
-    if added:
+    if added or revised:
+        # A REVISED action counts as a change to the bill for exactly the same
+        # reason a new one does: it can move the derived status. An action
+        # gaining a `failure` or `executive-signature` classification is the
+        # whole event, and before this it was invisible on every channel --
+        # not written, not re-derived, not announced.
+        if bill.updated_at is None or retrieved_at > bill.updated_at:
+            bill.updated_at = retrieved_at
+        result.touched_bill_ids.add(bill.id)
         # One event per sync for the whole batch, not one per action: a
         # consumer refetches the bill's action list either way, and a bill
         # importing 40 historical actions should not occupy 40 pages of every
         # subscriber's feed.
-        events.record_event(
-            db, bill.id, events.ACTIONS, f"{added} action(s) added"
+        detail = ", ".join(
+            part
+            for part in (
+                f"{added} action(s) added" if added else "",
+                f"{revised} action(s) revised" if revised else "",
+            )
+            if part
         )
+        events.record_event(db, bill.id, events.ACTIONS, detail)
     db.flush()
 
 
