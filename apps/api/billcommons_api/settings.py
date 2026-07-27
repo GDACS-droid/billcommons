@@ -17,7 +17,16 @@ class Settings(BaseSettings):
         "search and data across all 50 states + DC."
     )
     cors_allow_origins: list[str] = ["*"]
-    rate_limit_default: str = "60/minute"
+    # 60/minute was too tight to use the API for what it is for. A consumer
+    # monitoring a modest watchlist of ~160 bills needed three minutes of
+    # serial polling to check it once, and this project's own contract test
+    # suite could not complete a run without nine tests failing on 429.
+    #
+    # Reads here are indexed lookups and the website sits behind its own cache,
+    # so the ceiling was protecting against very little. 300/minute (5 req/s
+    # per IP) keeps a floor under abuse while letting the API be used for
+    # monitoring, which is the point of publishing it.
+    rate_limit_default: str = "300/minute"
     environment: str = "development"
 
 
