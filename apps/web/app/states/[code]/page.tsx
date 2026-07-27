@@ -4,6 +4,7 @@ import DataUnavailable from "@/components/DataUnavailable";
 import BillListItem from "@/components/BillListItem";
 import { CoverageBadge } from "@/components/StatusBadge";
 import { apiGet } from "@/lib/api";
+import { billPath, slugify } from "@/lib/billUrl";
 import type {
   BillSummary,
   CoverageRow,
@@ -16,30 +17,38 @@ interface Props {
   params: Promise<{ code: string }>;
 }
 
+// This page is in the sitemap and is a hub a crawler follows into 200k bill
+// pages, so its reads are cached rather than no-store.
+const STATE_REVALIDATE = 1800;
+
 async function getJurisdiction(code: string) {
-  return apiGet<Jurisdiction>(`/api/v1/jurisdictions/${code}`);
+  return apiGet<Jurisdiction>(`/api/v1/jurisdictions/${code}`, undefined, {
+    revalidate: STATE_REVALIDATE,
+  });
 }
 
 async function getSessions(code: string) {
-  return apiGet<ListEnvelope<Session>>("/api/v1/sessions", {
-    jurisdiction: code,
-    per_page: 20,
-  });
+  return apiGet<ListEnvelope<Session>>(
+    "/api/v1/sessions",
+    { jurisdiction: code, per_page: 20 },
+    { revalidate: STATE_REVALIDATE }
+  );
 }
 
 async function getRecentBills(code: string) {
-  return apiGet<ListEnvelope<BillSummary>>("/api/v1/bills", {
-    jurisdiction: code,
-    sort: "latest_action",
-    per_page: 10,
-  });
+  return apiGet<ListEnvelope<BillSummary>>(
+    "/api/v1/bills",
+    { jurisdiction: code, sort: "latest_action", per_page: 10 },
+    { revalidate: STATE_REVALIDATE }
+  );
 }
 
 async function getCoverage(code: string) {
-  return apiGet<ListEnvelope<CoverageRow>>("/api/v1/coverage", {
-    jurisdiction: code,
-    per_page: 1,
-  });
+  return apiGet<ListEnvelope<CoverageRow>>(
+    "/api/v1/coverage",
+    { jurisdiction: code, per_page: 1 },
+    { revalidate: STATE_REVALIDATE }
+  );
 }
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
@@ -64,6 +73,14 @@ export default async function StatePage({ params }: Props) {
       getRecentBills(upperCode),
       getCoverage(upperCode),
     ]);
+
+  // Bills here span every session in the state, so map session_id -> slug once
+  // and link each row at its canonical URL instead of routing through /bills/<uuid>.
+  const sessionSlugById = new Map<string, string>(
+    sessionsResult.ok
+      ? sessionsResult.data.data.map((s) => [s.id, slugify(s.identifier)])
+      : []
+  );
 
   const coverageStatus = coverageResult.ok
     ? coverageResult.data.data[0]?.status
@@ -141,7 +158,19 @@ export default async function StatePage({ params }: Props) {
         ) : (
           <ul className="mt-3 space-y-3">
             {billsResult.data.data.map((bill) => (
-              <BillListItem key={bill.id} bill={bill} />
+              <BillListItem
+                key={bill.id}
+                bill={bill}
+                href={
+                  sessionSlugById.get(bill.session_id)
+                    ? billPath(
+                        upperCode,
+                        sessionSlugById.get(bill.session_id)!,
+                        bill.identifier_norm
+                      )
+                    : undefined
+                }
+              />
             ))}
           </ul>
         )}

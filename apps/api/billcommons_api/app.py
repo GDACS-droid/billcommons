@@ -21,6 +21,7 @@ from billcommons_api.routers import (
     people,
     search,
     sessions,
+    sitemap,
     sources,
 )
 from billcommons_api.settings import get_settings
@@ -78,6 +79,7 @@ def create_app() -> FastAPI:
         search.router,
         sources.router,
         coverage.router,
+        sitemap.router,
     ):
         app.include_router(router, prefix=API_PREFIX)
 

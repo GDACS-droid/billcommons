@@ -8,9 +8,24 @@ export type ApiResult<T> =
   | { ok: true; data: T }
   | { ok: false; error: string; status?: number };
 
+export interface ApiGetOptions {
+  /**
+   * Seconds to cache this response for (Next ISR). Omit for `no-store`.
+   *
+   * Crawlable pages MUST pass this. A bill page fans out to seven API calls,
+   * and the sitemaps expose ~200k of them; uncached, a single search-engine
+   * crawl turns into well over a million requests against the API and its
+   * Postgres. Anything personalized or query-driven (i.e. /search) stays
+   * uncached, which is why no-store remains the default rather than the
+   * exception.
+   */
+  revalidate?: number;
+}
+
 export async function apiGet<T>(
   path: string,
-  searchParams?: Record<string, string | number | undefined>
+  searchParams?: Record<string, string | number | undefined>,
+  options?: ApiGetOptions
 ): Promise<ApiResult<T>> {
   const url = new URL(path.replace(/^\//, ""), `${API_BASE}/`);
   if (searchParams) {
@@ -23,7 +38,9 @@ export async function apiGet<T>(
 
   try {
     const res = await fetch(url.toString(), {
-      cache: "no-store",
+      ...(options?.revalidate === undefined
+        ? { cache: "no-store" as const }
+        : { next: { revalidate: options.revalidate } }),
       headers: { Accept: "application/json" },
     });
 

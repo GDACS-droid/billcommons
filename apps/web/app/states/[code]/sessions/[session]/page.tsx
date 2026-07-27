@@ -4,6 +4,7 @@ import DataUnavailable from "@/components/DataUnavailable";
 import BillListItem from "@/components/BillListItem";
 import PaginationNav from "@/components/PaginationNav";
 import { apiGet } from "@/lib/api";
+import { billPath } from "@/lib/billUrl";
 import type { BillSummary, ListEnvelope } from "@/lib/types";
 
 interface Props {
@@ -17,13 +18,13 @@ async function getBills(
   page: number,
   chamber?: string
 ) {
-  return apiGet<ListEnvelope<BillSummary>>("/api/v1/bills", {
-    jurisdiction: code,
-    session,
-    chamber,
-    page,
-    per_page: 25,
-  });
+  return apiGet<ListEnvelope<BillSummary>>(
+    "/api/v1/bills",
+    { jurisdiction: code, session, chamber, page, per_page: 25 },
+    // Crawlable listing page: cached so a bulk crawl of the session index does
+    // not replay the same query per request.
+    { revalidate: 1800 }
+  );
 }
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
@@ -79,7 +80,11 @@ export default async function SessionPage({ params, searchParams }: Props) {
             </p>
             <ul className="mt-3 space-y-3">
               {billsResult.data.data.map((bill) => (
-                <BillListItem key={bill.id} bill={bill} />
+                <BillListItem
+                  key={bill.id}
+                  bill={bill}
+                  href={billPath(upperCode, session, bill.identifier_norm)}
+                />
               ))}
             </ul>
             <PaginationNav

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
 
 
@@ -43,3 +45,62 @@ def test_list_bills_envelope_and_filters(client):
         assert row["chamber"] == "lower"
         if nc is not None:
             assert row["jurisdiction_id"] == nc["id"]
+
+
+def test_list_bills_identifier_filter_resolves_a_single_bill(client):
+    """A bill must be addressable by its NUMBER, not just its UUID.
+
+    This is the lookup real consumers reach for ("does it have HI SB 2135?")
+    and it is what the /states/{code}/bills/{session}/{slug} web routes resolve
+    against, so a regression here breaks both the public API contract and every
+    keyword bill URL on the site.
+    """
+    seed = client.get("/api/v1/bills", params={"jurisdiction": "NC", "per_page": 1})
+    assert seed.status_code == 200
+    rows = seed.json()["data"]
+    if not rows:
+        pytest.skip("no NC bills loaded in this DB")
+    target = rows[0]
+
+    resp = client.get(
+        "/api/v1/bills",
+        params={"jurisdiction": "NC", "identifier": target["identifier"]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # Narrowing is the whole point: an ignored filter would return the entire
+    # NC corpus (thousands), so a small total is what proves the WHERE ran.
+    assert body["pagination"]["total"] <= 20, "identifier filter did not narrow the result set"
+    assert body["data"], "the bill we just read back must match its own identifier"
+    for row in body["data"]:
+        assert row["identifier_norm"] == target["identifier_norm"]
+    assert any(row["id"] == target["id"] for row in body["data"])
+
+
+def test_list_bills_identifier_filter_is_normalization_insensitive(client):
+    """'hb123', 'H.B. 123' and 'HB 123' are the same bill to a human, so they
+    must be the same bill to the API -- consumers type bill numbers by hand and
+    the slug in a URL ('hb-123') is yet another surface form."""
+    seed = client.get("/api/v1/bills", params={"jurisdiction": "NC", "per_page": 1})
+    rows = seed.json()["data"]
+    if not rows:
+        pytest.skip("no NC bills loaded in this DB")
+    target = rows[0]
+    canonical = target["identifier_norm"]
+
+    scrambled = canonical.replace(" ", "").lower()
+    if scrambled == canonical:
+        pytest.skip(f"identifier {canonical!r} has no distinct scrambled form")
+
+    resp = client.get(
+        "/api/v1/bills", params={"jurisdiction": "NC", "identifier": scrambled}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    found = body["data"]
+    # Without the narrowing assertion this test passes vacuously: an IGNORED
+    # filter returns the unfiltered NC list, whose first page still contains
+    # `target`. Demand the result set actually shrank.
+    assert body["pagination"]["total"] <= 20, "identifier filter did not narrow the result set"
+    assert found, f"{scrambled!r} must resolve to the same bill as {canonical!r}"
+    assert any(row["id"] == target["id"] for row in found)

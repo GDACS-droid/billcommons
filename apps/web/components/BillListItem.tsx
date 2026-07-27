@@ -3,12 +3,25 @@ import type { BillSummary } from "@/lib/types";
 import { renderHighlight } from "@/lib/highlight";
 import { BillStatusBadge } from "./StatusBadge";
 
-export default function BillListItem({ bill }: { bill: BillSummary }) {
+/**
+ * `href` lets a caller that knows the jurisdiction and session link straight to
+ * the canonical /states/{code}/bills/{session}/{number} URL. Without it the
+ * item falls back to /bills/{uuid}, which 301s to the same place -- correct,
+ * but a redirect hop that wastes crawl budget on listing pages a search engine
+ * follows in bulk.
+ */
+export default function BillListItem({
+  bill,
+  href,
+}: {
+  bill: BillSummary;
+  href?: string;
+}) {
   return (
     <li className="rounded-lg border border-slate-200 p-4 transition hover:border-slate-300 hover:shadow-sm">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <Link
-          href={`/bills/${encodeURIComponent(bill.id)}`}
+          href={href ?? `/bills/${encodeURIComponent(bill.id)}`}
           className="font-medium text-slate-900 hover:underline"
         >
           {bill.identifier} — {bill.title}

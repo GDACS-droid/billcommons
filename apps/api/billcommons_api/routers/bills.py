@@ -8,6 +8,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import selectinload
 
+from billcommons_shared.normalize import normalize_bill_number
+
 from billcommons_api.deps import get_db
 from billcommons_api.errors import conflict, not_found
 from billcommons_api.etag import make_etag
@@ -58,6 +60,14 @@ def list_bills(
     request: Request,
     jurisdiction: str | None = Query(None, description="Jurisdiction abbreviation, e.g. NC"),
     session: str | None = Query(None, description="Session identifier"),
+    identifier: str | None = Query(
+        None,
+        description=(
+            "Bill number, matched on the normalized form -- 'HB123', 'hb 123' and "
+            "'H.B. 123' all find HB 123. Combine with jurisdiction (and session) to "
+            "resolve a single bill."
+        ),
+    ),
     chamber: str | None = Query(None),
     status: str | None = Query(None),
     page: int = Query(DEFAULT_PAGE, ge=1),
@@ -81,6 +91,18 @@ def list_bills(
     if session:
         stmt = stmt.where(Session.identifier == session)
         count_stmt = count_stmt.where(Session.identifier == session)
+    if identifier:
+        # Match the stored normalized form, and normalize the caller's input the
+        # same way the ingest did (billcommons_ingest.api_sync) so any surface
+        # spelling of a bill number resolves. Unparseable input falls back to
+        # raw uppercase, which is exactly what ingest stored in that case -- so
+        # even malformed identifiers stay addressable rather than 0-result.
+        try:
+            identifier_norm = normalize_bill_number(identifier)
+        except ValueError:
+            identifier_norm = identifier.upper().strip()
+        stmt = stmt.where(Bill.identifier_norm == identifier_norm)
+        count_stmt = count_stmt.where(Bill.identifier_norm == identifier_norm)
     if chamber:
         stmt = stmt.where(Bill.chamber == chamber)
         count_stmt = count_stmt.where(Bill.chamber == chamber)
