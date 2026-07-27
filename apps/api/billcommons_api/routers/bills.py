@@ -151,7 +151,17 @@ def list_bills(
     )
 
 
-MAX_BATCH_KEYS = 100
+# The GET form is additionally bounded by URL length in practice (~100
+# session-qualified keys approaches the default request-line limit on common
+# proxies, which return 414 before this check runs) -- which is why POST
+# /bills/lookup exists and is the documented path for a real watchlist.
+#
+# 250, not 100: the first integrator to build a daily sync had ~130 tracked
+# bills, so a 100 cap silently turned "one request" into "paginate the thing
+# that exists to avoid pagination". Cost is bounded by jurisdiction, not key
+# count -- lookups are grouped, so 250 keys spanning 50 states is 50 queries,
+# the same as 100 keys spanning 50 states.
+MAX_BATCH_KEYS = 250
 
 
 @router.get("/batch", response_model=BillBatchEnvelope)

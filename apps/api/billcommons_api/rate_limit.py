@@ -39,29 +39,59 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._lock = threading.Lock()
         # ip -> (window_start, count)
         self._buckets: dict[str, tuple[float, int]] = {}
+        self._last_sweep = 0.0
 
-    def _allow(self, ip: str) -> tuple[bool, int]:
+    def _sweep(self, now: float) -> None:
+        """Drop buckets whose window has expired. Caller holds the lock.
+
+        Without this the dict grows once per distinct client IP and is never
+        reclaimed, which is both an unbounded memory leak and a cheap way for
+        anyone to exhaust the process by rotating source addresses. Swept at
+        most once per window, so the cost is amortized to near nothing.
+        """
+        if now - self._last_sweep < self._window:
+            return
+        self._last_sweep = now
+        stale = [ip for ip, (start, _) in self._buckets.items() if now - start >= self._window]
+        for ip in stale:
+            del self._buckets[ip]
+
+    def _allow(self, ip: str) -> tuple[bool, int, int, int]:
+        """Returns (allowed, retry_after, remaining, reset_in_seconds)."""
         now = self._clock()
         with self._lock:
+            self._sweep(now)
             start, count = self._buckets.get(ip, (now, 0))
             if now - start >= self._window:
                 start, count = now, 0
             count += 1
             self._buckets[ip] = (start, count)
+            reset_in = max(1, int(self._window - (now - start)))
+            remaining = max(0, self._limit - count)
             if count > self._limit:
-                retry_after = max(1, int(self._window - (now - start)))
-                return False, retry_after
-            return True, 0
+                return False, reset_in, 0, reset_in
+            return True, 0, remaining, reset_in
+
+    def _headers(self, remaining: int, reset_in: int) -> dict[str, str]:
+        # Advertised on EVERY response, not just 429s. A client that can only
+        # discover the limit by hitting it has to either guess or get throttled
+        # on purpose -- and an integrator sizing a nightly sync needs the
+        # budget up front, which is exactly the gap a consumer reported.
+        return {
+            "X-RateLimit-Limit": str(self._limit),
+            "X-RateLimit-Remaining": str(remaining),
+            "X-RateLimit-Reset": str(reset_in),
+        }
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path in _EXEMPT_PATHS:
             return await call_next(request)
-        allowed, retry_after = self._allow(client_ip(request))
+        allowed, retry_after, remaining, reset_in = self._allow(client_ip(request))
         if not allowed:
             request_id = request.headers.get("x-request-id", "")
             return JSONResponse(
                 status_code=429,
-                headers={"Retry-After": str(retry_after)},
+                headers={"Retry-After": str(retry_after), **self._headers(0, reset_in)},
                 content={
                     "error": {
                         "code": "rate_limited",
@@ -73,4 +103,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     }
                 },
             )
-        return await call_next(request)
+        response = await call_next(request)
+        response.headers.update(self._headers(remaining, reset_in))
+        return response

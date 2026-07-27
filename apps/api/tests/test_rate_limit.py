@@ -62,3 +62,49 @@ def test_the_configured_limit_is_the_one_actually_applied(limited_client):
         for _ in range(TEST_LIMIT + 3)
     )
     assert allowed == TEST_LIMIT, f"expected exactly {TEST_LIMIT} allowed, got {allowed}"
+
+
+def test_rate_limit_headers_are_advertised_on_every_response(limited_client):
+    """A consumer reported being unable to confirm the limit without hitting
+    it. Discovering your budget by getting throttled is not a design; an
+    integrator sizing a nightly sync needs the numbers up front."""
+    headers = {"X-Forwarded-For": "203.0.113.55"}
+    res = limited_client.get("/api/v1/jurisdictions", headers=headers)
+    assert res.status_code == 200
+    assert res.headers["X-RateLimit-Limit"] == str(TEST_LIMIT)
+    assert res.headers["X-RateLimit-Remaining"] == str(TEST_LIMIT - 1)
+    assert int(res.headers["X-RateLimit-Reset"]) > 0
+
+
+def test_remaining_counts_down_and_bottoms_out_at_zero(limited_client):
+    headers = {"X-Forwarded-For": "203.0.113.56"}
+    seen = [
+        int(limited_client.get("/api/v1/jurisdictions", headers=headers).headers["X-RateLimit-Remaining"])
+        for _ in range(TEST_LIMIT + 2)
+    ]
+    assert seen[0] == TEST_LIMIT - 1
+    assert seen == sorted(seen, reverse=True), "remaining must never increase within a window"
+    assert seen[-1] == 0
+    # The 429 itself must still carry the headers -- that is the response a
+    # client most needs them on.
+    refused = limited_client.get("/api/v1/jurisdictions", headers=headers)
+    assert refused.status_code == 429
+    assert refused.headers["X-RateLimit-Remaining"] == "0"
+    assert refused.headers["Retry-After"]
+
+
+def test_expired_buckets_are_reclaimed():
+    """The bucket dict grew once per distinct client IP and was never
+    reclaimed -- an unbounded memory leak, and a cheap way to exhaust the
+    process by rotating source addresses."""
+    from billcommons_api.rate_limit import RateLimitMiddleware
+
+    now = [0.0]
+    mw = RateLimitMiddleware(None, limit=10, window=60.0, clock=lambda: now[0])
+    for i in range(500):
+        mw._allow(f"198.51.100.{i % 256}-{i}")
+    assert len(mw._buckets) == 500
+
+    now[0] = 601.0  # every window has long since expired
+    mw._allow("203.0.113.1")
+    assert len(mw._buckets) == 1, f"stale buckets not reclaimed: {len(mw._buckets)} left"

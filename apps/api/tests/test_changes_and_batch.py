@@ -105,12 +105,32 @@ def test_batch_does_not_report_a_found_bill_as_missing(client):
 
 
 def test_batch_refuses_an_oversized_request(client):
-    keys = ",".join(str(uuid.uuid4()) for _ in range(101))
+    from billcommons_api.routers.bills import MAX_BATCH_KEYS
+
+    keys = ",".join(str(uuid.uuid4()) for _ in range(MAX_BATCH_KEYS + 1))
     res = client.get("/api/v1/bills/batch", params={"ids": keys})
     assert res.status_code == 400
-    # Refusing loudly beats silently truncating to the first 100 and returning
-    # a short list that reads as complete.
-    assert "100" in res.text
+    # Refusing loudly beats silently truncating and returning a short list that
+    # reads as complete. Reads the constant rather than hardcoding it: the cap
+    # was raised once already (a consumer's real watchlist exceeded it), and a
+    # test pinned to the old number would have failed for the wrong reason.
+    assert str(MAX_BATCH_KEYS) in res.text
+
+
+def test_lookup_handles_a_realistic_watchlist(client):
+    """A real integrator's daily sync was ~130 bills. The cap must not turn
+    the endpoint that exists to avoid pagination back into a paginated one."""
+    from billcommons_api.routers.bills import MAX_BATCH_KEYS
+
+    assert MAX_BATCH_KEYS >= 130
+    bills = client.get("/api/v1/bills", params={"per_page": 50}).json()["data"]
+    keys = [{"id": b["id"]} for b in bills]
+    # Pad to a realistic watchlist size with misses, so the response still has
+    # to account for every key.
+    keys += [{"id": str(uuid.uuid4())} for _ in range(130 - len(keys))]
+    body = client.post("/api/v1/bills/lookup", json={"keys": keys}).json()
+    assert len(body["data"]) + len(body["not_found"]) + len(body["ambiguous"]) == len(keys)
+    assert len(body["data"]) == len(bills)
 
 
 def test_batch_requires_something_to_look_up(client):
