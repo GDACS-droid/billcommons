@@ -1,0 +1,31 @@
+# Metadata-refresh worker.
+#
+# Identical image to Dockerfile.worker; only the entrypoint differs. It runs as
+# its OWN service because api_sync must never share a process with the crawl:
+# one api_sync holds a DB session open across minutes of rate-limited Open
+# States HTTP, and running it inside the crawl loop showed up as `idle in
+# transaction` and froze fetch_text twice. The crawl worker therefore refuses
+# api_sync jobs outright (cli.CRAWL_WORKER_EXCLUDED_KINDS) -- which left them
+# with no consumer at all, so the corpus stopped refreshing entirely. This
+# service is that consumer.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpq-dev gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./requirements.txt
+COPY packages/schema ./packages/schema
+COPY packages/shared ./packages/shared
+COPY packages/source-registry ./packages/source-registry
+COPY workers/ingest ./workers/ingest
+COPY data/registry ./data/registry
+
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -e workers/ingest
+
+# Nightly by default (SYNC_WORKER_INTERVAL=86400). Consumers doing a daily sync
+# need nothing faster, and it keeps usage well inside the upstream API's limits.
+CMD ["python", "-m", "billcommons_ingest", "sync-worker"]

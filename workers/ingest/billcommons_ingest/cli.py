@@ -56,6 +56,7 @@ from billcommons_ingest.session_match import (
 )
 from billcommons_schema.models import (
     BillDocument,
+    IngestJob,
     IngestionRun,
     Jurisdiction,
     JurisdictionCoverage,
@@ -683,6 +684,139 @@ def record_job_failure(
         db.close()
 
 
+def cmd_sync_worker(args: argparse.Namespace) -> int:
+    """Dedicated, long-running METADATA-refresh loop -- the only thing in this
+    system that claims `api_sync` jobs.
+
+    Why it exists: the crawl worker refuses api_sync outright
+    (CRAWL_WORKER_EXCLUDED_KINDS) because a single api_sync holds a DB session
+    open across minutes of rate-limited HTTP, which starved fetch_text and
+    froze the crawl twice. With no other consumer, api_sync jobs simply piled
+    up -- 75 sat `queued` and unclaimable while EVERY ONE of the 209,612 bills
+    kept `updated_at` from the original bulk load. The corpus was a frozen
+    snapshot: bill text kept arriving, but no bill's STATUS, actions or votes
+    ever changed again. A consumer polling us for "what moved today" would have
+    been told "nothing" forever, which is the worst failure a monitoring source
+    can have -- silence that looks like an answer.
+
+    Each cycle:
+      1. `scheduler.run_schedule_pass` -- enqueue api_sync for jurisdictions
+         whose cadence tier says they are due (it holds its own advisory lock,
+         so running this alongside anything else is safe).
+      2. Drain queued api_sync jobs, one short-lived session each, up to
+         `--max-jobs` so one pathological state cannot spin a cycle forever.
+      3. Recompute coverage, because api_sync creates bills and the counts
+         behind every coverage row would otherwise lag a full crawl cadence.
+      4. Sleep `--interval` (default 24h -- nightly is enough for consumers
+         doing a daily sync, and keeps us well inside the upstream API's
+         rate limits).
+
+    Failure isolation matches the crawl worker exactly: `claimed_attempts` is
+    read while the claim's increment is still live, and failures are recorded
+    in a FRESH session via `record_job_failure`, so a permanently-failing state
+    actually reaches the dead-letter cap instead of retrying forever.
+    """
+    worker_id = args.worker_id or f"{socket.gethostname()}-sync-worker"
+    interval = args.interval
+    max_jobs = args.max_jobs
+    print(
+        f"sync-worker {worker_id}: interval={interval}s max_jobs_per_cycle={max_jobs} "
+        f"once={args.once} (api_sync ONLY; never claims fetch_text/validate)",
+        flush=True,
+    )
+
+    try:
+        while True:
+            # Step 1: enqueue whatever is due.
+            db = get_session()
+            try:
+                enqueued = scheduler_mod.run_schedule_pass(db)
+                db.commit()
+                print(
+                    f"sync-worker {worker_id}: schedule pass enqueued "
+                    f"{len(enqueued)} jurisdiction(s): {sorted(enqueued)}",
+                    flush=True,
+                )
+            except Exception:
+                db.rollback()
+                traceback.print_exc()
+            finally:
+                db.close()
+
+            # Step 2: drain. One session per job, released before the next --
+            # never one long transaction spanning every state's HTTP.
+            processed = 0
+            failed = 0
+            while processed + failed < max_jobs:
+                db = get_session()
+                try:
+                    job = queue_mod.claim_job(
+                        db, worker_id, kind=scheduler_mod.API_SYNC_KIND
+                    )
+                    if job is None:
+                        db.commit()
+                        break
+                    # Read the post-claim count while this session's
+                    # uncommitted increment is still live; rollback below
+                    # would otherwise expire it and hand back the pre-claim
+                    # value, so the job could never reach the dead-letter cap.
+                    claimed_attempts = job.attempts
+                    job_id = job.id
+                    state = job.payload.get("state")
+                    try:
+                        result = api_sync_mod.run_api_sync_job(db, state)
+                        queue_mod.complete_job(db, job)
+                        db.commit()
+                        processed += 1
+                        print(
+                            f"sync-worker {worker_id}: api_sync {result.state} "
+                            f"created={result.bills_created} updated={result.bills_updated} "
+                            f"unchanged={result.bills_unchanged} actions={result.actions}",
+                            flush=True,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - per-job isolation
+                        db.rollback()
+                        failed += 1
+                        print(
+                            f"sync-worker {worker_id}: api_sync {state} FAILED: {exc}",
+                            flush=True,
+                        )
+                        record_job_failure(
+                            job_id,
+                            IngestJob,
+                            claimed_attempts=claimed_attempts,
+                            error=str(exc),
+                        )
+                finally:
+                    db.close()
+
+            print(
+                f"sync-worker {worker_id}: cycle done -- {processed} synced, {failed} failed",
+                flush=True,
+            )
+
+            # Step 3: api_sync creates bills; refresh the counts every coverage
+            # row is derived from rather than waiting on the crawl worker.
+            if processed:
+                db = get_session()
+                try:
+                    coverage_mod.recompute_all_coverage(db)
+                    db.commit()
+                    print(f"sync-worker {worker_id}: coverage recomputed", flush=True)
+                except Exception:
+                    db.rollback()
+                    traceback.print_exc()
+                finally:
+                    db.close()
+
+            if args.once:
+                return 0
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print(f"sync-worker {worker_id}: stopping")
+        return 0
+
+
 def cmd_validate_worker(args: argparse.Namespace) -> int:
     """Dedicated, long-running validation-ONLY loop -- a separate process
     from `cmd_worker` (the crawl worker) so validation's minutes-long
@@ -995,6 +1129,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-check a DEGRADED jurisdiction after this many hours (default 6)",
     )
     p_validate_worker.set_defaults(func=cmd_validate_worker)
+
+    p_sync_worker = sub.add_parser(
+        "sync-worker",
+        help=(
+            "dedicated metadata-refresh loop -- the ONLY consumer of api_sync "
+            "jobs (the crawl worker refuses them); nightly by default"
+        ),
+    )
+    p_sync_worker.add_argument("--worker-id", default=None)
+    p_sync_worker.add_argument(
+        "--interval",
+        type=float,
+        default=float(os.environ.get("SYNC_WORKER_INTERVAL", "86400")),
+        help="seconds between cycles (default 86400s/24h, env SYNC_WORKER_INTERVAL)",
+    )
+    p_sync_worker.add_argument(
+        "--max-jobs",
+        type=int,
+        default=int(os.environ.get("SYNC_WORKER_MAX_JOBS", "200")),
+        help=(
+            "cap on api_sync jobs drained per cycle so one pathological state "
+            "cannot spin a cycle forever (default 200, env SYNC_WORKER_MAX_JOBS)"
+        ),
+    )
+    p_sync_worker.add_argument(
+        "--once",
+        action="store_true",
+        help=(
+            "run a single cycle and exit instead of looping -- lets the whole "
+            "path be exercised and verified, and makes the command usable from "
+            "an external scheduler"
+        ),
+    )
+    p_sync_worker.set_defaults(func=cmd_sync_worker)
 
     p_ca = sub.add_parser(
         "ca-fulltext",
