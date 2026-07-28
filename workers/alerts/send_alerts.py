@@ -105,21 +105,21 @@ def topic_membership_sql() -> dict[str, str]:
     in apps/api/tests keeps the two in sync."""
     return {
         "artificial-intelligence": (
-            "(lower(b.title) LIKE '%artificial intelligence%' OR EXISTS ("
+            "(lower(b.title) LIKE '%%artificial intelligence%%' OR EXISTS ("
             "SELECT 1 FROM bill_subjects s WHERE s.bill_id = b.id AND "
-            "lower(s.subject) LIKE '%artificial intelligence%'))"
+            "lower(s.subject) LIKE '%%artificial intelligence%%'))"
         ),
         "data-privacy": (
-            "(lower(b.title) LIKE '%data privacy%' OR lower(b.title) LIKE '%consumer privacy%'"
-            " OR lower(b.title) LIKE '%personal data%' OR lower(b.title) LIKE '%biometric%'"
+            "(lower(b.title) LIKE '%%data privacy%%' OR lower(b.title) LIKE '%%consumer privacy%%'"
+            " OR lower(b.title) LIKE '%%personal data%%' OR lower(b.title) LIKE '%%biometric%%'"
             " OR EXISTS (SELECT 1 FROM bill_subjects s WHERE s.bill_id = b.id AND"
-            " lower(s.subject) LIKE '%data privacy%'))"
+            " lower(s.subject) LIKE '%%data privacy%%'))"
         ),
         "cryptocurrency": (
-            "(lower(b.title) LIKE '%cryptocurrency%' OR lower(b.title) LIKE '%digital asset%'"
-            " OR lower(b.title) LIKE '%blockchain%' OR lower(b.title) LIKE '%virtual currency%'"
+            "(lower(b.title) LIKE '%%cryptocurrency%%' OR lower(b.title) LIKE '%%digital asset%%'"
+            " OR lower(b.title) LIKE '%%blockchain%%' OR lower(b.title) LIKE '%%virtual currency%%'"
             " OR EXISTS (SELECT 1 FROM bill_subjects s WHERE s.bill_id = b.id AND"
-            " (lower(s.subject) LIKE '%cryptocurrency%' OR lower(s.subject) LIKE '%blockchain%')))"
+            " (lower(s.subject) LIKE '%%cryptocurrency%%' OR lower(s.subject) LIKE '%%blockchain%%')))"
         ),
     }
 
