@@ -2,9 +2,13 @@
 """Nightly topic-digest sender for Bill Commons email alerts.
 
 Runs on the box (systemd user timer `billcommons-alerts.timer`), NOT on
-Railway: the Gmail OAuth refresh tokens live in ~/.config/gmail-mcp-server/
+Railway: the Resend key and DB credentials live in ~/.config/billcommons/
 on this machine, and shipping them into a cloud env var to save a timer was
 judged the worse trade.
+
+Sends via Resend from alerts@billcommons.org (domain verified on the Resend
+account 2026-07-28) — subscriber mail must come from the product's own domain,
+not a personal Gmail.
 
 For each active subscription it walks bill_events from the subscription's
 private cursor (`last_seq`) to the feed watermark, keeps events whose bill is
@@ -23,22 +27,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import sys
-import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 
 import psycopg
 
 DB_CONFIG = Path.home() / ".config/billcommons/railway-pg.json"
-GMAIL_DIR = Path.home() / ".config/gmail-mcp-server"
-TOKEN_FILE = GMAIL_DIR / "tokens/gdacs-new.json"
-FROM_ADDR = "Bill Commons <alberto@gdacs.net>"
+RESEND_CONFIG = Path.home() / ".config/billcommons/resend.json"
+FROM_ADDR = "Bill Commons <alerts@billcommons.org>"
 API_BASE = "https://api.billcommons.org"
 SITE = "https://billcommons.org"
 
@@ -62,35 +61,29 @@ KIND_LABEL = {
 }
 
 
-def get_access_token() -> str:
-    creds = json.loads((GMAIL_DIR / "credentials.json").read_text())["installed"]
-    token = json.loads(TOKEN_FILE.read_text())
-    body = urllib.parse.urlencode(
-        {
-            "client_id": creds["client_id"],
-            "client_secret": creds["client_secret"],
-            "refresh_token": token["refresh_token"],
-            "grant_type": "refresh_token",
-        }
-    ).encode()
-    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=body)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)["access_token"]
+def get_resend_key() -> str:
+    return json.loads(RESEND_CONFIG.read_text())["api_key"]
 
 
-def gmail_send(access_token: str, to_addr: str, subject: str, html: str, text_body: str) -> str:
-    msg = MIMEMultipart("alternative")
-    msg["From"] = FROM_ADDR
-    msg["To"] = to_addr
-    msg["Subject"] = subject
-    msg.attach(MIMEText(text_body, "plain"))
-    msg.attach(MIMEText(html, "html"))
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+def resend_send(
+    api_key: str, to_addr: str, subject: str, html: str, text_body: str, unsub_url: str
+) -> str:
+    payload = {
+        "from": FROM_ADDR,
+        "to": [to_addr],
+        "subject": subject,
+        "html": html,
+        "text": text_body,
+        # Header-level unsubscribe so mail clients surface their own
+        # unsubscribe affordance; the endpoint is GET-only, so no
+        # one-click POST variant is advertised.
+        "headers": {"List-Unsubscribe": f"<{unsub_url}>"},
+    }
     req = urllib.request.Request(
-        "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-        data=json.dumps({"raw": raw}).encode(),
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode(),
         headers={
-            "Authorization": f"Bearer {access_token}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
     )
@@ -124,7 +117,7 @@ def topic_membership_sql() -> dict[str, str]:
     }
 
 
-def render_digest(topic: str, events: list[dict], total: int, token: str) -> tuple[str, str, str]:
+def render_digest(topic: str, events: list[dict], total: int, unsub: str) -> tuple[str, str, str]:
     """Returns (subject, html, text)."""
     n = total
     subject = f"[Bill Commons] {n} update{'s' if n != 1 else ''} on {topic.replace('-', ' ')} bills"
@@ -146,7 +139,6 @@ def render_digest(topic: str, events: list[dict], total: int, token: str) -> tup
             f'<p><a href="{SITE}/topics/{topic}">…and {total - len(events)} more — '
             f"see the full tracker</a></p>"
         )
-    unsub = f"{API_BASE}/api/v1/alerts/unsubscribe?token={token}"
     html = f"""<div style="font-family:system-ui,sans-serif;max-width:620px;margin:0 auto">
 <h2 style="margin-bottom:4px">Bill Commons</h2>
 <p style="color:#555;margin-top:0">What moved on <a href="{SITE}/topics/{topic}">{topic.replace('-', ' ')}</a> since your last digest:</p>
@@ -173,7 +165,7 @@ def main() -> int:
     url = json.loads(DB_CONFIG.read_text())["DATABASE_PUBLIC_URL"]
     membership = topic_membership_sql()
     sent = skipped = fast_forwarded = 0
-    access_token: str | None = None
+    api_key: str | None = None
 
     with psycopg.connect(url, connect_timeout=30) as conn:
         with conn.cursor() as cur:
@@ -243,16 +235,17 @@ def main() -> int:
                 }
                 for _, kind, detail, bill_id, identifier, title, jur in rows[:MAX_EVENTS_PER_DIGEST]
             ]
-            subject, html, text_body = render_digest(target, events, len(rows), unsub_token)
+            unsub_url = f"{API_BASE}/api/v1/alerts/unsubscribe?token={unsub_token}"
+            subject, html, text_body = render_digest(target, events, len(rows), unsub_url)
 
             if args.dry_run:
                 print(f"DRY {email}: {subject} ({len(rows)} events)", flush=True)
                 continue
 
-            if access_token is None:
-                access_token = get_access_token()
+            if api_key is None:
+                api_key = get_resend_key()
             try:
-                msg_id = gmail_send(access_token, email, subject, html, text_body)
+                msg_id = resend_send(api_key, email, subject, html, text_body, unsub_url)
             except Exception as exc:  # noqa: BLE001 - one bad address must not kill the run
                 print(f"FAIL {email}: {exc}", flush=True)
                 continue
@@ -263,7 +256,7 @@ def main() -> int:
                 )
             conn.commit()
             sent += 1
-            print(f"SENT {email} {target}: {len(rows)} events (gmail {msg_id})", flush=True)
+            print(f"SENT {email} {target}: {len(rows)} events (resend {msg_id})", flush=True)
 
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     print(
