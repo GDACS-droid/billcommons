@@ -22,6 +22,24 @@ managed Postgres) and Vercel (project `billcommons-web`). See
 [`docs/operations/deployment-runbook.md`](docs/operations/deployment-runbook.md)
 for the full deploy/rollback procedure.
 
+## Use with Claude (or any MCP client)
+
+The hosted MCP server gives AI assistants direct access to all 209k+ bills —
+no API key, no setup beyond one command:
+
+```bash
+claude mcp add bill-commons --transport http https://mcp.billcommons.org/mcp
+```
+
+Claude Desktop: **Settings → Connectors → Add custom connector** with URL
+`https://mcp.billcommons.org/mcp`. Cursor and other clients: add the same URL
+as a Streamable HTTP server in `mcp.json`.
+
+Ten tools including `search_legislation`, `get_bill_record`,
+`compare_bill_versions`, and `trace_legislative_history`. Full walkthrough
+(including REST recipes for agents without MCP):
+https://billcommons.org/docs/agents
+
 ## Architecture at a glance
 
 ```
