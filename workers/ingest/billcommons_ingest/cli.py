@@ -1070,6 +1070,15 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
     # failed recompute is retried instead of being lost with the cycle.
     pending_status_bills: set = set()
 
+    # Jurisdictions the session-date top-up has already tried this round.
+    # Some sessions have no upstream end date and never will -- a two-year
+    # biennium mid-term (IL, WI, DC) genuinely has not ended. Those never
+    # leave the needy set, so an unordered LIMIT would hand them the same
+    # slots every cycle and starve the ones that CAN be filled. Excluding
+    # what was already tried turns the cap into a round-robin; the round
+    # resets when everyone has had a turn.
+    session_date_checked: set = set()
+
     try:
         while True:
             touched_this_cycle: set = set()
@@ -1204,13 +1213,29 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
             # sync, and starving that to fill a date would be a bad trade.
             db = get_session()
             try:
-                needy = db.execute(
-                    select(Jurisdiction)
-                    .join(SessionModel, SessionModel.jurisdiction_id == Jurisdiction.id)
-                    .where(SessionModel.end_date.is_(None))
-                    .distinct()
-                    .limit(SESSION_DATE_TOPUP_PER_CYCLE)
-                ).scalars().all()
+                def _needy(exclude: set) -> list:
+                    stmt = (
+                        select(Jurisdiction)
+                        .join(
+                            SessionModel,
+                            SessionModel.jurisdiction_id == Jurisdiction.id,
+                        )
+                        .where(SessionModel.end_date.is_(None))
+                    )
+                    if exclude:
+                        stmt = stmt.where(Jurisdiction.id.not_in(exclude))
+                    return db.execute(
+                        stmt.distinct()
+                        .order_by(Jurisdiction.abbreviation)
+                        .limit(SESSION_DATE_TOPUP_PER_CYCLE)
+                    ).scalars().all()
+
+                needy = _needy(session_date_checked)
+                if not needy and session_date_checked:
+                    # Everyone has had a turn; start the next round.
+                    session_date_checked = set()
+                    needy = _needy(session_date_checked)
+                session_date_checked |= {j.id for j in needy}
                 if needy:
                     stats = refresh_session_dates(db, needy, delay=11.0)
                     db.commit()
