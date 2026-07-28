@@ -177,41 +177,82 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
 
     order = _order_by(f.sort)
 
+    # ts_headline is computed ONLY for the page being returned, never inside
+    # the match CTE. The original query headlined the FULL extracted text of
+    # every matching document before the LIMIT -- for a common word ("act"
+    # appears in essentially every bill) that is a quarter-million headline
+    # calls to return one row, and it blew the statement timeout in prod the
+    # week the text corpus reached 126k bills. Rank is cheap; headline is not.
     sql = text(f"""
         WITH matches AS (
             SELECT b.id AS bill_id,
-                   ts_rank(b.search_tsv, websearch_to_tsquery('english', :q)) AS rank,
-                   ts_headline('english', coalesce(b.title, '') || ' ' || coalesce(b.description, ''),
-                               websearch_to_tsquery('english', :q),
-                               :headline_options) AS highlight
+                   ts_rank(b.search_tsv, websearch_to_tsquery('english', :q)) AS rank
             FROM bills b
             WHERE b.search_tsv @@ websearch_to_tsquery('english', :q)
-            UNION
+            UNION ALL
             SELECT bv.bill_id AS bill_id,
-                   ts_rank(bd.text_tsv, websearch_to_tsquery('english', :q)) AS rank,
-                   ts_headline('english', coalesce(bd.extracted_text, ''),
-                               websearch_to_tsquery('english', :q),
-                               :headline_options) AS highlight
+                   ts_rank(bd.text_tsv, websearch_to_tsquery('english', :q)) AS rank
             FROM bill_documents bd
             JOIN bill_versions bv ON bv.id = bd.bill_version_id
             WHERE bd.text_tsv @@ websearch_to_tsquery('english', :q)
         ),
         ranked AS (
-            SELECT bill_id, max(rank) AS rank, max(highlight) AS highlight
+            SELECT bill_id, max(rank) AS rank
             FROM matches
             GROUP BY bill_id
+        ),
+        page AS (
+            SELECT b.id, b.jurisdiction_id, b.session_id, b.chamber, b.identifier,
+                   b.identifier_norm, b.title, b.short_title, b.bill_type, b.status,
+                   b.status_date, b.introduced_date, b.latest_action_text,
+                   b.latest_action_date, b.source_url, r.rank,
+                   row_number() OVER (ORDER BY {order}) AS ord
+            FROM ranked r
+            JOIN bills b ON b.id = r.bill_id
+            JOIN jurisdictions j ON j.id = b.jurisdiction_id
+            JOIN sessions s ON s.id = b.session_id
+            WHERE 1=1{where_sql}
+            ORDER BY {order}
+            LIMIT :limit OFFSET :offset
         )
-        SELECT b.id, b.jurisdiction_id, b.session_id, b.chamber, b.identifier,
-               b.identifier_norm, b.title, b.short_title, b.bill_type, b.status,
-               b.status_date, b.introduced_date, b.latest_action_text,
-               b.latest_action_date, b.source_url, r.rank, r.highlight
-        FROM ranked r
-        JOIN bills b ON b.id = r.bill_id
-        JOIN jurisdictions j ON j.id = b.jurisdiction_id
-        JOIN sessions s ON s.id = b.session_id
-        WHERE 1=1{where_sql}
-        ORDER BY {order}
-        LIMIT :limit OFFSET :offset
+        SELECT p.id, p.jurisdiction_id, p.session_id, p.chamber, p.identifier,
+               p.identifier_norm, p.title, p.short_title, p.bill_type, p.status,
+               p.status_date, p.introduced_date, p.latest_action_text,
+               p.latest_action_date, p.source_url, p.rank, hl.highlight
+        FROM page p
+        LEFT JOIN LATERAL (
+            -- One highlight per bill: prefer the title/description snippet
+            -- (what the old max(highlight) usually surfaced), fall back to
+            -- the best-ranked matching document's text.
+            SELECT h.highlight
+            FROM (
+                SELECT 0 AS pri,
+                       ts_headline('english',
+                                   coalesce(b2.title, '') || ' ' || coalesce(b2.description, ''),
+                                   websearch_to_tsquery('english', :q),
+                                   :headline_options) AS highlight
+                FROM bills b2
+                WHERE b2.id = p.id
+                  AND b2.search_tsv @@ websearch_to_tsquery('english', :q)
+                UNION ALL
+                SELECT 1 AS pri,
+                       ts_headline('english', best_doc.extracted_text,
+                                   websearch_to_tsquery('english', :q),
+                                   :headline_options) AS highlight
+                FROM (
+                    SELECT bd.extracted_text
+                    FROM bill_documents bd
+                    JOIN bill_versions bv ON bv.id = bd.bill_version_id
+                    WHERE bv.bill_id = p.id
+                      AND bd.text_tsv @@ websearch_to_tsquery('english', :q)
+                    ORDER BY ts_rank(bd.text_tsv, websearch_to_tsquery('english', :q)) DESC
+                    LIMIT 1
+                ) best_doc
+            ) h
+            ORDER BY h.pri
+            LIMIT 1
+        ) hl ON true
+        ORDER BY p.ord
     """)
 
     count_sql = text(f"""

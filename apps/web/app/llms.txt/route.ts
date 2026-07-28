@@ -72,6 +72,10 @@ on the website lives at a readable URL:
 - \`GET /api/v1/bills/{id}\` — detail, plus /versions /actions /sponsors /votes /documents
 - \`GET /api/v1/jurisdictions\`, \`/api/v1/sessions\` — reference data
 - \`GET /api/v1/coverage\` — per-jurisdiction coverage state and validation results
+- \`POST /api/v1/bills/lookup\` — resolve up to 250 (jurisdiction, bill number) keys at once
+- \`GET /api/v1/changes?cursor=\` — change feed: what moved since your last check, with the status transition in each event
+- \`GET /api/v1/stats/mortality\` — per-state counts of how bills ended (enacted / killed / died on adjournment)
+- \`GET /api/v1/topics\` and \`/api/v1/topics/{slug}\` — curated cross-state trackers (artificial-intelligence, data-privacy, cryptocurrency)
 
 ## Honest limitations
 

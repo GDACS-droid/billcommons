@@ -24,6 +24,8 @@ from billcommons_api.routers import (
     sessions,
     sitemap,
     sources,
+    stats,
+    topics,
 )
 from billcommons_api.settings import get_settings
 
@@ -82,6 +84,8 @@ def create_app() -> FastAPI:
         sources.router,
         coverage.router,
         sitemap.router,
+        stats.router,
+        topics.router,
     ):
         app.include_router(router, prefix=API_PREFIX)
 

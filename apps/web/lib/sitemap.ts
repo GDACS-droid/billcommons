@@ -69,10 +69,16 @@ export const XML_HEADERS = {
 export const STATIC_ROUTES = [
   "",
   "/states",
+  "/topics",
+  "/topics/artificial-intelligence",
+  "/topics/data-privacy",
+  "/topics/cryptocurrency",
+  "/reports/2026-bill-mortality",
   "/hearings",
   "/coverage",
   "/docs/api",
   "/docs/mcp",
+  "/docs/agents",
   "/methodology",
   "/about",
 ];

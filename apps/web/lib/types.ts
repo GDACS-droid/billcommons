@@ -165,6 +165,10 @@ export interface BillSummary {
   id: string;
   jurisdiction_id: string;
   session_id: string;
+  // Human-readable labels for the two ids above; filled by the API
+  // (billcommons_api.labels.attach_bill_labels) on every list surface.
+  jurisdiction_abbreviation?: string | null;
+  session_identifier?: string | null;
   chamber?: string | null;
   identifier: string;
   identifier_norm: string;
@@ -252,3 +256,32 @@ export interface CoverageRow {
 }
 
 export type SearchResult = BillSummary;
+
+// apps/api/billcommons_api/routers/stats.py
+export interface MortalityRow {
+  jurisdiction_code: string;
+  jurisdiction_name: string;
+  total: number;
+  enacted: number;
+  died_on_adjournment: number;
+  killed: number;
+  pending: number;
+  unknown: number;
+  enacted_pct?: number | null;
+  died_on_adjournment_pct?: number | null;
+  has_active_session: boolean;
+}
+
+export interface MortalityReport {
+  data: MortalityRow[];
+  totals: Omit<MortalityRow, "jurisdiction_code" | "jurisdiction_name" | "has_active_session">;
+  meta: { api_version: string; request_id: string };
+}
+
+// apps/api/billcommons_api/routers/topics.py
+export interface Topic {
+  slug: string;
+  name: string;
+  description: string;
+  bill_count: number;
+}

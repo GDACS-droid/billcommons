@@ -172,6 +172,59 @@ class ChangeFeedEnvelope(BaseModel):
     meta: dict
 
 
+class MortalityJurisdictionRow(BaseModel):
+    """One jurisdiction's bills bucketed by how they ended (or haven't).
+
+    `died_on_adjournment` is broken out from `killed` because the consumer
+    action differs: voted-down is finished, out-of-clock is a reintroduction
+    candidate. `pending` for a jurisdiction with no active session usually
+    means an enrolled bill awaiting signature or a session whose end date we
+    have not confirmed yet -- `has_active_session` is published so a reader
+    can tell those apart.
+    """
+
+    jurisdiction_code: str
+    jurisdiction_name: str
+    total: int
+    enacted: int
+    died_on_adjournment: int
+    killed: int
+    pending: int
+    unknown: int
+    enacted_pct: float | None = None
+    died_on_adjournment_pct: float | None = None
+    has_active_session: bool
+
+
+class MortalityTotals(BaseModel):
+    total: int
+    enacted: int
+    died_on_adjournment: int
+    killed: int
+    pending: int
+    unknown: int
+    enacted_pct: float | None = None
+    died_on_adjournment_pct: float | None = None
+
+
+class MortalityReportEnvelope(BaseModel):
+    data: list[MortalityJurisdictionRow]
+    totals: MortalityTotals
+    meta: dict
+
+
+class TopicOut(BaseModel):
+    slug: str
+    name: str
+    description: str
+    bill_count: int
+
+
+class TopicListEnvelope(BaseModel):
+    data: list[TopicOut]
+    meta: dict
+
+
 class BillIdentifierOut(OrmModel):
     id: uuid.UUID
     identifier: str

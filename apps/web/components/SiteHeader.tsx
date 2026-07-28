@@ -3,10 +3,11 @@ import SearchBox from "./SearchBox";
 
 const NAV = [
   { href: "/states", label: "States" },
-  { href: "/hearings", label: "Hearings" },
+  { href: "/topics", label: "Topics" },
+  { href: "/reports/2026-bill-mortality", label: "Reports" },
   { href: "/coverage", label: "Coverage" },
   { href: "/docs/api", label: "API" },
-  { href: "/docs/mcp", label: "MCP" },
+  { href: "/docs/agents", label: "AI Agents" },
   { href: "/methodology", label: "Methodology" },
   { href: "/about", label: "About" },
 ];

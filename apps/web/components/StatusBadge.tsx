@@ -33,7 +33,12 @@ export function BillStatusBadge({ status }: { status?: string | null }) {
   let style = "bg-slate-100 text-slate-700";
   if (lower.includes("enact") || lower.includes("signed") || lower.includes("pass")) {
     style = "bg-emerald-100 text-emerald-800";
-  } else if (lower.includes("veto") || lower.includes("fail") || lower.includes("dead")) {
+  } else if (
+    lower.includes("veto") ||
+    lower.includes("fail") ||
+    lower.includes("dead") ||
+    lower.includes("died")
+  ) {
     style = "bg-red-100 text-red-800";
   } else if (lower.includes("withdraw")) {
     style = "bg-slate-200 text-slate-600";
