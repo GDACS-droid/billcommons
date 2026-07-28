@@ -46,9 +46,13 @@ export default async function SessionPage({ params, searchParams }: Props) {
   const { code, session } = await params;
   const sp = await searchParams;
   const upperCode = code.toUpperCase();
+  // App Router params arrive percent-encoded; the API filter and slugify both
+  // need the real identifier ("2025-2026 Regular Session (...)"), while hrefs
+  // keep using the encoded segment.
+  const sessionId = decodeURIComponent(session);
   const page = Number(sp.page ?? "1") || 1;
 
-  const billsResult = await getBills(upperCode, session, page, sp.chamber);
+  const billsResult = await getBills(upperCode, sessionId, page, sp.chamber);
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
@@ -60,13 +64,13 @@ export default async function SessionPage({ params, searchParams }: Props) {
         <Link href={`/states/${upperCode}`} className="hover:underline">
           {upperCode}
         </Link>{" "}
-        / {decodeURIComponent(session)}
+        / {sessionId}
       </nav>
 
       <div className="mt-3">
         <PageHeader
           eyebrow="Legislative session"
-          title={`${upperCode} — ${decodeURIComponent(session)}`}
+          title={`${upperCode} — ${sessionId}`}
         />
       </div>
 
@@ -87,7 +91,7 @@ export default async function SessionPage({ params, searchParams }: Props) {
                 <BillListItem
                   key={bill.id}
                   bill={bill}
-                  href={billPath(upperCode, session, bill.identifier_norm)}
+                  href={billPath(upperCode, sessionId, bill.identifier_norm)}
                 />
               ))}
             </ul>
