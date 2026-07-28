@@ -3,10 +3,9 @@ import type { Metadata } from "next";
 import SearchBox from "@/components/SearchBox";
 import DataUnavailable from "@/components/DataUnavailable";
 import JsonLd from "@/components/JsonLd";
-import { apiGet } from "@/lib/api";
 import { fetchAllPages } from "@/lib/collections";
 import { API_DOCS_URL, MCP_URL, SITE_URL } from "@/lib/config";
-import type { CoverageRow, ListEnvelope, Session } from "@/lib/types";
+import type { CoverageRow, Session } from "@/lib/types";
 
 export const metadata: Metadata = {
   alternates: { canonical: "/" },
@@ -16,11 +15,14 @@ export const metadata: Metadata = {
 // the API as raw query load.
 const HOME_REVALIDATE = 900;
 
+// All of them, not the first page: the 8 shown are picked by bill count, and
+// a fresh special session with zero ingested bills must not outrank a live
+// regular session with thousands just because it started more recently.
 async function getActiveSessions() {
-  return apiGet<ListEnvelope<Session>>(
+  return fetchAllPages<Session>(
     "/api/v1/sessions",
-    { active: "true", per_page: 8 },
-    { revalidate: HOME_REVALIDATE }
+    { active: "true" },
+    HOME_REVALIDATE
   );
 }
 
@@ -50,6 +52,23 @@ export default async function HomePage() {
     (sum, r) => sum + (r.bill_count ?? 0),
     0
   );
+
+  // Rank the active-session cards by ingested bill count so the top slots are
+  // sessions a visitor can actually browse; brand-new specials with nothing
+  // ingested yet sort to the bottom instead of leading with dead clicks.
+  const billCountBySession = new Map(
+    coverageRows.map((r) => [
+      `${r.jurisdiction_code}|${r.session_identifier ?? ""}`,
+      r.bill_count ?? 0,
+    ])
+  );
+  const sessionBillCount = (s: Session) =>
+    billCountBySession.get(
+      `${s.jurisdiction_abbreviation ?? ""}|${s.identifier}`
+    ) ?? 0;
+  const topSessions = [...sessionsResult.items]
+    .sort((a, b) => sessionBillCount(b) - sessionBillCount(a))
+    .slice(0, 8);
 
   return (
     <div>
@@ -149,13 +168,13 @@ export default async function HomePage() {
           <div className="mt-4">
             <DataUnavailable message="Active-session data is temporarily unavailable." />
           </div>
-        ) : sessionsResult.data.data.length === 0 ? (
+        ) : topSessions.length === 0 ? (
           <p className="mt-4 text-sm text-slate-600">
             No active sessions reported right now.
           </p>
         ) : (
           <ul className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            {sessionsResult.data.data.map((session) => (
+            {topSessions.map((session) => (
               <li
                 key={session.id}
                 className="rounded-lg border border-slate-200 p-4"
@@ -171,7 +190,11 @@ export default async function HomePage() {
                 </Link>
                 <p className="mt-1 text-xs text-slate-500">
                   {session.classification ?? "session"}
-                  {session.start_date ? ` · started ${session.start_date}` : ""}
+                  {sessionBillCount(session) > 0
+                    ? ` · ${sessionBillCount(session).toLocaleString()} bills`
+                    : session.start_date
+                      ? ` · started ${session.start_date}`
+                      : ""}
                 </p>
               </li>
             ))}
