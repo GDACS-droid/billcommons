@@ -85,6 +85,8 @@ def resend_send(
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            # Resend's edge 403s the default Python-urllib user agent.
+            "User-Agent": "billcommons-alerts/1.0",
         },
     )
     with urllib.request.urlopen(req, timeout=60) as r:
