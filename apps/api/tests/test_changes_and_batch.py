@@ -258,18 +258,22 @@ def test_changes_full_sweep_visits_every_event_exactly_once(client):
 
 def test_changes_empty_page_echoes_the_cursor_rather_than_nulling_it(client):
     """Returning null invites a client to pass it back and get a 422;
-    advancing to "now" would step them past changes they never received."""
-    body = client.get("/api/v1/changes", params={"per_page": 500}).json()
-    while body["has_more"]:
-        body = client.get(
-            "/api/v1/changes", params={"per_page": 500, "cursor": body["next_cursor"]}
-        ).json()
-    caught_up = body["next_cursor"]
+    advancing to "now" would step them past changes they never received.
 
-    again = client.get("/api/v1/changes", params={"cursor": caught_up}).json()
+    The empty page is manufactured with a cursor past the newest event rather
+    than by walking the feed to its end: this suite runs against the live DB,
+    and while the text crawl is draining, tens of thousands of events land per
+    day -- a real event can (and did) arrive between "caught up" and the
+    follow-up request, which is the feed working, not the echo breaking."""
+    from billcommons_api.routers.changes import decode_cursor, encode_cursor
+
+    body = client.get("/api/v1/changes", params={"per_page": 1}).json()
+    beyond = encode_cursor(decode_cursor(body["next_cursor"]) + 10_000_000)
+
+    again = client.get("/api/v1/changes", params={"cursor": beyond}).json()
     assert again["data"] == []
     assert again["has_more"] is False
-    assert again["next_cursor"] == caught_up, "an empty page moved the cursor"
+    assert again["next_cursor"] == beyond, "an empty page moved the cursor"
 
 
 def test_changes_can_be_filtered_to_a_watchlist(client):
