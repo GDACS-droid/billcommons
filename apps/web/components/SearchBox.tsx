@@ -25,17 +25,17 @@ export default function SearchBox({
 }) {
   return (
     <form action="/search" method="GET" role="search" aria-label="Search legislation">
-      <label htmlFor="q" className="sr-only">
+      <label htmlFor={compact ? "q-compact" : "q"} className="sr-only">
         Search bills by number, keyword, or full text
       </label>
       <div
-        className={`flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 focus-within:border-slate-500 focus-within:ring-2 focus-within:ring-amber-400/40 ${
-          compact ? "py-1.5" : "py-3"
+        className={`flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition-colors focus-within:border-blue-700 focus-within:ring-4 focus-within:ring-blue-700/10 ${
+          compact ? "py-1" : "py-3.5"
         }`}
       >
         <SearchIcon />
         <input
-          id="q"
+          id={compact ? "q-compact" : "q"}
           name="q"
           type="search"
           autoFocus={autoFocus}
@@ -51,7 +51,7 @@ export default function SearchBox({
         />
         <button
           type="submit"
-          className={`shrink-0 rounded-md bg-slate-900 font-medium text-white hover:bg-slate-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-500 ${
+          className={`shrink-0 rounded-md bg-blue-700 font-medium text-white transition-colors hover:bg-blue-800 ${
             compact ? "px-2.5 py-1 text-xs" : "px-4 py-2 text-sm"
           }`}
         >

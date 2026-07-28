@@ -1,6 +1,7 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 import DataUnavailable from "@/components/DataUnavailable";
+import PageHeader from "@/components/PageHeader";
 import { fetchAllPages } from "@/lib/collections";
 import type { Jurisdiction } from "@/lib/types";
 
@@ -22,14 +23,17 @@ export default async function StatesPage() {
   const result = await getJurisdictions();
 
   return (
-    <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
-      <h1 className="text-2xl font-semibold text-slate-900">
-        States &amp; jurisdictions
-      </h1>
-      <p className="mt-2 max-w-2xl text-sm text-slate-600">
-        All 50 states plus the District of Columbia. Select a jurisdiction to
-        see its current legislative session, bills, and coverage status.
-      </p>
+    <div className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
+      <PageHeader
+        eyebrow="Directory"
+        title="States & jurisdictions"
+        description={
+          <p>
+            All 50 states plus the District of Columbia. Select a jurisdiction
+            to see its current legislative session, bills, and coverage status.
+          </p>
+        }
+      />
 
       <div className="mt-8">
         {!result.ok ? (
@@ -44,11 +48,11 @@ export default async function StatesPage() {
               .map((j) => (
                 <li
                   key={j.id}
-                  className="rounded-lg border border-slate-200 p-4"
+                  className="rounded-md border border-slate-200 bg-white p-4 transition-colors hover:border-slate-300 hover:bg-slate-50"
                 >
                   <Link
                     href={`/states/${j.abbreviation}`}
-                    className="font-medium text-slate-900 hover:underline"
+                    className="font-medium text-blue-800 hover:text-blue-700 hover:underline"
                   >
                     {j.name}
                   </Link>

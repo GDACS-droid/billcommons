@@ -3,6 +3,7 @@
 :root {
   --background: #ffffff;
   --foreground: #101a30;
+  --accent: #1d4ed8;
 }
 
 @theme inline {
@@ -15,6 +16,7 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-inter), system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-feature-settings: "cv11" 1, "ss01" 1;
 }
 
 ::selection {
@@ -35,4 +37,117 @@ body {
 
 .skip-link:focus {
   left: 0;
+}
+
+/* Keep focus treatment consistent for links, form controls, and disclosure UI. */
+:where(a, button, input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.page-header {
+  margin-bottom: 2.25rem;
+}
+
+.page-header-tight {
+  margin-bottom: 0;
+}
+
+.page-eyebrow {
+  color: var(--accent);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  line-height: 1rem;
+  text-transform: uppercase;
+}
+
+.page-title {
+  margin-top: 0.5rem;
+  color: #0f172a;
+  font-size: 1.875rem;
+  font-weight: 650;
+  letter-spacing: -0.025em;
+  line-height: 2.25rem;
+}
+
+.page-lead {
+  margin-top: 0.875rem;
+  max-width: 44rem;
+  color: #475569;
+  font-size: 0.9375rem;
+  line-height: 1.6;
+}
+
+.page-lead a,
+.page-lead strong {
+  color: #1e293b;
+}
+
+.surface-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 0.375rem;
+  background: #ffffff;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.data-table thead {
+  background: #f8fafc;
+}
+
+.data-table th {
+  color: #64748b;
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1rem;
+  text-transform: uppercase;
+}
+
+.data-table th,
+.data-table td {
+  border-bottom: 1px solid #f1f5f9;
+  padding: 0.75rem 1rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.data-table th.text-right,
+.data-table td.text-right {
+  text-align: right;
+}
+
+.data-table tbody tr {
+  transition: background-color 120ms ease;
+}
+
+.data-table tbody tr:hover {
+  background: #f8fafc;
+}
+
+.code-block {
+  overflow: hidden;
+  border: 1px solid #1e293b;
+  border-radius: 0.375rem;
+}
+
+.code-block pre {
+  overflow-x: auto;
+  background: #0f172a;
+  padding: 1rem;
+  color: #e2e8f0;
+  font-size: 0.75rem;
+  line-height: 1.65;
+}
+
+@media (min-width: 640px) {
+  .page-title {
+    font-size: 2.25rem;
+    line-height: 2.5rem;
+  }
 }

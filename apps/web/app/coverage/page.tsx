@@ -1,6 +1,7 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 import DataUnavailable from "@/components/DataUnavailable";
+import PageHeader from "@/components/PageHeader";
 import { CoverageBadge } from "@/components/StatusBadge";
 import { apiGet } from "@/lib/api";
 import type { CoverageRow, ListEnvelope } from "@/lib/types";
@@ -22,11 +23,12 @@ export default async function CoveragePage() {
   const result = await getCoverage();
 
   return (
-    <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
-      <h1 className="text-2xl font-semibold text-slate-900">
-        Coverage status
-      </h1>
-      <p className="mt-2 max-w-2xl text-sm text-slate-600">
+    <div className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
+      <PageHeader
+        eyebrow="Data quality"
+        title="Coverage status"
+        description={
+          <p>
         Bill Commons publishes its ingestion status for every jurisdiction —
         no black boxes. A jurisdiction reaches <strong>GREEN</strong> only
         after its session is identified from an authoritative source, all
@@ -36,9 +38,11 @@ export default async function CoveragePage() {
           methodology
         </Link>{" "}
         for the full criteria.
-      </p>
+          </p>
+        }
+      />
 
-      <div className="mt-8 overflow-x-auto">
+      <div className="surface-card overflow-x-auto">
         {!result.ok ? (
           <DataUnavailable message="Coverage data is temporarily unavailable." />
         ) : result.data.data.length === 0 ? (
@@ -46,18 +50,18 @@ export default async function CoveragePage() {
             No coverage data reported yet.
           </p>
         ) : (
-          <table className="w-full min-w-[900px] border-collapse text-sm">
+          <table className="data-table min-w-[900px]">
             <thead>
-              <tr className="border-b border-slate-300 text-left text-xs uppercase tracking-wide text-slate-500">
-                <th className="py-2 pr-3">Jurisdiction</th>
-                <th className="py-2 pr-3">Session</th>
-                <th className="py-2 pr-3">Bills</th>
-                <th className="py-2 pr-3">Full text</th>
-                <th className="py-2 pr-3">Of obtainable</th>
-                <th className="py-2 pr-3">Last update</th>
-                <th className="py-2 pr-3">Source</th>
-                <th className="py-2 pr-3">Validation</th>
-                <th className="py-2 pr-3">Status</th>
+              <tr>
+                <th>Jurisdiction</th>
+                <th>Session</th>
+                <th className="text-right">Bills</th>
+                <th className="text-right">Full text</th>
+                <th className="text-right">Of obtainable</th>
+                <th>Last update</th>
+                <th>Source</th>
+                <th>Validation</th>
+                <th>Status</th>
               </tr>
             </thead>
             <tbody>
@@ -69,9 +73,9 @@ export default async function CoveragePage() {
                 .map((row) => (
                   <tr
                     key={row.jurisdiction_code}
-                    className="border-b border-slate-100"
+                    className="transition-colors"
                   >
-                    <td className="py-2 pr-3 font-medium">
+                    <td className="font-medium">
                       <Link
                         href={`/states/${row.jurisdiction_code}`}
                         className="hover:underline"
@@ -79,19 +83,19 @@ export default async function CoveragePage() {
                         {row.jurisdiction_name}
                       </Link>
                     </td>
-                    <td className="py-2 pr-3 text-slate-600">
+                    <td className="text-slate-600">
                       {row.session_identifier ?? "—"}
                       {row.session_status ? ` (${row.session_status})` : ""}
                     </td>
-                    <td className="py-2 pr-3 text-slate-600">
+                    <td className="text-right tabular-nums text-slate-600">
                       {row.bill_count?.toLocaleString() ?? "—"}
                     </td>
-                    <td className="py-2 pr-3 text-slate-600">
+                    <td className="text-right tabular-nums text-slate-600">
                       {row.full_text_pct != null
                         ? `${row.full_text_pct}%`
                         : "—"}
                     </td>
-                    <td className="py-2 pr-3 text-slate-600">
+                    <td className="text-right tabular-nums text-slate-600">
                       {row.full_text_of_available_pct != null ? (
                         `${row.full_text_of_available_pct}%`
                       ) : row.full_text_available_count === 0 ? (
@@ -102,13 +106,13 @@ export default async function CoveragePage() {
                         "—"
                       )}
                     </td>
-                    <td className="py-2 pr-3 text-slate-600">
+                    <td className="text-slate-600">
                       {row.last_update ?? "—"}
                     </td>
-                    <td className="py-2 pr-3 text-slate-600">
+                    <td className="text-slate-600">
                       {row.source_name ?? "—"}
                     </td>
-                    <td className="py-2 pr-3 text-slate-600">
+                    <td className="tabular-nums text-slate-600">
                       {row.validation_sample
                         ? `${row.validation_sample} (${
                             row.validation_pass_rate != null
@@ -117,7 +121,7 @@ export default async function CoveragePage() {
                           })`
                         : "—"}
                     </td>
-                    <td className="py-2 pr-3">
+                    <td>
                       <CoverageBadge status={row.status} />
                       {row.known_gaps?.length ? (
                         <p className="mt-1 text-xs text-slate-400">

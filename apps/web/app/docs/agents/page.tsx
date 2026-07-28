@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { API_DOCS_URL, MCP_URL } from "@/lib/config";
+import PageHeader from "@/components/PageHeader";
 
 export const metadata: Metadata = {
   title: "Use Bill Commons from your AI agent",
@@ -11,13 +12,13 @@ export const metadata: Metadata = {
 
 function CodeBlock({ children, label }: { children: string; label?: string }) {
   return (
-    <div className="mt-3 overflow-hidden rounded-lg border border-slate-200">
+    <div className="code-block mt-4">
       {label ? (
-        <div className="border-b border-slate-200 bg-slate-50 px-4 py-1.5 text-xs font-medium text-slate-500">
+        <div className="border-b border-slate-700 bg-slate-800 px-4 py-1.5 text-xs font-medium text-slate-400">
           {label}
         </div>
       ) : null}
-      <pre className="overflow-x-auto bg-slate-900 p-4 text-xs leading-relaxed text-slate-100">
+      <pre>
         <code>{children}</code>
       </pre>
     </div>
@@ -26,21 +27,21 @@ function CodeBlock({ children, label }: { children: string; label?: string }) {
 
 export default function AgentsDocsPage() {
   return (
-    <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6">
-      <p className="text-xs font-semibold uppercase tracking-wide text-amber-600">
-        Quickstart
-      </p>
-      <h1 className="mt-1 text-2xl font-semibold text-slate-900">
-        Use Bill Commons from your AI agent
-      </h1>
-      <p className="mt-3 max-w-2xl text-slate-600">
+    <div className="mx-auto max-w-4xl px-4 py-12 sm:px-6">
+      <PageHeader
+        eyebrow="Quickstart"
+        title="Use Bill Commons from your AI agent"
+        description={
+          <p>
         You don&apos;t need to write integration code — or be a programmer at
         all. Connect your AI assistant once, then ask it questions in plain
         English: <em>&quot;find every AI bill introduced in Texas this
         session&quot;</em>, <em>&quot;did GA SB 594 pass?&quot;</em>,{" "}
         <em>&quot;which of these 40 bills moved this week?&quot;</em> No API
         key, no signup, free.
-      </p>
+          </p>
+        }
+      />
 
       <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">Claude Code</h2>
@@ -54,7 +55,7 @@ export default function AgentsDocsPage() {
         </p>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">
           Claude Desktop / Claude.ai
         </h2>
@@ -65,7 +66,7 @@ export default function AgentsDocsPage() {
         <CodeBlock>{MCP_URL}</CodeBlock>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">
           Cursor / other MCP clients
         </h2>
@@ -87,7 +88,7 @@ export default function AgentsDocsPage() {
         </p>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">
           Building an automated monitor
         </h2>
@@ -121,7 +122,7 @@ curl "${API_DOCS_URL}/api/v1/changes?cursor=<next_cursor>&kind=status&ids=..."`}
         </p>
       </section>
 
-      <section className="mt-8 rounded-lg border border-amber-200 bg-amber-50 p-5">
+      <section className="mt-10 rounded-md border border-blue-200 bg-blue-50 p-5">
         <h2 className="text-base font-semibold text-slate-900">
           Not technical? You&apos;re done after step one.
         </h2>

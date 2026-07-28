@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import DataUnavailable from "@/components/DataUnavailable";
 import PaginationNav from "@/components/PaginationNav";
+import PageHeader from "@/components/PageHeader";
 import { apiGet } from "@/lib/api";
 import type { HearingEvent, ListEnvelope } from "@/lib/types";
 
@@ -30,19 +31,22 @@ export default async function HearingsPage({ searchParams }: Props) {
   const result = await getHearings(page, sp.jurisdiction);
 
   return (
-    <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6">
-      <h1 className="text-2xl font-semibold text-slate-900">
-        Upcoming hearings
-      </h1>
-      <p className="mt-2 text-sm text-slate-600">
+    <div className="mx-auto max-w-4xl px-4 py-12 sm:px-6">
+      <PageHeader
+        eyebrow="Calendar"
+        title="Upcoming hearings"
+        description={
+          <p>
         Committee hearings and legislative events, sourced from official
         calendars where available.
-      </p>
+          </p>
+        }
+      />
       {/* Said plainly rather than shown as an empty list: no calendar source is
           ingested yet, so this page holds zero events. An empty table with no
           explanation reads as "no hearings scheduled anywhere", which is a
           much stronger and completely false claim. */}
-      <p className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+      <p className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
         <strong>Not yet populated.</strong> Hearing and committee-calendar
         ingestion is not built yet, so this page is empty — that is a gap in
         Bill Commons, not an absence of scheduled hearings. Bill action
@@ -66,7 +70,7 @@ export default async function HearingsPage({ searchParams }: Props) {
               {result.data.data.map((h) => (
                 <li
                   key={h.id}
-                  className="rounded-lg border border-slate-200 p-4"
+                  className="rounded-md border border-slate-200 bg-white p-4 transition-colors hover:border-slate-300 hover:bg-slate-50"
                 >
                   <p className="font-medium text-slate-900">{h.name}</p>
                   <p className="mt-1 text-sm text-slate-600">
@@ -78,7 +82,7 @@ export default async function HearingsPage({ searchParams }: Props) {
                     <p className="mt-2 text-xs">
                       <Link
                         href={`/bills/${h.bill_id}`}
-                        className="rounded-full border border-slate-300 px-2 py-0.5 hover:bg-slate-50"
+                        className="rounded-md border border-slate-300 px-2 py-0.5 text-blue-800 transition-colors hover:border-slate-400 hover:bg-slate-50"
                       >
                         View related bill
                       </Link>

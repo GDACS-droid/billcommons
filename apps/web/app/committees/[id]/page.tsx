@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import DataUnavailable from "@/components/DataUnavailable";
+import PageHeader from "@/components/PageHeader";
 import { apiGet } from "@/lib/api";
 import type { Committee } from "@/lib/types";
 
@@ -30,7 +31,7 @@ export default async function CommitteePage({ params }: Props) {
 
   if (!result.ok) {
     return (
-      <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
+      <div className="mx-auto max-w-3xl px-4 py-12 sm:px-6">
         <DataUnavailable message="This committee's record is temporarily unavailable." />
       </div>
     );
@@ -39,15 +40,16 @@ export default async function CommitteePage({ params }: Props) {
   const committee = result.data;
 
   return (
-    <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
-      <h1 className="mt-2 text-2xl font-semibold text-slate-900">
-        {committee.name}
-      </h1>
-      {committee.classification ? (
-        <p className="mt-1 text-sm text-slate-600">{committee.classification}</p>
-      ) : null}
+    <div className="mx-auto max-w-3xl px-4 py-12 sm:px-6">
+      <PageHeader
+        eyebrow="Committee"
+        title={committee.name}
+        description={
+          committee.classification ? <p>{committee.classification}</p> : undefined
+        }
+      />
 
-      <section className="mt-8">
+      <section className="border-t border-slate-200 pt-8">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
           Members
         </h2>
@@ -56,7 +58,7 @@ export default async function CommitteePage({ params }: Props) {
         </p>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10 border-t border-slate-200 pt-8">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
           Bills before this committee
         </h2>

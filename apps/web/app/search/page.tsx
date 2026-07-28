@@ -3,6 +3,7 @@ import SearchBox from "@/components/SearchBox";
 import DataUnavailable from "@/components/DataUnavailable";
 import BillListItem from "@/components/BillListItem";
 import PaginationNav from "@/components/PaginationNav";
+import PageHeader from "@/components/PageHeader";
 import { apiGet } from "@/lib/api";
 import type { ListEnvelope, SearchResult } from "@/lib/types";
 
@@ -68,11 +69,9 @@ export default async function SearchPage({ searchParams }: Props) {
   const result = hasQuery ? await search(sp) : null;
 
   return (
-    <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6">
-      <h1 className="text-2xl font-semibold text-slate-900">
-        Search legislation
-      </h1>
-      <div className="mt-4">
+    <div className="mx-auto max-w-4xl px-4 py-12 sm:px-6">
+      <PageHeader eyebrow="Search" title="Search legislation" />
+      <div className="-mt-4">
         <SearchBox defaultValue={sp.q ?? ""} autoFocus={!hasQuery} />
       </div>
 
@@ -91,7 +90,7 @@ export default async function SearchPage({ searchParams }: Props) {
           </p>
         ) : (
           <>
-            <p className="text-sm text-slate-500">
+            <p className="text-sm tabular-nums text-slate-500">
               {result.data.pagination.total.toLocaleString()} results
             </p>
             <ul className="mt-3 space-y-3">

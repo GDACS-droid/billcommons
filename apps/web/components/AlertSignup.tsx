@@ -42,7 +42,7 @@ export default function AlertSignup({ topicSlug, topicName }: { topicSlug: strin
 
   if (state === "done") {
     return (
-      <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
+      <div className="rounded-md border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
         <strong>You&apos;re on the list.</strong> You&apos;ll get an email
         digest when {topicName.toLowerCase()} bills move — status changes, new
         bills, new text. Every email has a one-click unsubscribe.
@@ -53,7 +53,7 @@ export default function AlertSignup({ topicSlug, topicName }: { topicSlug: strin
   return (
     <form
       onSubmit={submit}
-      className="rounded-lg border border-amber-200 bg-amber-50 p-4"
+      className="rounded-md border border-blue-200 bg-blue-50 p-4"
     >
       <p className="text-sm font-semibold text-slate-900">
         Get emailed when {topicName.toLowerCase()} bills move
@@ -70,12 +70,12 @@ export default function AlertSignup({ topicSlug, topicName }: { topicSlug: strin
           onChange={(e) => setEmail(e.target.value)}
           placeholder="you@example.com"
           aria-label="Email address"
-          className="min-w-0 flex-1 rounded border border-slate-300 bg-white px-3 py-1.5 text-sm focus:border-amber-500 focus:outline-none"
+          className="min-w-0 flex-1 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/10"
         />
         <button
           type="submit"
           disabled={state === "busy"}
-          className="rounded bg-slate-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+          className="rounded-md bg-blue-700 px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-blue-800 disabled:opacity-50"
         >
           {state === "busy" ? "Subscribing…" : "Subscribe"}
         </button>

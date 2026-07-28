@@ -8,7 +8,7 @@ export default function DataUnavailable({
   return (
     <div
       role="status"
-      className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-6 text-sm text-slate-800"
+      className="rounded-md border border-amber-200 bg-amber-50 px-4 py-5 text-sm text-slate-800"
     >
       <p className="font-medium">
         {message ?? "This data is temporarily unavailable."}

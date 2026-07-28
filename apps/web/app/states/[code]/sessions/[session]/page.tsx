@@ -3,6 +3,7 @@ import type { Metadata } from "next";
 import DataUnavailable from "@/components/DataUnavailable";
 import BillListItem from "@/components/BillListItem";
 import PaginationNav from "@/components/PaginationNav";
+import PageHeader from "@/components/PageHeader";
 import { apiGet } from "@/lib/api";
 import { billPath } from "@/lib/billUrl";
 import type { BillSummary, ListEnvelope } from "@/lib/types";
@@ -50,7 +51,7 @@ export default async function SessionPage({ params, searchParams }: Props) {
   const billsResult = await getBills(upperCode, session, page, sp.chamber);
 
   return (
-    <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
+    <div className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
       <nav aria-label="Breadcrumb" className="text-sm text-slate-500">
         <Link href="/states" className="hover:underline">
           States
@@ -62,9 +63,12 @@ export default async function SessionPage({ params, searchParams }: Props) {
         / {decodeURIComponent(session)}
       </nav>
 
-      <h1 className="mt-2 text-2xl font-semibold text-slate-900">
-        {upperCode} — {decodeURIComponent(session)}
-      </h1>
+      <div className="mt-3">
+        <PageHeader
+          eyebrow="Legislative session"
+          title={`${upperCode} — ${decodeURIComponent(session)}`}
+        />
+      </div>
 
       <section className="mt-8">
         {!billsResult.ok ? (

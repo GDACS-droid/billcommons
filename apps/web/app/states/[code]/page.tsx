@@ -3,6 +3,7 @@ import type { Metadata } from "next";
 import DataUnavailable from "@/components/DataUnavailable";
 import BillListItem from "@/components/BillListItem";
 import { CoverageBadge } from "@/components/StatusBadge";
+import PageHeader from "@/components/PageHeader";
 import { apiGet } from "@/lib/api";
 import { billPath, slugify } from "@/lib/billUrl";
 import type {
@@ -87,7 +88,7 @@ export default async function StatePage({ params }: Props) {
     : undefined;
 
   return (
-    <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
+    <div className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
       <nav aria-label="Breadcrumb" className="text-sm text-slate-500">
         <Link href="/states" className="hover:underline">
           States
@@ -95,10 +96,12 @@ export default async function StatePage({ params }: Props) {
         / {upperCode}
       </nav>
 
-      <div className="mt-2 flex flex-wrap items-center gap-3">
-        <h1 className="text-2xl font-semibold text-slate-900">
-          {jurisdictionResult.ok ? jurisdictionResult.data.name : upperCode}
-        </h1>
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <PageHeader
+          eyebrow="Jurisdiction"
+          title={jurisdictionResult.ok ? jurisdictionResult.data.name : upperCode}
+          className="page-header-tight"
+        />
         {coverageStatus ? <CoverageBadge status={coverageStatus} /> : null}
       </div>
 
@@ -123,13 +126,13 @@ export default async function StatePage({ params }: Props) {
             {sessionsResult.data.data.map((session) => (
               <li
                 key={session.id}
-                className="rounded-lg border border-slate-200 p-4"
+                className="rounded-md border border-slate-200 bg-white p-4 transition-colors hover:border-slate-300 hover:bg-slate-50"
               >
                 <Link
                   href={`/states/${upperCode}/sessions/${encodeURIComponent(
                     session.identifier
                   )}`}
-                  className="font-medium text-slate-900 hover:underline"
+                  className="font-medium text-blue-800 hover:text-blue-700 hover:underline"
                 >
                   {session.name ?? session.identifier}
                 </Link>

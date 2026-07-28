@@ -2,66 +2,94 @@ import Link from "next/link";
 
 export default function SiteFooter() {
   return (
-    <footer className="mt-16 border-t border-slate-200 bg-slate-50">
-      <div className="mx-auto max-w-6xl px-4 py-10 text-sm text-slate-600 sm:px-6">
-        <div className="grid gap-8 sm:grid-cols-3">
+    <footer className="mt-20 border-t border-slate-200 bg-slate-50">
+      <div className="mx-auto max-w-6xl px-4 py-12 text-sm text-slate-600 sm:px-6">
+        <div className="grid gap-10 sm:grid-cols-[1.4fr_repeat(3,1fr)]">
           <div>
-            <p className="font-semibold text-slate-900">Bill Commons</p>
-            <p className="mt-2 max-w-xs">
+            <p className="text-base font-semibold tracking-tight text-slate-950">
+              <span className="font-normal">Bill</span> Commons
+            </p>
+            <p className="mt-3 max-w-xs leading-6">
               Free, open-source, nonpartisan legislative search covering all
               50 states and DC.
             </p>
           </div>
           <div>
-            <p className="font-semibold text-slate-900">Data &amp; access</p>
-            <ul className="mt-2 space-y-1.5">
+            <p className="text-xs font-semibold uppercase tracking-[0.1em] text-slate-900">
+              Product
+            </p>
+            <ul className="mt-4 space-y-2">
               <li>
-                <Link className="hover:underline" href="/coverage">
+                <Link className="transition-colors hover:text-blue-800" href="/states">
+                  States
+                </Link>
+              </li>
+              <li>
+                <Link className="transition-colors hover:text-blue-800" href="/topics">
+                  Topics
+                </Link>
+              </li>
+              <li>
+                <Link className="transition-colors hover:text-blue-800" href="/reports/2026-bill-mortality">
+                  Reports
+                </Link>
+              </li>
+            </ul>
+          </div>
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.1em] text-slate-900">
+              Data
+            </p>
+            <ul className="mt-4 space-y-2">
+              <li>
+                <Link className="transition-colors hover:text-blue-800" href="/coverage">
                   Coverage status
                 </Link>
               </li>
               <li>
-                <Link className="hover:underline" href="/methodology">
+                <Link className="transition-colors hover:text-blue-800" href="/methodology">
                   Methodology
                 </Link>
               </li>
               <li>
-                <Link className="hover:underline" href="/docs/api">
+                <Link className="transition-colors hover:text-blue-800" href="/docs/api">
                   REST API docs
                 </Link>
               </li>
               <li>
-                <Link className="hover:underline" href="/docs/mcp">
+                <Link className="transition-colors hover:text-blue-800" href="/docs/mcp">
                   MCP server
                 </Link>
               </li>
             </ul>
           </div>
           <div>
-            <p className="font-semibold text-slate-900">Project</p>
-            <ul className="mt-2 space-y-1.5">
+            <p className="text-xs font-semibold uppercase tracking-[0.1em] text-slate-900">
+              Company
+            </p>
+            <ul className="mt-4 space-y-2">
               <li>
-                <Link className="hover:underline" href="/about">
+                <Link className="transition-colors hover:text-blue-800" href="/about">
                   About &amp; license
                 </Link>
               </li>
               <li>
                 <a
-                  className="hover:underline"
+                  className="transition-colors hover:text-blue-800"
                   href="https://github.com/GDACS-droid/billcommons"
                 >
                   Source on GitHub
                 </a>
               </li>
               <li>
-                <Link className="hover:underline" href="/services">
+                <Link className="transition-colors hover:text-blue-800" href="/services">
                   Custom tracking &amp; consulting
                 </Link>
               </li>
             </ul>
           </div>
         </div>
-        <p className="mt-8 border-t border-slate-200 pt-6 text-xs text-slate-500">
+        <p className="mt-10 border-t border-slate-200 pt-6 text-xs leading-5 text-slate-500">
           Bill Commons is an independent, nonpartisan project. Legislative
           data is sourced from official state records and Open States;
           see the{" "}

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import PageHeader from "@/components/PageHeader";
 
 export const metadata: Metadata = {
   title: "Methodology",
@@ -10,16 +11,21 @@ export const metadata: Metadata = {
 
 export default function MethodologyPage() {
   return (
-    <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
-      <h1 className="text-2xl font-semibold text-slate-900">Methodology</h1>
-      <p className="mt-2 text-slate-600">
+    <div className="mx-auto max-w-3xl px-4 py-12 sm:px-6">
+      <PageHeader
+        eyebrow="Data standards"
+        title="Methodology"
+        description={
+          <p>
         Bill Commons aims to be the most complete, accurate, and honest
         public index of state legislation. This page explains where the
         data comes from, how it&rsquo;s verified, and where it currently
         falls short.
-      </p>
+          </p>
+        }
+      />
 
-      <section className="mt-8">
+      <section className="mt-10 border-t border-slate-200 pt-8">
         <h2 className="text-lg font-semibold text-slate-900">
           Data sources (tiered)
         </h2>
@@ -50,7 +56,7 @@ export default function MethodologyPage() {
         </ul>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10 border-t border-slate-200 pt-8">
         <h2 className="text-lg font-semibold text-slate-900">Attribution</h2>
         <p className="mt-2 text-sm text-slate-700">
           Every bill record on Bill Commons carries a source name, source
@@ -62,7 +68,7 @@ export default function MethodologyPage() {
         </p>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10 border-t border-slate-200 pt-8">
         <h2 className="text-lg font-semibold text-slate-900">
           Coverage state machine
         </h2>
@@ -97,7 +103,7 @@ export default function MethodologyPage() {
         </p>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10 border-t border-slate-200 pt-8">
         <h2 className="text-lg font-semibold text-slate-900">
           Refresh policy
         </h2>
@@ -116,7 +122,7 @@ export default function MethodologyPage() {
         </p>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10 border-t border-slate-200 pt-8">
         <h2 className="text-lg font-semibold text-slate-900">
           Version diffing
         </h2>
@@ -130,7 +136,7 @@ export default function MethodologyPage() {
         </p>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10 border-t border-slate-200 pt-8">
         <h2 className="text-lg font-semibold text-slate-900">
           Quality assurance
         </h2>
@@ -147,7 +153,7 @@ export default function MethodologyPage() {
         </p>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10 border-t border-slate-200 pt-8">
         <h2 className="text-lg font-semibold text-slate-900">
           Known limitations
         </h2>

@@ -4,6 +4,7 @@ import DataUnavailable from "@/components/DataUnavailable";
 import JsonLd from "@/components/JsonLd";
 import { apiGet } from "@/lib/api";
 import { API_DOCS_URL, SITE_URL } from "@/lib/config";
+import PageHeader from "@/components/PageHeader";
 import type { MortalityReport } from "@/lib/types";
 
 // Aggregates over the whole corpus move slowly; six hours keeps the report
@@ -31,20 +32,20 @@ export default async function MortalityReportPage() {
   const result = await getReport();
 
   return (
-    <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
-      <p className="text-xs font-semibold uppercase tracking-wide text-amber-600">
-        Bill Commons Report · 2026 cycle
-      </p>
-      <h1 className="mt-1 text-3xl font-semibold tracking-tight text-slate-900">
-        How State Bills Die
-      </h1>
-      <p className="mt-3 max-w-3xl text-slate-600">
+    <div className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
+      <PageHeader
+        eyebrow="Bill Commons Report · 2026 cycle"
+        title="How State Bills Die"
+        description={
+          <p className="max-w-3xl">
         The most common way a state bill ends is not a vote. It is the session
         adjourning with the bill still sitting in committee — nothing is filed,
         no action is recorded, the bill just stops. Trackers that read only the
         action record report those bills as alive indefinitely. This report
         measures that silence across every state legislature in the country.
-      </p>
+          </p>
+        }
+      />
 
       {!result.ok ? (
         <div className="mt-10">
@@ -54,7 +55,7 @@ export default async function MortalityReportPage() {
         <ReportBody report={result.data} />
       )}
 
-      <section className="mt-12 max-w-3xl">
+      <section className="mt-14 max-w-3xl border-t border-slate-200 pt-8">
         <h2 className="text-lg font-semibold text-slate-900">Methodology</h2>
         <div className="mt-3 space-y-3 text-sm text-slate-600">
           <p>
@@ -155,27 +156,27 @@ function ReportBody({ report }: { report: MortalityReport }) {
         />
       </div>
 
-      <div className="mt-10 overflow-x-auto">
-        <table className="w-full min-w-[820px] border-collapse text-sm">
+      <div className="surface-card mt-10 overflow-x-auto">
+        <table className="data-table min-w-[820px]">
           <thead>
-            <tr className="border-b border-slate-300 text-left text-xs uppercase tracking-wide text-slate-500">
-              <th className="py-2 pr-3">State</th>
-              <th className="py-2 pr-3 text-right">Bills</th>
-              <th className="py-2 pr-3 text-right">Enacted</th>
-              <th className="py-2 pr-3 text-right">Died on adjournment</th>
-              <th className="py-2 pr-3 text-right">Killed</th>
-              <th className="py-2 pr-3 text-right">Pending</th>
-              <th className="py-2 pr-3 text-right">Enact rate</th>
-              <th className="py-2 pr-3 text-right">Adjournment mortality</th>
+            <tr>
+              <th>State</th>
+              <th className="text-right">Bills</th>
+              <th className="text-right">Enacted</th>
+              <th className="text-right">Died on adjournment</th>
+              <th className="text-right">Killed</th>
+              <th className="text-right">Pending</th>
+              <th className="text-right">Enact rate</th>
+              <th className="text-right">Adjournment mortality</th>
             </tr>
           </thead>
           <tbody>
             {rows.map((row) => (
-              <tr key={row.jurisdiction_code} className="border-b border-slate-100">
-                <td className="py-2 pr-3 font-medium">
+              <tr key={row.jurisdiction_code}>
+                <td className="font-medium">
                   <Link
                     href={`/states/${row.jurisdiction_code}`}
-                    className="hover:underline"
+                    className="text-blue-800 hover:text-blue-700 hover:underline"
                   >
                     {row.jurisdiction_name}
                   </Link>
@@ -185,19 +186,19 @@ function ReportBody({ report }: { report: MortalityReport }) {
                     </span>
                   ) : null}
                 </td>
-                <td className="py-2 pr-3 text-right tabular-nums">{fmt(row.total)}</td>
-                <td className="py-2 pr-3 text-right tabular-nums">{fmt(row.enacted)}</td>
-                <td className="py-2 pr-3 text-right tabular-nums">
+                <td className="text-right tabular-nums">{fmt(row.total)}</td>
+                <td className="text-right tabular-nums">{fmt(row.enacted)}</td>
+                <td className="text-right tabular-nums">
                   {fmt(row.died_on_adjournment)}
                 </td>
-                <td className="py-2 pr-3 text-right tabular-nums">{fmt(row.killed)}</td>
-                <td className="py-2 pr-3 text-right tabular-nums">
+                <td className="text-right tabular-nums">{fmt(row.killed)}</td>
+                <td className="text-right tabular-nums">
                   {fmt(row.pending + row.unknown)}
                 </td>
-                <td className="py-2 pr-3 text-right tabular-nums">
+                <td className="text-right tabular-nums">
                   {row.enacted_pct != null ? `${row.enacted_pct}%` : "—"}
                 </td>
-                <td className="py-2 pr-3 text-right tabular-nums font-medium">
+                <td className="text-right tabular-nums font-medium">
                   {row.died_on_adjournment_pct != null
                     ? `${row.died_on_adjournment_pct}%`
                     : "—"}
@@ -231,8 +232,8 @@ function Stat({
 }) {
   return (
     <div
-      className={`rounded-lg border p-4 ${
-        emphasis ? "border-amber-300 bg-amber-50" : "border-slate-200"
+      className={`rounded-md border p-4 ${
+        emphasis ? "border-amber-300 bg-amber-50" : "border-slate-200 bg-white"
       }`}
     >
       <p className="text-xs font-medium uppercase tracking-wide text-slate-500">

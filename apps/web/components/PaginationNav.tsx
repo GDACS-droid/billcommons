@@ -25,25 +25,25 @@ export default function PaginationNav({
   return (
     <nav
       aria-label="Pagination"
-      className="mt-6 flex items-center justify-between border-t border-slate-200 pt-4 text-sm"
+      className="mt-8 flex items-center justify-between border-t border-slate-200 pt-4 text-sm"
     >
       {page > 1 ? (
         <Link
           href={buildHref(page - 1)}
-          className="rounded-md border border-slate-300 px-3 py-1.5 hover:bg-slate-50"
+          className="rounded-md border border-slate-300 px-3 py-1.5 transition-colors hover:border-slate-400 hover:bg-slate-50"
         >
           ← Previous
         </Link>
       ) : (
         <span />
       )}
-      <span className="text-slate-500">
+      <span className="tabular-nums text-slate-500">
         Page {page} of {total_pages}
       </span>
       {page < total_pages ? (
         <Link
           href={buildHref(page + 1)}
-          className="rounded-md border border-slate-300 px-3 py-1.5 hover:bg-slate-50"
+          className="rounded-md border border-slate-300 px-3 py-1.5 transition-colors hover:border-slate-400 hover:bg-slate-50"
         >
           Next →
         </Link>

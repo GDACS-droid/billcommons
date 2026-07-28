@@ -52,16 +52,17 @@ export default async function ComparePage({ params, searchParams }: Props) {
   const compareResult = from && to ? await getCompare(id, from, to) : null;
 
   return (
-    <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6">
-      <nav aria-label="Breadcrumb" className="text-sm text-slate-500">
-        <Link href={`/bills/${id}`} className="hover:underline">
+    <div className="mx-auto max-w-4xl px-4 py-12 sm:px-6">
+      <nav aria-label="Breadcrumb" className="text-xs text-slate-500">
+        <Link href={`/bills/${id}`} className="text-blue-800 hover:text-blue-700 hover:underline">
           Back to bill
         </Link>
       </nav>
 
-      <h1 className="mt-2 text-2xl font-semibold text-slate-900">
-        Compare versions
-      </h1>
+      <header className="page-header mt-4">
+        <p className="page-eyebrow">Bill text</p>
+        <h1 className="page-title">Compare versions</h1>
+      </header>
 
       {!versionsResult.ok ? (
         <div className="mt-6">
@@ -89,7 +90,7 @@ export default async function ComparePage({ params, searchParams }: Props) {
             />
             <button
               type="submit"
-              className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700"
+              className="rounded-md bg-blue-700 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-800"
             >
               Compare
             </button>
@@ -103,18 +104,18 @@ export default async function ComparePage({ params, searchParams }: Props) {
             ) : !compareResult.ok ? (
               <DataUnavailable message="Version comparison is temporarily unavailable." />
             ) : (
-              <pre className="overflow-x-auto rounded-lg border border-slate-200 bg-slate-50 p-4 font-mono text-xs leading-relaxed">
+              <pre className="overflow-x-auto rounded-md border border-slate-800 bg-slate-900 p-4 font-mono text-xs leading-relaxed">
                 {compareResult.data.data.diff_lines.map((line, i) => (
                   <div
                     key={i}
                     className={
                       line.type === "add"
-                        ? "bg-emerald-100 text-emerald-900"
+                        ? "bg-emerald-900/60 text-emerald-100"
                         : line.type === "remove"
-                        ? "bg-red-100 text-red-900"
+                        ? "bg-red-900/60 text-red-100"
                         : line.type === "meta"
                         ? "text-slate-400"
-                        : "text-slate-700"
+                        : "text-slate-300"
                     }
                   >
                     {line.text}
@@ -156,7 +157,7 @@ function VersionSelect({
       <select
         name={name}
         defaultValue={selected}
-        className="rounded-md border border-slate-300 px-3 py-2 text-sm"
+        className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm transition-colors focus:border-blue-700"
       >
         {versions.map((v) => (
           <option key={v.id} value={v.id}>

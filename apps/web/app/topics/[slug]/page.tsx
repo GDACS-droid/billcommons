@@ -5,6 +5,7 @@ import AlertSignup from "@/components/AlertSignup";
 import DataUnavailable from "@/components/DataUnavailable";
 import JsonLd from "@/components/JsonLd";
 import BillListItem from "@/components/BillListItem";
+import PageHeader from "@/components/PageHeader";
 import { apiGet } from "@/lib/api";
 import { fetchAllPages } from "@/lib/collections";
 import { billPath } from "@/lib/billUrl";
@@ -82,7 +83,7 @@ export default async function TopicPage({ params }: Props) {
 
   if (topic === null || !bills.ok) {
     return (
-      <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6">
+      <div className="mx-auto max-w-4xl px-4 py-12 sm:px-6">
         <DataUnavailable message="This topic tracker is temporarily unavailable." />
       </div>
     );
@@ -102,7 +103,7 @@ export default async function TopicPage({ params }: Props) {
   const states = [...byState.entries()].sort((a, b) => b[1] - a[1]);
 
   return (
-    <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6">
+    <div className="mx-auto max-w-4xl px-4 py-12 sm:px-6">
       <JsonLd
         data={{
           "@context": "https://schema.org",
@@ -114,14 +115,12 @@ export default async function TopicPage({ params }: Props) {
         }}
       />
 
-      <p className="text-xs font-semibold uppercase tracking-wide text-amber-600">
-        Topic tracker
-      </p>
-      <h1 className="mt-1 text-2xl font-semibold text-slate-900">
-        {topic.name} legislation, all 50 states
-      </h1>
-      <p className="mt-2 max-w-2xl text-sm text-slate-600">{topic.description}</p>
-      <p className="mt-3 text-sm text-slate-500">
+      <PageHeader
+        eyebrow="Topic tracker"
+        title={`${topic.name} legislation, all 50 states`}
+        description={<p>{topic.description}</p>}
+      />
+      <p className="mt-3 text-sm tabular-nums text-slate-500">
         <strong className="text-slate-900">
           {bills.items.length.toLocaleString("en-US")}
         </strong>{" "}
@@ -143,7 +142,7 @@ export default async function TopicPage({ params }: Props) {
           <Link
             key={code}
             href={`/states/${code}`}
-            className="rounded-full border border-slate-200 px-3 py-1 text-xs font-medium text-slate-600 hover:border-slate-300 hover:text-slate-900"
+          className="rounded-full border border-slate-200 px-3 py-1 text-xs font-medium tabular-nums text-slate-600 transition-colors hover:border-blue-300 hover:bg-blue-50 hover:text-blue-800"
           >
             {code} · {count}
           </Link>
@@ -158,7 +157,7 @@ export default async function TopicPage({ params }: Props) {
       {byBucket.map((bucket) =>
         bucket.bills.length === 0 ? null : (
           <section key={bucket.key} className="mt-10">
-            <h2 className="text-lg font-semibold text-slate-900">
+            <h2 className="text-lg font-semibold tracking-tight text-slate-950">
               {bucket.label}{" "}
               <span className="text-sm font-normal text-slate-500">
                 ({bucket.bills.length.toLocaleString("en-US")})

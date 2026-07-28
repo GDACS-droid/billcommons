@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { API_DOCS_URL } from "@/lib/config";
+import PageHeader from "@/components/PageHeader";
 
 export const metadata: Metadata = {
   title: "API documentation",
@@ -11,13 +12,13 @@ export const metadata: Metadata = {
 
 function CodeBlock({ children, label }: { children: string; label?: string }) {
   return (
-    <div className="mt-3 overflow-hidden rounded-lg border border-slate-200">
+    <div className="code-block mt-4">
       {label ? (
-        <div className="border-b border-slate-200 bg-slate-50 px-4 py-1.5 text-xs font-medium text-slate-500">
+        <div className="border-b border-slate-700 bg-slate-800 px-4 py-1.5 text-xs font-medium text-slate-400">
           {label}
         </div>
       ) : null}
-      <pre className="overflow-x-auto bg-slate-900 p-4 text-xs leading-relaxed text-slate-100">
+      <pre>
         <code>{children}</code>
       </pre>
     </div>
@@ -49,11 +50,12 @@ const ENDPOINTS: { method: string; path: string; description: string }[] = [
 
 export default function ApiDocsPage() {
   return (
-    <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6">
-      <h1 className="text-2xl font-semibold text-slate-900">
-        REST API documentation
-      </h1>
-      <p className="mt-2 text-slate-600">
+    <div className="mx-auto max-w-4xl px-4 py-12 sm:px-6">
+      <PageHeader
+        eyebrow="Developer access"
+        title="REST API documentation"
+        description={
+          <p>
         The Bill Commons API is free, public, and read-only. It serves
         JSON over HTTPS with a consistent pagination envelope, ETags, and
         request IDs. Interactive OpenAPI 3.1 docs are available at{" "}
@@ -64,14 +66,16 @@ export default function ApiDocsPage() {
           {API_DOCS_URL}/docs
         </a>
         .
-      </p>
+          </p>
+        }
+      />
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">Base URL</h2>
         <CodeBlock>{API_DOCS_URL}</CodeBlock>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">
           Authentication &amp; rate limits
         </h2>
@@ -86,7 +90,7 @@ export default function ApiDocsPage() {
         </p>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">
           Pagination envelope
         </h2>
@@ -109,27 +113,27 @@ export default function ApiDocsPage() {
 }`}</CodeBlock>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">Endpoints</h2>
-        <div className="mt-3 overflow-x-auto rounded-lg border border-slate-200">
-          <table className="w-full min-w-[640px] text-left text-sm">
-            <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+        <div className="surface-card mt-4 overflow-x-auto">
+          <table className="data-table min-w-[640px]">
+            <thead>
               <tr>
-                <th className="px-4 py-2">Method</th>
-                <th className="px-4 py-2">Path</th>
-                <th className="px-4 py-2">Description</th>
+                <th>Method</th>
+                <th>Path</th>
+                <th>Description</th>
               </tr>
             </thead>
             <tbody>
               {ENDPOINTS.map((e) => (
-                <tr key={e.path} className="border-t border-slate-100">
-                  <td className="px-4 py-2 font-mono text-xs text-slate-500">
+                <tr key={e.path}>
+                  <td className="font-mono text-xs text-slate-500">
                     {e.method}
                   </td>
-                  <td className="px-4 py-2 font-mono text-xs text-slate-800">
+                  <td className="font-mono text-xs text-slate-800">
                     {e.path}
                   </td>
-                  <td className="px-4 py-2 text-slate-600">
+                  <td className="text-slate-600">
                     {e.description}
                   </td>
                 </tr>
@@ -139,7 +143,7 @@ export default function ApiDocsPage() {
         </div>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">
           Example: search for a bill
         </h2>
@@ -168,7 +172,7 @@ for (const bill of data) {
 }`}</CodeBlock>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">
           Example: get a bill&apos;s full record
         </h2>

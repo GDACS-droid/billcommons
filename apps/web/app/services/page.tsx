@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import PageHeader from "@/components/PageHeader";
 
 export const metadata: Metadata = {
   title: "Custom tracking & consulting",
@@ -29,14 +30,12 @@ const OFFERINGS: { title: string; body: string }[] = [
 
 export default function ServicesPage() {
   return (
-    <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6">
-      <p className="text-xs font-semibold uppercase tracking-wide text-amber-600">
-        Services
-      </p>
-      <h1 className="mt-1 text-2xl font-semibold text-slate-900">
-        Custom tracking &amp; consulting
-      </h1>
-      <p className="mt-3 max-w-2xl text-slate-600">
+    <div className="mx-auto max-w-4xl px-4 py-12 sm:px-6">
+      <PageHeader
+        eyebrow="Services"
+        title="Custom tracking & consulting"
+        description={
+          <p>
         Bill Commons is free and stays free. It&apos;s built and operated by{" "}
         <a href="https://gdacs.net" className="underline">
           GDACS
@@ -44,18 +43,20 @@ export default function ServicesPage() {
         , a data consulting shop — and the same team takes on custom work for
         policy teams, government-affairs shops, and lobbying firms that need
         more than the public site.
-      </p>
+          </p>
+        }
+      />
 
-      <div className="mt-8 grid gap-4 sm:grid-cols-2">
+      <div className="grid gap-4 sm:grid-cols-2">
         {OFFERINGS.map((o) => (
-          <div key={o.title} className="rounded-lg border border-slate-200 p-5">
+          <div key={o.title} className="rounded-md border border-slate-200 bg-white p-5 transition-colors hover:border-slate-300 hover:bg-slate-50">
             <h2 className="font-semibold text-slate-900">{o.title}</h2>
             <p className="mt-2 text-sm text-slate-600">{o.body}</p>
           </div>
         ))}
       </div>
 
-      <section className="mt-10 rounded-lg border border-slate-200 bg-slate-50 p-6">
+      <section className="mt-12 rounded-md border border-slate-200 border-l-2 border-l-blue-700 bg-slate-50 p-6">
         <h2 className="text-lg font-semibold text-slate-900">
           Case study: the 139-bill audit
         </h2>

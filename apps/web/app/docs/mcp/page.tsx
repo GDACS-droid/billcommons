@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { MCP_URL } from "@/lib/config";
+import PageHeader from "@/components/PageHeader";
 
 export const metadata: Metadata = {
   title: "MCP server setup",
@@ -11,13 +12,13 @@ export const metadata: Metadata = {
 
 function CodeBlock({ children, label }: { children: string; label?: string }) {
   return (
-    <div className="mt-3 overflow-hidden rounded-lg border border-slate-200">
+    <div className="code-block mt-4">
       {label ? (
-        <div className="border-b border-slate-200 bg-slate-50 px-4 py-1.5 text-xs font-medium text-slate-500">
+        <div className="border-b border-slate-700 bg-slate-800 px-4 py-1.5 text-xs font-medium text-slate-400">
           {label}
         </div>
       ) : null}
-      <pre className="overflow-x-auto bg-slate-900 p-4 text-xs leading-relaxed text-slate-100">
+      <pre>
         <code>{children}</code>
       </pre>
     </div>
@@ -39,20 +40,23 @@ const TOOLS: { name: string; description: string }[] = [
 
 export default function McpDocsPage() {
   return (
-    <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6">
-      <h1 className="text-2xl font-semibold text-slate-900">
-        MCP server setup
-      </h1>
-      <p className="mt-2 text-slate-600">
+    <div className="mx-auto max-w-4xl px-4 py-12 sm:px-6">
+      <PageHeader
+        eyebrow="Agent access"
+        title="MCP server setup"
+        description={
+          <p>
         Bill Commons runs a Model Context Protocol (MCP) server over
         Streamable HTTP, so Claude and other MCP-compatible clients can
         search and cite legislation directly. Every tool returns structured
         JSON with canonical IDs, official source URLs, and freshness
         timestamps — and warns you explicitly when a jurisdiction&rsquo;s
         coverage is thin rather than guessing.
-      </p>
+          </p>
+        }
+      />
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">Endpoint</h2>
         <CodeBlock>{MCP_URL}</CodeBlock>
         <p className="mt-2 text-sm text-slate-600">
@@ -61,7 +65,7 @@ export default function McpDocsPage() {
         </p>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">
           Claude Desktop / Claude Code
         </h2>
@@ -82,7 +86,7 @@ export default function McpDocsPage() {
         <CodeBlock label="shell">{`claude mcp add bill-commons --transport http ${MCP_URL}`}</CodeBlock>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">
           Other MCP clients
         </h2>
@@ -104,23 +108,23 @@ async with streamablehttp_client("${MCP_URL}") as (read, write, _):
         print(result)`}</CodeBlock>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">Tools</h2>
-        <div className="mt-3 overflow-hidden rounded-lg border border-slate-200">
-          <table className="w-full text-left text-sm">
-            <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+        <div className="surface-card mt-4 overflow-x-auto">
+          <table className="data-table min-w-[640px]">
+            <thead>
               <tr>
-                <th className="px-4 py-2">Tool</th>
-                <th className="px-4 py-2">Description</th>
+                <th>Tool</th>
+                <th>Description</th>
               </tr>
             </thead>
             <tbody>
               {TOOLS.map((t) => (
-                <tr key={t.name} className="border-t border-slate-100">
-                  <td className="whitespace-nowrap px-4 py-2 font-mono text-xs text-slate-800">
+                <tr key={t.name}>
+                  <td className="whitespace-nowrap font-mono text-xs text-slate-800">
                     {t.name}
                   </td>
-                  <td className="px-4 py-2 text-slate-600">
+                  <td className="text-slate-600">
                     {t.description}
                   </td>
                 </tr>

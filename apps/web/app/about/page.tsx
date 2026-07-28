@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import PageHeader from "@/components/PageHeader";
 
 export const metadata: Metadata = {
   title: "About",
@@ -10,19 +11,23 @@ export const metadata: Metadata = {
 
 export default function AboutPage() {
   return (
-    <div className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
-      <h1 className="text-2xl font-semibold text-slate-900">About Bill Commons</h1>
-
-      <p className="mt-4 text-slate-700">
+    <div className="mx-auto max-w-3xl px-4 py-12 sm:px-6">
+      <PageHeader
+        eyebrow="About the project"
+        title="About Bill Commons"
+        description={
+          <p>
         Bill Commons is a free, public, nonpartisan search engine for state
         legislation across all 50 states and the District of Columbia. It
         exists because finding out what your state legislature is actually
         doing — which bills are moving, who sponsored them, how they voted,
         what changed between drafts — is harder than it should be, and
         often locked behind inconsistent or paywalled state systems.
-      </p>
+          </p>
+        }
+      />
 
-      <p className="mt-4 text-slate-700">
+      <p className="text-[0.9375rem] leading-7 text-slate-700">
         The project provides a public website, a free REST API (60
         requests/minute, no key required for the anonymous tier), and a
         Model Context Protocol (MCP) server so AI assistants can search and
@@ -31,7 +36,7 @@ export default function AboutPage() {
         jurisdiction is still thin.
       </p>
 
-      <section className="mt-8">
+      <section className="mt-12 border-t border-slate-200 pt-8">
         <h2 className="text-lg font-semibold text-slate-900">
           Open source
         </h2>
@@ -63,7 +68,7 @@ export default function AboutPage() {
         </p>
       </section>
 
-      <section className="mt-8">
+      <section className="mt-10 border-t border-slate-200 pt-8">
         <h2 className="text-lg font-semibold text-slate-900">Contact</h2>
         <p className="mt-2 text-slate-700">
           For questions, corrections, or to report a data issue, see the

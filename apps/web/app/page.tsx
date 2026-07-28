@@ -74,31 +74,31 @@ export default async function HomePage() {
     <div>
       <JsonLd data={siteJsonLd()} />
       <JsonLd data={datasetJsonLd(totalBills, jurisdictionCount)} />
-      <section className="border-b border-slate-200 bg-gradient-to-b from-slate-50 to-white">
-        <div className="mx-auto max-w-4xl px-4 py-16 text-center sm:px-6 sm:py-24">
-          <h1 className="text-3xl font-semibold tracking-tight text-slate-900 sm:text-5xl">
+      <section className="border-b border-slate-200 bg-slate-50">
+        <div className="mx-auto max-w-4xl px-4 py-20 text-center sm:px-6 sm:py-28">
+          <h1 className="text-4xl font-semibold tracking-[-0.04em] text-slate-950 sm:text-5xl">
             Free, open, nonpartisan legislative search
           </h1>
-          <p className="mx-auto mt-4 max-w-2xl text-base text-slate-600 sm:text-lg">
+          <p className="mx-auto mt-5 max-w-2xl text-base leading-7 text-slate-600 sm:text-lg">
             Track bills, sponsors, votes, and full text across all 50 states
             and DC — sourced from official legislative records, with full
             attribution.
           </p>
-          <div className="mx-auto mt-8 max-w-2xl">
+          <div className="mx-auto mt-9 max-w-3xl">
             <SearchBox autoFocus />
           </div>
           <p className="mt-4 text-sm text-slate-500">
             Try{" "}
             <Link
               href="/search?q=HB+123"
-              className="underline underline-offset-2 hover:text-slate-700"
+              className="text-blue-800 underline underline-offset-2 hover:text-blue-700"
             >
               &ldquo;HB 123&rdquo;
             </Link>{" "}
             or{" "}
             <Link
               href="/search?q=paid+family+leave"
-              className="underline underline-offset-2 hover:text-slate-700"
+              className="text-blue-800 underline underline-offset-2 hover:text-blue-700"
             >
               &ldquo;paid family leave&rdquo;
             </Link>
@@ -106,8 +106,8 @@ export default async function HomePage() {
         </div>
       </section>
 
-      <section className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
-        <div className="grid gap-6 sm:grid-cols-3">
+      <section className="mx-auto max-w-6xl px-4 py-14 sm:px-6">
+        <div className="grid gap-4 sm:grid-cols-3">
           <StatCard
             label="Jurisdictions tracked"
             value={jurisdictionCount ? `${jurisdictionCount} / 51` : "—"}
@@ -128,37 +128,37 @@ export default async function HomePage() {
       </section>
 
       <section className="mx-auto max-w-6xl px-4 pb-4 sm:px-6">
-        <div className="rounded-lg border border-slate-200 bg-slate-50 px-5 py-4 text-sm text-slate-700">
-          <span className="font-semibold text-slate-900">
+        <div className="rounded-md border border-slate-200 border-l-2 border-l-blue-700 bg-white px-5 py-5 text-sm leading-6 text-slate-600">
+          <span className="font-semibold text-slate-950">
             Building something with this?
           </span>{" "}
           Every bill, sponsor, action and vote here is available from a free
           public REST API — no key, no licence fee.{" "}
-          <Link href="/docs/api" className="underline hover:text-slate-900">
+          <Link href="/docs/api" className="text-blue-800 underline hover:text-blue-700">
             API docs
           </Link>
           {" · "}
-          <Link href="/docs/mcp" className="underline hover:text-slate-900">
+          <Link href="/docs/mcp" className="text-blue-800 underline hover:text-blue-700">
             MCP server for AI assistants
           </Link>
           {" · "}
           <a
             href="https://github.com/GDACS-droid/billcommons"
-            className="underline hover:text-slate-900"
+            className="text-blue-800 underline hover:text-blue-700"
           >
             Source on GitHub
           </a>
         </div>
       </section>
 
-      <section className="mx-auto max-w-6xl px-4 pb-16 pt-8 sm:px-6">
+      <section className="mx-auto max-w-6xl px-4 pb-20 pt-10 sm:px-6">
         <div className="flex items-baseline justify-between">
-          <h2 className="text-xl font-semibold text-slate-900">
+          <h2 className="text-xl font-semibold tracking-tight text-slate-950">
             Active sessions
           </h2>
           <Link
             href="/states"
-            className="text-sm font-medium text-slate-600 hover:underline"
+            className="text-sm font-medium text-blue-800 hover:text-blue-700 hover:underline"
           >
             Browse all states →
           </Link>
@@ -177,18 +177,18 @@ export default async function HomePage() {
             {topSessions.map((session) => (
               <li
                 key={session.id}
-                className="rounded-lg border border-slate-200 p-4"
+                className="rounded-md border border-slate-200 bg-white p-4 transition-colors hover:border-slate-300 hover:bg-slate-50"
               >
                 <Link
                   href={`/states/${
                     session.jurisdiction_abbreviation ?? ""
                   }/sessions/${encodeURIComponent(session.identifier)}`}
-                  className="font-medium text-slate-900 hover:underline"
+                  className="font-medium text-blue-800 hover:text-blue-700 hover:underline"
                 >
                   {session.jurisdiction_abbreviation ?? ""} —{" "}
                   {session.name ?? session.identifier}
                 </Link>
-                <p className="mt-1 text-xs text-slate-500">
+                  <p className="mt-1 text-xs tabular-nums text-slate-500">
                   {session.classification ?? "session"}
                   {sessionBillCount(session) > 0
                     ? ` · ${sessionBillCount(session).toLocaleString()} bills`
@@ -203,10 +203,10 @@ export default async function HomePage() {
       </section>
 
       <section className="border-t border-slate-200 bg-slate-50">
-        <div className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
+        <div className="mx-auto max-w-6xl px-4 py-14 sm:px-6">
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
-              <h2 className="text-xl font-semibold text-slate-900">
+              <h2 className="text-xl font-semibold tracking-tight text-slate-950">
                 Coverage dashboard
               </h2>
               <p className="mt-1 max-w-2xl text-sm text-slate-600">
@@ -216,7 +216,7 @@ export default async function HomePage() {
             </div>
             <Link
               href="/coverage"
-              className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700"
+              className="rounded-md bg-blue-700 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-800"
             >
               View full coverage matrix
             </Link>
@@ -229,9 +229,9 @@ export default async function HomePage() {
 
 function StatCard({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border border-slate-200 bg-white p-6 text-center">
-      <p className="text-3xl font-semibold text-slate-900">{value}</p>
-      <p className="mt-1 text-sm text-slate-500">{label}</p>
+    <div className="rounded-md border border-slate-200 bg-white p-5">
+      <p className="text-3xl font-semibold tabular-nums tracking-tight text-slate-950">{value}</p>
+      <p className="mt-2 text-xs font-medium uppercase tracking-wide text-slate-500">{label}</p>
     </div>
   );
 }
