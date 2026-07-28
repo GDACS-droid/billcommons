@@ -43,7 +43,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
 
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, text
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_schema.models import (
@@ -641,6 +641,28 @@ def ingest_session_csv_zip(
                 result.related_bills += 1
         related_bill_inserter.flush()
         db.flush()
+        # Companion links arrive as identifier strings ("A 5209") with no FK.
+        # Resolve them table-wide, not just for touched bills: a link often
+        # lands before its target bill exists, so each run also heals links
+        # left dangling by earlier runs. Companion is the only relation type
+        # whose target lives in the same session (prior-session/replaces
+        # point across sessions), and (session, identifier_norm) is unique.
+        db.execute(
+            text(
+                """
+                UPDATE related_bills r
+                SET related_bill_id = b2.id
+                FROM bills b, bills b2
+                WHERE r.bill_id = b.id
+                  AND r.related_bill_id IS NULL
+                  AND r.relation_type = 'companion'
+                  AND b2.jurisdiction_id = b.jurisdiction_id
+                  AND b2.session_id = b.session_id
+                  AND b2.identifier_norm =
+                      upper(regexp_replace(r.related_identifier, '\\s+', ' ', 'g'))
+                """
+            )
+        )
         db.commit()
 
         # -- Sponsorships --

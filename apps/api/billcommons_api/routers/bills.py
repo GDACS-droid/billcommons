@@ -469,10 +469,16 @@ def list_related_bills(
         .all()
     )
 
+    # Same-session resolution is only valid for same-session relation types.
+    # A prior-session link's identifier names a bill in the PREVIOUS session;
+    # resolving it here would attach the current session's unrelated reuse of
+    # that number (NY reuses nearly every number every cycle).
     wanted = {
         r.related_identifier.strip()
         for r in rows
-        if r.related_bill_id is None and r.related_identifier
+        if r.related_bill_id is None
+        and r.related_identifier
+        and r.relation_type != "prior-session"
     }
     resolved: dict[str, uuid.UUID] = {}
     if wanted:
@@ -496,7 +502,11 @@ def list_related_bills(
     out = []
     for r in rows:
         item = RelatedBillOut.model_validate(r)
-        if item.related_bill_id is None and r.related_identifier:
+        if (
+            item.related_bill_id is None
+            and r.related_identifier
+            and r.relation_type != "prior-session"
+        ):
             item.related_bill_id = resolved.get(r.related_identifier.strip())
         out.append(item)
     return out
