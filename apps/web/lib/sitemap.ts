@@ -82,6 +82,7 @@ export const STATIC_ROUTES = [
   "/services",
   "/methodology",
   "/about",
+  "/feedback",
 ];
 
 interface SitemapStats {

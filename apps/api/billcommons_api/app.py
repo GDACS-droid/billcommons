@@ -18,6 +18,7 @@ from billcommons_api.routers import (
     committees,
     coverage,
     events,
+    feedback,
     health,
     jurisdictions,
     people,
@@ -68,14 +69,16 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allow_origins,
-        # POST exists for exactly two browser-facing writes: /bills/lookup
-        # (large watchlists overflow a query string) and /alerts/subscribe.
+        # POST exists for exactly three browser-facing writes: /bills/lookup
+        # (large watchlists overflow a query string), /alerts/subscribe and
+        # /feedback.
         allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
 
     for router in (
         alerts.router,
+        feedback.router,
         health.router,
         jurisdictions.router,
         sessions.router,

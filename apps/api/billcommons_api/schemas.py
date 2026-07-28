@@ -238,6 +238,19 @@ class AlertSubscribeResponse(BaseModel):
     meta: dict
 
 
+class FeedbackRequest(BaseModel):
+    message: str = Field(min_length=3, max_length=5000)
+    email: str | None = Field(default=None, max_length=320)
+    page: str | None = Field(default=None, max_length=2000)
+    # Honeypot -- hidden on the real form; a value here means a bot.
+    website: str | None = Field(default=None, max_length=320)
+
+
+class FeedbackResponse(BaseModel):
+    received: bool
+    meta: dict
+
+
 class BillIdentifierOut(OrmModel):
     id: uuid.UUID
     identifier: str

@@ -646,3 +646,22 @@ class AlertSubscription(Base):
         UniqueConstraint("email", "kind", "target", name="uq_alert_email_kind_target"),
         Index("ix_alert_subscriptions_active", "active"),
     )
+
+
+class Feedback(Base):
+    """One site-feedback message (see migration 0007). Write-only from the
+    API's perspective: there is no read endpoint; rows are read by the owner
+    directly."""
+
+    __tablename__ = "feedback"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    email: Mapped[str | None] = mapped_column(Text, nullable=True)
+    page: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
