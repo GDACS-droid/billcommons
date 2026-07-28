@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import type { Metadata } from "next";
+import AlertSignup from "@/components/AlertSignup";
 import DataUnavailable from "@/components/DataUnavailable";
 import JsonLd from "@/components/JsonLd";
 import BillListItem from "@/components/BillListItem";
@@ -132,6 +133,10 @@ export default async function TopicPage({ params }: Props) {
           Tell us.
         </Link>
       </p>
+
+      <div className="mt-6 max-w-xl">
+        <AlertSignup topicSlug={slug} topicName={topic.name} />
+      </div>
 
       <div className="mt-6 flex flex-wrap gap-2">
         {states.slice(0, 12).map(([code, count]) => (

@@ -53,6 +53,11 @@ export default function SiteFooter() {
                   Source on GitHub
                 </a>
               </li>
+              <li>
+                <Link className="hover:underline" href="/services">
+                  Custom tracking &amp; consulting
+                </Link>
+              </li>
             </ul>
           </div>
         </div>

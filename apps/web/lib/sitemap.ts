@@ -79,6 +79,7 @@ export const STATIC_ROUTES = [
   "/docs/api",
   "/docs/mcp",
   "/docs/agents",
+  "/services",
   "/methodology",
   "/about",
 ];

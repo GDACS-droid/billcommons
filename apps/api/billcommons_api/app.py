@@ -12,6 +12,7 @@ from slowapi.util import get_remote_address
 from billcommons_api.errors import register_exception_handlers
 from billcommons_api.middleware import RequestIDMiddleware, SecureHeadersMiddleware
 from billcommons_api.routers import (
+    alerts,
     bills,
     changes,
     committees,
@@ -67,11 +68,14 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allow_origins,
-        allow_methods=["GET"],
+        # POST exists for exactly two browser-facing writes: /bills/lookup
+        # (large watchlists overflow a query string) and /alerts/subscribe.
+        allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
 
     for router in (
+        alerts.router,
         health.router,
         jurisdictions.router,
         sessions.router,

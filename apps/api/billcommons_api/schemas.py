@@ -225,6 +225,19 @@ class TopicListEnvelope(BaseModel):
     meta: dict
 
 
+class AlertSubscribeRequest(BaseModel):
+    email: str = Field(max_length=320)
+    kind: str = "topic"
+    target: str = Field(max_length=100)
+
+
+class AlertSubscribeResponse(BaseModel):
+    subscribed: bool
+    kind: str
+    target: str
+    meta: dict
+
+
 class BillIdentifierOut(OrmModel):
     id: uuid.UUID
     identifier: str

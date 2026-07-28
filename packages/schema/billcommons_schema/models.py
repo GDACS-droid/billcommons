@@ -616,3 +616,33 @@ class IngestJob(UUIDPkMixin, TimestampMixin, Base):
         ),
         Index("ix_ingest_jobs_status_run_after", "status", "run_after"),
     )
+
+
+class AlertSubscription(Base):
+    """One "email me when X moves" subscription (see migration 0006).
+
+    Not a UUIDPkMixin/TimestampMixin row by convention alone -- it does use a
+    UUID pk, but `last_seq` is the load-bearing column: the sender's private
+    cursor into bill_events, advanced only after a digest is handed to the
+    mail provider, so a crashed run re-sends rather than silently skips.
+    """
+
+    __tablename__ = "alert_subscriptions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    email: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    target: Mapped[str] = mapped_column(Text, nullable=False)
+    unsubscribe_token: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("email", "kind", "target", name="uq_alert_email_kind_target"),
+        Index("ix_alert_subscriptions_active", "active"),
+    )
