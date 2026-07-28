@@ -7,7 +7,7 @@ const COVERAGE_STYLES: Record<string, string> = {
   METADATA_SEARCHABLE: "bg-slate-200 text-slate-700",
   BOOTSTRAPPED: "bg-slate-200 text-slate-700",
   SOURCE_IDENTIFIED: "bg-slate-100 text-slate-600",
-  NOT_STARTED: "bg-slate-100 text-slate-500",
+  NOT_STARTED: "bg-slate-100 text-slate-600",
 };
 
 const COVERAGE_DOTS: Record<string, string> = {
@@ -38,7 +38,7 @@ export function CoverageBadge({ status }: { status: string }) {
 export function BillStatusBadge({ status }: { status?: string | null }) {
   if (!status) {
     return (
-      <span className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-full bg-slate-100 px-2 py-0.5 text-[0.6875rem] font-semibold text-slate-500">
+      <span className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-full bg-slate-100 px-2 py-0.5 text-[0.6875rem] font-semibold text-slate-600">
         <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-slate-400" />
         Status unknown
       </span>

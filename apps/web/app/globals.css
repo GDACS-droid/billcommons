@@ -79,9 +79,18 @@ body {
   line-height: 1.6;
 }
 
-.page-lead a,
 .page-lead strong {
   color: #1e293b;
+}
+
+.page-lead a {
+  color: #1e40af; /* blue-800 -- match the site-wide link color */
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.page-lead a:hover {
+  color: #1d4ed8;
 }
 
 .surface-card {
