@@ -117,6 +117,13 @@ export default function BillDetailView({
         </p>
       </header>
 
+      <QuickAnswers
+        bill={bill}
+        jurisdictionCode={jurisdictionCode}
+        sessionLabel={sessionLabel}
+        sponsors={sponsors.ok ? sponsors.data : null}
+      />
+
       {bill.description ? (
         <section className="mt-8">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
@@ -428,6 +435,102 @@ export default function BillDetailView({
         for data sources and limitations.
       </p>
     </div>
+  );
+}
+
+/**
+ * Question-shaped answer block. AI search retrieval chunks pages into ~500-token
+ * blocks keyed by their nearest headings, so the answer to "did HB 571 pass?"
+ * must live as a self-contained question + 2-3 sentence answer near the top of
+ * the page -- the status badge alone is not extractable prose. Answers are
+ * derived deterministically from the controlled status vocabulary
+ * (workers/ingest/billcommons_ingest/status.py); an unknown status says so
+ * rather than guessing.
+ */
+function QuickAnswers({
+  bill,
+  jurisdictionCode,
+  sessionLabel,
+  sponsors,
+}: {
+  bill: NonNullable<BillPageData["bill"] & { ok: true }>["data"];
+  jurisdictionCode?: string;
+  sessionLabel?: string | null;
+  sponsors: { name?: string | null; primary?: boolean | null; classification?: string | null }[] | null;
+}) {
+  const ref = `${jurisdictionCode ? `${jurisdictionCode} ` : ""}${bill.identifier}`;
+  const asOf = bill.status_date ?? bill.latest_action_date;
+
+  const passAnswers: Record<string, string> = {
+    enacted: `Yes. ${ref} has been enacted into law${asOf ? ` as of ${asOf}` : ""}.`,
+    vetoed: `No. ${ref} passed the legislature but was vetoed${asOf ? ` on ${asOf}` : ""}.`,
+    dead: `No. ${ref} did not pass — it was defeated or died in the legislative process${asOf ? ` (${asOf})` : ""}.`,
+    withdrawn: `No. ${ref} was withdrawn${asOf ? ` on ${asOf}` : ""} and is no longer under consideration.`,
+    died_on_adjournment: `No. ${ref} died when ${
+      sessionLabel
+        ? // Some upstream session identifiers are machine labels ("2025_26");
+          // make sure the sentence still reads as English.
+          `the ${sessionLabel.replaceAll("_", "-")}${
+            /session/i.test(sessionLabel) ? "" : " session"
+          }`
+        : "its legislative session"
+    } adjourned without final action on it. Bills that die this way are sometimes reintroduced in a later session.`,
+    enrolled: `Not yet law. ${ref} has passed both chambers and is enrolled, awaiting executive action (signature or veto)${asOf ? ` as of ${asOf}` : ""}.`,
+    passed_both: `Not yet law. ${ref} has passed both chambers but has not been enacted${asOf ? ` as of ${asOf}` : ""}.`,
+    passed_one_chamber: `Not yet. ${ref} has passed one chamber and awaits action in the other${asOf ? ` as of ${asOf}` : ""}.`,
+    in_committee: `Not yet. ${ref} is in committee${asOf ? ` as of ${asOf}` : ""} and has not come to a final vote.`,
+    introduced: `Not yet. ${ref} has been introduced${asOf ? ` as of ${asOf}` : ""} but has not advanced to a vote.`,
+  };
+  const passAnswer =
+    (bill.status && passAnswers[bill.status]) ??
+    `The current status of ${ref} is not known from the official record.`;
+  const latest =
+    bill.latest_action_date && bill.latest_action_text
+      ? ` Latest recorded action (${bill.latest_action_date}): ${bill.latest_action_text}`
+      : "";
+
+  const primaries = (sponsors ?? []).filter((s) => s.primary && s.name);
+  const cosponsorCount = (sponsors ?? []).length - primaries.length;
+  const sponsorAnswer = primaries.length
+    ? `${primaries
+        .slice(0, 3)
+        .map((s) => s.name)
+        .join(", ")}${primaries.length > 3 ? ` and ${primaries.length - 3} others` : ""} ${
+        primaries.length === 1 ? "is the primary sponsor" : "are the primary sponsors"
+      } of ${ref}${cosponsorCount > 0 ? `, joined by ${cosponsorCount} cosponsor${cosponsorCount === 1 ? "" : "s"}` : ""}.`
+    : null;
+
+  return (
+    <section className="mt-8">
+      <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+        Quick answers
+      </h2>
+      <div className="surface-card mt-2 space-y-4 p-5">
+        <div>
+          <h3 className="text-sm font-semibold text-slate-900">Did {ref} pass?</h3>
+          <p className="mt-1 text-sm leading-6 text-slate-800">
+            {passAnswer}
+            {latest}
+          </p>
+        </div>
+        <div>
+          <h3 className="text-sm font-semibold text-slate-900">What is {ref} about?</h3>
+          <p className="mt-1 text-sm leading-6 text-slate-800">
+            {bill.description && bill.description !== bill.title
+              ? bill.description
+              : `${ref} is a ${bill.bill_type ?? "bill"}${
+                  sessionLabel ? ` in the ${sessionLabel}` : ""
+                } titled “${bill.title}”.`}
+          </p>
+        </div>
+        {sponsorAnswer ? (
+          <div>
+            <h3 className="text-sm font-semibold text-slate-900">Who sponsors {ref}?</h3>
+            <p className="mt-1 text-sm leading-6 text-slate-800">{sponsorAnswer}</p>
+          </div>
+        ) : null}
+      </div>
+    </section>
   );
 }
 
