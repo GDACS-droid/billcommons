@@ -1,6 +1,7 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 import DataUnavailable from "@/components/DataUnavailable";
+import DataFreshness from "@/components/DataFreshness";
 import PageHeader from "@/components/PageHeader";
 import { CoverageBadge } from "@/components/StatusBadge";
 import { apiGet } from "@/lib/api";
@@ -30,6 +31,16 @@ async function getCoverage() {
 export default async function CoveragePage() {
   const result = await getCoverage();
 
+  // The most recent successful ingest across all jurisdictions -- the honest
+  // "as of" for this table. Nulls are skipped rather than treated as epoch.
+  const lastConfirmed = result.ok
+    ? result.data.data.reduce<string | null>((latest, row) => {
+        const t = row.last_update;
+        if (!t) return latest;
+        return latest === null || t > latest ? t : latest;
+      }, null)
+    : null;
+
   return (
     <div className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
       <PageHeader
@@ -48,6 +59,11 @@ export default async function CoveragePage() {
         for the full criteria.
           </p>
         }
+      />
+
+      <DataFreshness
+        timestamp={lastConfirmed}
+        maxAgeSeconds={COVERAGE_REVALIDATE}
       />
 
       <div className="surface-card overflow-x-auto">
