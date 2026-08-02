@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 
 class ErrorDetail(BaseModel):
@@ -84,6 +85,39 @@ def register_exception_handlers(app: FastAPI) -> None:
                 )
             ).model_dump(),
             headers=NO_STORE,
+        )
+
+    @app.exception_handler(SQLAlchemyTimeoutError)
+    async def pool_timeout_handler(
+        request: Request, exc: SQLAlchemyTimeoutError
+    ) -> JSONResponse:
+        """Pool exhaustion is overload, not a bug -- say so, and say when to retry.
+
+        Without this it fell through to the 500 handler, which is wrong in three
+        ways. It told the caller the server was broken when it was merely busy,
+        so a well-behaved client had no reason to back off. It gave no
+        Retry-After, so every client retried immediately and deepened the
+        overload. And because each one printed a full traceback, the incident on
+        2026-08-02 generated tracebacks fast enough that Railway rate-limited
+        logging and dropped ~11,000 lines -- destroying the evidence needed to
+        diagnose it.
+
+        503 + Retry-After is the honest signal: shed load, tell the client when
+        to come back, and log one line instead of a stack trace.
+        """
+        return JSONResponse(
+            status_code=503,
+            content=ErrorResponse(
+                error=ErrorDetail(
+                    code="overloaded",
+                    message=(
+                        "The API is at capacity and could not get a database "
+                        "connection in time. Retry shortly."
+                    ),
+                    request_id=_request_id(request),
+                )
+            ).model_dump(),
+            headers={"Retry-After": "5", **NO_STORE},
         )
 
     @app.exception_handler(Exception)

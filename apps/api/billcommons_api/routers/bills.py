@@ -85,22 +85,32 @@ def list_bills(
     db: OrmSession = Depends(get_db),
 ) -> Page[BillSummary]:
     per_page = clamp_per_page(per_page)
-    stmt = select(Bill).join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id).join(
-        Session, Session.id == Bill.session_id
-    )
-    count_stmt = (
-        select(func.count())
-        .select_from(Bill)
-        .join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id)
-        .join(Session, Session.id == Bill.session_id)
-    )
+    # Join a table only when a filter actually uses it.
+    #
+    # Both statements used to join `jurisdictions` AND `sessions`
+    # unconditionally. Neither join can change the result when unfiltered --
+    # both are many-to-one over a NOT NULL foreign key, so they match exactly
+    # one row per bill -- but they are not free: on an unfiltered count they
+    # turn an index-only aggregate into a hash join over the whole corpus. The
+    # planner cannot drop them for us, because it cannot know the FK guarantees
+    # one match.
+    stmt = select(Bill)
+    count_stmt = select(func.count()).select_from(Bill)
 
     if jurisdiction:
-        stmt = stmt.where(Jurisdiction.abbreviation == jurisdiction.upper())
-        count_stmt = count_stmt.where(Jurisdiction.abbreviation == jurisdiction.upper())
+        stmt = stmt.join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id).where(
+            Jurisdiction.abbreviation == jurisdiction.upper()
+        )
+        count_stmt = count_stmt.join(
+            Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id
+        ).where(Jurisdiction.abbreviation == jurisdiction.upper())
     if session:
-        stmt = stmt.where(Session.identifier == session)
-        count_stmt = count_stmt.where(Session.identifier == session)
+        stmt = stmt.join(Session, Session.id == Bill.session_id).where(
+            Session.identifier == session
+        )
+        count_stmt = count_stmt.join(Session, Session.id == Bill.session_id).where(
+            Session.identifier == session
+        )
     if identifier:
         # Match the stored normalized form, and normalize the caller's input the
         # same way the ingest did (billcommons_ingest.api_sync) so any surface
