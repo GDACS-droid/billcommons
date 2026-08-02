@@ -27,15 +27,19 @@ const nextConfig: NextConfig = {
   async rewrites() {
     return {
       beforeFiles: [
+        // status.billcommons.org used to land on /coverage, which reports how
+        // much DATA we hold per state and says nothing about whether the
+        // service is answering. On 2026-08-02 the API was down for hours while
+        // /coverage rendered perfectly from cache. /status actually probes.
         {
           source: "/",
           has: [{ type: "host", value: "status.billcommons.org" }],
-          destination: "/coverage",
+          destination: "/status",
         },
         {
           source: "/:path*",
           has: [{ type: "host", value: "status.billcommons.org" }],
-          destination: "/coverage",
+          destination: "/status",
         },
       ],
       afterFiles: [],

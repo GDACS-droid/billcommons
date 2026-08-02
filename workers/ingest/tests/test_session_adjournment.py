@@ -93,3 +93,48 @@ def test_it_is_idempotent():
     must be a no-op rather than churning updated_at and re-announcing."""
     once = status.apply_session_outcome(status.IN_COMMITTEE, ADJOURNED, TODAY)
     assert status.apply_session_outcome(once, ADJOURNED, TODAY) == once
+
+
+# --- expected_adjournment is an ESTIMATE, not a sine die --------------------
+
+
+def test_an_active_session_never_kills_its_bills():
+    """`sessions.end_date` comes from Open States' `expected_adjournment`. When
+    a chamber sits past its expected date the estimate silently becomes a past
+    date, and the calendar alone marks every live bill dead.
+
+    Measured 2026-08-02: 26,165 bills across four jurisdictions the source
+    still flagged active, including 18,343 in Massachusetts -- 19.3% of the
+    entire national died_on_adjournment figure.
+    """
+    from datetime import date
+
+    from billcommons_ingest.status import apply_session_outcome
+
+    past = date(2026, 7, 31)
+    today = date(2026, 8, 2)
+
+    assert (
+        apply_session_outcome("in_committee", past, today, session_active=True)
+        == "in_committee"
+    )
+    assert (
+        apply_session_outcome("in_committee", past, today, session_active=False)
+        == "died_on_adjournment"
+    )
+
+
+def test_the_active_guard_does_not_resurrect_a_settled_outcome():
+    """An enacted bill stays enacted whether or not the session is sitting --
+    the guard must only prevent asserting a death, never rewrite a real one."""
+    from datetime import date
+
+    from billcommons_ingest.status import apply_session_outcome
+
+    past = date(2026, 7, 31)
+    today = date(2026, 8, 2)
+    for active in (True, False):
+        assert (
+            apply_session_outcome("enacted", past, today, session_active=active)
+            == "enacted"
+        )

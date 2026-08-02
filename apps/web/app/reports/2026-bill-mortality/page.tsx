@@ -47,6 +47,38 @@ export default async function MortalityReportPage() {
         }
       />
 
+      <div className="mt-8 max-w-3xl rounded-lg border-l-[3px] border-rose-500 bg-rose-50 px-4 py-3">
+        <p className="text-sm font-semibold text-slate-900">
+          Correction in progress — read before citing these figures (2 August
+          2026)
+        </p>
+        <p className="mt-2 text-sm text-slate-800">
+          A bill is marked <code>died_on_adjournment</code> when its session&apos;s
+          end date has passed. That end date is the{" "}
+          <strong>expected</strong> adjournment reported by our upstream source,
+          not a recorded sine die — so when a chamber sits past its estimate,
+          the calendar alone marks every live bill in it dead.
+        </p>
+        <p className="mt-2 text-sm text-slate-800">
+          <strong>
+            29,227 bills across 8 jurisdictions are currently marked dead inside
+            sessions that the same source still reports as active
+          </strong>{" "}
+          — 18,343 of them in Massachusetts, whose General Court runs to the end
+          of the year. That is 30.8% of the national{" "}
+          <code>died_on_adjournment</code> count on this page.
+        </p>
+        <p className="mt-2 text-sm text-slate-800">
+          Removing all of them would move the adjournment-death share from{" "}
+          <strong>45.2% to 31.3%</strong> of the corpus. The true figure is
+          somewhere in that range: some of those sessions genuinely have
+          adjourned and the upstream active flag is stale, and we are not yet
+          able to say which. Until that is resolved,{" "}
+          <strong>treat the per-state adjournment counts as an upper bound</strong>{" "}
+          and the enactment counts, which are unaffected, as sound.
+        </p>
+      </div>
+
       {!result.ok ? (
         <div className="mt-10">
           <DataUnavailable message="Report data is temporarily unavailable." />

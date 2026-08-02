@@ -42,38 +42,64 @@ export async function getBill(id: string) {
   });
 }
 
+interface BillFullEnvelope {
+  bill: Bill;
+  versions: BillVersion[];
+  actions: BillAction[];
+  sponsors: Sponsor[];
+  votes: VoteEvent[];
+  documents: BillDocument[];
+  related: RelatedBill[];
+  subjects: string[];
+  jurisdiction: Jurisdiction | null;
+}
+
+/**
+ * One request instead of nine.
+ *
+ * This page used to fetch the detail, seven sub-resources and the jurisdiction
+ * separately. With ~200k crawlable bill pages that made a single crawl well
+ * over a million API requests, each checking out its own pooled connection --
+ * the load half of the 2026-08-02 outage.
+ *
+ * The per-section {ok, data} shape is preserved so callers keep rendering each
+ * block independently. It is now all-or-nothing in practice, which is honest:
+ * with one upstream request there is no longer a case where the sponsors
+ * arrived and the votes did not, and pretending otherwise would show an empty
+ * "no votes recorded" section during an outage -- absence read as ignorance,
+ * the exact confusion this project exists to prevent.
+ */
 export async function getBillData(id: string): Promise<BillPageData> {
-  const opts = { revalidate: BILL_REVALIDATE };
-  const [bill, versions, actions, sponsors, votes, documents, related, subjects] =
-    await Promise.all([
-    getBill(id),
-    apiGet<BillVersion[]>(`/api/v1/bills/${id}/versions`, undefined, opts),
-    apiGet<BillAction[]>(`/api/v1/bills/${id}/actions`, undefined, opts),
-    apiGet<Sponsor[]>(`/api/v1/bills/${id}/sponsors`, undefined, opts),
-    apiGet<VoteEvent[]>(`/api/v1/bills/${id}/votes`, undefined, opts),
-    apiGet<BillDocument[]>(`/api/v1/bills/${id}/documents`, undefined, opts),
-    apiGet<RelatedBill[]>(`/api/v1/bills/${id}/related`, undefined, opts),
-    apiGet<string[]>(`/api/v1/bills/${id}/subjects`, undefined, opts),
-  ]);
+  const full = await apiGet<BillFullEnvelope>(`/api/v1/bills/${id}/full`, undefined, {
+    revalidate: BILL_REVALIDATE,
+  });
 
-  const jurisdiction = bill.ok
-    ? await apiGet<Jurisdiction>(
-        `/api/v1/jurisdictions/${bill.data.jurisdiction_id}`,
-        undefined,
-        opts
-      )
-    : null;
+  if (!full.ok) {
+    const failed = { ok: false as const, error: full.error, status: full.status };
+    return {
+      bill: failed,
+      versions: failed,
+      actions: failed,
+      sponsors: failed,
+      votes: failed,
+      documents: failed,
+      related: failed,
+      subjects: failed,
+      jurisdiction: failed,
+    };
+  }
 
+  const d = full.data;
   return {
-    bill,
-    versions,
-    actions,
-    sponsors,
-    votes,
-    documents,
-    related,
-    subjects,
-    jurisdiction,
+    bill: { ok: true, data: d.bill },
+    versions: { ok: true, data: d.versions },
+    actions: { ok: true, data: d.actions },
+    sponsors: { ok: true, data: d.sponsors },
+    votes: { ok: true, data: d.votes },
+    documents: { ok: true, data: d.documents },
+    related: { ok: true, data: d.related },
+    subjects: { ok: true, data: d.subjects },
+    jurisdiction: d.jurisdiction ? { ok: true, data: d.jurisdiction } : null,
   };
 }
 

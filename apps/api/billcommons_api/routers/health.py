@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from billcommons_shared.db import get_engine
 
+from billcommons_api.concurrency import current_limiter
 from billcommons_api.deps import get_db
 from billcommons_api.schemas import HealthOut, ReadyOut
 
@@ -57,10 +58,14 @@ def health(db: Session = Depends(get_db)) -> HealthOut:
     # when database is "error". That is deliberate (a 5xx here would take the
     # service out of rotation on a transient blip) and it is also exactly what
     # made the 2026-08-02 outage invisible. Assert on the BODY.
+    limiter = current_limiter()
     return HealthOut(
         status="ok" if db_status == "ok" else "degraded",
         database=db_status,
         pool=_pool_census(),
+        # Non-zero shed_total is the trace of a load-shed event. Without it an
+        # overload leaves no evidence and gets diagnosed from scratch twice.
+        concurrency=limiter.stats() if limiter else None,
     )
 
 

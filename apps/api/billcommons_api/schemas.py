@@ -477,6 +477,32 @@ class SearchResult(BillSummary):
     match_type: str
 
 
+class BillFullEnvelope(BaseModel):
+    """Everything one bill page needs, in a single response.
+
+    The web bill page fanned out to NINE requests per render (detail, versions,
+    actions, sponsors, votes, documents, related, subjects, jurisdiction). The
+    sitemap exposed ~200,000 such pages, so one crawl was well over a million
+    API requests -- and each one checked out its own pooled connection. That
+    fan-out is the load half of the 2026-08-02 outage.
+
+    One request, one connection, one transaction. Sub-resource endpoints stay
+    exactly as they are: they are a reasonable API for a consumer who wants one
+    slice, and this is for the consumer who wants all of it.
+    """
+
+    bill: BillDetail
+    versions: list[BillVersionOut]
+    actions: list[BillActionOut]
+    sponsors: list[SponsorshipOut]
+    votes: list[VoteEventOut]
+    documents: list[BillDocumentOut]
+    related: list[RelatedBillOut]
+    subjects: list[str]
+    jurisdiction: Jurisdiction | None = None
+    meta: dict
+
+
 class HealthOut(BaseModel):
     status: str
     database: str
@@ -488,6 +514,9 @@ class HealthOut(BaseModel):
     # way to see it was querying pg_stat_activity by hand from the box, after
     # the fact. `checked_out` approaching `size + overflow` is the signature.
     pool: dict | None = None
+    # In-flight request census plus the cumulative count of requests shed for
+    # overload. Null when the limiter is not installed.
+    concurrency: dict | None = None
 
 
 class ReadyOut(BaseModel):

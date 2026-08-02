@@ -732,13 +732,15 @@ def recompute_status_for_bills(
     # whole chunk. See status.apply_session_outcome.
     current = {}
     session_end = {}
+    session_active = {}
     for r in db.execute(
-        select(Bill.id, Bill.status, SessionModel.end_date)
+        select(Bill.id, Bill.status, SessionModel.end_date, SessionModel.active)
         .join(SessionModel, SessionModel.id == Bill.session_id)
         .where(Bill.id.in_(bill_ids))
     ).all():
         current[r.id] = r.status
         session_end[r.id] = r.end_date
+        session_active[r.id] = bool(r.active)
     actions_by_bill: dict[object, list[status_mod.ActionRow]] = {bid: [] for bid in bill_ids}
     for a in db.execute(
         select(
@@ -760,7 +762,9 @@ def recompute_status_for_bills(
     cleared = 0
     for bid in bill_ids:
         derived = status_mod.apply_session_outcome(
-            status_mod.derive_status(actions_by_bill[bid]), session_end.get(bid)
+            status_mod.derive_status(actions_by_bill[bid]),
+            session_end.get(bid),
+            session_active=session_active.get(bid, False),
         )
         if counts is not None and derived is not None:
             counts[derived] = counts.get(derived, 0) + 1
@@ -1275,6 +1279,10 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                         .where(
                             SessionModel.end_date.is_not(None),
                             SessionModel.end_date < datetime.now(timezone.utc).date(),
+                            # end_date is `expected_adjournment` -- an estimate.
+                            # A session the source still calls active has not
+                            # adjourned, whatever our estimate says.
+                            SessionModel.active.is_(False),
                             or_(
                                 Bill.status.is_(None),
                                 Bill.status.in_(sorted(status_mod.LIVE_STATUSES)),

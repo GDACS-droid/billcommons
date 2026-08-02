@@ -9,6 +9,7 @@ from slowapi.errors import RateLimitExceeded
 from billcommons_api.rate_limit import RateLimitMiddleware
 from slowapi.util import get_remote_address
 
+from billcommons_api.concurrency import ConcurrencyLimitMiddleware
 from billcommons_api.errors import register_exception_handlers
 from billcommons_api.middleware import RequestIDMiddleware, SecureHeadersMiddleware
 from billcommons_api.routers import (
@@ -66,6 +67,11 @@ def create_app() -> FastAPI:
     app.add_middleware(SecureHeadersMiddleware, api_version=settings.api_version)
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(RateLimitMiddleware, limit=rate_limit_num, window=60.0)
+    # Outermost of the two limiters: a request rejected for overload should not
+    # first consume a rate-limit token, and shedding should happen before any
+    # per-request setup. Starlette applies middleware in reverse order of
+    # registration, so registering this AFTER the rate limiter puts it in front.
+    app.add_middleware(ConcurrencyLimitMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allow_origins,

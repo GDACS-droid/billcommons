@@ -22,14 +22,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date
 
 from billcommons_shared.enrollment import (
     ENROLLED_PENDING_GRACE_DAYS as _ENROLLED_PENDING_GRACE_DAYS,
-)
-from billcommons_shared.enrollment import (
     enrolled_outcome_is_uncaptured as _enrolled_outcome_is_uncaptured,
 )
+from datetime import date
 
 # Controlled vocabulary. Deliberately matches what downstream consumers asked
 # for, so nobody has to translate ours into theirs.
@@ -70,15 +68,162 @@ TERMINAL_STATUSES = frozenset({ENACTED, VETOED, DEAD, WITHDRAWN, DIED_ON_ADJOURN
 # would be the same error in the opposite direction.
 LIVE_STATUSES = frozenset({INTRODUCED, IN_COMMITTEE, PASSED_ONE_CHAMBER, PASSED_BOTH})
 
-# The ENROLLED grace window lives in billcommons_shared.enrollment because the
-# API needs it too and ships in a container that has no access to this package.
+# Used only to break ties between statuses derived from the SAME date.
+_RANK = {
+    INTRODUCED: 1,
+    IN_COMMITTEE: 2,
+    PASSED_ONE_CHAMBER: 3,
+    PASSED_BOTH: 4,
+    ENROLLED: 5,
+    # Below the affirmative endings: adjournment is never derived from an
+    # action, so it can only ever apply where nothing else concluded the bill.
+    DIED_ON_ADJOURNMENT: 5.5,
+    WITHDRAWN: 6,
+    DEAD: 7,
+    VETOED: 8,
+    # Enactment outranks a veto on the same day: an override is recorded as
+    # both, and the bill is law.
+    ENACTED: 9,
+}
+
+# Open States action classifications -> status. A single action may carry
+# several comma-separated classifications; the highest-ranked one wins.
+_CLASSIFICATION_STATUS = {
+    "became-law": ENACTED,
+    "executive-signature": ENACTED,
+    "executive-veto": VETOED,
+    "executive-veto-line-item": VETOED,
+    "withdrawal": WITHDRAWN,
+    "failure": DEAD,
+    "committee-failure": DEAD,
+    "enrolled": ENROLLED,
+    "executive-receipt": ENROLLED,
+    "passage": PASSED_ONE_CHAMBER,
+    "committee-passage": IN_COMMITTEE,
+    "committee-passage-favorable": IN_COMMITTEE,
+    "committee-passage-unfavorable": IN_COMMITTEE,
+    "referral-committee": IN_COMMITTEE,
+    "introduction": INTRODUCED,
+    "filing": INTRODUCED,
+    "reading-1": INTRODUCED,
+    "reading-2": INTRODUCED,
+    "reading-3": INTRODUCED,
+}
+
+# Text fallback, applied ONLY when an action has no classification.
+#
+# Every pattern here is anchored on wording that states actually use and that
+# cannot plausibly mean anything else. Deliberately omitted: bare "passed",
+# "reported", "amended" -- too easy to match a motion that FAILED to do the
+# thing ("motion to withdraw failed"), and a wrong terminal status is far
+# costlier than a missing one.
+_TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Enactment first: "veto overridden" must read as law, not as a veto.
+    (re.compile(r"\bveto\s+overr(idden|ide)\b", re.I), ENACTED),
+    (re.compile(r"\boverr(idden|ode)\s+.{0,20}\bveto\b", re.I), ENACTED),
+    (re.compile(r"\bchaptered\b", re.I), ENACTED),
+    (re.compile(r"\bbecame\s+law\b", re.I), ENACTED),
+    (re.compile(r"\b(signed|approved)\s+by\s+(the\s+)?governor\b", re.I), ENACTED),
+    (re.compile(r"^act\s+\d+", re.I), ENACTED),
+    (re.compile(r"\bact\s+\d+,\s*\d{2}/\d{2}/\d{4}", re.I), ENACTED),
+    (re.compile(r"\bvetoed\s+by\s+(the\s+)?governor\b", re.I), VETOED),
+    (re.compile(r"^vetoed\b", re.I), VETOED),
+    (re.compile(r"\bdied\s+(in|on|pursuant)\b", re.I), DEAD),
+    (re.compile(r"\bfailed\s+to\s+pass\b", re.I), DEAD),
+    (re.compile(r"\b(indefinitely\s+postponed|postponed\s+indefinitely)\b", re.I), DEAD),
+    (re.compile(r"\bsession\s+sine\s+die\b", re.I), DEAD),
+    (re.compile(r"\bwithdrawn\s+by\s+(the\s+)?(author|sponsor|patron)\b", re.I), WITHDRAWN),
+    (re.compile(r"^withdrawn\b", re.I), WITHDRAWN),
+    (re.compile(r"\bsent\s+to\s+(the\s+)?governor\b", re.I), ENROLLED),
+    (re.compile(r"\benrolled\b", re.I), ENROLLED),
+    (re.compile(r"\breferred\s+to\b", re.I), IN_COMMITTEE),
+    (re.compile(r"\bintroduced\b", re.I), INTRODUCED),
+)
+
+
+@dataclass(frozen=True)
+class ActionRow:
+    """The only three fields status derivation reads."""
+
+    action_date: date | None
+    classification: str | None
+    description: str | None
+
+
+def _status_from_classification(classification: str | None) -> str | None:
+    if not classification:
+        return None
+    best: str | None = None
+    for token in classification.split(","):
+        mapped = _CLASSIFICATION_STATUS.get(token.strip())
+        if mapped and (best is None or _RANK[mapped] > _RANK[best]):
+            best = mapped
+    return best
+
+
+def _status_from_text(description: str | None) -> str | None:
+    if not description:
+        return None
+    for pattern, status in _TEXT_PATTERNS:
+        if pattern.search(description):
+            return status
+    return None
+
+
+def status_for_action(action: ActionRow) -> str | None:
+    """Status implied by one action, or None if it implies nothing.
+
+    Classification wins outright when present -- it is structured upstream data
+    and beats guessing from prose. The text fallback exists only for the 42% of
+    actions that arrive unclassified.
+    """
+    from_class = _status_from_classification(action.classification)
+    if from_class is not None:
+        return from_class
+    return _status_from_text(action.description)
+
+
+def derive_status(actions: list[ActionRow]) -> str | None:
+    """Normalized status for a bill, or None when the record does not say.
+
+    An OUTCOME (enacted/vetoed/dead/withdrawn), once reached, is what the bill
+    is -- later procedural filings cannot demote it back to "in committee". So
+    terminal statuses are considered first, and among them the latest-dated one
+    wins, which is what makes "died, then revived and enacted" and "vetoed,
+    then overridden" both come out right. Only if nothing terminal was ever
+    recorded does the newest procedural stage stand.
+
+    Undated actions sort oldest: an action with no date cannot be shown to
+    supersede one that has a date, so it must not win by accident.
+    """
+    derived: list[tuple[date | None, str]] = []
+    for action in actions:
+        status = status_for_action(action)
+        if status is not None:
+            derived.append((action.action_date, status))
+
+    if not derived:
+        return None
+
+    def sort_key(entry: tuple[date | None, str]) -> tuple[date, int]:
+        action_date, status = entry
+        return (action_date or date.min, _RANK[status])
+
+    terminal = [entry for entry in derived if entry[1] in TERMINAL_STATUSES]
+    pool = terminal or derived
+    return max(pool, key=sort_key)[1]
+
+
 # Re-exported here so ingest callers keep importing it from status.
 ENROLLED_PENDING_GRACE_DAYS = _ENROLLED_PENDING_GRACE_DAYS
 enrolled_outcome_is_uncaptured = _enrolled_outcome_is_uncaptured
 
 
 def apply_session_outcome(
-    status: str | None, session_end_date: date | None, today: date | None = None
+    status: str | None,
+    session_end_date: date | None,
+    today: date | None = None,
+    session_active: bool = False,
 ) -> str | None:
     """Fold the session's fate into a bill's action-derived status.
 
@@ -103,7 +248,25 @@ def apply_session_outcome(
     veto, withdrawal and an explicit death all outrank adjournment, and
     ENROLLED is excluded from LIVE_STATUSES because a bill on the governor's
     desk survives sine die by design.
+
+    And never applied while the SOURCE still calls the session active.
+    `sessions.end_date` is populated from Open States' `expected_adjournment`
+    (registry.py) -- an ESTIMATE, not a recorded sine die. When a chamber sits
+    past its expected date, that estimate silently becomes a past date and the
+    calendar alone marks every live bill in the session dead.
+
+    Not hypothetical: on 2026-08-02 this had killed 26,165 bills across four
+    jurisdictions the source still flagged active, including 18,343 in
+    Massachusetts, whose 194th General Court runs to the end of the year and
+    whose expected adjournment had passed two days earlier. Those 18,343 were
+    19.3% of the entire national died_on_adjournment figure this project
+    publishes as its flagship finding.
+
+    `active` is upstream's statement of fact; `expected_adjournment` is
+    upstream's guess. When they disagree, the fact wins and we assert nothing.
     """
+    if session_active:
+        return status
     if session_end_date is None:
         return status
     if status is not None and status not in LIVE_STATUSES:

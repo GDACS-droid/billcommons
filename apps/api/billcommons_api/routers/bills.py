@@ -35,6 +35,7 @@ from billcommons_api.pagination import (
 )
 from billcommons_api.schemas import (
     BillActionOut,
+    BillFullEnvelope,
     BillBatchEnvelope,
     BillCompareEnvelope,
     BillCompareOut,
@@ -44,6 +45,7 @@ from billcommons_api.schemas import (
     BillDocumentOut,
     BillSummary,
     BillVersionOut,
+    Jurisdiction as JurisdictionSchema,
     RelatedBillOut,
     DiffLineOut,
     SponsorshipOut,
@@ -857,3 +859,43 @@ def get_bill_evidence(
     if request.headers.get("if-none-match") == headers["ETag"]:
         return Response(status_code=304, headers=headers)
     return JSONResponse(content=payload, headers=headers)
+
+
+@router.get("/{bill_id}/full", response_model=BillFullEnvelope)
+def get_bill_full(
+    bill_id: uuid.UUID,
+    request: Request,
+    response: Response,
+    db: OrmSession = Depends(get_db),
+) -> BillFullEnvelope:
+    """Every sub-resource for one bill in a single round trip.
+
+    Composes the existing handlers rather than re-implementing their queries.
+    Duplicating them would mean this envelope and the individual endpoints
+    could drift into disagreeing about the same bill -- and the sub-resource
+    handlers carry real logic worth not forking (related-bill identifier
+    resolution, vote records grouped per event, the enrolled-outcome flag).
+
+    They each call _get_bill_or_404, which is `db.get` -- served from the
+    session identity map after the first, so the repeated existence check costs
+    nothing.
+    """
+    row = _get_bill_or_404(db, bill_id)
+    response.headers["ETag"] = make_etag(row.id, row.updated_at)
+
+    jurisdiction = db.get(Jurisdiction, row.jurisdiction_id)
+
+    return BillFullEnvelope(
+        bill=get_bill(bill_id, response, db),
+        versions=list_bill_versions(bill_id, db),
+        actions=list_bill_actions(bill_id, db),
+        sponsors=list_bill_sponsors(bill_id, db),
+        votes=list_bill_votes(bill_id, db),
+        documents=list_bill_documents(bill_id, db),
+        related=list_related_bills(bill_id, db),
+        subjects=list_bill_subjects(bill_id, db),
+        jurisdiction=(
+            JurisdictionSchema.model_validate(jurisdiction) if jurisdiction else None
+        ),
+        meta={"api_version": "v1", "request_id": request.state.request_id},
+    )
