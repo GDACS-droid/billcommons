@@ -126,7 +126,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             request_id = request.headers.get("x-request-id", "")
             return JSONResponse(
                 status_code=429,
-                headers={"Retry-After": str(retry_after), **self._headers(0, reset_in)},
+                # no-store is load-bearing here, not boilerplate: a cached 429
+                # is a self-inflicted outage that outlives its cause. Next's
+                # Data Cache is deployment-persistent, and a CDN with a
+                # cache-everything rule would pin this refusal at the edge for
+                # every client behind it.
+                headers={
+                    "Retry-After": str(retry_after),
+                    "Cache-Control": "no-store",
+                    **self._headers(0, reset_in),
+                },
                 content={
                     "error": {
                         "code": "rate_limited",

@@ -2,6 +2,8 @@
 
 Every error response has the shape:
     {"error": {"code": str, "message": str, "request_id": str}}
+
+Every error response is also explicitly uncacheable. See NO_STORE.
 """
 from __future__ import annotations
 
@@ -21,8 +23,33 @@ class ErrorResponse(BaseModel):
     error: ErrorDetail
 
 
+# Errors must never be stored by ANY cache -- a CDN, a proxy, or Next's Data
+# Cache. This project has already been burned twice by a cached failure
+# outliving its cause: a 404 captured before an endpoint shipped kept being
+# served for the full revalidate window and survived redeploys, because Next's
+# Data Cache is deployment-persistent. Put a CDN in front with a
+# "cache everything" rule and the same class of bug moves to a layer that
+# cannot be fixed by redeploying at all.
+#
+# `no-store` (not merely `no-cache`) is the correct directive: no-cache permits
+# storing and revalidating, which still leaves a copy to serve if revalidation
+# fails. This is a prerequisite for putting any edge cache in front of the API.
+NO_STORE = {"Cache-Control": "no-store"}
+
+
 def _request_id(request: Request) -> str:
     return getattr(request.state, "request_id", "unknown")
+
+
+def _error_headers(extra: dict | None = None) -> dict:
+    """NO_STORE, merged over any handler-supplied headers.
+
+    NO_STORE wins on conflict: nothing an exception carries should be able to
+    make an error response cacheable.
+    """
+    headers = dict(extra or {})
+    headers.update(NO_STORE)
+    return headers
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -40,7 +67,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             content=ErrorResponse(
                 error=ErrorDetail(code=code, message=message, request_id=_request_id(request))
             ).model_dump(),
-            headers=exc.headers,
+            headers=_error_headers(exc.headers),
         )
 
     @app.exception_handler(RequestValidationError)
@@ -56,6 +83,7 @@ def register_exception_handlers(app: FastAPI) -> None:
                     request_id=_request_id(request),
                 )
             ).model_dump(),
+            headers=NO_STORE,
         )
 
     @app.exception_handler(Exception)
@@ -69,6 +97,7 @@ def register_exception_handlers(app: FastAPI) -> None:
                     request_id=_request_id(request),
                 )
             ).model_dump(),
+            headers=NO_STORE,
         )
 
 

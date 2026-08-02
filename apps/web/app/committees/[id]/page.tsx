@@ -11,8 +11,17 @@ interface Props {
 // GET /committees/{id} returns the bare CommitteeOut object -- no {data,
 // meta} envelope (unlike list endpoints). See
 // apps/api/billcommons_api/routers/committees.py.
+// Crawlable page: this MUST pass `revalidate`, or every crawler hit becomes a
+// live API call. `apiGet` defaults to `no-store`, which is right for
+// personalized or query-driven routes and wrong for anything a search engine
+// walks. Leaving these uncached is part of what let a routine crawl saturate
+// the API on 2026-08-02.
+const COMMITTEE_REVALIDATE = 3600;
+
 async function getCommittee(id: string) {
-  return apiGet<Committee>(`/api/v1/committees/${id}`);
+  return apiGet<Committee>(`/api/v1/committees/${id}`, undefined, {
+    revalidate: COMMITTEE_REVALIDATE,
+  });
 }
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {

@@ -17,12 +17,18 @@ interface Props {
   searchParams: Promise<{ page?: string; jurisdiction?: string }>;
 }
 
+// Crawlable page: this MUST pass `revalidate`, or every crawler hit becomes a
+// live API call. `apiGet` defaults to `no-store` -- right for personalized or
+// query-driven routes, wrong for anything a search engine walks. Leaving
+// these uncached is part of what let a routine crawl saturate the API.
+const HEARINGS_REVALIDATE = 3600;
+
 async function getHearings(page: number, jurisdiction?: string) {
-  return apiGet<ListEnvelope<HearingEvent>>("/api/v1/events", {
-    jurisdiction,
-    page,
-    per_page: 25,
-  });
+  return apiGet<ListEnvelope<HearingEvent>>(
+    "/api/v1/events",
+    { jurisdiction, page, per_page: 25 },
+    { revalidate: HEARINGS_REVALIDATE }
+  );
 }
 
 export default async function HearingsPage({ searchParams }: Props) {

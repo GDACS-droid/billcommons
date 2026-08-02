@@ -26,13 +26,25 @@ interface CompareResponse {
 
 // GET /bills/{id}/versions returns a bare array (see
 // billcommons_api.routers.bills.list_bill_versions), not an envelope.
+// A diff between two FIXED version ids is immutable -- the underlying texts
+// never change -- so this caches for a day rather than an hour. It is also the
+// most expensive page on the site: /compare runs difflib over two full bill
+// texts, and it is linked from every bill page, so crawlers reach it.
+const COMPARE_REVALIDATE = 86_400;
+
 async function getVersions(id: string) {
-  return apiGet<BillVersion[]>(`/api/v1/bills/${id}/versions`);
+  return apiGet<BillVersion[]>(`/api/v1/bills/${id}/versions`, undefined, {
+    revalidate: COMPARE_REVALIDATE,
+  });
 }
 
 async function getCompare(id: string, from?: string, to?: string) {
   if (!from || !to) return null;
-  return apiGet<CompareResponse>(`/api/v1/bills/${id}/compare`, { from, to });
+  return apiGet<CompareResponse>(
+    `/api/v1/bills/${id}/compare`,
+    { from, to },
+    { revalidate: COMPARE_REVALIDATE }
+  );
 }
 
 export const metadata: Metadata = {

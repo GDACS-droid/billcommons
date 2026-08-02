@@ -162,3 +162,22 @@ def test_bypass_is_inert_when_no_secret_is_configured(limited_client, monkeypatc
         for _ in range(TEST_LIMIT + 3)
     ]
     assert 429 in statuses, "empty secret + empty header bypassed the limiter"
+
+
+def test_429_is_never_cacheable(limited_client):
+    """A cached 429 is a self-inflicted outage that outlives its cause.
+
+    Next's Data Cache is deployment-persistent and a CDN cache-everything rule
+    would pin this refusal at the edge for every client behind it.
+    """
+    headers = {"X-Forwarded-For": "203.0.113.77"}
+    responses = [
+        limited_client.get("/api/v1/jurisdictions", headers=headers)
+        for _ in range(TEST_LIMIT + 3)
+    ]
+    throttled = [r for r in responses if r.status_code == 429]
+    assert throttled, "limiter never triggered — cannot assert on the 429"
+    for r in throttled:
+        assert r.headers.get("cache-control") == "no-store", (
+            "429 is cacheable — an edge or Data Cache can pin the refusal"
+        )

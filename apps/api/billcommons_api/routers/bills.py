@@ -434,13 +434,32 @@ def list_bill_votes(bill_id: uuid.UUID, db: OrmSession = Depends(get_db)) -> lis
         .scalars()
         .all()
     )
+    # One query for every event's records, not one query per event.
+    #
+    # This was an N+1: a bill with 12 vote events issued 12 separate
+    # `vote_records` queries. Before `ix_vote_records_vote_event_id` existed
+    # each of those was a full scan of a 6.7M-row table, so `/votes` could cost
+    # several seconds and hold its connection for the duration. The index makes
+    # each lookup sub-millisecond, but the round trips are still per-event and
+    # this route is called for every crawled bill page.
+    by_event: dict[uuid.UUID, list[VoteRecord]] = {}
+    if events:
+        records = (
+            db.execute(
+                select(VoteRecord).where(
+                    VoteRecord.vote_event_id.in_([e.id for e in events])
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for record in records:
+            by_event.setdefault(record.vote_event_id, []).append(record)
+
     out = []
     for e in events:
-        records = (
-            db.execute(select(VoteRecord).where(VoteRecord.vote_event_id == e.id)).scalars().all()
-        )
         item = VoteEventOut.model_validate(e)
-        item.votes = [VoteRecordOut.model_validate(r) for r in records]
+        item.votes = [VoteRecordOut.model_validate(r) for r in by_event.get(e.id, [])]
         out.append(item)
     return out
 
@@ -530,21 +549,42 @@ def list_bill_subjects(bill_id: uuid.UUID, db: OrmSession = Depends(get_db)) -> 
 @router.get("/{bill_id}/documents", response_model=list[BillDocumentOut])
 def list_bill_documents(bill_id: uuid.UUID, db: OrmSession = Depends(get_db)) -> list[BillDocumentOut]:
     _get_bill_or_404(db, bill_id)
-    rows = (
-        db.execute(
-            select(BillDocument)
-            .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
-            .where(BillVersion.bill_id == bill_id)
+    # Select the five columns this response actually returns, NOT the whole row.
+    #
+    # `select(BillDocument)` pulled `extracted_text` and `text_tsv` for every
+    # document -- averaging ~10.9 KB per row across the table and reaching into
+    # megabytes on long bills -- purely so the loop below could compute one
+    # boolean from it. That cost TOAST decompression in Postgres, the bytes on
+    # the wire, and the whole payload in Python memory, on a route the website
+    # calls for every crawled bill page.
+    #
+    # The emptiness test moves into SQL. `<> ''` matters as well as NOT NULL:
+    # a failed extraction can land an empty string, and `bool('')` was already
+    # treating that as "no text" -- keep the two in agreement.
+    rows = db.execute(
+        select(
+            BillDocument.id,
+            BillDocument.bill_version_id,
+            BillDocument.media_type,
+            BillDocument.url,
+            (
+                (BillDocument.extracted_text.isnot(None))
+                & (BillDocument.extracted_text != "")
+            ).label("has_extracted_text"),
         )
-        .scalars()
-        .all()
-    )
-    out = []
-    for r in rows:
-        item = BillDocumentOut.model_validate(r)
-        item.has_extracted_text = bool(r.extracted_text)
-        out.append(item)
-    return out
+        .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
+        .where(BillVersion.bill_id == bill_id)
+    ).all()
+    return [
+        BillDocumentOut(
+            id=r.id,
+            bill_version_id=r.bill_version_id,
+            media_type=r.media_type,
+            url=r.url,
+            has_extracted_text=bool(r.has_extracted_text),
+        )
+        for r in rows
+    ]
 
 
 @router.get("/{bill_id}/compare", response_model=BillCompareEnvelope)

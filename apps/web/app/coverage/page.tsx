@@ -13,10 +13,18 @@ export const metadata: Metadata = {
   alternates: { canonical: "/coverage" },
 };
 
+// Crawlable page: this MUST pass `revalidate`, or every crawler hit becomes a
+// live API call. `apiGet` defaults to `no-store` -- right for personalized or
+// query-driven routes, wrong for anything a search engine walks. Leaving
+// these uncached is part of what let a routine crawl saturate the API.
+const COVERAGE_REVALIDATE = 3600;
+
 async function getCoverage() {
-  return apiGet<ListEnvelope<CoverageRow>>("/api/v1/coverage", {
-    per_page: 200,
-  });
+  return apiGet<ListEnvelope<CoverageRow>>(
+    "/api/v1/coverage",
+    { per_page: 200 },
+    { revalidate: COVERAGE_REVALIDATE }
+  );
 }
 
 export default async function CoveragePage() {

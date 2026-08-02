@@ -12,8 +12,16 @@ interface Props {
 // GET /people/{id} returns the bare PersonDetail object -- no {data, meta}
 // envelope (unlike list endpoints). See
 // apps/api/billcommons_api/routers/people.py.
+// Crawlable page: this MUST pass `revalidate`, or every crawler hit becomes a
+// live API call. `apiGet` defaults to `no-store` -- right for personalized or
+// query-driven routes, wrong for anything a search engine walks. Leaving
+// these uncached is part of what let a routine crawl saturate the API.
+const PERSON_REVALIDATE = 3600;
+
 async function getPerson(id: string) {
-  return apiGet<Person>(`/api/v1/people/${id}`);
+  return apiGet<Person>(`/api/v1/people/${id}`, undefined, {
+    revalidate: PERSON_REVALIDATE,
+  });
 }
 
 // There's no /people/{id}/sponsored-bills sub-resource yet; the closest real
@@ -21,10 +29,13 @@ async function getPerson(id: string) {
 // on the sponsorship name (not a person_id join) -- so results here are a
 // best-effort, name-based approximation, not a precise sponsorship record.
 async function getSponsoredBills(name: string) {
-  return apiGet<ListEnvelope<BillSummary>>("/api/v1/search", {
-    sponsor: name,
-    per_page: 20,
-  });
+  // /search is the most expensive endpoint we have -- caching this one
+  // matters more than the rest, not less.
+  return apiGet<ListEnvelope<BillSummary>>(
+    "/api/v1/search",
+    { sponsor: name, per_page: 20 },
+    { revalidate: PERSON_REVALIDATE }
+  );
 }
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
