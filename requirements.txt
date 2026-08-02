@@ -1,18 +1,35 @@
-sqlalchemy>=2.0
-alembic
-psycopg[binary]
-fastapi
-uvicorn[standard]
-httpx
-pydantic>=2
-pydantic-settings
-python-dateutil
-certifi
-cryptography>=42
-slowapi
-pytest
-mcp
-pypdf
+# PINNED, deliberately.
+#
+# Every line here was unpinned until 2026-08-02, which meant each deploy
+# resolved whatever PyPI had published that day. On 2026-08-02 the `mcp`
+# package released 2.0.0, which moved `mcp.server.fastmcp`; the next Railway
+# rebuild pulled it and the MCP server crash-looped on
+# `ModuleNotFoundError: No module named 'mcp.server.fastmcp'`, taking
+# mcp.billcommons.org to a 502. Nothing in the repo had changed to cause it --
+# a deploy of unrelated code was simply the first rebuild after the release.
+#
+# These versions are the ones the test suite actually runs against (134 API +
+# 25 MCP tests green on 2026-08-02). Upgrade deliberately: bump a pin, run both
+# suites, deploy. Do not loosen a pin to "pick up the latest fix" -- that is
+# exactly how this failure works.
+sqlalchemy==2.0.51
+alembic==1.18.5
+psycopg[binary]==3.3.4
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+httpx==0.28.1
+pydantic==2.13.4
+pydantic-settings==2.14.2
+python-dateutil==2.9.0.post0
+certifi==2026.7.22
+cryptography==49.0.0
+slowapi==0.1.10
+pytest==9.1.1
+# mcp 2.x removed mcp.server.fastmcp, which apps/mcp/server.py imports.
+# Staying on 1.x is a deliberate choice, not staleness -- moving to 2.x is a
+# code migration, not a version bump.
+mcp==1.28.1
+pypdf==6.14.2
 
 # workspace packages (editable installs, single source of truth for models/utils)
 -e packages/schema
