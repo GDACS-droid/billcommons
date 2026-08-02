@@ -18,6 +18,12 @@ from sqlalchemy.orm import Session
 from billcommons_schema.models import Jurisdiction, JurisdictionCoverage, Session as SessionModel
 
 # Coverage states in state-machine order (see ARCHITECTURE.md / SPEC.md).
+#
+# NOTE: this is LIFECYCLE order, not severity. DEGRADED and BLOCKED are
+# terminal fault states appended after GREEN, so a jurisdiction can be at
+# GREEN and then fall to DEGRADED -- position here says nothing about how
+# trustworthy the data is. Use COVERAGE_SEVERITY for that; see the comment
+# on it.
 COVERAGE_STATES = [
     "NOT_STARTED",
     "SOURCE_IDENTIFIED",
@@ -29,6 +35,42 @@ COVERAGE_STATES = [
     "DEGRADED",
     "BLOCKED",
 ]
+
+# How much the data can be TRUSTED, lowest first. Distinct from COVERAGE_STATES
+# on purpose.
+#
+# Ranking severity by position in COVERAGE_STATES silently disabled the coverage
+# warning. DEGRADED (index 7) and BLOCKED (index 8) sit after GREEN (index 6),
+# so `min(..., key=COVERAGE_STATES.index)` -- documented as "least advanced" --
+# scored them as MORE advanced than GREEN. Two consequences, both live:
+#
+#   * A wholly DEGRADED jurisdiction cleared the METADATA_SEARCHABLE threshold
+#     and returned no warning at all. Massachusetts was in exactly this state.
+#   * A BLOCKED session was masked by any non-BLOCKED sibling row, because the
+#     GREEN row won the min().
+#
+# That is the precise failure this warning exists to prevent: a caller reading
+# an empty or thin result as "no such legislation exists" rather than "we do
+# not have this yet". DEGRADED ranks below METADATA_SEARCHABLE so it always
+# warns; BLOCKED ranks lowest so it can never be masked.
+COVERAGE_SEVERITY = {
+    "BLOCKED": 0,
+    "NOT_STARTED": 1,
+    "SOURCE_IDENTIFIED": 2,
+    "BOOTSTRAPPED": 3,
+    "DEGRADED": 4,
+    "METADATA_SEARCHABLE": 5,
+    "FULL_TEXT_SEARCHABLE": 6,
+    "VALIDATING": 7,
+    "GREEN": 8,
+}
+
+
+def coverage_severity(status: str) -> int:
+    """Trust rank for a coverage status. Unknown statuses are treated as the
+    least trustworthy -- a status we do not recognise must never be assumed
+    safe."""
+    return COVERAGE_SEVERITY.get(status, 0)
 
 # States at or beyond which metadata search is considered reliable.
 _SUFFICIENT_FOR_METADATA = {
@@ -96,11 +138,15 @@ def coverage_rows_for_jurisdiction(
 
 
 def worst_status(rows: list[JurisdictionCoverage]) -> str:
-    """Return the least-advanced status among coverage rows (or NOT_STARTED
-    if there are none), used to decide whether to warn."""
+    """Return the LEAST TRUSTWORTHY status among coverage rows (or NOT_STARTED
+    if there are none), used to decide whether to warn.
+
+    Ranked by COVERAGE_SEVERITY, not by position in COVERAGE_STATES -- see the
+    comment there for the bug that distinction fixes.
+    """
     if not rows:
         return "NOT_STARTED"
-    return min(rows, key=lambda r: COVERAGE_STATES.index(r.status)).status
+    return min(rows, key=lambda r: coverage_severity(r.status)).status
 
 
 def serialize_coverage_row(row: JurisdictionCoverage) -> dict[str, Any]:
@@ -129,9 +175,10 @@ def coverage_warning_for_jurisdiction(
     """
     rows = coverage_rows_for_jurisdiction(db, jurisdiction.id)
     status = worst_status(rows)
-    if COVERAGE_STATES.index(status) >= COVERAGE_STATES.index(min_state) and status not in (
-        "BLOCKED",
-    ):
+    # Severity, not lifecycle position. The BLOCKED special-case that used to be
+    # needed here is gone: BLOCKED is now simply the lowest severity, so it
+    # fails this comparison on its own.
+    if coverage_severity(status) >= coverage_severity(min_state):
         return None
     return {
         "jurisdiction": jurisdiction.abbreviation,
