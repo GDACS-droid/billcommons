@@ -108,3 +108,57 @@ def test_expired_buckets_are_reclaimed():
     now[0] = 601.0  # every window has long since expired
     mw._allow("203.0.113.1")
     assert len(mw._buckets) == 1, f"stale buckets not reclaimed: {len(mw._buckets)} left"
+
+
+def test_trusted_internal_client_bypasses_the_limit(limited_client, monkeypatch):
+    """Our own server-side renderer must not be throttled by its own visitors.
+
+    The website is server-rendered, so every page view reaches the API from one
+    of a handful of Vercel egress addresses -- and the limiter keys on that
+    address. Without a bypass the entire public site shares ONE bucket, so at
+    7-10 API calls per bill page the whole site is capped at ~30-43 pages per
+    minute and visitors 429 each other.
+    """
+    monkeypatch.setenv("BILLCOMMONS_INTERNAL_CLIENT_SECRET", "s3cret-shared-value")
+    headers = {
+        "X-Forwarded-For": "203.0.113.99",
+        "x-billcommons-internal": "s3cret-shared-value",
+    }
+    statuses = [
+        limited_client.get("/api/v1/jurisdictions", headers=headers).status_code
+        for _ in range(TEST_LIMIT + 5)
+    ]
+    assert 429 not in statuses, "trusted internal client was throttled"
+
+
+def test_wrong_or_missing_secret_is_still_throttled(limited_client, monkeypatch):
+    """The bypass must fail CLOSED.
+
+    A blank secret, a missing header, or a wrong value must all be treated as
+    ordinary public traffic -- otherwise a misconfigured deploy silently
+    removes the rate limit for everyone.
+    """
+    monkeypatch.setenv("BILLCOMMONS_INTERNAL_CLIENT_SECRET", "s3cret-shared-value")
+    wrong = {
+        "X-Forwarded-For": "203.0.113.100",
+        "x-billcommons-internal": "not-the-secret",
+    }
+    statuses = [
+        limited_client.get("/api/v1/jurisdictions", headers=wrong).status_code
+        for _ in range(TEST_LIMIT + 3)
+    ]
+    assert 429 in statuses, "a wrong secret bypassed the limiter"
+
+
+def test_bypass_is_inert_when_no_secret_is_configured(limited_client, monkeypatch):
+    """With no secret set, presenting the header must grant nothing."""
+    monkeypatch.delenv("BILLCOMMONS_INTERNAL_CLIENT_SECRET", raising=False)
+    headers = {
+        "X-Forwarded-For": "203.0.113.101",
+        "x-billcommons-internal": "",
+    }
+    statuses = [
+        limited_client.get("/api/v1/jurisdictions", headers=headers).status_code
+        for _ in range(TEST_LIMIT + 3)
+    ]
+    assert 429 in statuses, "empty secret + empty header bypassed the limiter"

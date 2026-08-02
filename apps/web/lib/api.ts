@@ -22,6 +22,24 @@ export interface ApiGetOptions {
   revalidate?: number;
 }
 
+/**
+ * Headers identifying this renderer to the API's rate limiter.
+ *
+ * Every server-rendered page reaches the API from one of a few Vercel egress
+ * addresses, and the limiter keys on that address -- so without this the whole
+ * public site shares ONE 300/minute bucket. At 7-10 API calls per bill page
+ * that caps the entire site at ~30-43 bill pages a minute, and visitors start
+ * 429ing each other.
+ *
+ * Read at call time, not module scope, so a rotated secret takes effect on
+ * redeploy without a stale build-time capture. Unset => header omitted => the
+ * request is simply rate limited as anonymous traffic (fails closed).
+ */
+function internalHeaders(): Record<string, string> {
+  const secret = process.env.BILLCOMMONS_INTERNAL_CLIENT_SECRET;
+  return secret ? { "x-billcommons-internal": secret } : {};
+}
+
 export async function apiGet<T>(
   path: string,
   searchParams?: Record<string, string | number | undefined>,
@@ -41,7 +59,7 @@ export async function apiGet<T>(
       ...(options?.revalidate === undefined
         ? { cache: "no-store" as const }
         : { next: { revalidate: options.revalidate } }),
-      headers: { Accept: "application/json" },
+      headers: { Accept: "application/json", ...internalHeaders() },
     });
 
     if (!res.ok) {
@@ -58,7 +76,7 @@ export async function apiGet<T>(
       if (options?.revalidate !== undefined) {
         const retry = await fetch(url.toString(), {
           cache: "no-store",
-          headers: { Accept: "application/json" },
+          headers: { Accept: "application/json", ...internalHeaders() },
         });
         if (retry.ok) {
           return { ok: true, data: (await retry.json()) as T };

@@ -9,6 +9,8 @@ in scope for the v1 public tier.
 """
 from __future__ import annotations
 
+import hmac
+import os
 import threading
 import time
 
@@ -19,6 +21,10 @@ from starlette.responses import JSONResponse
 # Endpoints that must never be throttled (uptime probes / load-balancer checks).
 _EXEMPT_PATHS = frozenset({"/api/v1/health", "/api/v1/ready"})
 
+# Header carrying the shared secret that identifies our own server-side
+# renderer. See `is_trusted_client`.
+TRUSTED_CLIENT_HEADER = "x-billcommons-internal"
+
 
 def client_ip(request: Request) -> str:
     """First hop of X-Forwarded-For (Railway/reverse-proxy) else the peer."""
@@ -26,6 +32,35 @@ def client_ip(request: Request) -> str:
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+def is_trusted_client(request: Request) -> bool:
+    """True when the caller proves it is our own server-side renderer.
+
+    The website is server-rendered on Vercel, so every page view reaches this
+    API from one of a handful of Vercel egress addresses -- and `client_ip`
+    keys on exactly that address. The entire public site therefore shared ONE
+    per-IP bucket. At 7-10 API calls per bill page, a 300/minute limit is a
+    hard ceiling of ~30-43 bill pages per minute *for all visitors combined*,
+    and every visitor past it sees 429s caused by other visitors.
+
+    Worse, the web app caches API responses: a 429 storm can be written into
+    Next's Data Cache and served back for the full revalidate window, so a
+    brief self-throttle outlives itself.
+
+    The fix is identity, not a bigger number. The renderer sends a shared
+    secret and skips the limiter; unauthenticated public traffic is unaffected
+    and still limited per IP. Absent/blank secret => no bypass, so a
+    misconfigured deploy fails closed (throttled) rather than open.
+    """
+    secret = os.environ.get("BILLCOMMONS_INTERNAL_CLIENT_SECRET", "")
+    if not secret:
+        return False
+    presented = request.headers.get(TRUSTED_CLIENT_HEADER, "")
+    if not presented:
+        return False
+    # compare_digest: the comparison must not leak the secret through timing.
+    return hmac.compare_digest(presented, secret)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -84,7 +119,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         }
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path in _EXEMPT_PATHS:
+        if request.url.path in _EXEMPT_PATHS or is_trusted_client(request):
             return await call_next(request)
         allowed, retry_after, remaining, reset_in = self._allow(client_ip(request))
         if not allowed:
