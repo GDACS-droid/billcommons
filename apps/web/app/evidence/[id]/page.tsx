@@ -85,7 +85,10 @@ export default async function EvidencePage({ params }: Props) {
   // No revalidate: a citation check must reflect the record now, not a cached
   // copy from an hour ago. The whole value of the page is telling a reader
   // whether what they cited still holds.
-  const result = await apiGet<EvidencePayload>(`bills/${id}/evidence`);
+  // Full path including /api/v1 -- API_BASE is the origin only, and every
+  // other caller passes the version prefix. Omitting it 404s the upstream
+  // request, which this page then renders as a missing bill.
+  const result = await apiGet<EvidencePayload>(`/api/v1/bills/${id}/evidence`);
   if (!result.ok) {
     if (result.status === 404) notFound();
     return (

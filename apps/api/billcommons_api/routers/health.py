@@ -25,21 +25,22 @@ def _pool_census() -> dict | None:
     try:
         pool = get_engine().pool
         size = pool.size()
-        overflow = pool.overflow()
+        max_overflow = getattr(pool, "_max_overflow", 0) or 0
         checked_out = pool.checkedout()
+        capacity = size + max_overflow
+        # Deliberately NOT reporting pool.overflow(). It is an internal counter
+        # that starts at -pool_size and reads as "-29" on a healthy service --
+        # a number an operator has to stop and decode during an incident, which
+        # is the worst possible moment to hand someone a puzzle.
         return {
-            "size": size,
-            "checked_out": checked_out,
-            "available": pool.checkedin(),
-            "overflow": overflow,
-            "max_overflow": getattr(pool, "_max_overflow", None),
-            # The number that matters during an incident: 1.0 means every slot
-            # is held and the next request queues for pool_timeout seconds.
-            "saturation": (
-                round(checked_out / (size + max(overflow, 0)), 3)
-                if (size + max(overflow, 0)) > 0
-                else None
-            ),
+            "in_use": checked_out,
+            "idle": pool.checkedin(),
+            "capacity": capacity,
+            "pool_size": size,
+            "max_overflow": max_overflow,
+            # The one number that matters: 1.0 means every slot is held and the
+            # next request queues for pool_timeout seconds before failing.
+            "saturation": round(checked_out / capacity, 3) if capacity else None,
         }
     except Exception:  # noqa: BLE001 - health must never fail on its own telemetry
         return None
