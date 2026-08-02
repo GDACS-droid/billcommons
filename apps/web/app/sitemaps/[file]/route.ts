@@ -16,8 +16,10 @@ export const dynamic = "force-dynamic";
 /**
  * Serves the individual sitemap files named by /sitemap.xml:
  *   /sitemaps/pages.xml     static routes
- *   /sitemaps/states.xml    every state hub and session index
- *   /sitemaps/bills-N.xml   one chunk of bill pages
+ *   /sitemaps/states.xml    the 51 state hub pages
+ *   /sitemaps/bills-N.xml   one chunk of bill pages -- still served for API
+ *                           consumers enumerating the corpus, but NO LONGER
+ *                           listed in /sitemap.xml and noindex at page level
  */
 export async function GET(
   _request: Request,

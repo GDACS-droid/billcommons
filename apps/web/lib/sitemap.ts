@@ -2,7 +2,7 @@ import { apiGet } from "./api";
 import { billPath, slugify } from "./billUrl";
 import { fetchAllPages } from "./collections";
 import { SITE_URL } from "./config";
-import type { Jurisdiction, Session } from "./types";
+import type { Jurisdiction } from "./types";
 
 /**
  * XML sitemap construction.
@@ -122,34 +122,32 @@ export function billUrlsFor(rows: SitemapBillRow[]): SitemapUrl[] {
     }));
 }
 
-/** Every state hub page plus every session index -- the crawl paths INTO bills. */
+/**
+ * The 51 state hub pages. Session indexes are deliberately NOT included.
+ *
+ * A state hub answers a question that no official site answers: what we hold
+ * for this jurisdiction, how fresh it is, how it validates, and where the
+ * authoritative source lives. A session index is a thin paginated list of bill
+ * links, and now that bill pages are noindex it exists only as a crawl path --
+ * useful to follow, not worth submitting for indexing.
+ *
+ * This is the whole strategy in one function: submit the pages that deserve to
+ * be cited, not every page that exists. See app/sitemap.xml/route.ts.
+ */
 export async function getStateAndSessionUrls(): Promise<SitemapUrl[]> {
-  // Both of these span more than one page (51 jurisdictions, 77 sessions,
-  // per_page clamped to 50), so both must be paged in full.
-  const [jurisdictionsResult, sessionsResult] = await Promise.all([
-    fetchAllPages<Jurisdiction>("/api/v1/jurisdictions", {}, SITEMAP_REVALIDATE),
-    fetchAllPages<Session>("/api/v1/sessions", {}, SITEMAP_REVALIDATE),
-  ]);
+  // 51 jurisdictions against a per_page clamped to 50 -- this MUST be paged in
+  // full or the directory silently loses a state (it has, twice).
+  const jurisdictionsResult = await fetchAllPages<Jurisdiction>(
+    "/api/v1/jurisdictions",
+    {},
+    SITEMAP_REVALIDATE
+  );
 
-  const urls: SitemapUrl[] = jurisdictionsResult.items.map((j) => ({
+  return jurisdictionsResult.items.map((j) => ({
     loc: `${SITE_URL}/states/${j.abbreviation.toUpperCase()}`,
     changefreq: "daily",
     priority: 0.8,
   }));
-
-  for (const session of sessionsResult.items) {
-    const code = session.jurisdiction_abbreviation;
-    if (!code) continue;
-    urls.push({
-      loc: `${SITE_URL}/states/${code.toUpperCase()}/sessions/${encodeURIComponent(
-        session.identifier
-      )}`,
-      changefreq: "daily",
-      priority: 0.7,
-    });
-  }
-
-  return urls;
 }
 
 /** Parse "bills-12.xml" -> 12; anything else -> null. */
