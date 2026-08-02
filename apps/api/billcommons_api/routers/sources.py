@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_api.deps import get_db
 from billcommons_api.pagination import (
+    MAX_PAGE,
     DEFAULT_PAGE,
     DEFAULT_PER_PAGE,
     Page,
@@ -25,7 +26,7 @@ def list_sources(
     request: Request,
     entity_type: str | None = Query(None),
     entity_id: uuid.UUID | None = Query(None),
-    page: int = Query(DEFAULT_PAGE, ge=1),
+    page: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE),
     per_page: int = Query(DEFAULT_PER_PAGE, ge=1),
     db: OrmSession = Depends(get_db),
 ) -> Page[SourceRecordOut]:

@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_api.deps import get_db
 from billcommons_api.pagination import (
+    MAX_PAGE,
     DEFAULT_PAGE,
     DEFAULT_PER_PAGE,
     Page,
@@ -25,7 +26,7 @@ def list_sessions(
     request: Request,
     jurisdiction: str | None = Query(None, description="Jurisdiction abbreviation, e.g. NC"),
     active: bool | None = Query(None),
-    page: int = Query(DEFAULT_PAGE, ge=1),
+    page: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE),
     per_page: int = Query(DEFAULT_PER_PAGE, ge=1),
     db: OrmSession = Depends(get_db),
 ) -> Page[SessionOut]:

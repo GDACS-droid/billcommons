@@ -29,6 +29,42 @@ const IMPACT_STYLE: Record<Entry["impact"], { label: string; className: string }
 const ENTRIES: Entry[] = [
   {
     date: "2026-08-02",
+    title: "Evidence packets are citable: permalink, snapshot id, downloadable JSON",
+    impact: "fix",
+    body: (
+      <>
+        A packet used to be a JSON blob in an agent transcript — nothing a
+        reader could open, and no way to tell later whether the record had
+        moved. Packets now carry a <code>how_to_cite</code> block: a one-line{" "}
+        <code>cite_as</code> sentence, a human <strong>permalink</strong> at{" "}
+        <code>/evidence/&#123;bill_id&#125;</code>, a JSON download, and a{" "}
+        <code>snapshot_id</code> that changes if and only if a cited fact
+        changes. <strong>Snapshots are not archived.</strong> The id is a
+        change detector, not a way to retrieve the version you cited — so keep
+        your own copy. The derived-status caveat rides inside the citation
+        sentence itself, because a footnote is exactly where that distinction
+        gets lost.
+      </>
+    ),
+  },
+  {
+    date: "2026-08-02",
+    title: "Offset pagination is bounded at 50,000 rows",
+    impact: "fix",
+    body: (
+      <>
+        <code>page</code> was bounded below and not above, so{" "}
+        <code>?page=1000000</code> became <code>OFFSET 50,000,000</code> — and
+        Postgres walks every one of those rows before discarding them. On a
+        public, anonymous API that is a one-line denial of service that costs
+        the caller nothing. The limit is on how <em>deep</em> one result set can
+        be paged, not on how much data you can reach: filter by jurisdiction or
+        session and page within that.
+      </>
+    ),
+  },
+  {
+    date: "2026-08-02",
     title: "Usage figures no longer count our own uptime monitor",
     impact: "fix",
     body: (

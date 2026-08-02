@@ -2,13 +2,23 @@ from __future__ import annotations
 
 import difflib
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import selectinload
 
 from billcommons_shared.enrollment import enrolled_outcome_is_uncaptured
+from billcommons_shared.evidence import (
+    citation_text,
+    download_url,
+    evidence_digest,
+    permalink,
+    reproducibility_note,
+    snapshot_id,
+)
 from billcommons_shared.normalize import normalize_bill_number
 
 from billcommons_api.deps import get_db
@@ -16,6 +26,7 @@ from billcommons_api.errors import bad_request, conflict, not_found
 from billcommons_api.etag import make_etag
 from billcommons_api.labels import attach_bill_labels
 from billcommons_api.pagination import (
+    MAX_PAGE,
     DEFAULT_PAGE,
     DEFAULT_PER_PAGE,
     Page,
@@ -81,7 +92,7 @@ def list_bills(
     subject: str | None = Query(
         None, description="Subject/topic tag, matched case-insensitively"
     ),
-    page: int = Query(DEFAULT_PAGE, ge=1),
+    page: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE),
     per_page: int = Query(DEFAULT_PER_PAGE, ge=1),
     db: OrmSession = Depends(get_db),
 ) -> Page[BillSummary]:
@@ -690,3 +701,159 @@ def compare_bill_versions(
         data=result,
         meta={"api_version": "v1", "request_id": request.state.request_id},
     )
+
+
+@router.get("/{bill_id}/evidence")
+def get_bill_evidence(
+    bill_id: uuid.UUID,
+    request: Request,
+    response: Response,
+    download: bool = Query(
+        False,
+        description="Serve as a file attachment named after the bill and snapshot.",
+    ),
+    question: str | None = Query(
+        None,
+        max_length=500,
+        description="What this packet was assembled to answer; echoed back into the artifact.",
+    ),
+    db: OrmSession = Depends(get_db),
+) -> Response:
+    """A citable evidence packet for one bill.
+
+    This is the endpoint the MCP tool's `permalink` and `download_url` point
+    at, so a packet quoted in a report resolves for a human reader instead of
+    being a UUID stranded in an agent transcript.
+
+    The `snapshot_id` is computed by `billcommons_shared.evidence`, the same
+    module the MCP tool uses. That sharing is the point: if the two surfaces
+    computed it independently they would eventually disagree about whether a
+    bill had changed, which is worse than not offering the id at all.
+
+    Returned as a raw JSONResponse rather than through a response_model so the
+    payload the caller downloads is byte-identical to the one that was hashed.
+    """
+    row = _get_bill_or_404(db, bill_id)
+    jur = db.get(Jurisdiction, row.jurisdiction_id)
+    sess = db.get(Session, row.session_id) if row.session_id else None
+
+    action_ids = list(
+        db.execute(select(BillAction.id).where(BillAction.bill_id == row.id)).scalars()
+    )
+    version_ids = list(
+        db.execute(select(BillVersion.id).where(BillVersion.bill_id == row.id)).scalars()
+    )
+    vote_ids = list(
+        db.execute(select(VoteEvent.id).where(VoteEvent.bill_id == row.id)).scalars()
+    )
+
+    digest = evidence_digest(
+        bill_id=str(row.id),
+        jurisdiction_code=jur.abbreviation if jur else None,
+        session_name=sess.name if sess else None,
+        identifier=row.identifier,
+        title=row.title,
+        status=row.status,
+        action_ids=action_ids,
+        version_ids=version_ids,
+        vote_event_ids=vote_ids,
+    )
+    snapshot = snapshot_id(digest)
+    retrieved_at = datetime.now(timezone.utc).isoformat()
+
+    session_end = sess.end_date if sess else None
+    payload = {
+        "bill_id": str(row.id),
+        "how_to_cite": {
+            "snapshot_id": snapshot,
+            "permalink": permalink(str(row.id)),
+            "download_url": download_url(str(row.id)),
+            "retrieved_at": retrieved_at,
+            "cite_as": citation_text(
+                identifier=row.identifier,
+                title=row.title,
+                jurisdiction_name=jur.name if jur else None,
+                session_name=sess.name if sess else None,
+                status=row.status,
+                retrieved_at=retrieved_at,
+                snapshot=snapshot,
+                bill_id=str(row.id),
+            ),
+            "reproducibility": reproducibility_note(),
+        },
+        "request": {
+            "question": question,
+            "jurisdiction_scope": (
+                f"{jur.name} ({jur.abbreviation}) only" if jur else "jurisdiction unknown"
+            ),
+            "scope_note": (
+                "This packet covers ONE bill. It is not a search of the "
+                "jurisdiction and cannot support a claim that no other bill "
+                "addresses this subject."
+            ),
+        },
+        "record": {
+            # Same honesty contract as the MCP packet: `status` is our
+            # conclusion, not the legislature's filing, and a citation is
+            # exactly where that distinction gets dropped.
+            "label": "official, except the fields named in derived_fields",
+            "derived_fields": ["status", "status_date"],
+            "derived_note": (
+                "`status` is derived by Bill Commons from the action record and "
+                "the session calendar, not reported by the jurisdiction. "
+                "`died_on_adjournment` in particular has no filed action behind "
+                "it: the session ended while the bill was pending. Cite it as a "
+                "Bill Commons conclusion. `status_date` is not populated."
+            ),
+            "data": {
+                "identifier": row.identifier,
+                "title": row.title,
+                "status": row.status,
+                "chamber": row.chamber,
+                "jurisdiction": jur.name if jur else None,
+                "jurisdiction_code": jur.abbreviation if jur else None,
+                "session": sess.name if sess else None,
+                "session_end_date": session_end.isoformat() if session_end else None,
+                "introduced_date": (
+                    row.introduced_date.isoformat() if row.introduced_date else None
+                ),
+                "source_url": row.source_url,
+                "enrolled_outcome_uncaptured": enrolled_outcome_is_uncaptured(
+                    row.status, session_end
+                ),
+            },
+        },
+        "counts": {
+            "actions": len(action_ids),
+            "versions": len(version_ids),
+            "vote_events": len(vote_ids),
+            # Stated rather than omitted: an absent hearings count reads as
+            # zero hearings, which is a claim we cannot support.
+            "hearings": None,
+        },
+        "hearings_note": (
+            "Bill Commons collects no hearing data. That is 'not collected', "
+            "never 'none scheduled'."
+        ),
+        "full_packet_note": (
+            "This is the citable summary. The complete packet -- full timeline, "
+            "member-level votes, every version URL -- is the MCP tool "
+            "build_legislative_evidence_packet, which returns the same "
+            "snapshot_id for the same record."
+        ),
+        "meta": {"api_version": "v1", "request_id": request.state.request_id},
+    }
+
+    headers = {}
+    if download:
+        safe = (row.identifier or str(row.id)).replace(" ", "-").replace("/", "-")
+        prefix = f"{jur.abbreviation}-" if jur else ""
+        headers["Content-Disposition"] = (
+            f'attachment; filename="billcommons-{prefix}{safe}-{snapshot}.json"'
+        )
+    # Weak validator on the snapshot: a client re-checking whether its citation
+    # still holds gets a 304 instead of the whole payload.
+    headers["ETag"] = f'W/"{snapshot}"'
+    if request.headers.get("if-none-match") == headers["ETag"]:
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(content=payload, headers=headers)

@@ -81,3 +81,19 @@ def test_request_id_header_present_and_matches_body(client):
     resp = client.get("/api/v1/jurisdictions")
     assert "X-Request-ID" in resp.headers
     assert resp.headers["X-Request-ID"] == resp.json()["meta"]["request_id"]
+
+
+def test_deep_pagination_is_bounded(client):
+    """`page` was bounded below and not above, so ?page=1000000 became
+    OFFSET 50,000,000 -- and Postgres walks every one of those rows before
+    discarding them. On a public, anonymous API that is a one-line denial of
+    service that costs the caller nothing."""
+    res = client.get("/api/v1/bills", params={"page": 1_000_000, "per_page": 50})
+    assert res.status_code == 422
+
+
+def test_the_bound_does_not_break_a_legitimate_browse(client):
+    """The deepest real browse -- the largest state's bill list at the maximum
+    page size -- must still work."""
+    res = client.get("/api/v1/bills", params={"page": 900, "per_page": 50})
+    assert res.status_code == 200

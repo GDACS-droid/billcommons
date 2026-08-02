@@ -118,12 +118,24 @@ def trace_legislative_history(bill_id: str) -> dict:
 
 
 @mcp.tool()
-def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = False) -> dict:
+def build_legislative_evidence_packet(
+    bill_id: str,
+    include_full_text: bool = False,
+    question: str | None = None,
+) -> dict:
     """Compile a citation-ready evidence packet for a bill: full official
     record, legislative history timeline, votes with member-level detail, and
-    hearings -- each explicitly labeled official vs. derived with source
-    URLs."""
-    return tools.build_legislative_evidence_packet(bill_id, include_full_text)
+    hearings -- each explicitly labeled official vs. derived with source URLs.
+
+    Returns a `how_to_cite` block with a one-line `cite_as` sentence, a human
+    `permalink`, a JSON `download_url`, and a `snapshot_id` that changes if and
+    only if a cited fact about the bill changes -- so a reader can check later
+    whether the citation still holds. Snapshots are NOT archived; the id is a
+    change detector, not a way to retrieve an older packet.
+
+    Pass `question` to record what the packet was assembled to answer; it is
+    echoed into the artifact so a filed packet carries its own scope."""
+    return tools.build_legislative_evidence_packet(bill_id, include_full_text, question)
 
 
 @mcp.tool()

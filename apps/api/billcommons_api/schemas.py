@@ -480,6 +480,14 @@ class SearchResult(BillSummary):
 class HealthOut(BaseModel):
     status: str
     database: str
+    # Pool census. Absent when the pool cannot be inspected -- never faked with
+    # zeros, which would read as "an idle, healthy pool" during exactly the
+    # failure this exists to diagnose.
+    #
+    # On 2026-08-02 the API was down for hours on pool exhaustion and the only
+    # way to see it was querying pg_stat_activity by hand from the box, after
+    # the fact. `checked_out` approaching `size + overflow` is the signature.
+    pool: dict | None = None
 
 
 class ReadyOut(BaseModel):

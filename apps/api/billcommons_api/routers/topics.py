@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session as OrmSession
 from billcommons_api.deps import get_db
 from billcommons_api.labels import attach_bill_labels
 from billcommons_api.pagination import (
+    MAX_PAGE,
     DEFAULT_PAGE,
     DEFAULT_PER_PAGE,
     Page,
@@ -127,7 +128,7 @@ def list_topics(request: Request, db: OrmSession = Depends(get_db)) -> TopicList
 def topic_bills(
     request: Request,
     slug: str,
-    page: int = Query(DEFAULT_PAGE, ge=1),
+    page: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE),
     per_page: int = Query(DEFAULT_PER_PAGE, ge=1),
     db: OrmSession = Depends(get_db),
 ) -> Page[BillSummary]:

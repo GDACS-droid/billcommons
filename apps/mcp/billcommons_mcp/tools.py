@@ -25,6 +25,7 @@ from sqlalchemy.orm import selectinload
 from billcommons_mcp.telemetry import record_invocation
 from billcommons_schema.models import (
     Bill,
+    BillAction,
     BillDocument,
     BillVersion,
     Jurisdiction,
@@ -34,6 +35,14 @@ from billcommons_schema.models import (
     VoteEvent,
 )
 from billcommons_shared.db import get_session
+from billcommons_shared.evidence import (
+    citation_text,
+    download_url,
+    evidence_digest,
+    permalink,
+    reproducibility_note,
+    snapshot_id,
+)
 from billcommons_shared.normalize import normalize_bill_number
 
 from billcommons_mcp.common import (
@@ -848,7 +857,11 @@ def trace_legislative_history(bill_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = False) -> dict[str, Any]:
+def build_legislative_evidence_packet(
+    bill_id: str,
+    include_full_text: bool = False,
+    question: str | None = None,
+) -> dict[str, Any]:
     """Compile a single evidence packet for a bill: full record, timeline,
     vote events with member votes, and hearings, each with official source
     URLs and explicit official-vs-derived labeling. Intended as citation-ready
@@ -915,10 +928,78 @@ def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = Fa
 
             jr = db.get(Jurisdiction, bill.jurisdiction_id)
             warning = coverage_warning_for_jurisdiction(db, jr) if jr else None
+            sess = db.get(SessionModel, bill.session_id) if bill.session_id else None
+
+            # Ids for the snapshot digest come from dedicated queries rather
+            # than the capped lists above: the digest must describe the BILL,
+            # not this packet's display limits. Two packets of the same bill
+            # under different caps are the same evidence and must hash alike.
+            all_vote_ids = list(
+                db.execute(select(VoteEvent.id).where(VoteEvent.bill_id == bid)).scalars()
+            )
+            all_action_ids = list(
+                db.execute(select(BillAction.id).where(BillAction.bill_id == bid)).scalars()
+            )
+            all_version_ids = list(
+                db.execute(select(BillVersion.id).where(BillVersion.bill_id == bid)).scalars()
+            )
+
+            digest = evidence_digest(
+                bill_id=str(bid),
+                jurisdiction_code=jr.abbreviation if jr else None,
+                session_name=sess.name if sess else None,
+                identifier=bill.identifier,
+                title=bill.title,
+                status=bill.status,
+                action_ids=all_action_ids,
+                version_ids=all_version_ids,
+                vote_event_ids=all_vote_ids,
+            )
+            snapshot = snapshot_id(digest)
+            retrieved_at = iso(utcnow())
 
             packet: dict[str, Any] = {
                 "bill_id": str(bid),
-                "generated_at": iso(utcnow()),
+                "generated_at": retrieved_at,
+                # Everything a reader needs to cite this and to find out later
+                # whether it still says the same thing.
+                # Named how_to_cite, not "citation": the packet already has a
+                # `citations` block of source URLs, and two near-identical keys
+                # in one object is how a consumer grabs the wrong one.
+                "how_to_cite": {
+                    "snapshot_id": snapshot,
+                    "permalink": permalink(str(bid)),
+                    "download_url": download_url(str(bid)),
+                    "retrieved_at": retrieved_at,
+                    "cite_as": citation_text(
+                        identifier=bill.identifier,
+                        title=bill.title,
+                        jurisdiction_name=jr.name if jr else None,
+                        session_name=sess.name if sess else None,
+                        status=bill.status,
+                        retrieved_at=retrieved_at,
+                        snapshot=snapshot,
+                        bill_id=str(bid),
+                    ),
+                    "reproducibility": reproducibility_note(),
+                },
+                # What this packet was assembled to answer, echoed back so the
+                # artifact carries its own scope. An agent that files a packet
+                # without the question it answered has produced a document
+                # nobody can check the relevance of.
+                "request": {
+                    "question": question,
+                    "jurisdiction_scope": (
+                        f"{jr.name} ({jr.abbreviation}) only"
+                        if jr
+                        else "single bill; jurisdiction unknown"
+                    ),
+                    "scope_note": (
+                        "This packet covers ONE bill. It is not a search of the "
+                        "jurisdiction and cannot support a claim that no other "
+                        "bill addresses this subject."
+                    ),
+                },
                 "official_record": {
                     # NOT wholly official, and saying so is the entire point of
                     # this packet. serialize_bill_full carries `status`, which

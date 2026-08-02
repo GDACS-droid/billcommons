@@ -10,6 +10,7 @@ from billcommons_api.deps import get_db
 from billcommons_api.errors import not_found
 from billcommons_api.etag import make_etag
 from billcommons_api.pagination import (
+    MAX_PAGE,
     DEFAULT_PAGE,
     DEFAULT_PER_PAGE,
     Page,
@@ -25,7 +26,7 @@ router = APIRouter(prefix="/jurisdictions", tags=["jurisdictions"])
 @router.get("", response_model=Page[JurisdictionOut])
 def list_jurisdictions(
     request: Request,
-    page: int = Query(DEFAULT_PAGE, ge=1),
+    page: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE),
     per_page: int = Query(DEFAULT_PER_PAGE, ge=1),
     db: Session = Depends(get_db),
 ) -> Page[JurisdictionOut]:

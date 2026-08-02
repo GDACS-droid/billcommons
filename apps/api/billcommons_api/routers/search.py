@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session as OrmSession
 from billcommons_api.deps import get_db
 from billcommons_api.errors import bad_request
 from billcommons_api.labels import attach_bill_labels
-from billcommons_api.pagination import Page, clamp_per_page, paginate
+from billcommons_api.pagination import MAX_PAGE, Page, clamp_per_page, paginate
 from billcommons_api.schemas import SearchResult
 from billcommons_api.search import VALID_SORTS, SearchFilters, run_search
 
@@ -29,7 +29,7 @@ def search(
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
     sort: str = Query("relevance"),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     per_page: int = Query(25, ge=1),
     db: OrmSession = Depends(get_db),
 ) -> Page[SearchResult]:
