@@ -82,11 +82,6 @@ export default function SiteFooter() {
                 </a>
               </li>
               <li>
-                <Link className="transition-colors hover:text-blue-800" href="/services">
-                  Custom tracking &amp; consulting
-                </Link>
-              </li>
-              <li>
                 <Link className="transition-colors hover:text-blue-800" href="/feedback">
                   Feedback
                 </Link>

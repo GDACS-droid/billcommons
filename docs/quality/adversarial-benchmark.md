@@ -32,11 +32,15 @@ Each question has a `failure_signature` — the observable symptom, written so i
 can be asserted on rather than eyeballed. Two harnesses:
 
 - **Deterministic** (`terminal_split_is_degenerate`, coverage severity, ambiguity
-  flags): assert directly against the API/MCP response. These belong in CI.
+  flags): assert directly against the API/MCP response. **These are wired up and
+  run on every test run** — a published benchmark nothing executes is a brochure:
+  - `apps/api/tests/test_benchmark_deterministic.py` — Q1.1, 1.4, 2.2, 2.3, 2.4,
+    3.2, 3.3, 6.2
+  - `apps/mcp/tests/test_benchmark_deterministic_mcp.py` — Q1.2, 4.1, 4.2, 6.1, 6.3
 - **Agentic** (hallucination bait, refusal quality): run an agent against the MCP
-  server and grade the transcript. The strongest assertion is *substring
-  provenance* — every bill number, session name, and date in the answer must
-  appear verbatim in some recorded tool response.
+  server and grade the transcript. Not automated yet. The strongest assertion is
+  *substring provenance* — every bill number, session name, and date in the answer
+  must appear verbatim in some recorded tool response.
 
 ---
 

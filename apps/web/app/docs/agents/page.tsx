@@ -122,6 +122,98 @@ curl "${API_DOCS_URL}/api/v1/changes?cursor=<next_cursor>&kind=status&ids=..."`}
         </p>
       </section>
 
+      <section className="mt-10">
+        <h2 className="text-lg font-semibold text-slate-900">
+          Three prompts, and what you should get back
+        </h2>
+        <p className="mt-2 text-sm text-slate-700">
+          Worked examples, including the answers that look unhelpful and are
+          actually correct. If your agent returns something confidently
+          different from the third one, it is guessing — see the{" "}
+          <Link href="/quality" className="underline">
+            data-integrity contract
+          </Link>
+          .
+        </p>
+
+        <h3 className="mt-6 text-sm font-semibold text-slate-900">
+          1. A straight lookup
+        </h3>
+        <CodeBlock label="prompt">
+          {`Did Hawaii SB 2135 become law? Give me the source URL.`}
+        </CodeBlock>
+        <p className="mt-2 text-sm text-slate-700">
+          <strong>Expect:</strong> enacted, with the signing date and a{" "}
+          <code>source_url</code> pointing at the Hawaii legislature. Note the
+          session adjourned 2026-05-08 and it was signed 2026-07-07 — a tracker
+          that assumes everything dies at adjournment gets this wrong.
+        </p>
+
+        <h3 className="mt-6 text-sm font-semibold text-slate-900">
+          2. A multi-state scan
+        </h3>
+        <CodeBlock label="prompt">
+          {`Search all states for bills about algorithmic pricing this session.
+For each one tell me the state, bill number, status, and whether the
+session has already adjourned. Flag any state where coverage is degraded.`}
+        </CodeBlock>
+        <p className="mt-2 text-sm text-slate-700">
+          <strong>Expect:</strong> a table, plus a{" "}
+          <code>coverage_warning</code> for any jurisdiction below the search
+          threshold. The warning is the point — it is what stops an empty
+          result from reading as &quot;no such legislation exists&quot;.
+        </p>
+
+        <h3 className="mt-6 text-sm font-semibold text-slate-900">
+          3. The one that should refuse
+        </h3>
+        <CodeBlock label="prompt">{`What happened to Texas HB 1?`}</CodeBlock>
+        <p className="mt-2 text-sm text-slate-700">
+          <strong>Expect a refusal.</strong> &quot;TX HB 1&quot; matches three
+          different sessions, so there is no single answer. A correct response
+          lists the candidate sessions and asks which one you mean. An answer
+          that confidently reports one status has picked a session for you
+          without saying so — that is the single most common failure in
+          legislative tooling, and it is why{" "}
+          <code>match_type: bill_number_ambiguous</code> exists.
+        </p>
+      </section>
+
+      <section className="mt-10">
+        <h2 className="text-lg font-semibold text-slate-900">
+          What this system will not tell you
+        </h2>
+        <p className="mt-2 text-sm text-slate-700">
+          Stated up front, because an agent that discovers a gap mid-answer
+          tends to fill it:
+        </p>
+        <ul className="mt-3 list-disc space-y-1.5 pl-5 text-sm text-slate-700">
+          <li>
+            <strong>No hearing schedules.</strong> A hearings tool exists but
+            there are zero hearing records. An empty result there means
+            &quot;not collected&quot;, never &quot;none scheduled&quot;.
+          </li>
+          <li>
+            <strong>No federal legislation.</strong> 50 states and DC only.
+          </li>
+          <li>
+            <strong>No historical sessions.</strong> Current session or biennium
+            only — not an archive.
+          </li>
+          <li>
+            <strong>Status is derived, not reported.</strong> Especially{" "}
+            <code>died_on_adjournment</code>, which exists precisely because
+            nothing was filed. Cite it as our conclusion, not the
+            legislature&apos;s.
+          </li>
+          <li>
+            <strong>Roughly 5% of bills have no status at all</strong>, on
+            purpose. States disagree on identical wording, so the derivation
+            returns nothing rather than guess.
+          </li>
+        </ul>
+      </section>
+
       <section className="mt-10 rounded-md border border-blue-200 bg-blue-50 p-5">
         <h2 className="text-base font-semibold text-slate-900">
           Not technical? You&apos;re done after step one.
