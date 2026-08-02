@@ -158,11 +158,51 @@ def search_legislation(
                 stmt = stmt.where(Bill.status.ilike(status))
 
             match_type = "full_text_search"
+            number_ambiguity: dict[str, Any] | None = None
+            number_truncated = False
             if bill_number_match:
-                number_stmt = stmt.where(Bill.identifier_norm == bill_number_match)
+                # Deterministic order + a real LIMIT. This path had neither:
+                # "HB 1" with no jurisdiction filter selected every HB 1 in the
+                # corpus, unbounded, and the payload then sliced it with
+                # `results[:limit_n]` -- so WHICH bills a caller saw depended on
+                # whatever order Postgres happened to return, and the rest
+                # vanished with no indication. The full-text branch below has
+                # always limited in SQL; this one did not.
+                #
+                # Fetch one extra row so truncation is detectable rather than
+                # inferred from a count that equals the limit by coincidence.
+                number_stmt = (
+                    stmt.where(Bill.identifier_norm == bill_number_match)
+                    .order_by(Bill.jurisdiction_id, Bill.session_id, Bill.id)
+                    .limit(limit_n + 1)
+                )
                 results = list(db.execute(number_stmt).unique().scalars().all())
+                number_truncated = len(results) > limit_n
+                results = results[:limit_n]
                 if results:
-                    match_type = "bill_number_exact"
+                    # A bill number matching several sessions is AMBIGUOUS, not
+                    # exact, and this project's whole contract is that the two
+                    # are never conflated -- TX HB 1 resolves to three sessions.
+                    # Reporting "bill_number_exact" for a multi-session match
+                    # told an agent it had THE bill when it had a pile of
+                    # candidates.
+                    distinct_sessions = {b.session_id for b in results}
+                    if len(distinct_sessions) > 1 or number_truncated:
+                        match_type = "bill_number_ambiguous"
+                        number_ambiguity = {
+                            "identifier": bill_number_match,
+                            "distinct_sessions": len(distinct_sessions),
+                            "message": (
+                                f"{bill_number_match!r} matches bills in "
+                                f"{len(distinct_sessions)} session(s)"
+                                + (" or more" if number_truncated else "")
+                                + ". This is ambiguous, not a single bill -- add a "
+                                "jurisdiction (and session) to resolve it, or use "
+                                "get_bill_record with a bill_id."
+                            ),
+                        }
+                    else:
+                        match_type = "bill_number_exact"
                 else:
                     results = None
             else:
@@ -190,6 +230,13 @@ def search_legislation(
                 "result_count": len(results[:limit_n]),
                 "meta": meta_envelope(),
             }
+            if number_ambiguity:
+                payload["ambiguity"] = number_ambiguity
+            if number_truncated:
+                # Explicit, per the same rule the evidence packet follows: a
+                # list that stops at the limit must say so, or "the list ends
+                # here" and "we stopped here" are indistinguishable.
+                payload["results_truncated"] = True
             if coverage_warning:
                 payload["coverage_warning"] = coverage_warning
             elif not jurisdiction_row and not results:

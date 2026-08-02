@@ -151,6 +151,10 @@ export interface Bill {
   bill_type?: string | null;
   status?: string | null;
   status_date?: string | null;
+  // True when the bill is `enrolled` but its session adjourned long enough ago
+  // that the executive-action window has closed -- so it is NOT awaiting
+  // signature; the final action simply was not captured.
+  enrolled_outcome_uncaptured?: boolean;
   introduced_date?: string | null;
   latest_action_text?: string | null;
   latest_action_date?: string | null;

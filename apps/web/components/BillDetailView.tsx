@@ -482,7 +482,16 @@ function QuickAnswers({
           }`
         : "its legislative session"
     } adjourned without final action on it. Bills that die this way are sometimes reintroduced in a later session.`,
-    enrolled: `Not yet law. ${ref} has passed both chambers and is enrolled, awaiting executive action (signature or veto)${asOf ? ` as of ${asOf}` : ""}.`,
+    enrolled: bill.enrolled_outcome_uncaptured
+      ? // The session adjourned long enough ago that the executive-action
+        // window has certainly closed -- every state bounds it, typically at
+        // 5-45 days from presentment. Saying "awaiting signature" here was
+        // asserting a wait that ended months ago: 2,192 Texas bills from a
+        // session that closed in June 2025 all read that way.
+        `${ref} passed both chambers and was enrolled, but its session adjourned long enough ago that the executive-action window has closed. Bill Commons did not capture the final signature or veto, so the outcome is unknown here — check the ${
+          jurisdictionCode ?? "state"
+        } legislature's own record.`
+      : `Not yet law. ${ref} has passed both chambers and is enrolled, awaiting executive action (signature or veto)${asOf ? ` as of ${asOf}` : ""}.`,
     passed_both: `Not yet law. ${ref} has passed both chambers but has not been enacted${asOf ? ` as of ${asOf}` : ""}.`,
     passed_one_chamber: `Not yet. ${ref} has passed one chamber and awaits action in the other${asOf ? ` as of ${asOf}` : ""}.`,
     in_committee: `Not yet. ${ref} is in committee${asOf ? ` as of ${asOf}` : ""} and has not come to a final vote.`,

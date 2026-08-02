@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import selectinload
 
+from billcommons_shared.enrollment import enrolled_outcome_is_uncaptured
 from billcommons_shared.normalize import normalize_bill_number
 
 from billcommons_api.deps import get_db
@@ -388,7 +389,16 @@ def get_bill(
 ) -> BillDetail:
     row = _get_bill_or_404(db, bill_id)
     response.headers["ETag"] = make_etag(row.id, row.updated_at)
-    return attach_bill_labels(db, [BillDetail.model_validate(row)])[0]
+    detail = attach_bill_labels(db, [BillDetail.model_validate(row)])[0]
+    # An enrolled bill whose session closed long ago is not awaiting anything.
+    # See BillDetail.enrolled_outcome_uncaptured.
+    session_end = db.execute(
+        select(Session.end_date).where(Session.id == row.session_id)
+    ).scalar_one_or_none()
+    detail.enrolled_outcome_uncaptured = enrolled_outcome_is_uncaptured(
+        row.status, session_end
+    )
+    return detail
 
 
 @router.get("/{bill_id}/versions", response_model=list[BillVersionOut])

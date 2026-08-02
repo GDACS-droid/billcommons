@@ -86,6 +86,15 @@ class BillDetail(BillSummary):
     source_name: str | None = None
     retrieved_at: datetime | None = None
     upstream_updated_at: datetime | None = None
+    # True when status is `enrolled` but the session adjourned long enough ago
+    # that the executive-action window has certainly closed -- so the bill is
+    # NOT "awaiting signature", we just never captured the final action.
+    #
+    # The status stays `enrolled` because that is what the record supports;
+    # this flag exists so consumers stop asserting a wait that has ended. Of
+    # 4,918 enrolled bills, 3,274 were in this state on 2026-08-02, including
+    # 2,192 Texas bills from a session that ended fourteen months earlier.
+    enrolled_outcome_uncaptured: bool = False
 
 
 class BillBatchEnvelope(BaseModel):
