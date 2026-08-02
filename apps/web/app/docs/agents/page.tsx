@@ -181,6 +181,42 @@ session has already adjourned. Flag any state where coverage is degraded.`}
 
       <section className="mt-10">
         <h2 className="text-lg font-semibold text-slate-900">
+          Producing something a human can check
+        </h2>
+        <p className="mt-2 text-sm text-slate-700">
+          <code>build_legislative_evidence_packet</code> returns a{" "}
+          <code>how_to_cite</code> block. Pass what you were asked as{" "}
+          <code>question</code> and the packet records its own scope.
+        </p>
+        <ul className="mt-3 list-disc space-y-1.5 pl-5 text-sm text-slate-700">
+          <li>
+            <code>cite_as</code> — one quotable sentence. It names derived
+            status as derived, inside the sentence, because that is the field a
+            quoter drops first.
+          </li>
+          <li>
+            <code>permalink</code> — a page a person can open. Put this in the
+            answer, not the bill UUID.
+          </li>
+          <li>
+            <code>snapshot_id</code> — changes if and only if a cited fact
+            changes.{" "}
+            <strong>
+              It is a change detector, not an archive: nothing is stored
+            </strong>
+            , so it cannot retrieve the version that was cited. If the exact
+            wording matters later, keep a copy.
+          </li>
+        </ul>
+        <p className="mt-3 text-sm text-slate-700">
+          The same packet is available without MCP at{" "}
+          <code>GET /api/v1/bills/&#123;id&#125;/evidence</code>, and returns the
+          same <code>snapshot_id</code> for the same record.
+        </p>
+      </section>
+
+      <section className="mt-10">
+        <h2 className="text-lg font-semibold text-slate-900">
           What this system will not tell you
         </h2>
         <p className="mt-2 text-sm text-slate-700">
