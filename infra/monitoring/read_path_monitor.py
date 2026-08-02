@@ -75,6 +75,21 @@ PROBES = [
     ),
 ]
 
+# The MCP server is a SEPARATE Railway service with its own container and its
+# own dependencies. It stayed healthy through the API outage on 2026-08-02 --
+# and then went down on its own hours later, on an unpinned `mcp` release, while
+# every probe above stayed green. Watching the API does not watch this.
+#
+# A real tool call, not just a handshake: `initialize` succeeds without touching
+# the database, so it cannot see the failure mode that matters.
+MCP_URL = "https://mcp.billcommons.org/mcp"
+MCP_TOOL_CALL = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {"name": "get_jurisdiction_coverage", "arguments": {}},
+}
+
 
 def telegram(text: str) -> bool:
     """Best-effort Telegram alert (crawl_stall_monitor.py pattern). Never raises."""
@@ -133,8 +148,41 @@ def probe(label: str, url: str, must_contain: str | None) -> tuple[bool, str, fl
         return False, f"{type(exc).__name__}: {str(exc)[:120]}", time.monotonic() - started
 
 
+def probe_mcp() -> tuple[bool, str, float]:
+    """Call a real MCP tool. Never raises."""
+    started = time.monotonic()
+    try:
+        req = urllib.request.Request(
+            MCP_URL,
+            data=json.dumps(MCP_TOOL_CALL).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "User-Agent": UA,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as res:
+            body = res.read(65536).decode("utf-8", "replace")
+            elapsed = time.monotonic() - started
+            if res.status != 200:
+                return False, f"HTTP {res.status}", elapsed
+            # A structured MCP error still comes back as HTTP 200.
+            if '"isError":true' in "".join(body.split()):
+                return False, "tool returned isError", elapsed
+            if "jurisdiction_count" not in body:
+                return False, "tool response missing expected payload", elapsed
+            if elapsed > SLOW_SECONDS:
+                return False, f"slow: {elapsed:.1f}s", elapsed
+            return True, f"{elapsed:.2f}s", elapsed
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}", time.monotonic() - started
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {str(exc)[:120]}", time.monotonic() - started
+
+
 def main() -> int:
     results = [(label, *probe(label, url, needle)) for label, url, needle in PROBES]
+    results.append(("mcp tool call", *probe_mcp()))
     failures = [(label, detail) for label, ok, detail, _ in results if not ok]
     healthy = not failures
 
@@ -167,7 +215,7 @@ def main() -> int:
             detail = "\n".join(f"  ✗ {label}: {why}" for label, why in failures)
             telegram(
                 "🔴 Bill Commons: READ PATH DOWN\n\n"
-                f"{len(failures)} of {len(PROBES)} probes failing "
+                f"{len(failures)} of {len(results)} probes failing "
                 f"({consecutive} consecutive runs)\n\n"
                 f"{detail}\n\n"
                 "Note: /health returns HTTP 200 even when the DB is unreachable "
@@ -191,7 +239,7 @@ def main() -> int:
 
     for label, ok, detail, _ in results:
         print(f"  [{'ok' if ok else 'FAIL'}] {label}: {detail}")
-    print(f"[{effective}] {len(failures)}/{len(PROBES)} failing")
+    print(f"[{effective}] {len(failures)}/{len(results)} failing")
     return 0 if healthy else 1
 
 

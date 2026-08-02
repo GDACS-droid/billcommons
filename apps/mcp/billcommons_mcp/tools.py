@@ -13,6 +13,8 @@ trigram similarity scores, diff results) and is always labeled as such.
 """
 from __future__ import annotations
 
+import time
+
 import difflib
 import uuid
 from typing import Any
@@ -20,6 +22,7 @@ from typing import Any
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import selectinload
 
+from billcommons_mcp.telemetry import record_invocation
 from billcommons_schema.models import (
     Bill,
     BillDocument,
@@ -91,16 +94,39 @@ def _bill_query_base():
     )
 
 
-def _run_tool(fn):
+def _run_tool(fn, tool_name: str | None = None):
     """Wrap a tool body so ToolError -> structured error dict, and any other
     exception is converted to a generic structured error rather than leaking
-    a traceback to the client."""
+    a traceback to the client.
+
+    Also the single chokepoint where usage is recorded. Every tool passes
+    through here, so instrumenting it means no tool can be added later and
+    silently go unmeasured -- which is how we ended up unable to answer
+    "is anyone using this?" in the first place.
+    """
+    started = time.monotonic()
+    outcome, error_code = "ok", None
     try:
-        return fn()
+        result = fn()
+        # A structured error dict is still an error, even though nothing raised.
+        if isinstance(result, dict) and isinstance(result.get("error"), dict):
+            outcome = "error"
+            error_code = result["error"].get("code")
+        return result
     except ToolError as e:
+        outcome, error_code = "error", getattr(e, "code", "tool_error")
         return e.to_dict()
     except Exception as e:  # noqa: BLE001 - convert to structured tool error
+        outcome, error_code = "error", "internal_error"
         return {"error": {"code": "internal_error", "message": str(e)}}
+    finally:
+        if tool_name:
+            record_invocation(
+                tool=tool_name,
+                outcome=outcome,
+                error_code=error_code,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +287,7 @@ def search_legislation(
         finally:
             db.close()
 
-    return _run_tool(body)
+    return _run_tool(body, "search_legislation")
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +387,7 @@ def get_bill_record(
         finally:
             db.close()
 
-    return _run_tool(body)
+    return _run_tool(body, "get_bill_record")
 
 
 # ---------------------------------------------------------------------------
@@ -503,7 +529,7 @@ def compare_bill_versions(
         finally:
             db.close()
 
-    return _run_tool(body)
+    return _run_tool(body, "compare_bill_versions")
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +610,7 @@ def find_similar_bills(bill_id: str, limit: int | None = None) -> dict[str, Any]
         finally:
             db.close()
 
-    return _run_tool(body)
+    return _run_tool(body, "find_similar_bills")
 
 
 # ---------------------------------------------------------------------------
@@ -659,7 +685,7 @@ def get_vote_details(vote_event_id: str | None = None, bill_id: str | None = Non
         finally:
             db.close()
 
-    return _run_tool(body)
+    return _run_tool(body, "get_vote_details")
 
 
 # ---------------------------------------------------------------------------
@@ -722,7 +748,7 @@ def get_upcoming_hearings(
         finally:
             db.close()
 
-    return _run_tool(body)
+    return _run_tool(body, "get_upcoming_hearings")
 
 
 # ---------------------------------------------------------------------------
@@ -814,7 +840,7 @@ def trace_legislative_history(bill_id: str) -> dict[str, Any]:
         finally:
             db.close()
 
-    return _run_tool(body)
+    return _run_tool(body, "trace_legislative_history")
 
 
 # ---------------------------------------------------------------------------
@@ -979,7 +1005,7 @@ def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = Fa
         finally:
             db.close()
 
-    return _run_tool(body)
+    return _run_tool(body, "build_legislative_evidence_packet")
 
 
 # ---------------------------------------------------------------------------
@@ -1051,7 +1077,7 @@ def get_jurisdiction_coverage(state: str | None = None) -> dict[str, Any]:
         finally:
             db.close()
 
-    return _run_tool(body)
+    return _run_tool(body, "get_jurisdiction_coverage")
 
 
 # ---------------------------------------------------------------------------
@@ -1104,4 +1130,4 @@ def get_active_sessions(jurisdiction: str | None = None) -> dict[str, Any]:
         finally:
             db.close()
 
-    return _run_tool(body)
+    return _run_tool(body, "get_active_sessions")

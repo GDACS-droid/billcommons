@@ -485,3 +485,26 @@ class HealthOut(BaseModel):
 class ReadyOut(BaseModel):
     ready: bool
     database: str
+
+
+class ToolUsageRow(BaseModel):
+    tool: str
+    ok: int = 0
+    error: int = 0
+    median_ms: int | None = None
+
+
+class UsageStatsOut(BaseModel):
+    """Aggregate MCP tool usage.
+
+    Counts CALLS, not connections. A directory health prober connects, lists
+    the tools and disconnects -- that is not usage, and conflating the two is
+    how a project convinces itself it has adoption it does not have.
+    """
+
+    window_days: int
+    total_tool_calls: int
+    tools: list[ToolUsageRow]
+    error_codes: dict[str, int]
+    note: str
+    meta: dict

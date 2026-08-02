@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 
@@ -9,8 +11,10 @@ from billcommons_api.schemas import (
     MortalityJurisdictionRow,
     MortalityReportEnvelope,
     MortalityTotals,
+    ToolUsageRow,
+    UsageStatsOut,
 )
-from billcommons_schema.models import Bill, Jurisdiction, Session
+from billcommons_schema.models import Bill, Jurisdiction, Session, ToolInvocation
 
 router = APIRouter(prefix="/stats", tags=["stats"])
 
@@ -143,6 +147,75 @@ def mortality_report(
                 if grand_total
                 else None
             ),
+        ),
+        meta={"api_version": "v1", "request_id": request.state.request_id},
+    )
+
+
+@router.get("/usage", response_model=UsageStatsOut)
+def usage_stats(
+    request: Request,
+    days: int = Query(30, ge=1, le=365),
+    db: OrmSession = Depends(get_db),
+) -> UsageStatsOut:
+    """Aggregate MCP tool usage. Public, because the honest number is the point.
+
+    This exists because "is anyone using this?" was unanswerable. Over one log
+    window the MCP server served 139 successful POSTs and exactly ONE tool
+    call: everything else connected, listed the tools, and disconnected --
+    directory health probers, not researchers. Connections are not usage, and
+    only tool CALLS distinguish them.
+
+    Published rather than kept private: a project whose pitch is that it
+    refuses to dress up what it does not know should not quietly sit on its own
+    adoption numbers. Aggregate only -- no IP, no query text, no bill ids.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = db.execute(
+        select(
+            ToolInvocation.tool,
+            ToolInvocation.outcome,
+            func.count().label("n"),
+            func.percentile_disc(0.5)
+            .within_group(ToolInvocation.duration_ms)
+            .label("median_ms"),
+        )
+        .where(ToolInvocation.occurred_at >= since)
+        .group_by(ToolInvocation.tool, ToolInvocation.outcome)
+    ).all()
+
+    by_tool: dict[str, dict] = {}
+    for tool, outcome, n, median_ms in rows:
+        b = by_tool.setdefault(
+            tool, {"tool": tool, "ok": 0, "error": 0, "median_ms": None}
+        )
+        b[outcome] = n
+        if outcome == "ok" and median_ms is not None:
+            b["median_ms"] = int(median_ms)
+
+    errors = db.execute(
+        select(ToolInvocation.error_code, func.count())
+        .where(
+            ToolInvocation.occurred_at >= since,
+            ToolInvocation.outcome == "error",
+        )
+        .group_by(ToolInvocation.error_code)
+        .order_by(func.count().desc())
+    ).all()
+
+    total_calls = sum(b["ok"] + b["error"] for b in by_tool.values())
+    return UsageStatsOut(
+        window_days=days,
+        total_tool_calls=total_calls,
+        tools=[
+            ToolUsageRow(**b)
+            for b in sorted(by_tool.values(), key=lambda b: -(b["ok"] + b["error"]))
+        ],
+        error_codes={code or "unknown": n for code, n in errors},
+        note=(
+            "MCP tool calls only. Connections, tool listings and health probes "
+            "are deliberately excluded -- they are not usage. No IP, query text "
+            "or bill ids are recorded."
         ),
         meta={"api_version": "v1", "request_id": request.state.request_id},
     )

@@ -23,6 +23,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     Numeric,
@@ -665,3 +666,30 @@ class Feedback(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class ToolInvocation(Base):
+    """One MCP tool call, recorded in aggregate (see migration 0008).
+
+    Exists because "is anyone using this?" was unanswerable. The MCP logs
+    showed 139 successful POSTs and, over the same window, exactly ONE tool
+    call -- the rest were connect, list tools, disconnect: directory health
+    probers, not users. Nothing distinguished them without recording it.
+
+    Aggregate-only by construction: no IP, no query text, no bill ids, no
+    auth. Enough to tell a research session from a health check; not enough to
+    profile a caller.
+    """
+
+    __tablename__ = "tool_invocations"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+    tool: Mapped[str] = mapped_column(Text, nullable=False)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    # Error CLASS only. Never the message -- messages can quote user input.
+    error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    client_family: Mapped[str | None] = mapped_column(Text, nullable=True)
