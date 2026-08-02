@@ -63,6 +63,12 @@ class BillSummary(OrmModel):
     short_title: str | None = None
     bill_type: str | None = None
     status: str | None = None
+    # ALWAYS NULL TODAY. The column exists in the model and is read by the
+    # API search path, both MCP serializers and the web bill page, but nothing
+    # writes it -- 0 of 209,814 bills have a value. Do not build on it until an
+    # ingest or status job populates it; until then a consumer should date a
+    # status from latest_action_date, or for died_on_adjournment from the
+    # session end date, and not from this field.
     status_date: date_ | None = None
     introduced_date: date_ | None = None
     latest_action_text: str | None = None

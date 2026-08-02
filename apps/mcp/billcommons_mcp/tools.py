@@ -838,7 +838,24 @@ def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = Fa
                 "bill_id": str(bid),
                 "generated_at": iso(utcnow()),
                 "official_record": {
-                    "label": "official",
+                    # NOT wholly official, and saying so is the entire point of
+                    # this packet. serialize_bill_full carries `status`, which
+                    # this project DERIVES -- classification, then a narrow text
+                    # fallback, then None when unsure -- and `died_on_adjournment`
+                    # is inferred from the session calendar with no filed action
+                    # behind it at all. Labelling that block "official" beside
+                    # citations.bill_source_url told an agent the legislature had
+                    # said it. No legislature said it; we concluded it.
+                    "label": "official, except the fields named in derived_fields",
+                    "derived_fields": ["status", "status_date"],
+                    "derived_note": (
+                        "`status` is derived by Bill Commons from the action "
+                        "record and the session calendar, not reported by the "
+                        "jurisdiction. `died_on_adjournment` in particular has no "
+                        "filed action behind it: the session ended while the bill "
+                        "was pending. Cite it as a Bill Commons conclusion, not as "
+                        "an official record. `status_date` is not populated."
+                    ),
                     "data": serialize_bill_full(bill, include_text=include_full_text),
                 },
                 "legislative_history": {
@@ -851,8 +868,31 @@ def build_legislative_evidence_packet(bill_id: str, include_full_text: bool = Fa
                     "data": [serialize_vote_event(v) for v in votes],
                 },
                 "hearings": {
-                    "label": "official",
+                    # Bill Commons collects NO hearing data -- legislative_events
+                    # is empty corpus-wide. An empty list labelled "official"
+                    # reads as "the legislature scheduled none", which is a
+                    # different and much stronger claim than "we do not have
+                    # this". That is precisely the absence-vs-ignorance
+                    # confusion this packet exists to prevent, so the label has
+                    # to carry it.
+                    "label": (
+                        "official"
+                        if hearings
+                        else "not collected -- Bill Commons has no hearing data"
+                    ),
                     "data": [serialize_event(h) for h in hearings],
+                    **(
+                        {}
+                        if hearings
+                        else {
+                            "absence_note": (
+                                "An empty list here means Bill Commons does not "
+                                "collect hearing events. It does NOT mean no "
+                                "hearings were scheduled. Check the jurisdiction's "
+                                "own calendar."
+                            )
+                        }
+                    ),
                 },
                 "citations": {
                     "bill_source_url": bill.source_url,

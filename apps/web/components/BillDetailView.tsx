@@ -135,7 +135,10 @@ export default function BillDetailView({
 
       <dl className="surface-card mt-8 grid grid-cols-2 gap-x-5 gap-y-6 p-5 text-sm sm:grid-cols-3">
         <Field label="Introduced" value={bill.introduced_date} />
-        <Field label="Status date" value={bill.status_date} />
+        {/* No "Status date" field: bills.status_date is NULL for all 209,814
+            rows -- the column is declared and read in several places but never
+            written by any ingest or status job, so this rendered an
+            always-blank cell. See the note on BillDetail.status_date. */}
         <Field
           label="Latest action"
           value={
@@ -459,6 +462,10 @@ function QuickAnswers({
   sponsors: { name?: string | null; primary?: boolean | null; classification?: string | null }[] | null;
 }) {
   const ref = `${jurisdictionCode ? `${jurisdictionCode} ` : ""}${bill.identifier}`;
+  // In practice this is always latest_action_date: status_date is unpopulated
+  // corpus-wide (see BillDetail.status_date). The fallback is kept so the
+  // prose starts using the real value the moment that column is populated,
+  // rather than needing to be found and changed again.
   const asOf = bill.status_date ?? bill.latest_action_date;
 
   const passAnswers: Record<string, string> = {
