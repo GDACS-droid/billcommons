@@ -100,12 +100,25 @@ def mortality_report(
         for key in totals:
             totals[key] += bucket[key]
         total = bucket["total"]
+        # The cross-state comparable figure. See MortalityJurisdictionRow:
+        # which of the two terminal buckets a state uses is decided by whether
+        # its clerk files a death action, so only their SUM is comparable.
+        did_not_pass = bucket["died_on_adjournment"] + bucket["killed"]
         items.append(
             MortalityJurisdictionRow(
                 **bucket,
                 enacted_pct=round(100 * bucket["enacted"] / total, 1) if total else None,
                 died_on_adjournment_pct=(
                     round(100 * bucket["died_on_adjournment"] / total, 1) if total else None
+                ),
+                killed_pct=round(100 * bucket["killed"] / total, 1) if total else None,
+                did_not_pass=did_not_pass,
+                did_not_pass_pct=round(100 * did_not_pass / total, 1) if total else None,
+                # Zero in one bucket means the split reflects only this
+                # jurisdiction's recording convention.
+                terminal_split_is_degenerate=(
+                    did_not_pass > 0
+                    and (bucket["died_on_adjournment"] == 0 or bucket["killed"] == 0)
                 ),
                 has_active_session=bucket["jurisdiction_code"] in active,
             )
@@ -116,6 +129,14 @@ def mortality_report(
         data=items,
         totals=MortalityTotals(
             **totals,
+            did_not_pass=totals["died_on_adjournment"] + totals["killed"],
+            did_not_pass_pct=(
+                round(
+                    100 * (totals["died_on_adjournment"] + totals["killed"]) / grand_total, 1
+                )
+                if grand_total
+                else None
+            ),
             enacted_pct=round(100 * totals["enacted"] / grand_total, 1) if grand_total else None,
             died_on_adjournment_pct=(
                 round(100 * totals["died_on_adjournment"] / grand_total, 1)

@@ -181,6 +181,27 @@ class MortalityJurisdictionRow(BaseModel):
     means an enrolled bill awaiting signature or a session whose end date we
     have not confirmed yet -- `has_active_session` is published so a reader
     can tell those apart.
+
+    DO NOT COMPARE THE died_on_adjournment/killed SPLIT ACROSS STATES.
+
+    The two buckets are separated by whether the legislature FILED an action
+    recording the death, not by what happened to the bill. A clerk who files
+    "Died in Committee" or "Session Sine Die" produces `killed` (the text
+    classifier matches those strings); a clerk who files nothing produces
+    `died_on_adjournment` (the calendar rule infers it). Both bills met the
+    identical fate: the session ended while they were pending.
+
+    The distribution proves it is convention, not behaviour. Of the 43
+    jurisdictions with more than 200 terminal bills, ELEVEN have zero `killed`
+    and THREE have zero `died_on_adjournment`: CA, WI and NY report 100%
+    `killed`; MA, MO, IA, WA, NC, MD, CT, KY, ND and CO report 100%
+    `died_on_adjournment`. Real legislatures are not bimodal like that.
+
+    So: use `did_not_pass` (= died_on_adjournment + killed) for any cross-state
+    comparison; it is unaffected by filing convention. Use the split only
+    within a single jurisdiction, where the convention is constant.
+    `terminal_split_is_degenerate` flags the jurisdictions where the split
+    carries no information at all.
     """
 
     jurisdiction_code: str
@@ -193,6 +214,16 @@ class MortalityJurisdictionRow(BaseModel):
     unknown: int
     enacted_pct: float | None = None
     died_on_adjournment_pct: float | None = None
+    # Cross-state comparable. The died_on_adjournment/killed SPLIT is not --
+    # see the note on MortalityJurisdictionRow. Use this for any per-state
+    # comparison, and the split only within a single jurisdiction.
+    did_not_pass: int = 0
+    did_not_pass_pct: float | None = None
+    killed_pct: float | None = None
+    # True when this jurisdiction has zero bills in one of the two terminal
+    # buckets, which means its recording convention -- not its legislative
+    # behaviour -- determines which bucket it uses.
+    terminal_split_is_degenerate: bool = False
     has_active_session: bool
 
 
@@ -201,6 +232,8 @@ class MortalityTotals(BaseModel):
     enacted: int
     died_on_adjournment: int
     killed: int
+    did_not_pass: int = 0
+    did_not_pass_pct: float | None = None
     pending: int
     unknown: int
     enacted_pct: float | None = None

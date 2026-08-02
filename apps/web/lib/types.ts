@@ -259,6 +259,14 @@ export type SearchResult = BillSummary;
 
 // apps/api/billcommons_api/routers/stats.py
 export interface MortalityRow {
+  // did_not_pass (= died_on_adjournment + killed) is the only cross-state
+  // comparable mortality figure; which of the two buckets a state uses is
+  // decided by whether its clerk files a death action. See
+  // MortalityJurisdictionRow in apps/api/billcommons_api/schemas.py.
+  did_not_pass?: number;
+  did_not_pass_pct?: number | null;
+  killed_pct?: number | null;
+  terminal_split_is_degenerate?: boolean;
   jurisdiction_code: string;
   jurisdiction_name: string;
   total: number;

@@ -105,12 +105,17 @@ export default async function MortalityReportPage() {
 
 function ReportBody({ report }: { report: MortalityReport }) {
   const { totals } = report;
+  // Ranked by the CROSS-STATE COMPARABLE figure. Ranking by adjournment
+  // mortality alone sorted states by their clerks' filing habits: California,
+  // Wisconsin and New York record a death action for every bill and so score
+  // 0%, while Massachusetts, Missouri and Iowa record none and score ~100%.
+  // Same underlying fate, opposite ends of the table.
   const rows = report.data
     .slice()
-    .sort(
-      (a, b) =>
-        (b.died_on_adjournment_pct ?? -1) - (a.died_on_adjournment_pct ?? -1)
-    );
+    .sort((a, b) => (b.did_not_pass_pct ?? -1) - (a.did_not_pass_pct ?? -1));
+  const degenerateCount = report.data.filter(
+    (r) => r.terminal_split_is_degenerate
+  ).length;
 
   return (
     <>
@@ -156,7 +161,26 @@ function ReportBody({ report }: { report: MortalityReport }) {
         />
       </div>
 
-      <div className="surface-card mt-10 overflow-x-auto">
+      <div className="mt-10 rounded-lg border-l-[3px] border-amber-500 bg-amber-50 px-4 py-3">
+        <p className="text-sm text-slate-800">
+          <strong>Read the last two columns together, not separately.</strong>{" "}
+          Whether a bill that ran out of time lands in{" "}
+          <em>Died on adjournment</em> or <em>Killed</em> depends on whether the
+          legislature <em>files an action</em> recording the death — not on what
+          happened to the bill. A clerk who files “Died in Committee” produces a
+          recorded kill; a clerk who files nothing leaves it to the calendar.
+          Both bills met the same end.
+        </p>
+        <p className="mt-2 text-sm text-slate-800">
+          {degenerateCount} of the {report.data.length} jurisdictions here report{" "}
+          <strong>zero</strong> bills in one of those two columns, which is a
+          reporting convention rather than a legislative one. Compare states
+          using <em>Did not pass</em>, which is unaffected; the split is
+          meaningful only within a single state.
+        </p>
+      </div>
+
+      <div className="surface-card mt-4 overflow-x-auto">
         <table className="data-table min-w-[820px]">
           <thead>
             <tr>
@@ -166,6 +190,7 @@ function ReportBody({ report }: { report: MortalityReport }) {
               <th className="text-right">Died on adjournment</th>
               <th className="text-right">Killed</th>
               <th className="text-right">Pending</th>
+              <th className="text-right">Did not pass</th>
               <th className="text-right">Enact rate</th>
               <th className="text-right">Adjournment mortality</th>
             </tr>
@@ -195,13 +220,24 @@ function ReportBody({ report }: { report: MortalityReport }) {
                 <td className="text-right tabular-nums">
                   {fmt(row.pending + row.unknown)}
                 </td>
+                <td className="text-right tabular-nums font-medium">
+                  {row.did_not_pass_pct != null ? `${row.did_not_pass_pct}%` : "—"}
+                </td>
                 <td className="text-right tabular-nums">
                   {row.enacted_pct != null ? `${row.enacted_pct}%` : "—"}
                 </td>
-                <td className="text-right tabular-nums font-medium">
+                <td className="text-right tabular-nums text-slate-600">
                   {row.died_on_adjournment_pct != null
                     ? `${row.died_on_adjournment_pct}%`
                     : "—"}
+                  {row.terminal_split_is_degenerate ? (
+                    <span
+                      title="This jurisdiction reports zero bills in one of the two terminal buckets — the split reflects its filing convention, not its legislative behaviour."
+                      className="ml-1 cursor-help text-amber-600"
+                    >
+                      *
+                    </span>
+                  ) : null}
                 </td>
               </tr>
             ))}

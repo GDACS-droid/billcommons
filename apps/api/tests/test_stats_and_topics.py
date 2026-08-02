@@ -79,3 +79,55 @@ def test_topic_bills_is_a_standard_pageable_list(client):
 def test_unknown_topic_is_a_404_not_an_empty_page(client):
     resp = client.get("/api/v1/topics/underwater-basket-weaving")
     assert resp.status_code == 404
+
+
+def test_mortality_exposes_a_cross_state_comparable_figure():
+    """did_not_pass must equal died_on_adjournment + killed, per row and total.
+
+    Which of the two terminal buckets a state uses is decided by whether its
+    clerk files a death action -- CA/WI/NY report 100% killed, MA/MO/IA report
+    100% died_on_adjournment -- so only the SUM is comparable across states.
+    The report publishes a per-state table, so it has to offer the comparable
+    number rather than inviting a comparison of a filing convention.
+    """
+    from fastapi.testclient import TestClient
+    from billcommons_api.app import create_app
+
+    client = TestClient(create_app())
+    body = client.get("/api/v1/stats/mortality").json()
+
+    for row in body["data"]:
+        assert row["did_not_pass"] == row["died_on_adjournment"] + row["killed"], (
+            f"{row['jurisdiction_code']}: did_not_pass is not the sum of the two "
+            "terminal buckets"
+        )
+        if row["total"]:
+            assert row["did_not_pass_pct"] == round(
+                100 * row["did_not_pass"] / row["total"], 1
+            )
+        # The degenerate flag must be exactly "one bucket is empty".
+        expected = row["did_not_pass"] > 0 and (
+            row["died_on_adjournment"] == 0 or row["killed"] == 0
+        )
+        assert row["terminal_split_is_degenerate"] is expected, (
+            f"{row['jurisdiction_code']}: degenerate flag disagrees with the buckets"
+        )
+
+    totals = body["totals"]
+    assert totals["did_not_pass"] == totals["died_on_adjournment"] + totals["killed"]
+
+
+def test_mortality_flags_the_states_where_the_split_is_meaningless():
+    """At least one real jurisdiction must trip the degenerate flag.
+
+    If this ever returns nothing, either the corpus changed shape or the flag
+    stopped working -- both are worth knowing, because the per-state table is
+    published as citable.
+    """
+    from fastapi.testclient import TestClient
+    from billcommons_api.app import create_app
+
+    client = TestClient(create_app())
+    rows = client.get("/api/v1/stats/mortality").json()["data"]
+    degenerate = [r for r in rows if r["terminal_split_is_degenerate"]]
+    assert degenerate, "no jurisdiction flagged degenerate — flag is likely broken"
