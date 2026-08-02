@@ -24,6 +24,7 @@ from mcp.server.fastmcp import FastMCP
 
 from billcommons_mcp import tools
 from billcommons_mcp.rate_limit import RateLimitMiddleware
+from billcommons_mcp.telemetry import ClientFamilyMiddleware
 
 mcp = FastMCP(
     name="billcommons",
@@ -142,9 +143,13 @@ def get_active_sessions(jurisdiction: str | None = None) -> dict:
 
 def build_app():
     """Return the ASGI app: FastMCP's Streamable HTTP Starlette app wrapped
-    in the per-IP rate limiter. Used both by `__main__` (uvicorn.run below)
-    and by tests that want to boot the app in-process."""
-    app = mcp.streamable_http_app()
+    in the client tagger and the per-IP rate limiter. Used both by `__main__`
+    (uvicorn.run below) and by tests that want to boot the app in-process.
+
+    Order matters: the rate limiter is outermost so a rejected request never
+    reaches the tagger, and the tagger sits directly outside FastMCP so the
+    ContextVar it sets is still current when a tool records its invocation."""
+    app = ClientFamilyMiddleware(mcp.streamable_http_app())
     return RateLimitMiddleware(app)
 
 

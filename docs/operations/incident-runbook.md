@@ -153,7 +153,7 @@ Pool exhaustion now returns **503 + `Retry-After: 5`**, not a 500 traceback.
 
 | Monitor | Watches | Cadence |
 |---|---|---|
-| `com.gdacs.billcommons-read-path.timer` | API + website read path | 5 min |
+| `com.gdacs.billcommons-read-path.timer` | API + website + a real MCP tool call | 2 min |
 | `com.gdacs.billcommons-stall-monitor.timer` | full-text crawl (write path) | 10 min |
 | `com.gdacs.billcommons-alerts.timer` | nightly topic digests | daily 08:30 |
 
@@ -161,3 +161,35 @@ Both monitors alert to Telegram on a state change, after two consecutive
 failures, with a 6-hour re-notify. Silence from a monitor is not health — check
 `systemctl --user list-timers 'com.gdacs.billcommons*'` if you have not seen one
 fire.
+
+### The read-path monitor must not be counted as usage
+
+The monitor calls a real MCP tool (not just `initialize`, which succeeds
+against a dead database). At a 2-minute cadence that is ~720 tool calls a day
+landing in `tool_invocations` — the table whose entire purpose is answering
+"is anyone using this?". On 2026-08-02 it was **65 of 67 rows** within two
+hours of both shipping.
+
+It now sends `x-billcommons-probe`, which
+`billcommons_mcp.telemetry.ClientFamilyMiddleware` turns into
+`client_family = 'self-probe'`, and `/api/v1/stats/usage` excludes.
+
+**This can break silently.** The tag rides a ContextVar set in ASGI middleware
+and read inside the tool; if a future `mcp` release dispatches the request
+through a task group that does not copy context, the tag is lost, no error is
+raised anywhere, and the only symptom is a usage figure that flatters us. The
+in-process test cannot cover that leg (the stack deadlocks on the streaming
+response), so **verify it against production after any `mcp` upgrade or change
+to `build_app()`**:
+
+```bash
+# Should be ~0 untagged coverage calls; every monitor row must be 'self-probe'.
+psql "$DATABASE_URL" -c "
+  select coalesce(client_family,'(null)') fam, count(*)
+    from tool_invocations
+   where tool='get_jurisdiction_coverage'
+     and occurred_at > now() - interval '30 minutes'
+   group by 1;"
+```
+
+A NULL family on a 120s cadence means the tagger stopped working.

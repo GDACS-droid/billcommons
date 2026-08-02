@@ -29,6 +29,25 @@ const IMPACT_STYLE: Record<Entry["impact"], { label: string; className: string }
 const ENTRIES: Entry[] = [
   {
     date: "2026-08-02",
+    title: "Usage figures no longer count our own uptime monitor",
+    impact: "fix",
+    body: (
+      <>
+        The read-path monitor calls a real MCP tool every two minutes on purpose
+        — a handshake succeeds against a dead database, so nothing cheaper
+        detects an outage. Within two hours of shipping usage telemetry, that
+        monitor was <strong>65 of the 67 recorded tool calls</strong>, and{" "}
+        <code>/stats/usage</code> was publishing the total while its own note
+        claimed health probes were excluded. Monitor calls are now tagged at the
+        MCP edge, excluded from every figure, and reported separately as{" "}
+        <code>self_probe_calls</code> so the subtraction is checkable. The
+        earlier rows were attributed rather than deleted: all 65 sit on an exact
+        120-second cadence with no interleaved call.
+      </>
+    ),
+  },
+  {
+    date: "2026-08-02",
     title: "Adjournment and clock-deaths are not comparable across states",
     impact: "semantics",
     body: (

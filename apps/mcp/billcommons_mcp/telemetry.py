@@ -18,19 +18,40 @@ Three rules, all load-bearing:
 """
 from __future__ import annotations
 
+import contextvars
 import os
 import sys
 import threading
 
 from billcommons_schema.models import ToolInvocation
 from billcommons_shared.db import get_session
+from billcommons_shared.telemetry_constants import PROBE_FAMILY, PROBE_HEADER as _PROBE_HEADER_STR
 
 # Set BILLCOMMONS_TELEMETRY=0 to disable (tests, local dev).
 _ENABLED = os.environ.get("BILLCOMMONS_TELEMETRY", "1") not in ("0", "false", "no")
 
-# The client family from the MCP initialize handshake, if the client
-# volunteered one. Process-global because MCP holds one client per process
-# connection; a wrong value here is a mislabelled row, never a leak.
+# Reserved family for our OWN read-path monitor. It calls a real tool on a
+# 2-minute cadence deliberately (a handshake cannot see a dead database), which
+# means it manufactures ~720 "tool calls" a day. Within hours of shipping
+# telemetry it was 61 of 63 recorded calls -- the monitor built to prove the
+# service was alive was drowning the metric built to prove anyone was using it.
+# Marked at the edge, excluded at the read side, never silently deleted.
+
+# Header the monitor sets to identify itself. A header rather than a User-Agent
+# match: UA strings are guessable, and anything a stranger can spoof to make
+# their calls vanish from a public usage figure is a bad idea.
+PROBE_HEADER = _PROBE_HEADER_STR.encode("ascii")
+
+# The client family for the request being served. A ContextVar, not a global:
+# the streamable-HTTP session manager serves concurrent requests in one
+# process, so a module-level global would attribute rows to whichever client
+# connected most recently.
+_client_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "billcommons_client_family", default=None
+)
+
+# Fallback for the family reported at the MCP initialize handshake, when the
+# transport does not carry the request context through to the tool call.
 _client_family: str | None = None
 _lock = threading.Lock()
 
@@ -43,6 +64,41 @@ def set_client_family(name: str | None) -> None:
     global _client_family
     with _lock:
         _client_family = name.strip().lower()[:40] if name else None
+
+
+def current_client_family() -> str | None:
+    """Per-request family if the transport propagated it, else the handshake
+    value. Never raises."""
+    try:
+        scoped = _client_ctx.get()
+    except LookupError:  # pragma: no cover - default makes this unreachable
+        scoped = None
+    return scoped or _client_family
+
+
+class ClientFamilyMiddleware:
+    """ASGI middleware that tags the request with a client family.
+
+    Sits outside FastMCP because FastMCP (1.28) exposes no hook to read HTTP
+    headers from inside a tool -- there is no `get_http_headers` in this
+    release, and reaching into the session lifecycle to add one would be a lot
+    of fragile machinery for a label.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers") or [])
+        family = PROBE_FAMILY if headers.get(PROBE_HEADER) else None
+        token = _client_ctx.set(family)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _client_ctx.reset(token)
 
 
 def record_invocation(
@@ -64,7 +120,7 @@ def record_invocation(
                     outcome=outcome,
                     error_code=error_code[:80] if error_code else None,
                     duration_ms=duration_ms,
-                    client_family=_client_family,
+                    client_family=current_client_family(),
                 )
             )
             db.commit()

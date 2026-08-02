@@ -82,7 +82,15 @@ PROBES = [
 #
 # A real tool call, not just a handshake: `initialize` succeeds without touching
 # the database, so it cannot see the failure mode that matters.
+#
+# That has a cost: at a 2-minute cadence this manufactures ~720 tool calls a
+# day, and the usage telemetry shipped the same day exists precisely to answer
+# "is anyone actually calling these tools?". Within hours the monitor was 61 of
+# 63 recorded calls. PROBE_HEADER tags every one so /stats/usage can subtract
+# them -- see billcommons_mcp.telemetry.PROBE_FAMILY. Do not remove it, or the
+# adoption number silently becomes a measurement of this file.
 MCP_URL = "https://mcp.billcommons.org/mcp"
+PROBE_HEADER = "x-billcommons-probe"
 MCP_TOOL_CALL = {
     "jsonrpc": "2.0",
     "id": 1,
@@ -159,6 +167,7 @@ def probe_mcp() -> tuple[bool, str, float]:
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
                 "User-Agent": UA,
+                PROBE_HEADER: "read-path-monitor",
             },
         )
         with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as res:

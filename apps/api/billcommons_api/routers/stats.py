@@ -15,6 +15,7 @@ from billcommons_api.schemas import (
     UsageStatsOut,
 )
 from billcommons_schema.models import Bill, Jurisdiction, Session, ToolInvocation
+from billcommons_shared.telemetry_constants import PROBE_FAMILY
 
 router = APIRouter(prefix="/stats", tags=["stats"])
 
@@ -169,8 +170,27 @@ def usage_stats(
     Published rather than kept private: a project whose pitch is that it
     refuses to dress up what it does not know should not quietly sit on its own
     adoption numbers. Aggregate only -- no IP, no query text, no bill ids.
+
+    Our own read-path monitor calls a real tool every two minutes, on purpose:
+    a handshake succeeds against a dead database, so nothing cheaper detects
+    the outage that prompted it. That makes it ~720 synthetic calls a day, and
+    for the first hours of this table's life it was 61 of 63 rows. Those calls
+    are tagged at the MCP edge and excluded here, and the count we subtracted
+    is reported as `self_probe_calls` so the arithmetic is checkable.
     """
     since = datetime.now(timezone.utc) - timedelta(days=days)
+    is_probe = ToolInvocation.client_family == PROBE_FAMILY
+    real_traffic = ToolInvocation.client_family.is_distinct_from(PROBE_FAMILY)
+
+    self_probe_calls = (
+        db.execute(
+            select(func.count())
+            .select_from(ToolInvocation)
+            .where(ToolInvocation.occurred_at >= since, is_probe)
+        ).scalar_one()
+        or 0
+    )
+
     rows = db.execute(
         select(
             ToolInvocation.tool,
@@ -180,7 +200,7 @@ def usage_stats(
             .within_group(ToolInvocation.duration_ms)
             .label("median_ms"),
         )
-        .where(ToolInvocation.occurred_at >= since)
+        .where(ToolInvocation.occurred_at >= since, real_traffic)
         .group_by(ToolInvocation.tool, ToolInvocation.outcome)
     ).all()
 
@@ -198,6 +218,7 @@ def usage_stats(
         .where(
             ToolInvocation.occurred_at >= since,
             ToolInvocation.outcome == "error",
+            real_traffic,
         )
         .group_by(ToolInvocation.error_code)
         .order_by(func.count().desc())
@@ -212,9 +233,11 @@ def usage_stats(
             for b in sorted(by_tool.values(), key=lambda b: -(b["ok"] + b["error"]))
         ],
         error_codes={code or "unknown": n for code, n in errors},
+        self_probe_calls=self_probe_calls,
         note=(
-            "MCP tool calls only. Connections, tool listings and health probes "
-            "are deliberately excluded -- they are not usage. No IP, query text "
+            "MCP tool calls only. Connections and tool listings are excluded -- "
+            "they are not usage. Calls from our own uptime monitor are excluded "
+            "too, and counted separately as self_probe_calls. No IP, query text "
             "or bill ids are recorded."
         ),
         meta={"api_version": "v1", "request_id": request.state.request_id},

@@ -506,5 +506,10 @@ class UsageStatsOut(BaseModel):
     total_tool_calls: int
     tools: list[ToolUsageRow]
     error_codes: dict[str, int]
+    # Calls made by our OWN read-path monitor, excluded from every figure
+    # above. Reported rather than dropped: a usage number that quietly
+    # subtracts an unnamed quantity is not more honest than one that overstates
+    # -- the reader has to be able to check the subtraction.
+    self_probe_calls: int = 0
     note: str
     meta: dict
