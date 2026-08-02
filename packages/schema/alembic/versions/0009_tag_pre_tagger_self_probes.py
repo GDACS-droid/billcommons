@@ -41,9 +41,15 @@ down_revision: Union[str, None] = "0008"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-# The moment the tagger was deployed. Every row before it is untagged by
-# definition, so this bound is what makes the update safe to re-run.
-CUTOFF = "2026-08-02 21:30:00+00"
+# The moment this migration actually ran against production, between the
+# 21:22:08Z row (backfilled) and the 21:24:03Z row (which it did not touch).
+#
+# Deliberately NOT a round number in the future. The first draft said 21:30Z,
+# four minutes ahead of the clock, which would have tagged the next two monitor
+# ticks as self-probes before the tagger was even live -- manufacturing the
+# evidence that the tagger worked. Any bound past the run time makes this
+# migration capable of hiding the failure it is meant to correct.
+CUTOFF = "2026-08-02 21:23:00+00"
 
 
 def upgrade() -> None:
