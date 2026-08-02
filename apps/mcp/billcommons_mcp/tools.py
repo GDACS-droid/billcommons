@@ -192,13 +192,22 @@ def search_legislation(
                         number_ambiguity = {
                             "identifier": bill_number_match,
                             "distinct_sessions": len(distinct_sessions),
+                            # Tell the caller what they are actually missing.
+                            # Saying "add a jurisdiction" to someone who already
+                            # passed jurisdiction="TX" reads as the tool not
+                            # having listened, and sends them round the same loop.
                             "message": (
                                 f"{bill_number_match!r} matches bills in "
                                 f"{len(distinct_sessions)} session(s)"
                                 + (" or more" if number_truncated else "")
                                 + ". This is ambiguous, not a single bill -- add a "
-                                "jurisdiction (and session) to resolve it, or use "
-                                "get_bill_record with a bill_id."
+                                + (
+                                    "session"
+                                    if jurisdiction_row is not None
+                                    else "jurisdiction (and session)"
+                                )
+                                + " to resolve it, or use get_bill_record with a "
+                                "bill_id."
                             ),
                         }
                     else:
