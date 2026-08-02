@@ -768,6 +768,21 @@ def get_upcoming_hearings(
 def trace_legislative_history(bill_id: str) -> dict[str, Any]:
     """Full chronological legislative history for a bill: actions, versions,
     vote events, and related bills, merged into one timeline."""
+    return _run_tool(_trace_legislative_history_body(bill_id), "trace_legislative_history")
+
+
+def _trace_legislative_history_body(bill_id: str):
+    """The work, without the telemetry wrapper.
+
+    build_legislative_evidence_packet composes this. When it called the public
+    tool instead, ONE user request recorded TWO invocations -- and since the
+    packet is the flagship, the usage figures were quietly inflated by exactly
+    the tool we most wanted an honest count of. Same failure as the uptime
+    monitor: the metric measuring itself.
+
+    Callers that are themselves tools must use this; only the public entry
+    point records.
+    """
 
     def body() -> dict[str, Any]:
         db = get_session()
@@ -849,7 +864,7 @@ def trace_legislative_history(bill_id: str) -> dict[str, Any]:
         finally:
             db.close()
 
-    return _run_tool(body, "trace_legislative_history")
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -919,7 +934,8 @@ def build_legislative_evidence_packet(
             hearings = list(db.execute(hearing_stmt).unique().scalars().all())
             hearings_truncated = total_hearings > MAX_EVIDENCE_HEARINGS
 
-            history = trace_legislative_history(str(bid))
+            # Unrecorded internal call: see _trace_legislative_history_body.
+            history = _trace_legislative_history_body(str(bid))()
             full_timeline = history.get("timeline", [])
             total_history_items = len(full_timeline) if isinstance(full_timeline, list) else 0
             if isinstance(full_timeline, list):

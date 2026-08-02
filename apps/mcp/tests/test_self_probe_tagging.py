@@ -92,3 +92,26 @@ def test_the_monitor_actually_sends_the_header():
         / "read_path_monitor.py"
     ).read_text()
     assert PROBE_HEADER in src, "read_path_monitor.py no longer sends the probe header"
+
+
+def test_composed_tools_do_not_double_count():
+    """One user request must record ONE invocation.
+
+    build_legislative_evidence_packet composes the legislative-history query.
+    While it called the PUBLIC tool to do that, every packet recorded two
+    invocations -- and since the packet is the flagship, usage was inflated for
+    exactly the tool we most wanted an honest count of. Verified in production
+    on 2026-08-02: nine recorded calls, four of which were phantom traces
+    emitted by four real packet requests.
+
+    Same failure as the uptime monitor, one layer in: the metric measuring
+    itself. Any future tool that composes another must call the _body form.
+    """
+    import inspect
+
+    from billcommons_mcp import tools
+
+    src = inspect.getsource(tools.build_legislative_evidence_packet)
+    assert "_trace_legislative_history_body" in src
+    # The bare public name would re-enter _run_tool and record a second row.
+    assert "= trace_legislative_history(" not in src
