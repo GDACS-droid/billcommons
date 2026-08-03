@@ -189,9 +189,102 @@ def probe_mcp() -> tuple[bool, str, float]:
         return False, f"{type(exc).__name__}: {str(exc)[:120]}", time.monotonic() - started
 
 
+def _get_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as res:
+        return json.loads(res.read(1_000_000).decode("utf-8", "replace"))
+
+
+def probe_filter_is_applied() -> tuple[bool, str, float]:
+    """A query filter that is silently ignored looks exactly like a working one.
+
+    FastAPI drops unknown query parameters without complaint, so a filter that
+    was never deployed -- or was renamed, or removed -- answers HTTP 200 with a
+    perfectly well-formed payload. On 2026-08-03 `?sponsor=rouson` returned all
+    1,964 Florida bills instead of 45, and every status-code and body-shape
+    check passed. The only thing that distinguishes applied from ignored is
+    that an applied filter CHANGES THE RESULT.
+
+    Two requests, one assertion: a deliberately impossible sponsor must return
+    zero, while the same query without it returns some. If those ever agree,
+    the filter is not running.
+    """
+    started = time.monotonic()
+    try:
+        base = _get_json("https://api.billcommons.org/api/v1/bills?jurisdiction=FL&per_page=1")
+        filtered = _get_json(
+            "https://api.billcommons.org/api/v1/bills"
+            "?jurisdiction=FL&per_page=1&sponsor=zzzznotarealsponsorname"
+        )
+        elapsed = time.monotonic() - started
+        base_total = base["pagination"]["total"]
+        filtered_total = filtered["pagination"]["total"]
+        if base_total == 0:
+            return False, "baseline query returned nothing", elapsed
+        if filtered_total != 0:
+            return (
+                False,
+                f"sponsor filter ignored: impossible name matched {filtered_total} "
+                f"of {base_total} bills",
+                elapsed,
+            )
+        return True, f"{elapsed:.2f}s", elapsed
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {str(exc)[:120]}", time.monotonic() - started
+
+
+def probe_topic_hubs_resolve() -> tuple[bool, str, float]:
+    """Every topic the API advertises must have a page that renders.
+
+    These are two different systems: the API computes the topic list, and the
+    website resolves a slug against a SEPARATELY cached copy of it. On
+    2026-08-03 they disagreed -- /topics listed seven trackers while four of
+    them 404'd, because Vercel's Data Cache persists across deployments and the
+    slug lookup was reading a list that predated them. Neither side was down,
+    and no probe of either side alone could see it.
+
+    Checked from the list rather than a hardcoded set, so a topic added later
+    is covered without editing this file.
+
+    Throttled, unlike every other probe here. This one fetches a full page per
+    topic, and at the monitor's 2-minute cadence that is ~5,800 extra website
+    requests a day to detect a condition that can only change on a deploy. Once
+    an hour is well inside the window where a broken hub still gets caught the
+    same day it ships.
+    """
+    started = time.monotonic()
+    try:
+        topics = _get_json("https://api.billcommons.org/api/v1/topics")["data"]
+        if not topics:
+            return False, "API advertises no topics", time.monotonic() - started
+        broken = []
+        for topic in topics:
+            slug = topic["slug"]
+            url = f"https://billcommons.org/topics/{slug}"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": UA})
+                with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as res:
+                    if res.status != 200:
+                        broken.append(f"{slug}:{res.status}")
+            except urllib.error.HTTPError as exc:
+                broken.append(f"{slug}:{exc.code}")
+        elapsed = time.monotonic() - started
+        if broken:
+            return False, f"topic hubs unreachable: {', '.join(broken)}", elapsed
+        return True, f"{len(topics)} hubs, {elapsed:.2f}s", elapsed
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {str(exc)[:120]}", time.monotonic() - started
+
+
 def main() -> int:
     results = [(label, *probe(label, url, needle)) for label, url, needle in PROBES]
     results.append(("mcp tool call", *probe_mcp()))
+    results.append(("bills sponsor filter applied", *probe_filter_is_applied()))
+    # Hourly, not every run -- see probe_topic_hubs_resolve's docstring. Keyed
+    # off the wall clock rather than a counter in the state file so a monitor
+    # restart cannot reset it into running every time.
+    if datetime.now(timezone.utc).minute < 2:
+        results.append(("topic hubs resolve", *probe_topic_hubs_resolve()))
     failures = [(label, detail) for label, ok, detail, _ in results if not ok]
     healthy = not failures
 
