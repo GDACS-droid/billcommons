@@ -5,12 +5,15 @@ import PageHeader from "@/components/PageHeader";
 import { apiGet } from "@/lib/api";
 import type { Topic } from "@/lib/types";
 
-const TOPICS_REVALIDATE = 21600;
+// Short, and deliberately matched to TOPIC_LIST_REVALIDATE in [slug]/page.tsx:
+// these two share one Data Cache entry, and a long TTL on it is what made a
+// newly shipped topic 404 on its own hub while appearing in this list.
+const TOPICS_REVALIDATE = 300;
 
 export const metadata: Metadata = {
   title: "Topic trackers",
   description:
-    "Cross-state legislative trackers: every artificial intelligence, data privacy, and cryptocurrency bill in all 50 states + DC, with live status.",
+    "Cross-state legislative trackers: every artificial intelligence, data privacy, youth online safety, platform accountability, cybersecurity, cryptocurrency, and local government bill in all 50 states + DC, with live status.",
   alternates: { canonical: "/topics" },
 };
 

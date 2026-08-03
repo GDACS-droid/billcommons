@@ -15,6 +15,23 @@ import type { BillSummary, Topic } from "@/lib/types";
 const TOPIC_REVALIDATE = 21600;
 
 /**
+ * The topic LIST is cached far more briefly than a topic's bills.
+ *
+ * Vercel's Data Cache persists across deployments, so a 6-hour TTL on the list
+ * meant a freshly deployed build could still resolve slugs against a list that
+ * predated them -- and `find()` returning undefined here is a 404, not a stale
+ * number. Four new topics 404'd for exactly that reason, and which ones 404'd
+ * shifted between deploys as different cache entries expired, which is what
+ * gave it away.
+ *
+ * The list is seven rows. Re-fetching it every few minutes costs almost
+ * nothing and makes a newly shipped topic reachable rather than pending a
+ * cache expiry. The bills BELOW a topic keep the long TTL -- they are the
+ * expensive part and staleness there is merely stale, not a missing page.
+ */
+const TOPIC_LIST_REVALIDATE = 300;
+
+/**
  * How many pages of bills a topic hub renders (50 per page).
  *
  * fetchAllPages defaults to 50 pages, and it issues every page after the first
@@ -51,7 +68,7 @@ interface Props {
  */
 export async function generateStaticParams() {
   const result = await apiGet<TopicsEnvelope>("/api/v1/topics", undefined, {
-    revalidate: TOPIC_REVALIDATE,
+    revalidate: TOPIC_LIST_REVALIDATE,
   });
   // Returning [] on a failed build-time fetch leaves every topic to on-demand
   // rendering rather than failing the build -- degraded, not broken.
@@ -64,7 +81,7 @@ interface TopicsEnvelope {
 
 async function getTopic(slug: string): Promise<Topic | null | undefined> {
   const result = await apiGet<TopicsEnvelope>("/api/v1/topics", undefined, {
-    revalidate: TOPIC_REVALIDATE,
+    revalidate: TOPIC_LIST_REVALIDATE,
   });
   // null = API down (render an error), undefined = topic does not exist (404).
   if (!result.ok) return null;
