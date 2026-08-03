@@ -277,12 +277,21 @@ class AlertSubscribeRequest(BaseModel):
     email: str = Field(max_length=320)
     kind: str = "topic"
     target: str = Field(max_length=100)
+    jurisdiction: str | None = Field(
+        default=None,
+        max_length=2,
+        description=(
+            "Narrow the digest to one jurisdiction, e.g. 'FL'. Omit for a "
+            "national digest across all 50 states + DC."
+        ),
+    )
 
 
 class AlertSubscribeResponse(BaseModel):
     subscribed: bool
     kind: str
     target: str
+    jurisdiction: str | None = None
     meta: dict
 
 

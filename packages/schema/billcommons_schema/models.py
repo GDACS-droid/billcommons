@@ -636,6 +636,10 @@ class AlertSubscription(Base):
     email: Mapped[str] = mapped_column(Text, nullable=False)
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     target: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Jurisdiction abbreviation to narrow the digest to, or NULL for national
+    #: (see migration 0011). A city or county affairs office wants its own
+    #: legislature, not all 51.
+    jurisdiction: Mapped[str | None] = mapped_column(Text, nullable=True)
     unsubscribe_token: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
@@ -644,7 +648,17 @@ class AlertSubscription(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("email", "kind", "target", name="uq_alert_email_kind_target"),
+        # NULLS NOT DISTINCT: `jurisdiction` is nullable, and under the default
+        # NULLS DISTINCT the constraint would stop binding national
+        # subscriptions entirely. See migration 0011.
+        UniqueConstraint(
+            "email",
+            "kind",
+            "target",
+            "jurisdiction",
+            name="uq_alert_email_kind_target_jurisdiction",
+            postgresql_nulls_not_distinct=True,
+        ),
         Index("ix_alert_subscriptions_active", "active"),
     )
 

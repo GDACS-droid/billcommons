@@ -44,6 +44,14 @@ class ResponseMeta(BaseModel):
     source_freshness: str | None = None
     api_version: str
     request_id: str
+    #: Why an empty `data` list is empty: "not_collected" (we hold none of this
+    #: dataset) or "no_match" (we hold it, nothing matched). Absent on any
+    #: non-empty response -- a populated result needs no explanation.
+    data_status: str | None = None
+    #: Human/agent-readable form of `data_status`, stating the inference NOT to
+    #: draw. Carried in meta rather than as a bare empty array so a caller
+    #: cannot report "none exist" without having been told otherwise.
+    notice: str | None = None
 
 
 class Page(BaseModel, Generic[T]):
@@ -71,6 +79,8 @@ def paginate(
     api_version: str,
     request_id: str,
     source_freshness: str | None = None,
+    data_status: str | None = None,
+    notice: str | None = None,
 ) -> Page[T]:
     return Page[T](
         data=items,
@@ -84,6 +94,8 @@ def paginate(
             source_freshness=source_freshness,
             api_version=api_version,
             request_id=request_id,
+            data_status=data_status,
+            notice=notice,
         ),
     )
 

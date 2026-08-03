@@ -5,6 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_api.deps import get_db
+from billcommons_api.emptiness import HEARINGS, describe_empty
 from billcommons_api.pagination import (
     MAX_PAGE,
     DEFAULT_PAGE,
@@ -52,6 +53,9 @@ def list_events(
         item = LegislativeEventOut.model_validate(event_row)
         item.jurisdiction_abbreviation = jurisdiction_row.abbreviation if jurisdiction_row else None
         items.append(item)
+    data_status, notice = (None, None)
+    if not items:
+        data_status, notice = describe_empty(db, LegislativeEvent, HEARINGS)
     return paginate(
         items,
         page=page,
@@ -59,4 +63,6 @@ def list_events(
         total=total,
         api_version="v1",
         request_id=request.state.request_id,
+        data_status=data_status,
+        notice=notice,
     )

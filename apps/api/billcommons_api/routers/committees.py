@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_api.deps import get_db
+from billcommons_api.emptiness import COMMITTEES, describe_empty
 from billcommons_api.errors import not_found
 from billcommons_api.etag import make_etag
 from billcommons_api.pagination import (
@@ -56,6 +57,9 @@ def list_committees(
         .all()
     )
     items = [CommitteeOut.model_validate(r) for r in rows]
+    data_status, notice = (None, None)
+    if not items:
+        data_status, notice = describe_empty(db, Committee, COMMITTEES)
     return paginate(
         items,
         page=page,
@@ -63,6 +67,8 @@ def list_committees(
         total=total,
         api_version="v1",
         request_id=request.state.request_id,
+        data_status=data_status,
+        notice=notice,
     )
 
 

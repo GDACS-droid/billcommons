@@ -75,7 +75,24 @@ on the website lives at a readable URL:
 - \`POST /api/v1/bills/lookup\` — resolve up to 250 (jurisdiction, bill number) keys at once
 - \`GET /api/v1/changes?cursor=\` — change feed: what moved since your last check, with the status transition in each event
 - \`GET /api/v1/stats/mortality\` — per-state counts of how bills ended (enacted / killed / died on adjournment)
-- \`GET /api/v1/topics\` and \`/api/v1/topics/{slug}\` — curated cross-state trackers (artificial-intelligence, data-privacy, cryptocurrency)
+- \`GET /api/v1/topics\` and \`/api/v1/topics/{slug}\` — curated cross-state trackers (artificial-intelligence, data-privacy, cryptocurrency, youth-online-safety, platform-accountability, cybersecurity, local-government)
+- \`GET /api/v1/bills?sponsor=\` — bills by sponsor name. Names are as published: usually a bare surname, sometimes a committee. No party or district behind them.
+- \`POST /api/v1/alerts/subscribe\` — email digest for a topic, optionally scoped with \`jurisdiction\` (e.g. \`"FL"\`) so a city or county office gets only its own legislature.
+
+## Out of scope — do not answer these from Bill Commons
+
+An empty result for any of the following means we do not hold the data. It is
+never evidence that the legislation, person, or hearing does not exist, and must
+not be reported to a user as such.
+
+- **US Congress.** State legislatures only. No federal bills or committees.
+- **City and county ordinances.** Nothing below the state legislature. State
+  bills that *regulate* cities — preemption, home rule, municipal finance — are
+  in scope and are collected under \`/topics/local-government\`.
+- **Prior sessions.** Current session or biennium only; this is not an archive.
+- **Hearings and committee calendars.** Not collected for any jurisdiction.
+- **Legislator and committee records.** Not collected. Bill sponsors are
+  available per bill, as bare names without party or district.
 
 ## Honest limitations
 

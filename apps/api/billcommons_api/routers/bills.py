@@ -94,6 +94,17 @@ def list_bills(
     subject: str | None = Query(
         None, description="Subject/topic tag, matched case-insensitively"
     ),
+    sponsor: str | None = Query(
+        None,
+        min_length=2,
+        description=(
+            "Sponsor name, case-insensitive substring. Sponsor names are stored "
+            "as the source published them -- usually a bare surname ('Rouson'), "
+            "sometimes a committee ('Appropriations Committee on Health'). There "
+            "is no legislator directory behind this, so a surname shared by two "
+            "members returns both, and party/district cannot be filtered on."
+        ),
+    ),
     page: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE),
     per_page: int = Query(DEFAULT_PER_PAGE, ge=1),
     db: OrmSession = Depends(get_db),
@@ -153,6 +164,18 @@ def list_bills(
         )
         stmt = stmt.where(subject_match.exists())
         count_stmt = count_stmt.where(subject_match.exists())
+    if sponsor:
+        # EXISTS for the same reason as subject: a bill has many sponsors, and
+        # a join would emit it once per match. lower(name) LIKE lower(...) --
+        # not ilike -- so the predicate matches the expression the trigram
+        # index in migration 0010 is built on.
+        needle = f"%{sponsor.strip().lower()}%"
+        sponsor_match = select(Sponsorship.id).where(
+            Sponsorship.bill_id == Bill.id,
+            func.lower(Sponsorship.name).like(needle),
+        )
+        stmt = stmt.where(sponsor_match.exists())
+        count_stmt = count_stmt.where(sponsor_match.exists())
 
     total = db.execute(count_stmt).scalar_one()
     rows = (

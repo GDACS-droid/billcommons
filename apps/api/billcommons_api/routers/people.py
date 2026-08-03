@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_api.deps import get_db
+from billcommons_api.emptiness import LEGISLATORS, describe_empty
 from billcommons_api.errors import not_found
 from billcommons_api.etag import make_etag
 from billcommons_api.pagination import (
@@ -54,6 +55,12 @@ def list_people(
         .all()
     )
     items = [PersonSummary.model_validate(r) for r in rows]
+    # An empty legislator list is the norm here, not an edge case: nothing
+    # populates this table. Say so, rather than letting a caller read the empty
+    # array as "this jurisdiction has no legislators".
+    data_status, notice = (None, None)
+    if not items:
+        data_status, notice = describe_empty(db, Person, LEGISLATORS)
     return paginate(
         items,
         page=page,
@@ -61,6 +68,8 @@ def list_people(
         total=total,
         api_version="v1",
         request_id=request.state.request_id,
+        data_status=data_status,
+        notice=notice,
     )
 
 

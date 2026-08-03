@@ -98,8 +98,20 @@ def test_sender_membership_map_matches_the_api_topics():
     boundaries = sorted(
         (sql_block.index(f'"{slug}": ('), slug) for slug in sender_slugs
     )
+    # The sender writes its LIKE patterns with '%%' -- psycopg treats '%' as a
+    # parameter marker, so every literal percent is doubled. Undo that before
+    # comparing against the API's single-'%' patterns.
+    #
+    # A raw substring check happens to work for a pattern whose only wildcards
+    # are leading and trailing ('%foo%' IS a substring of '%%foo%%'), which is
+    # why this went unnoticed while every topic looked like that. It fails the
+    # moment a pattern has an INTERIOR wildcard: '%social media%minor%' is not
+    # a substring of '%%social media%%minor%%'. Unescaping makes the comparison
+    # mean what it was always meant to mean.
     segments = {
-        slug: sql_block[start : boundaries[i + 1][0] if i + 1 < len(boundaries) else len(sql_block)]
+        slug: sql_block[
+            start : boundaries[i + 1][0] if i + 1 < len(boundaries) else len(sql_block)
+        ].replace("%%", "%")
         for i, (start, slug) in enumerate(boundaries)
     }
     for slug, topic in TOPICS.items():
@@ -107,3 +119,88 @@ def test_sender_membership_map_matches_the_api_topics():
             assert pattern in segments[slug], (
                 f"sender is missing pattern {pattern!r} for topic {slug!r}"
             )
+
+
+def test_jurisdiction_scoped_and_national_subscriptions_coexist(client):
+    """The Lauderhill case: a city affairs office wants FL local-government
+    bills, not all 51 jurisdictions' worth.
+
+    Scoped and national are different products for the same (email, topic), so
+    both must be storable. This is also the test that catches a regression in
+    the unique constraint: it is NULLS NOT DISTINCT precisely so the national
+    row (which carries a NULL scope) stays deduplicated.
+    """
+    email = _fresh_email()
+    scoped = client.post(
+        "/api/v1/alerts/subscribe",
+        json={"email": email, "kind": "topic", "target": "local-government",
+              "jurisdiction": "fl"},
+    )
+    assert scoped.status_code == 201
+    assert scoped.json()["jurisdiction"] == "FL", "scope should be normalised to upper case"
+
+    national = client.post(
+        "/api/v1/alerts/subscribe",
+        json={"email": email, "kind": "topic", "target": "local-government"},
+    )
+    assert national.status_code == 201
+    assert national.json()["jurisdiction"] is None
+
+    db = get_session()
+    try:
+        rows = db.execute(
+            text("SELECT jurisdiction FROM alert_subscriptions WHERE email = :e"),
+            {"e": email},
+        ).scalars().all()
+    finally:
+        db.close()
+    assert sorted(r or "" for r in rows) == ["", "FL"]
+
+
+def test_resubscribing_to_the_same_scope_is_idempotent(client):
+    email = _fresh_email()
+    body = {"email": email, "kind": "topic", "target": "local-government",
+            "jurisdiction": "FL"}
+    assert client.post("/api/v1/alerts/subscribe", json=body).status_code == 201
+    assert client.post("/api/v1/alerts/subscribe", json=body).status_code == 201
+
+    db = get_session()
+    try:
+        count = db.execute(
+            text("SELECT count(*) FROM alert_subscriptions WHERE email = :e"),
+            {"e": email},
+        ).scalar()
+    finally:
+        db.close()
+    assert count == 1, "re-subscribing to the same scope created a duplicate"
+
+
+def test_unknown_jurisdiction_is_rejected_not_stored(client):
+    """A stored-but-unmatchable scope is the silent failure this endpoint is
+    most prone to: 'subscribed' followed by a digest that never arrives, which
+    looks exactly like a broken sender."""
+    email = _fresh_email()
+    r = client.post(
+        "/api/v1/alerts/subscribe",
+        json={"email": email, "kind": "topic", "target": "local-government",
+              "jurisdiction": "ZZ"},
+    )
+    assert r.status_code == 422
+
+    db = get_session()
+    try:
+        count = db.execute(
+            text("SELECT count(*) FROM alert_subscriptions WHERE email = :e"),
+            {"e": email},
+        ).scalar()
+    finally:
+        db.close()
+    assert count == 0
+
+
+def test_sender_scopes_its_query_by_jurisdiction():
+    """The API can store a scope the sender ignores -- that failure is
+    invisible from either side alone, so pin it in the sender's source."""
+    source = SENDER.read_text()
+    assert "j.abbreviation = %s" in source, "sender does not filter by jurisdiction"
+    assert "scope_clause" in source

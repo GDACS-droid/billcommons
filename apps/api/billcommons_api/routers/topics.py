@@ -85,6 +85,92 @@ TOPICS: dict[str, Topic] = {
             ),
             subject_patterns=("%cryptocurrency%", "%blockchain%"),
         ),
+        # The four topics below were tuned against the live corpus rather than
+        # guessed. Patterns that read plausibly but matched badly were dropped:
+        # "%section 230%" matches "section 2307 of the public health law", and
+        # "%parental consent%" is mostly minors' mental-health and abortion
+        # bills, not platform consent. Both would have polluted a hub that is
+        # presented as "every X bill in the country".
+        Topic(
+            slug="youth-online-safety",
+            name="Youth Online Safety",
+            description=(
+                "State legislation on minors' access to online services -- age "
+                "verification, app-store and parental-consent duties, "
+                "age-appropriate design codes, and social media rules aimed "
+                "specifically at children."
+            ),
+            title_patterns=(
+                "%age verification%",
+                "%age-verification%",
+                "%app store accountability%",
+                "%social media%minor%",
+                "%minor%social media%",
+                "%social media%child%",
+                "%child%social media%",
+                "%child%online safety%",
+                "%age-appropriate design%",
+            ),
+            subject_patterns=("%age verification%",),
+        ),
+        Topic(
+            slug="platform-accountability",
+            name="Platform Accountability & Content Moderation",
+            description=(
+                "State legislation governing how online platforms moderate, "
+                "rank, and disclose content -- moderation mandates, "
+                "transparency reporting, algorithmic disclosure, and platform "
+                "duties that are not specific to minors."
+            ),
+            title_patterns=(
+                "%content moderation%",
+                "%social media platform%",
+                "%online platform%",
+                "%social media compan%",
+                "%social networking%",
+            ),
+            subject_patterns=("%social media%",),
+        ),
+        Topic(
+            slug="cybersecurity",
+            name="Cybersecurity",
+            description=(
+                "State legislation on cybersecurity programs, breach "
+                "notification, ransomware, and encryption requirements across "
+                "government and private systems."
+            ),
+            title_patterns=(
+                "%cybersecurity%",
+                "%cyber security%",
+                "%data breach%",
+                "%ransomware%",
+                "%encryption%",
+            ),
+            subject_patterns=("%cybersecurity%",),
+        ),
+        Topic(
+            slug="local-government",
+            name="Local Government & Preemption",
+            description=(
+                "State legislation that governs cities and counties -- home "
+                "rule, state preemption of local ordinances, municipal "
+                "finance, and local authority. Deliberately broad: a city "
+                "affairs office cares about municipal bonds, utilities and "
+                "courts as much as about preemption fights, so the hub errs "
+                "toward including anything a municipality is subject to."
+            ),
+            title_patterns=(
+                "%local government%",
+                "%home rule%",
+                "%preemption%",
+                "%municipal%",
+            ),
+            subject_patterns=(
+                "%local government%",
+                "%municipalit%",
+                "%municipal government%",
+            ),
+        ),
     )
 }
 

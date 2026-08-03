@@ -28,6 +28,83 @@ const IMPACT_STYLE: Record<Entry["impact"], { label: string; className: string }
 
 const ENTRIES: Entry[] = [
   {
+    date: "2026-08-03",
+    title: "Empty results now say why they are empty",
+    impact: "semantics",
+    body: (
+      <>
+        Three endpoints — <code>/people</code>, <code>/committees</code> and{" "}
+        <code>/events</code> — are published in our OpenAPI schema and return
+        zero rows for every query, because nothing populates those tables. They
+        returned a bare <code>{`{"data": []}`}</code>, which an agent reasonably
+        reads as <em>&quot;Florida has no legislators&quot;</em>. Worse, the MCP
+        hearings tool explained its emptiness as a{" "}
+        <strong>&quot;daily refresh target&quot;</strong> with possible{" "}
+        <strong>&quot;ingestion lag&quot;</strong> — for a table that has never
+        held a single row and that no code writes to. That is not a gap in the
+        data; it is the product describing itself inaccurately in the one
+        surface a machine reads.
+        <br />
+        <br />
+        Every empty response now carries <code>data_status</code> —{" "}
+        <code>not_collected</code> or <code>no_match</code> — and a{" "}
+        <code>notice</code> stating the inference <em>not</em> to draw. The
+        distinction is probed per request rather than hardcoded, so it stays
+        true if these datasets are ever ingested. The MCP server&apos;s
+        instructions now also declare what is out of scope entirely: Congress,
+        city and county ordinances, prior sessions, hearings, and legislator
+        records.
+      </>
+    ),
+  },
+  {
+    date: "2026-08-03",
+    title: "Four new topic trackers, and alerts you can scope to one state",
+    impact: "coverage",
+    body: (
+      <>
+        Three curated topics existed. Four more now cover the areas people
+        actually ask about:{" "}
+        <strong>
+          youth online safety, platform accountability, cybersecurity, and local
+          government &amp; preemption
+        </strong>{" "}
+        — 160, 150, 154 and 6,325 bills respectively. Patterns were tuned
+        against the corpus rather than guessed, and two plausible-looking ones
+        were dropped after inspection: <code>%section 230%</code> matches
+        &quot;section 2307 of the public health law&quot;, and{" "}
+        <code>%parental consent%</code> is mostly minors&apos; mental-health
+        bills.
+        <br />
+        <br />
+        Email alerts were national-only, so subscribing to a topic meant a
+        digest spanning all 51 jurisdictions. <code>/alerts/subscribe</code> now
+        takes an optional <code>jurisdiction</code>, which is what makes this
+        usable for a city or county affairs office tracking its own
+        legislature. The scope appears in the subject line, because a scoped
+        digest and a national one are otherwise indistinguishable in an inbox.
+      </>
+    ),
+  },
+  {
+    date: "2026-08-03",
+    title: "Bills are searchable by sponsor",
+    impact: "coverage",
+    body: (
+      <>
+        Just under a million sponsorship records were loaded and unreachable —
+        there was no way to ask what a given member filed.{" "}
+        <code>/api/v1/bills?sponsor=</code> now answers that, backed by a
+        trigram index so a substring search does not scan the table.{" "}
+        <strong>Read the names for what they are:</strong> they are stored as
+        the source published them, which is usually a bare surname
+        (&quot;Rouson&quot;) and sometimes a committee. There is no legislator
+        directory behind this, so a surname shared by two members returns both,
+        and you cannot filter by party or district.
+      </>
+    ),
+  },
+  {
     date: "2026-08-02",
     title: "Bills are no longer declared dead by a predicted adjournment date",
     impact: "semantics",
@@ -264,7 +341,21 @@ export default function ChangelogPage() {
             &quot;none scheduled&quot;.
           </li>
           <li>
+            <strong>No legislator or committee records.</strong>{" "}
+            <code>/people</code> and <code>/committees</code> are published and
+            permanently empty. Sponsors are available per bill, but as bare
+            names — no party, district, or chamber — so you cannot ask how a
+            given member voted across a session, or who chairs anything.
+          </li>
+          <li>
             <strong>No federal legislation.</strong> 50 states and DC only.
+          </li>
+          <li>
+            <strong>Nothing below the state legislature.</strong> No city or
+            county ordinances, commissions, or boards. State bills that
+            regulate municipalities are collected — those are a different
+            thing, and a city tracking its own ordinances will not find them
+            here.
           </li>
           <li>
             <strong>No historical sessions.</strong> Current session or biennium

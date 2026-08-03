@@ -116,13 +116,66 @@ def topic_membership_sql() -> dict[str, str]:
             " OR EXISTS (SELECT 1 FROM bill_subjects s WHERE s.bill_id = b.id AND"
             " (lower(s.subject) LIKE '%%cryptocurrency%%' OR lower(s.subject) LIKE '%%blockchain%%')))"
         ),
+        "youth-online-safety": (
+            "(lower(b.title) LIKE '%%age verification%%'"
+            " OR lower(b.title) LIKE '%%age-verification%%'"
+            " OR lower(b.title) LIKE '%%app store accountability%%'"
+            " OR lower(b.title) LIKE '%%social media%%minor%%'"
+            " OR lower(b.title) LIKE '%%minor%%social media%%'"
+            " OR lower(b.title) LIKE '%%social media%%child%%'"
+            " OR lower(b.title) LIKE '%%child%%social media%%'"
+            " OR lower(b.title) LIKE '%%child%%online safety%%'"
+            " OR lower(b.title) LIKE '%%age-appropriate design%%'"
+            " OR EXISTS (SELECT 1 FROM bill_subjects s WHERE s.bill_id = b.id AND"
+            " lower(s.subject) LIKE '%%age verification%%'))"
+        ),
+        "platform-accountability": (
+            "(lower(b.title) LIKE '%%content moderation%%'"
+            " OR lower(b.title) LIKE '%%social media platform%%'"
+            " OR lower(b.title) LIKE '%%online platform%%'"
+            " OR lower(b.title) LIKE '%%social media compan%%'"
+            " OR lower(b.title) LIKE '%%social networking%%'"
+            " OR EXISTS (SELECT 1 FROM bill_subjects s WHERE s.bill_id = b.id AND"
+            " lower(s.subject) LIKE '%%social media%%'))"
+        ),
+        "cybersecurity": (
+            "(lower(b.title) LIKE '%%cybersecurity%%'"
+            " OR lower(b.title) LIKE '%%cyber security%%'"
+            " OR lower(b.title) LIKE '%%data breach%%'"
+            " OR lower(b.title) LIKE '%%ransomware%%'"
+            " OR lower(b.title) LIKE '%%encryption%%'"
+            " OR EXISTS (SELECT 1 FROM bill_subjects s WHERE s.bill_id = b.id AND"
+            " lower(s.subject) LIKE '%%cybersecurity%%'))"
+        ),
+        "local-government": (
+            "(lower(b.title) LIKE '%%local government%%'"
+            " OR lower(b.title) LIKE '%%home rule%%'"
+            " OR lower(b.title) LIKE '%%preemption%%'"
+            " OR lower(b.title) LIKE '%%municipal%%'"
+            " OR EXISTS (SELECT 1 FROM bill_subjects s WHERE s.bill_id = b.id AND"
+            " (lower(s.subject) LIKE '%%local government%%'"
+            " OR lower(s.subject) LIKE '%%municipalit%%'"
+            " OR lower(s.subject) LIKE '%%municipal government%%')))"
+        ),
     }
 
 
-def render_digest(topic: str, events: list[dict], total: int, unsub: str) -> tuple[str, str, str]:
-    """Returns (subject, html, text)."""
+def render_digest(
+    topic: str, events: list[dict], total: int, unsub: str, scope: str | None = None
+) -> tuple[str, str, str]:
+    """Returns (subject, html, text).
+
+    `scope` is a jurisdiction abbreviation or None for national. It goes in the
+    subject line because a scoped digest and a national one are otherwise
+    indistinguishable in an inbox, and a reader who sees only Florida bills in
+    a national digest would reasonably conclude nothing else moved.
+    """
     n = total
-    subject = f"[Bill Commons] {n} update{'s' if n != 1 else ''} on {topic.replace('-', ' ')} bills"
+    where = f" ({scope})" if scope else ""
+    subject = (
+        f"[Bill Commons] {n} update{'s' if n != 1 else ''} on "
+        f"{topic.replace('-', ' ')} bills{where}"
+    )
     lines_html, lines_text = [], []
     for e in events:
         label = KIND_LABEL.get(e["kind"], e["kind"])
@@ -178,14 +231,33 @@ def main() -> int:
             )
             watermark = cur.fetchone()[0]
 
+            # This worker runs straight from the working tree (see the
+            # systemd unit's ExecStart), so a code edit is live on the next
+            # nightly run with no deploy step -- while the schema it depends on
+            # only changes when a migration is applied. Selecting a column that
+            # migration 0011 has not yet added would take down a working daily
+            # send. Probe for it and fall back to national-only rather than
+            # ordering the two by hand and hoping.
             cur.execute(
-                "SELECT id, email, target, unsubscribe_token, last_seq "
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'alert_subscriptions' AND column_name = 'jurisdiction'"
+            )
+            has_scope = cur.fetchone() is not None
+            scope_col = "jurisdiction" if has_scope else "NULL::text"
+            if not has_scope:
+                print(
+                    "WARN jurisdiction column absent (migration 0011 not applied); "
+                    "treating every subscription as national",
+                    flush=True,
+                )
+            cur.execute(
+                f"SELECT id, email, target, unsubscribe_token, last_seq, {scope_col} "
                 "FROM alert_subscriptions WHERE active AND kind = 'topic' "
                 "ORDER BY email"
             )
             subs = cur.fetchall()
 
-        for sub_id, email, target, unsub_token, last_seq in subs:
+        for sub_id, email, target, unsub_token, last_seq, scope in subs:
             predicate = membership.get(target)
             if predicate is None:
                 print(f"SKIP {email} {target}: unknown topic", flush=True)
@@ -201,6 +273,11 @@ def main() -> int:
                 fast_forwarded += 1
                 continue
 
+            # A NULL scope is national (the original behaviour). A scoped
+            # subscription still advances its cursor to the same watermark on a
+            # quiet run, so narrowing never causes a backlog to accumulate.
+            scope_clause = "" if scope is None else "AND j.abbreviation = %s"
+            scope_params: tuple = () if scope is None else (scope,)
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
@@ -209,10 +286,10 @@ def main() -> int:
                     FROM bill_events e
                     JOIN bills b ON b.id = e.bill_id
                     JOIN jurisdictions j ON j.id = b.jurisdiction_id
-                    WHERE e.seq > %s AND e.seq <= %s AND {predicate}
+                    WHERE e.seq > %s AND e.seq <= %s AND {predicate} {scope_clause}
                     ORDER BY e.seq
                     """,
-                    (last_seq, watermark),
+                    (last_seq, watermark, *scope_params),
                 )
                 rows = cur.fetchall()
 
@@ -238,7 +315,9 @@ def main() -> int:
                 for _, kind, detail, bill_id, identifier, title, jur in rows[:MAX_EVENTS_PER_DIGEST]
             ]
             unsub_url = f"{API_BASE}/api/v1/alerts/unsubscribe?token={unsub_token}"
-            subject, html, text_body = render_digest(target, events, len(rows), unsub_url)
+            subject, html, text_body = render_digest(
+                target, events, len(rows), unsub_url, scope
+            )
 
             if args.dry_run:
                 print(f"DRY {email}: {subject} ({len(rows)} events)", flush=True)

@@ -31,7 +31,7 @@ const TOOLS: { name: string; description: string }[] = [
   { name: "compare_bill_versions", description: "Deterministic diff between two versions of a bill's text." },
   { name: "find_similar_bills", description: "Find related bills by title similarity and shared text (labeled as derived, not official)." },
   { name: "get_vote_details", description: "Get a recorded vote, including member-level votes where available." },
-  { name: "get_upcoming_hearings", description: "List upcoming committee hearings for a jurisdiction." },
+  { name: "get_upcoming_hearings", description: "NOT COLLECTED — always returns an empty list with data_status: \"not_collected\". No hearing or calendar data is ingested for any jurisdiction, so an empty result means we lack the data, never that no hearings are scheduled." },
   { name: "trace_legislative_history", description: "Trace a bill's full action timeline from introduction to current status." },
   { name: "build_legislative_evidence_packet", description: "Assemble a citation-backed packet of bill facts for research use." },
   { name: "get_jurisdiction_coverage", description: "Check ingestion/coverage status for a jurisdiction before trusting results." },

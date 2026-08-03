@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session as OrmSession
 from billcommons_api.deps import get_db
 from billcommons_api.routers.topics import TOPICS
 from billcommons_api.schemas import AlertSubscribeRequest, AlertSubscribeResponse
-from billcommons_schema.models import AlertSubscription
+from billcommons_schema.models import AlertSubscription, Jurisdiction
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
 
@@ -44,11 +44,35 @@ def subscribe(
             detail=f"unknown topic {body.target!r}; see /api/v1/topics",
         )
 
+    # Validate the scope against real jurisdictions rather than accepting any
+    # two-character string. An unrecognised code would otherwise be stored,
+    # match nothing forever, and present as "subscribed, but the digest never
+    # arrives" -- indistinguishable from a broken sender.
+    jurisdiction: str | None = None
+    if body.jurisdiction is not None and body.jurisdiction.strip():
+        jurisdiction = body.jurisdiction.strip().upper()
+        known = db.execute(
+            select(Jurisdiction.abbreviation).where(
+                Jurisdiction.abbreviation == jurisdiction
+            )
+        ).scalar_one_or_none()
+        if known is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"unknown jurisdiction {jurisdiction!r}; use a two-letter "
+                    "state abbreviation, or omit for a national digest"
+                ),
+            )
+
     existing = db.execute(
         select(AlertSubscription).where(
             AlertSubscription.email == email,
             AlertSubscription.kind == body.kind,
             AlertSubscription.target == body.target,
+            AlertSubscription.jurisdiction.is_(None)
+            if jurisdiction is None
+            else AlertSubscription.jurisdiction == jurisdiction,
         )
     ).scalar_one_or_none()
     if existing is not None:
@@ -58,6 +82,7 @@ def subscribe(
             subscribed=True,
             kind=existing.kind,
             target=existing.target,
+            jurisdiction=existing.jurisdiction,
             meta={"api_version": "v1", "request_id": request.state.request_id},
         )
 
@@ -66,6 +91,7 @@ def subscribe(
             email=email,
             kind=body.kind,
             target=body.target,
+            jurisdiction=jurisdiction,
             unsubscribe_token=secrets.token_urlsafe(32),
         )
     )
@@ -74,6 +100,7 @@ def subscribe(
         subscribed=True,
         kind=body.kind,
         target=body.target,
+        jurisdiction=jurisdiction,
         meta={"api_version": "v1", "request_id": request.state.request_id},
     )
 
@@ -100,9 +127,10 @@ def unsubscribe(
         )
     sub.active = False
     db.commit()
+    scope = f" ({sub.jurisdiction})" if sub.jurisdiction else ""
     return HTMLResponse(
         "<h1>Unsubscribed</h1>"
-        f"<p>{sub.email} will no longer receive the {sub.target} digest. "
+        f"<p>{sub.email} will no longer receive the {sub.target}{scope} digest. "
         'Changed your mind? Re-subscribe any time at '
         f'<a href="https://billcommons.org/topics/{sub.target}">billcommons.org</a>.</p>'
     )

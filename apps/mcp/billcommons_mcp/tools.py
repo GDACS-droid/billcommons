@@ -706,7 +706,14 @@ def get_upcoming_hearings(
     jurisdiction: str | None = None, bill_id: str | None = None, limit: int | None = None
 ) -> dict[str, Any]:
     """List upcoming (start_date >= now) legislative hearings/events, optionally
-    filtered by jurisdiction or bill."""
+    filtered by jurisdiction or bill.
+
+    NOT COLLECTED TODAY. Bill Commons ingests no hearing or committee-calendar
+    data for any jurisdiction, so this tool returns an empty list every time.
+    An empty result means "we do not have this data", NEVER "no hearings are
+    scheduled" -- do not report the absence of hearings to a user as a fact
+    about the legislature's calendar. Check `data_status` on the response.
+    """
 
     def body() -> dict[str, Any]:
         db = get_session()
@@ -740,19 +747,40 @@ def get_upcoming_hearings(
                 "meta": meta_envelope(),
             }
             if not events:
-                warning = (
-                    coverage_warning_for_jurisdiction(db, jurisdiction_row)
-                    if jurisdiction_row
-                    else None
-                )
-                if warning:
-                    payload["coverage_warning"] = warning
-                else:
+                # Distinguish "we hold no calendar data at all" from "we hold
+                # some and none matched". The old note claimed a daily refresh
+                # target and possible ingestion lag; neither exists -- nothing
+                # in the pipeline has ever written a legislative_events row, so
+                # that note invited an agent to report a real empty calendar.
+                # Probing the table (rather than hardcoding the disclosure)
+                # keeps this honest in both directions if hearings are ingested
+                # later.
+                any_events = db.execute(
+                    select(LegislativeEvent.id).limit(1)
+                ).scalar_one_or_none()
+                if any_events is None:
+                    payload["data_status"] = "not_collected"
                     payload["note"] = (
-                        "No upcoming hearings found. Hearing/calendar data has a daily "
-                        "refresh target; absence here may reflect ingestion lag rather "
-                        "than an empty calendar."
+                        "Bill Commons does not collect hearing or committee-calendar "
+                        "data for any jurisdiction. This empty list means the data is "
+                        "not held, NOT that no hearings are scheduled. Consult the "
+                        "chamber's own calendar."
                     )
+                else:
+                    payload["data_status"] = "no_match"
+                    payload["note"] = (
+                        "No upcoming hearings matched this query. Hearing coverage is "
+                        "partial; absence is not evidence that none are scheduled."
+                    )
+                    warning = (
+                        coverage_warning_for_jurisdiction(db, jurisdiction_row)
+                        if jurisdiction_row
+                        else None
+                    )
+                    if warning:
+                        payload["coverage_warning"] = warning
+            else:
+                payload["data_status"] = "ok"
             return payload
         finally:
             db.close()
