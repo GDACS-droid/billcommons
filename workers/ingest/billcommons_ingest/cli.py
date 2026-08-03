@@ -35,7 +35,7 @@ import socket
 import sys
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import or_, select, text
@@ -73,6 +73,43 @@ from billcommons_shared.rawstore import FilesystemRawStore
 # bills at once; capping the pass keeps a single cycle bounded, and whatever is
 # left is picked up next cycle because the query is self-selecting.
 ADJOURNMENT_SWEEP_BATCH = 20000
+
+# How recently a session must have seen ANY filed action to count as
+# corroborated-live when the source's `active` flag and its own
+# `expected_adjournment` date contradict each other.
+#
+# 30 days is the midpoint of what a seven-model review converged on (14-45).
+# It is itself a threshold, i.e. the same class of assumption as the predicted
+# adjournment date that caused the original bug -- which is precisely why it is
+# only ever used to CONFIRM life, never to infer death. Silence past this
+# window yields "unknown", not "dead".
+SESSION_ACTIVITY_WINDOW_DAYS = int(
+    os.environ.get("BILLCOMMONS_SESSION_ACTIVITY_WINDOW_DAYS", "30") or 30
+)
+
+# Action classifications that only occur while a chamber is actually sitting.
+#
+# Volume alone is not evidence of a live session. South Carolina's most recent
+# filings were "Scrivener's error corrected", "Effective date 06/30/26" and
+# "Act No. 250" -- clerical bookkeeping on laws already passed, filed weeks
+# after the chamber went home. Counting those as proof of life would have kept
+# 3,685 SC bills reported as pending on the strength of a typo correction.
+#
+# Executive-side actions are excluded for the same reason: a governor signs,
+# vetoes and receives bills long after adjournment, and Alaska's entire recent
+# record is exactly that. Unclassified actions are excluded too -- they cannot
+# be shown to be chamber activity, and this signal may only ever CONFIRM life.
+CHAMBER_ACTIVITY_PATTERNS = (
+    "%referral-committee%",
+    "%committee-passage%",
+    "%reading-%",
+    "%passage%",
+    "%amendment-%",
+    "%introduction%",
+    "%failure%",
+    "%withdrawal%",
+    "%deferral%",
+)
 
 # Jurisdictions queried per cycle for missing session end dates. The upstream
 # free tier is 250 requests/day shared with the actual bill sync, so this stays
@@ -733,14 +770,59 @@ def recompute_status_for_bills(
     current = {}
     session_end = {}
     session_active = {}
+    bill_session = {}
     for r in db.execute(
-        select(Bill.id, Bill.status, SessionModel.end_date, SessionModel.active)
+        select(
+            Bill.id,
+            Bill.status,
+            Bill.session_id,
+            SessionModel.end_date,
+            SessionModel.active,
+        )
         .join(SessionModel, SessionModel.id == Bill.session_id)
         .where(Bill.id.in_(bill_ids))
     ).all():
         current[r.id] = r.status
         session_end[r.id] = r.end_date
         session_active[r.id] = bool(r.active)
+        bill_session[r.id] = r.session_id
+    # Session-level recent activity, for the case where the source calls a
+    # session active but its predicted adjournment has passed. Deliberately
+    # SESSION level, not bill level: a single bill can sit untouched for months
+    # inside a chamber that is filing paper daily, so per-bill silence says
+    # nothing about whether the legislature is sitting.
+    #
+    # Future-dated actions are excluded. South Carolina carries an action dated
+    # 2026-09-01 -- a month ahead of today -- and letting a scheduled or
+    # mis-keyed future date stand in as proof of current activity would make
+    # the corroboration meaningless.
+    recent_cutoff = datetime.now(timezone.utc).date() - timedelta(
+        days=SESSION_ACTIVITY_WINDOW_DAYS
+    )
+    today_date = datetime.now(timezone.utc).date()
+    session_ids = {sid for sid in bill_session.values() if sid is not None}
+    sessions_with_recent_activity: set = set()
+    if session_ids:
+        sessions_with_recent_activity = {
+            row[0]
+            for row in db.execute(
+                select(Bill.session_id)
+                .join(BillAction, BillAction.bill_id == Bill.id)
+                .where(
+                    Bill.session_id.in_(session_ids),
+                    BillAction.action_date >= recent_cutoff,
+                    BillAction.action_date <= today_date,
+                    or_(
+                        *[
+                            BillAction.classification.ilike(pat)
+                            for pat in CHAMBER_ACTIVITY_PATTERNS
+                        ]
+                    ),
+                )
+                .distinct()
+            ).all()
+        }
+
     actions_by_bill: dict[object, list[status_mod.ActionRow]] = {bid: [] for bid in bill_ids}
     for a in db.execute(
         select(
@@ -765,6 +847,9 @@ def recompute_status_for_bills(
             status_mod.derive_status(actions_by_bill[bid]),
             session_end.get(bid),
             session_active=session_active.get(bid, False),
+            session_has_recent_activity=(
+                bill_session.get(bid) in sessions_with_recent_activity
+            ),
         )
         if counts is not None and derived is not None:
             counts[derived] = counts.get(derived, 0) + 1

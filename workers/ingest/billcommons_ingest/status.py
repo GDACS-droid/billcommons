@@ -224,6 +224,7 @@ def apply_session_outcome(
     session_end_date: date | None,
     today: date | None = None,
     session_active: bool = False,
+    session_has_recent_activity: bool = False,
 ) -> str | None:
     """Fold the session's fate into a bill's action-derived status.
 
@@ -265,14 +266,36 @@ def apply_session_outcome(
     `active` is upstream's statement of fact; `expected_adjournment` is
     upstream's guess. When they disagree, the fact wins and we assert nothing.
     """
-    if session_active:
+    if status is not None and status not in LIVE_STATUSES:
         return status
     if session_end_date is None:
         return status
-    if status is not None and status not in LIVE_STATUSES:
-        return status
     if session_end_date >= (today or date.today()):
         return status
-    # Reached for status=None too: whatever stage it got to, the session
-    # closed without it becoming law, and nothing further can happen to it.
-    return DIED_ON_ADJOURNMENT
+
+    # Past the predicted adjournment. What the two upstream signals say now
+    # decides, and they do not always agree.
+    if not session_active:
+        # Source says the session is over and the date agrees. Reached for
+        # status=None too: whatever stage it got to, the session closed without
+        # it becoming law, and nothing further can happen to it.
+        return DIED_ON_ADJOURNMENT
+
+    # CONTRADICTION: the source calls the session active while its own
+    # predicted adjournment has passed. Neither field is authoritative here --
+    # `expected_adjournment` is a guess, and `active` is demonstrably sticky
+    # (Virginia sat at active=true with no filed action for over three months).
+    if session_has_recent_activity:
+        # A chamber filing paper this month has not adjourned. Affirmative
+        # evidence of life, so the bill's own record stands.
+        return status
+
+    # Contradiction with no corroboration either way. Silence cannot prove
+    # adjournment -- a recess looks identical -- and the source's active flag
+    # cannot prove life once it has gone stale. Asserting death here would
+    # recreate exactly the unsupported inference this function got wrong;
+    # asserting life would be the same mistake pointed the other way.
+    #
+    # So: assert nothing. This is the same doctrine that already leaves ~5% of
+    # bills unclassified rather than guessing at a state's wording.
+    return None

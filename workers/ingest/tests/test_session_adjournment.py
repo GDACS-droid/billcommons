@@ -114,8 +114,12 @@ def test_an_active_session_never_kills_its_bills():
     past = date(2026, 7, 31)
     today = date(2026, 8, 2)
 
+    # Corroborated by recent filings: the bill's own record stands.
     assert (
-        apply_session_outcome("in_committee", past, today, session_active=True)
+        apply_session_outcome(
+            "in_committee", past, today, session_active=True,
+            session_has_recent_activity=True,
+        )
         == "in_committee"
     )
     assert (
@@ -137,4 +141,47 @@ def test_the_active_guard_does_not_resurrect_a_settled_outcome():
         assert (
             apply_session_outcome("enacted", past, today, session_active=active)
             == "enacted"
+        )
+
+
+def test_a_contradiction_with_no_corroboration_asserts_nothing():
+    """`active=true` past the predicted adjournment, and the chamber has filed
+    nothing for a month. Neither signal is trustworthy here:
+    `expected_adjournment` is a guess, and `active` is demonstrably sticky --
+    Virginia sat at active=true with no filed action for over three months.
+
+    Asserting death recreates the unsupported inference this whole function got
+    wrong. Asserting life is the same mistake pointed the other way. A
+    seven-model review was unanimous on this: return nothing.
+    """
+    from datetime import date
+
+    from billcommons_ingest.status import apply_session_outcome
+
+    past = date(2026, 3, 14)
+    today = date(2026, 8, 2)
+    assert (
+        apply_session_outcome(
+            "in_committee", past, today,
+            session_active=True, session_has_recent_activity=False,
+        )
+        is None
+    )
+
+
+def test_silence_alone_never_produces_a_death():
+    """The recency window may only CONFIRM life. If it could also infer death
+    it would be the same class of assumption as the predicted adjournment date
+    that caused the original bug, just with a different threshold."""
+    from datetime import date
+
+    from billcommons_ingest.status import apply_session_outcome
+
+    for status in ("introduced", "in_committee", "passed_one_chamber", None):
+        assert (
+            apply_session_outcome(
+                status, date(2026, 1, 1), date(2026, 8, 2),
+                session_active=True, session_has_recent_activity=False,
+            )
+            != "died_on_adjournment"
         )

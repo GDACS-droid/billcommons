@@ -47,35 +47,36 @@ export default async function MortalityReportPage() {
         }
       />
 
-      <div className="mt-8 max-w-3xl rounded-lg border-l-[3px] border-rose-500 bg-rose-50 px-4 py-3">
+      <div className="mt-8 max-w-3xl rounded-lg border-l-[3px] border-amber-500 bg-amber-50 px-4 py-3">
         <p className="text-sm font-semibold text-slate-900">
-          Correction in progress — read before citing these figures (2 August
-          2026)
+          Corrected 2 August 2026: the adjournment figure was overstated by
+          29,227 bills
         </p>
         <p className="mt-2 text-sm text-slate-800">
-          A bill is marked <code>died_on_adjournment</code> when its session&apos;s
-          end date has passed. That end date is the{" "}
-          <strong>expected</strong> adjournment reported by our upstream source,
-          not a recorded sine die — so when a chamber sits past its estimate,
-          the calendar alone marks every live bill in it dead.
+          A bill was marked <code>died_on_adjournment</code> once its
+          session&apos;s end date passed. That date is the{" "}
+          <strong>expected</strong> adjournment reported by our upstream source
+          — a prediction, not a recorded sine die. When a chamber sat longer
+          than predicted, the calendar alone marked every live bill in it dead.
+          Massachusetts lost 18,343 bills this way two days after its estimate
+          passed, while its General Court was still filing committee reports.
         </p>
         <p className="mt-2 text-sm text-slate-800">
-          <strong>
-            29,227 bills across 8 jurisdictions are currently marked dead inside
-            sessions that the same source still reports as active
-          </strong>{" "}
-          — 18,343 of them in Massachusetts, whose General Court runs to the end
-          of the year. That is 30.8% of the national{" "}
-          <code>died_on_adjournment</code> count on this page.
+          The national adjournment-death share is now{" "}
+          <strong>31.3% of the corpus, down from 45.2%</strong>. Death is no
+          longer inferred from a lapsed prediction. It requires the source to
+          report the session as closed; where the source still calls a session
+          active, we publish the bill&apos;s action-derived status if the
+          chamber has filed real legislative business in the last 30 days, and{" "}
+          <strong>nothing at all</strong> if it has not.
         </p>
         <p className="mt-2 text-sm text-slate-800">
-          Removing all of them would move the adjournment-death share from{" "}
-          <strong>45.2% to 31.3%</strong> of the corpus. The true figure is
-          somewhere in that range: some of those sessions genuinely have
-          adjourned and the upstream active flag is stale, and we are not yet
-          able to say which. Until that is resolved,{" "}
-          <strong>treat the per-state adjournment counts as an upper bound</strong>{" "}
-          and the enactment counts, which are unaffected, as sound.
+          That last case covers <strong>7,861 bills in Arizona, Mississippi,
+          South Carolina and Virginia</strong>, which now carry no status. Those
+          chambers have probably adjourned — but &quot;probably&quot; is what
+          produced this error, so the honest answer is that we do not know. The
+          unknown share of the corpus rose from about 5% to 7.3% as a result.
+          Enactment counts are unaffected throughout.
         </p>
       </div>
 

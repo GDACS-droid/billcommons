@@ -29,6 +29,36 @@ const IMPACT_STYLE: Record<Entry["impact"], { label: string; className: string }
 const ENTRIES: Entry[] = [
   {
     date: "2026-08-02",
+    title: "Bills are no longer declared dead by a predicted adjournment date",
+    impact: "semantics",
+    body: (
+      <>
+        <code>died_on_adjournment</code> was applied once a session&apos;s end
+        date passed. That date is the <strong>expected</strong> adjournment
+        reported upstream — a prediction — and the rule never consulted the{" "}
+        <code>active</code> flag in the same record. A chamber sitting longer
+        than predicted therefore had its whole docket marked dead by the
+        calendar. <strong>29,227 bills across 8 jurisdictions</strong> were
+        affected, 18,343 in Massachusetts alone, and the national
+        adjournment-death share falls from <strong>45.2% to 31.3%</strong>.
+        <br />
+        <br />
+        The new rule: death requires the source to report the session closed.
+        Where it still reports the session active, we publish the
+        action-derived status if the chamber filed real legislative business in
+        the last 30 days, and <strong>no status at all</strong> otherwise —
+        7,861 bills in AZ, MS, SC and VA. Clerical filings do not count as
+        evidence a chamber is sitting; South Carolina&apos;s were &quot;Act No.
+        250&quot; and a scrivener&apos;s-error correction.{" "}
+        <strong>
+          If you compared adjournment mortality across dates or states before
+          today, re-pull it.
+        </strong>
+      </>
+    ),
+  },
+  {
+    date: "2026-08-02",
     title: "Evidence packets are citable: permalink, snapshot id, downloadable JSON",
     impact: "fix",
     body: (
