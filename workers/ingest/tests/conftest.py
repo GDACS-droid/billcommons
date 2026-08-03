@@ -8,14 +8,28 @@ transaction" test pattern.
 """
 from __future__ import annotations
 
+import os
 import uuid
 
-import pytest
-from sqlalchemy import text
-from sqlalchemy.orm import Session
+# Label every connection this test process opens, BEFORE the engine is built.
+#
+# These tests share a database with the running production workers, so
+# `pg_stat_activity` shows their connections too -- and a test that asserts
+# something about "connections left open" cannot tell its own from a crawl
+# worker's without a label. One such test tried to separate them by matching
+# on query text (`'jurisdictions' in query`), which fails whenever a
+# production worker is legitimately mid-transaction on that table, i.e. at
+# random. libpq reads PGAPPNAME, so this costs nothing and gives every
+# assertion an exact filter.
+TEST_APPLICATION_NAME = "billcommons-tests"
+os.environ.setdefault("PGAPPNAME", TEST_APPLICATION_NAME)
 
-from billcommons_shared.db import get_engine
-from billcommons_shared.rawstore import FilesystemRawStore
+import pytest  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+
+from billcommons_shared.db import get_engine  # noqa: E402
+from billcommons_shared.rawstore import FilesystemRawStore  # noqa: E402
 
 # Tests run against the real live DB (per the module docstring above), which
 # can carry orphaned idle-in-transaction connections holding row locks (see

@@ -198,7 +198,12 @@ def plan_schedule(db: OrmSession, *, now: datetime | None = None) -> list[Schedu
     return decisions
 
 
-def run_schedule_pass(db: OrmSession, *, now: datetime | None = None) -> list[str]:
+def run_schedule_pass(
+    db: OrmSession,
+    *,
+    now: datetime | None = None,
+    lock_key: int = SCHEDULE_PASS_ADVISORY_LOCK_KEY,
+) -> list[str]:
     """Enqueue one `api_sync` ingest_jobs row for every jurisdiction whose
     cadence tier is due. Caller commits. Returns the list of jurisdiction
     abbreviations enqueued (for logging).
@@ -231,9 +236,18 @@ def run_schedule_pass(db: OrmSession, *, now: datetime | None = None) -> list[st
     return `[]` forever -- a total, silent scheduling stall with no error
     surfaced anywhere. The xact-scoped lock has no such failure mode: it is
     automatically released the instant the transaction ends, by COMMIT *or*
-    ROLLBACK, with no explicit unlock statement required at all."""
+    ROLLBACK, with no explicit unlock statement required at all.
+
+    `lock_key` is injectable for ONE reason: the test suite runs against the
+    same live database the production sync-worker uses, and that worker runs
+    this pass on a loop. Sharing the key means a test's pass loses the race
+    whenever the worker happens to hold the lock, returns [] correctly, and
+    fails an assertion that has nothing to do with the code under test -- a
+    different subset failing on every run. Tests pass their own key so they
+    serialize against each other and not against production. Nothing in the
+    application ever overrides it."""
     acquired = db.execute(
-        text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": SCHEDULE_PASS_ADVISORY_LOCK_KEY}
+        text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": lock_key}
     ).scalar_one()
     if not acquired:
         return []

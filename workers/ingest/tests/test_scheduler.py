@@ -63,6 +63,29 @@ def _real_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+@pytest.fixture()
+def sched_lock_key() -> int:
+    """A private advisory-lock key for one test.
+
+    These tests run against the same live database the production
+    sync-worker uses, and that worker calls `run_schedule_pass` on a loop.
+    Sharing the real SCHEDULE_PASS_ADVISORY_LOCK_KEY made this file flaky in
+    both directions: a test's pass would lose the race and correctly return
+    [], failing an assertion about behaviour it never got to exercise -- and
+    the lock-contention test below would take production's key on a real
+    connection and stall the live scheduler for as long as it ran. Which
+    tests failed varied per run, because it depended entirely on where the
+    worker happened to be in its loop.
+
+    A fresh key per test keeps the contention semantics honest (the pass
+    still genuinely takes a lock, and the contention test still genuinely
+    races a second real connection) while isolating that contention to the
+    test that created it. The offset keeps these clear of the three
+    production keys, which are consecutive from ...882_001.
+    """
+    return 847_291_003_615_882_001 + 1_000 + (uuid.uuid4().int % 100_000)
+
+
 # ---------------------------------------------------------------------------
 # Pure cadence-tier classification
 # ---------------------------------------------------------------------------
@@ -175,12 +198,12 @@ def test_plan_schedule_skips_jurisdiction_with_no_sessions(db_session):
     assert all(d.jurisdiction_abbr != abbr for d in decisions)
 
 
-def test_run_schedule_pass_enqueues_api_sync_job(db_session):
+def test_run_schedule_pass_enqueues_api_sync_job(db_session, sched_lock_key):
     now = _real_now()
     jurisdiction, _ = _make_jurisdiction_with_session(db_session, active=True, end_date=now.date())
     db_session.flush()
 
-    enqueued = run_schedule_pass(db_session, now=now)
+    enqueued = run_schedule_pass(db_session, now=now, lock_key=sched_lock_key)
     assert jurisdiction.abbreviation in enqueued
 
     job = db_session.execute(
@@ -192,34 +215,34 @@ def test_run_schedule_pass_enqueues_api_sync_job(db_session):
     assert job.status == "queued"
 
 
-def test_run_schedule_pass_does_not_double_enqueue_when_not_due(db_session):
+def test_run_schedule_pass_does_not_double_enqueue_when_not_due(db_session, sched_lock_key):
     now = _real_now()
     jurisdiction, _ = _make_jurisdiction_with_session(db_session, active=True, end_date=now.date())
     db_session.flush()
 
-    first_pass = run_schedule_pass(db_session, now=now)
+    first_pass = run_schedule_pass(db_session, now=now, lock_key=sched_lock_key)
     assert jurisdiction.abbreviation in first_pass
 
     # Re-running immediately (well within the 30-min active cadence) must
     # not enqueue a second job for the same state -- this is the whole
     # point of checking `last_enqueued_at` against the tier interval rather
     # than blindly enqueueing every pass.
-    second_pass = run_schedule_pass(db_session, now=now + timedelta(minutes=5))
+    second_pass = run_schedule_pass(db_session, now=now + timedelta(minutes=5), lock_key=sched_lock_key)
     assert jurisdiction.abbreviation not in second_pass
 
 
-def test_run_schedule_pass_reenqueues_once_active_cadence_elapses(db_session):
+def test_run_schedule_pass_reenqueues_once_active_cadence_elapses(db_session, sched_lock_key):
     now = _real_now()
     jurisdiction, _ = _make_jurisdiction_with_session(db_session, active=True, end_date=now.date())
     db_session.flush()
 
-    run_schedule_pass(db_session, now=now)
+    run_schedule_pass(db_session, now=now, lock_key=sched_lock_key)
     later = _real_now() + timedelta(minutes=31)
-    second_pass = run_schedule_pass(db_session, now=later)
+    second_pass = run_schedule_pass(db_session, now=later, lock_key=sched_lock_key)
     assert jurisdiction.abbreviation in second_pass
 
 
-def test_run_schedule_pass_skips_when_another_pass_holds_the_advisory_lock(db_session):
+def test_run_schedule_pass_skips_when_another_pass_holds_the_advisory_lock(db_session, sched_lock_key):
     """Regression for Finding D: `run_schedule_pass` is a read-then-insert
     (plan_schedule reads the latest ingest_jobs row per state, THEN the
     caller loops inserting) with a real gap in between -- two concurrent
@@ -246,11 +269,11 @@ def test_run_schedule_pass_skips_when_another_pass_holds_the_advisory_lock(db_se
     blocking_connection = engine.connect()
     try:
         acquired = blocking_connection.execute(
-            text("SELECT pg_try_advisory_lock(:key)"), {"key": SCHEDULE_PASS_ADVISORY_LOCK_KEY}
+            text("SELECT pg_try_advisory_lock(:key)"), {"key": sched_lock_key}
         ).scalar_one()
         assert acquired is True, "sanity check: the blocking connection must actually hold the lock"
 
-        enqueued = run_schedule_pass(db_session, now=now)
+        enqueued = run_schedule_pass(db_session, now=now, lock_key=sched_lock_key)
         assert enqueued == [], (
             "run_schedule_pass must skip the whole pass (enqueue nothing) when it cannot "
             "acquire the advisory lock, rather than racing the concurrent holder's own pass"
@@ -265,12 +288,12 @@ def test_run_schedule_pass_skips_when_another_pass_holds_the_advisory_lock(db_se
         assert jobs == [], "no api_sync job must have been enqueued while the lock was held elsewhere"
     finally:
         blocking_connection.execute(
-            text("SELECT pg_advisory_unlock(:key)"), {"key": SCHEDULE_PASS_ADVISORY_LOCK_KEY}
+            text("SELECT pg_advisory_unlock(:key)"), {"key": sched_lock_key}
         )
         blocking_connection.close()
 
 
-def test_run_schedule_pass_raising_enqueue_does_not_leak_the_lock(db_session, monkeypatch):
+def test_run_schedule_pass_raising_enqueue_does_not_leak_the_lock(db_session, monkeypatch, sched_lock_key):
     """Regression for Finding 3: the OLD implementation used a
     session-scoped `pg_try_advisory_lock` + a `finally`-block
     `pg_advisory_unlock` on the SAME session. If `queue_mod.enqueue` raised
@@ -304,7 +327,7 @@ def test_run_schedule_pass_raising_enqueue_does_not_leak_the_lock(db_session, mo
     monkeypatch.setattr(scheduler_mod.queue_mod, "enqueue", _raising_once_enqueue)
 
     with pytest.raises(RuntimeError, match="simulated DB error"):
-        run_schedule_pass(db_session, now=now)
+        run_schedule_pass(db_session, now=now, lock_key=sched_lock_key)
 
     # Mirrors the real caller contract (cli.py's cmd_schedule_refresh /
     # cmd_worker both db.rollback() on any exception) -- this is what an
@@ -325,7 +348,7 @@ def test_run_schedule_pass_raising_enqueue_does_not_leak_the_lock(db_session, mo
                 fresh_session, active=True, end_date=now.date()
             )
             fresh_session.flush()
-            enqueued = run_schedule_pass(fresh_session, now=now)
+            enqueued = run_schedule_pass(fresh_session, now=now, lock_key=sched_lock_key)
             assert second_jurisdiction.abbreviation in enqueued, (
                 "a fresh session must still be able to acquire the advisory lock and "
                 "run a pass after a prior pass raised -- the lock must not have leaked"

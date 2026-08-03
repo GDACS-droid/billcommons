@@ -73,7 +73,7 @@ def test_recompute_coverage_row_updates_bill_count(db_session):
         )
     db_session.flush()
 
-    recompute_all_coverage(db_session)
+    recompute_all_coverage(db_session, jurisdiction_ids=[jurisdiction.id])
     db_session.flush()
     db_session.refresh(coverage)
 
@@ -135,7 +135,7 @@ def test_periodic_recompute_advances_metadata_searchable_to_full_text_searchable
     db_session.add(document)
     db_session.flush()
 
-    recompute_all_coverage(db_session)
+    recompute_all_coverage(db_session, jurisdiction_ids=[jurisdiction.id])
     db_session.flush()
     db_session.refresh(coverage)
 
@@ -163,7 +163,7 @@ def test_periodic_recompute_does_not_touch_green_or_degraded_rows(db_session):
     db_session.add(degraded)
     db_session.flush()
 
-    recompute_all_coverage(db_session)
+    recompute_all_coverage(db_session, jurisdiction_ids=[jurisdiction.id, jurisdiction2.id])
     db_session.flush()
     db_session.refresh(green)
     db_session.refresh(degraded)

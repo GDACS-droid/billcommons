@@ -12,6 +12,7 @@ promote a jurisdiction to GREEN when full-text coverage is still zero.
 """
 from __future__ import annotations
 
+import os
 import uuid
 
 import httpx
@@ -50,6 +51,11 @@ from billcommons_schema.models import (
     ValidationRun,
 )
 from billcommons_shared.db import get_session
+
+# Set by conftest via PGAPPNAME before the engine is built, so every
+# connection this test process opens is labelled and can be told apart from
+# the production workers sharing this database.
+TEST_APPLICATION_NAME = os.environ.get("PGAPPNAME", "billcommons-tests")
 
 
 def _make_jurisdiction_with_bills(db_session, n=3, abbr=None):
@@ -1335,29 +1341,33 @@ def test_txnfree_runs_structural_and_external_legs_with_no_session_held_during_h
             assert "cross_source" in leg_names
 
         # Independent proof this function's OWN backend connection(s) were
-        # never left idle-in-transaction. Scoped to backends whose
-        # application_name matches the shared engine (billcommons_shared.db
-        # sets no custom application_name, so this falls back to filtering
-        # on `query` containing this test's own marker-free jurisdiction
-        # lookups being absent from any idle-in-txn row) -- deliberately NOT
-        # a blanket "0 idle-in-txn rows in the whole database" assertion,
-        # since the shared live DB can carry OTHER processes' (e.g. a
-        # concurrently-running crawl worker's) genuinely open transactions
-        # that have nothing to do with this call.
+        # never left idle-in-transaction.
+        #
+        # Scoped by application_name, which the test conftest sets via
+        # PGAPPNAME. It previously filtered idle-in-transaction rows to those
+        # whose query text mentioned `jurisdictions` -- but this suite shares
+        # a database with the live crawl and sync workers, and those workers
+        # query that table constantly. Any one of them sitting in a genuine
+        # open transaction failed this assertion, at random, for a reason
+        # that had nothing to do with the function under test. Filtering on
+        # the connection's own label separates "we leaked a transaction" from
+        # "production is busy", which is the distinction the assertion was
+        # always trying to make.
         check_db = get_session()
         try:
-            idle_in_txn_rows = check_db.execute(
+            offending = check_db.execute(
                 text(
                     "SELECT pid, query FROM pg_stat_activity "
-                    "WHERE state = 'idle in transaction' AND datname = current_database()"
-                )
+                    "WHERE state = 'idle in transaction' "
+                    "AND datname = current_database() "
+                    "AND application_name = :app "
+                    "AND pid <> pg_backend_pid()"
+                ),
+                {"app": TEST_APPLICATION_NAME},
             ).all()
-            offending = [
-                row for row in idle_in_txn_rows if "jurisdictions" in (row.query or "").lower()
-            ]
             assert offending == [], (
-                "no idle-in-transaction connection holding a jurisdictions-table query should "
-                f"exist after validate_jurisdiction_txnfree; found: {offending}"
+                "validate_jurisdiction_txnfree left an idle-in-transaction connection "
+                f"belonging to this test process; found: {offending}"
             )
         finally:
             check_db.close()

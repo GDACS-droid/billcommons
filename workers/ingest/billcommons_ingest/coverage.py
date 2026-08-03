@@ -129,9 +129,23 @@ def recompute_coverage_row(db: OrmSession, coverage: JurisdictionCoverage) -> Ju
     return coverage
 
 
-def recompute_all_coverage(db: OrmSession) -> list[JurisdictionCoverage]:
-    """Recompute every jurisdiction_coverage row. Caller commits."""
-    rows = db.execute(select(JurisdictionCoverage)).scalars().all()
+def recompute_all_coverage(
+    db: OrmSession, *, jurisdiction_ids: list | None = None
+) -> list[JurisdictionCoverage]:
+    """Recompute every jurisdiction_coverage row. Caller commits.
+
+    `jurisdiction_ids` narrows the pass, and exists for the test suite. Tests
+    run against the same live database as the production worker, which calls
+    this on a loop; an unscoped call from a test takes a row lock on all 77
+    coverage rows and contends with that worker on the same rows, so the test
+    intermittently died on the 30s statement timeout with a failure that said
+    nothing about the code under test. A test that created one jurisdiction
+    only ever needed to recompute that one. Production passes nothing and
+    recomputes everything, unchanged."""
+    stmt = select(JurisdictionCoverage)
+    if jurisdiction_ids is not None:
+        stmt = stmt.where(JurisdictionCoverage.jurisdiction_id.in_(jurisdiction_ids))
+    rows = db.execute(stmt).scalars().all()
     for row in rows:
         recompute_coverage_row(db, row)
     return rows
