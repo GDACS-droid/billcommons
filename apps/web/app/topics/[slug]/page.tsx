@@ -14,8 +14,48 @@ import type { BillSummary, Topic } from "@/lib/types";
 
 const TOPIC_REVALIDATE = 21600;
 
+/**
+ * How many pages of bills a topic hub renders (50 per page).
+ *
+ * fetchAllPages defaults to 50 pages, and it issues every page after the first
+ * as ONE Promise.all burst. That was harmless while the largest topic held 789
+ * bills (16 pages), and stopped being harmless the moment `local-government`
+ * arrived with 6,325: 126 simultaneous requests, which trips our own rate
+ * limiter, and a silent truncation to 2,500 bills that the page then reported
+ * as if it were the whole set.
+ *
+ * 10 pages is a page a reader will actually scroll, and the true corpus size
+ * comes from `topic.bill_count` -- an aggregate, one query -- rather than from
+ * counting what we happened to fetch.
+ */
+const TOPIC_MAX_PAGES = 10;
+
 interface Props {
   params: Promise<{ slug: string }>;
+}
+
+/**
+ * Prerender every topic hub at build time.
+ *
+ * Without this, a topic page is rendered on demand and its `/api/v1/topics`
+ * fetch is served from Vercel's Data Cache -- which PERSISTS ACROSS
+ * DEPLOYMENTS. So on the day four topics were added, /topics listed all seven
+ * (that page is prerendered, and a build-time fetch is fresh) while
+ * /topics/youth-online-safety returned 404 for six hours, because the
+ * on-demand render read a cached list that predated them and `find()` came
+ * back undefined. Two surfaces, same endpoint, opposite answers.
+ *
+ * Prerendering ties a topic hub's existence to the deployment rather than to
+ * a cache TTL: ship a topic, deploy, it is there. The list is a handful of
+ * curated slugs, so the build cost is negligible.
+ */
+export async function generateStaticParams() {
+  const result = await apiGet<TopicsEnvelope>("/api/v1/topics", undefined, {
+    revalidate: TOPIC_REVALIDATE,
+  });
+  // Returning [] on a failed build-time fetch leaves every topic to on-demand
+  // rendering rather than failing the build -- degraded, not broken.
+  return result.ok ? result.data.data.map((t) => ({ slug: t.slug })) : [];
 }
 
 interface TopicsEnvelope {
@@ -78,7 +118,8 @@ export default async function TopicPage({ params }: Props) {
       : await fetchAllPages<BillSummary>(
           `/api/v1/topics/${slug}`,
           {},
-          TOPIC_REVALIDATE
+          TOPIC_REVALIDATE,
+          { maxPages: TOPIC_MAX_PAGES }
         );
 
   if (topic === null || !bills.ok) {
@@ -122,16 +163,38 @@ export default async function TopicPage({ params }: Props) {
       />
       <p className="mt-3 text-sm tabular-nums text-slate-500">
         <strong className="text-slate-900">
-          {bills.items.length.toLocaleString("en-US")}
+          {topic.bill_count.toLocaleString("en-US")}
         </strong>{" "}
-        bills across{" "}
-        <strong className="text-slate-900">{states.length}</strong>{" "}
-        jurisdictions — updated nightly. Membership is matched on bill titles
-        and official subject tags; see something missing?{" "}
+        bills — updated nightly. Membership is matched on bill titles and
+        official subject tags; see something missing?{" "}
         <Link href="/about" className="underline">
           Tell us.
         </Link>
       </p>
+      {/* Say the list is partial rather than letting the buckets below read as
+          the complete set. The counts inside each bucket are counts of what is
+          SHOWN, and on a large topic that is a fraction of the corpus. */}
+      {topic.bill_count > bills.items.length ? (
+        <p className="mt-2 text-sm text-slate-500">
+          Showing the{" "}
+          <strong className="text-slate-900">
+            {bills.items.length.toLocaleString("en-US")}
+          </strong>{" "}
+          most recently active, across{" "}
+          <strong className="text-slate-900">{states.length}</strong>{" "}
+          jurisdictions. For the full set, query{" "}
+          <code className="rounded bg-slate-100 px-1">
+            /api/v1/topics/{slug}
+          </code>{" "}
+          or filter by state.
+        </p>
+      ) : (
+        <p className="mt-2 text-sm text-slate-500">
+          Across{" "}
+          <strong className="text-slate-900">{states.length}</strong>{" "}
+          jurisdictions.
+        </p>
+      )}
 
       <div className="mt-6 max-w-xl">
         <AlertSignup topicSlug={slug} topicName={topic.name} />
