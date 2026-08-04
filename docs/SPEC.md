@@ -60,7 +60,7 @@ freshness metadata in every substantive response.
 Tools: search_legislation, get_bill_record, compare_bill_versions,
 find_similar_bills, get_vote_details, get_upcoming_hearings,
 trace_legislative_history, build_legislative_evidence_packet,
-get_jurisdiction_coverage, get_active_sessions. Each: structured JSON,
+get_jurisdiction_coverage, get_active_sessions, list_topics. Each: structured JSON,
 canonical IDs, official source URLs, freshness timestamps, official-vs-derived
 distinction, meaningful errors on thin coverage, no hallucinated fields.
 Integration tests run against the DEPLOYED endpoint with real tool calls.

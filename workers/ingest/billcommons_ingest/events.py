@@ -20,6 +20,9 @@ collections to refetch, not a field-level patch:
     text      document text became available (the bill is now searchable and
               diffable -- for a policy tracker, usually the event that matters)
     metadata  title/chamber/type/source fields changed
+    votes     one or more vote events were recorded (detail carries the
+              human-useful tally, e.g. "House: Third Reading -- passed 98-12",
+              when the source provides one)
 """
 from __future__ import annotations
 
@@ -33,8 +36,9 @@ ACTIONS = "actions"
 SPONSORS = "sponsors"
 TEXT = "text"
 METADATA = "metadata"
+VOTES = "votes"
 
-ALL_KINDS = frozenset({CREATED, STATUS, ACTIONS, SPONSORS, TEXT, METADATA})
+ALL_KINDS = frozenset({CREATED, STATUS, ACTIONS, SPONSORS, TEXT, METADATA, VOTES})
 
 
 def record_event(

@@ -16,7 +16,7 @@ import inspect
 
 import pytest
 
-from billcommons_ingest import api_sync, events, fulltext
+from billcommons_ingest import api_sync, events, fulltext, openstates_bulk
 
 
 def test_record_event_rejects_an_unknown_kind():
@@ -60,6 +60,14 @@ def test_bill_creation_and_metadata_changes_record_events():
     source = inspect.getsource(api_sync.sync_state)
     assert "events.CREATED" in source
     assert "events.METADATA" in source
+
+
+def test_vote_ingestion_records_an_event_only_for_new_votes():
+    """See test_openstates_bulk.py for the behavioral (DB-backed) version of
+    the no-re-announce-on-resync guarantee; this just pins the source shape."""
+    source = inspect.getsource(openstates_bulk.ingest_session_csv_zip)
+    assert "record_event" in source, "a new vote event emits no change event"
+    assert "events.VOTES" in source
 
 
 def test_no_ingest_path_stamps_bills_updated_at_by_hand_anymore():

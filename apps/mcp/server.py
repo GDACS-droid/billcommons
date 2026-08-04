@@ -1,6 +1,6 @@
 """Bill Commons MCP server entry point.
 
-Runs the 10 Bill Commons tools (see docs/SPEC.md "MCP" section) over
+Runs the 11 Bill Commons tools (see docs/SPEC.md "MCP" section) over
 Streamable HTTP, mounted at /mcp, stateless (no session affinity — safe
 behind a load balancer). Listens on env PORT (default 8400).
 
@@ -66,9 +66,19 @@ def search_legislation(
     status: str | None = None,
     limit: int | None = None,
 ) -> dict:
-    """Search bills by keyword/phrase (full-text) or normalized bill number
-    (e.g. "HB 123", "H.B. 123", "hb123" all match). Optionally filter by
-    jurisdiction (two-letter state code or name), chamber, and status."""
+    """Search FULL BILL TEXT -- not just known-bill-number lookup. `q` is
+    matched against titles, descriptions, AND ingested document text via
+    Postgres websearch_to_tsquery (supports "quoted phrases", OR, and
+    -exclusion, same syntax as a search engine), with a fuzzy pg_trgm
+    title-similarity fallback when the exact query has no hits. `q` can
+    ALSO be a bill number ("HB 123", "H.B. 123", "hb123" all match) and
+    that fast path is tried first. Optionally filter by jurisdiction
+    (two-letter state code or name), chamber, and status.
+
+    For a curated cross-state slice of a subject (e.g. "every AI bill in the
+    country") rather than an ad-hoc keyword search, call list_topics first --
+    its membership rules also match on structured subject tags this
+    full-text search does not see."""
     return tools.search_legislation(q, jurisdiction, chamber, status, limit)
 
 
@@ -167,6 +177,20 @@ def get_active_sessions(jurisdiction: str | None = None) -> dict:
     """List legislative sessions currently flagged active, optionally
     filtered by jurisdiction (two-letter state code or name)."""
     return tools.get_active_sessions(jurisdiction)
+
+
+@mcp.tool()
+def list_topics() -> dict:
+    """List Bill Commons' curated cross-state topic trackers (e.g. artificial
+    intelligence, youth online safety, platform accountability,
+    cybersecurity, cryptocurrency, data privacy, local government &
+    preemption) -- the entry point for "what subjects does Bill Commons
+    track across all 50 states + DC" and "how do I get every bill in one".
+    Each topic is a title/subject membership rule tuned for precision over
+    recall, with a live bill_count and how_to_fetch_bills. This tool does
+    not itself return bill rows -- pair it with search_legislation or the
+    REST API's /topics/{slug} for the bills."""
+    return tools.list_topics()
 
 
 def build_app():

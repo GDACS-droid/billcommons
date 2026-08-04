@@ -111,7 +111,7 @@ def list_changes(
         None,
         description=(
             "Restrict to one change kind: created, status, actions, sponsors, "
-            "text, metadata."
+            "text, metadata, votes."
         ),
     ),
     per_page: int = Query(DEFAULT_CHANGES_PER_PAGE, ge=1),

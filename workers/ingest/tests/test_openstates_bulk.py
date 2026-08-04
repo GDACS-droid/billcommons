@@ -21,11 +21,12 @@ from datetime import date, datetime, timezone
 
 from sqlalchemy import func, select
 
-from billcommons_ingest.openstates_bulk import ingest_session_csv_zip
+from billcommons_ingest.openstates_bulk import _vote_event_detail, ingest_session_csv_zip
 from billcommons_schema.models import (
     Bill,
     BillAction,
     BillDocument,
+    BillEvent,
     BillSubject,
     BillVersion,
     Jurisdiction,
@@ -200,6 +201,88 @@ def test_ingest_populates_vote_events_and_records(db_session, rawstore):
     ).scalars().all()
     assert len(vote_records_b) == 1
     assert vote_records_b[0].voter_name == "John Fixtureman"
+
+
+# ---------------------------------------------------------------------------
+# _vote_event_detail: pure function, no DB -- pins the head-join fix
+# ---------------------------------------------------------------------------
+
+
+def test_vote_detail_joins_org_and_motion():
+    assert _vote_event_detail("House", "Passage", "pass", 60, 40) == "House: Passage -- pass 60-40"
+
+
+def test_vote_detail_empty_motion_text_falls_back_to_org_alone():
+    """Regression: `f"{org}: {motion}"` with an empty motion_text produced
+    the truthy string "House: ", which skipped the "Vote recorded" fallback
+    and rendered "House:  -- pass 60-40" everywhere this detail surfaces."""
+    assert _vote_event_detail("House", "", "pass", 60, 40) == "House -- pass 60-40"
+
+
+def test_vote_detail_whitespace_only_motion_text_falls_back_to_org_alone():
+    """Same bug, invisible culprit: a whitespace-only motion_text ("  ", a
+    routine CSV-cell artifact) is truthy as a Python string but has no
+    actual content, so a truthiness-only filter would reproduce
+    "House:   -- pass 60-40" without an empty string anywhere to blame."""
+    assert _vote_event_detail("House", "   ", "pass", 60, 40) == "House -- pass 60-40"
+
+
+def test_vote_detail_missing_organization_falls_back_to_motion_alone():
+    assert _vote_event_detail(None, "Passage", "pass", 60, 40) == "Passage -- pass 60-40"
+
+
+def test_vote_detail_missing_result_omits_it_but_keeps_the_tally():
+    assert _vote_event_detail("House", "Passage", None, 60, 40) == "House: Passage -- 60-40"
+
+
+def test_vote_detail_missing_everything_but_org_and_motion_falls_back():
+    assert _vote_event_detail(None, "", None, 0, 0) == "Vote recorded"
+
+
+def test_ingest_records_a_votes_event_only_on_the_first_run(db_session, rawstore):
+    """New vote events must emit a `votes` bill_events entry with a
+    human-useful tally, and a re-run of the SAME zip must not re-announce
+    them -- a feed subscriber re-synced daily would otherwise see the same
+    two votes forever."""
+    session_row = _make_session_row(db_session)
+    zip_bytes = build_fixture_zip_bytes()
+
+    ingest_session_csv_zip(db_session, zip_bytes, session_row=session_row, rawstore=rawstore)
+    db_session.flush()
+
+    bill_hb1 = db_session.execute(
+        select(Bill).where(Bill.session_id == session_row.id, Bill.identifier_norm == "HB 1")
+    ).scalar_one()
+
+    vote_bill_events = db_session.execute(
+        select(BillEvent).where(BillEvent.bill_id == bill_hb1.id, BillEvent.kind == "votes")
+    ).scalars().all()
+    # vote-1 (60-40, pass) and vote-1b (10-5, pass) -- one event per new vote.
+    assert len(vote_bill_events) == 2
+    details = sorted(e.detail for e in vote_bill_events)
+    assert details == [
+        "Test State House: Passage -- pass 10-5",
+        "Test State House: Passage -- pass 60-40",
+    ]
+
+    # Re-ingesting the SAME zip must not add any more `votes` events: both
+    # vote-1 and vote-1b are found via upstream_id on the second pass and
+    # take the "existing" branch, which never calls record_event.
+    ingest_session_csv_zip(
+        db_session,
+        zip_bytes,
+        session_row=session_row,
+        rawstore=rawstore,
+        retrieved_at=datetime.now(timezone.utc),
+    )
+    db_session.flush()
+
+    vote_bill_events_after_resync = db_session.execute(
+        select(BillEvent).where(BillEvent.bill_id == bill_hb1.id, BillEvent.kind == "votes")
+    ).scalars().all()
+    assert len(vote_bill_events_after_resync) == 2, (
+        "a resync of unchanged votes must not re-announce them"
+    )
 
 
 def test_ingest_provenance_columns_populated(db_session, rawstore):

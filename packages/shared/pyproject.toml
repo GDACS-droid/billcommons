@@ -16,6 +16,7 @@ dependencies = [
     # dev venv; both are declared explicitly because relying on a transitive or
     # accidental install for a direct import means the worker image builds
     # without cryptography and the crawl process dies at module import.
+    "billcommons-schema",
     "certifi",
     "cryptography>=42",
     "httpx",

@@ -58,6 +58,7 @@ KIND_LABEL = {
     "sponsors": "Sponsor change",
     "text": "Bill text available",
     "metadata": "Details updated",
+    "votes": "Vote recorded",
 }
 
 

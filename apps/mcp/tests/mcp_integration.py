@@ -44,6 +44,7 @@ REQUIRED_TOOLS = {
     "build_legislative_evidence_packet",
     "get_jurisdiction_coverage",
     "get_active_sessions",
+    "list_topics",
 }
 
 
@@ -67,7 +68,7 @@ async def check_core_tools(url: str) -> None:
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            # --- list_tools: assert all 10 required tools are present ---
+            # --- list_tools: assert all required tools are present ---
             tools_result = await session.list_tools()
             tool_names = {t.name for t in tools_result.tools}
             missing = REQUIRED_TOOLS - tool_names
@@ -127,6 +128,18 @@ async def check_core_tools(url: str) -> None:
                 f"{payload['jurisdiction_count']} jurisdiction(s) "
                 f"(note={payload.get('note')!r})"
             )
+
+            # --- list_topics() ---
+            result = await session.call_tool("list_topics", {})
+            assert not result.isError, f"list_topics errored: {result}"
+            payload = _tool_result_json(result)
+            assert "topics" in payload and isinstance(payload["topics"], list), payload
+            assert payload["topics"], "expected at least one curated topic"
+            assert "meta" in payload and "retrieved_at" in payload["meta"], payload
+            first = payload["topics"][0]
+            for key in ("slug", "name", "description", "bill_count", "how_to_fetch_bills"):
+                assert key in first, f"list_topics topic missing {key!r}: {first}"
+            print(f"OK: list_topics -> {len(payload['topics'])} topic(s)")
 
 
 async def check_rate_limit_burst(url: str) -> None:

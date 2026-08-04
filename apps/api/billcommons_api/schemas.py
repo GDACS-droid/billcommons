@@ -155,9 +155,11 @@ class ChangeEvent(BaseModel):
     cursor: str
     kind: str = Field(
         description=(
-            "created | status | actions | sponsors | text | metadata. "
+            "created | status | actions | sponsors | text | metadata | votes. "
             "`text` means document text became available -- the bill is now "
-            "searchable and diffable."
+            "searchable and diffable. `votes` means one or more vote events "
+            "were recorded; `detail` carries the tally when the source "
+            "provides one."
         )
     )
     changed_at: datetime

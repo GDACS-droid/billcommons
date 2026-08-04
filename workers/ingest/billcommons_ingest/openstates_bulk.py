@@ -46,6 +46,7 @@ from typing import BinaryIO
 from sqlalchemy import insert, select, text
 from sqlalchemy.orm import Session as OrmSession
 
+from billcommons_ingest import events
 from billcommons_schema.models import (
     Bill,
     BillAction,
@@ -242,6 +243,43 @@ def _resolve_organization(db: OrmSession, org_cache: dict[str, Organization], op
     if org is not None:
         org_cache[openstates_id] = org
     return org
+
+
+def _vote_event_detail(
+    organization_name: str | None,
+    motion_text: str,
+    result: str | None,
+    yes_count: int,
+    no_count: int,
+) -> str:
+    """Human-useful one-line tally for the `votes` bill_events entry, e.g.
+    "House: Third Reading -- passed 98-12". Degrades gracefully: any of
+    chamber/result/counts can be missing from the source row, and this must
+    still read sensibly with whatever is actually there.
+
+    Built by joining only the NON-EMPTY, STRIPPED head parts, not by
+    checking the combined string's truthiness: `f"{organization_name}: {motion_text}"`
+    with a present organization_name and an empty motion_text produces
+    "House: " -- which IS truthy, so `head or "Vote recorded"` never fired
+    and every such vote (a real, if rare, source shape) rendered as
+    "House:  -- pass 60-40" everywhere this detail string surfaces (the
+    change feed, the Atom feed, email digests). Stripping before the
+    emptiness check matters too: a whitespace-only motion_text ("  ", a
+    routine artifact of CSV cells) is truthy as a Python string but has no
+    actual content, and would otherwise reproduce the exact same bug with
+    an invisible culprit."""
+    head_parts = [
+        stripped
+        for part in (organization_name, motion_text)
+        if part and (stripped := part.strip())
+    ]
+    head = ": ".join(head_parts) if head_parts else "Vote recorded"
+    tail_parts = []
+    if result:
+        tail_parts.append(result)
+    if yes_count or no_count:
+        tail_parts.append(f"{yes_count}-{no_count}")
+    return f"{head} -- {' '.join(tail_parts)}" if tail_parts else head
 
 
 def peek_session_slug(zip_source: str | Path | BinaryIO | bytes) -> str | None:
@@ -1154,6 +1192,24 @@ def ingest_session_csv_zip(
                         (bill.id, motion_text, start_date, organization_id)
                     ] = vote_event
                 vote_records_by_event[vote_event.id] = set()
+                # ONLY on this branch (a genuinely new upstream vote), so a
+                # re-run of the same zip -- which finds every prior vote via
+                # existing_vote_events_by_upstream_id/_fallback_key above and
+                # takes the `else` branch below -- never re-announces it. The
+                # BillEvent is added to the ORM session here and flushed at
+                # the same PROGRESS_CHUNK/final commit as vote_event_inserter
+                # below, so it lands in the SAME transaction as the vote row
+                # it describes (events.py's stated invariant), even though
+                # this loop commits in chunks rather than once at the end.
+                # Vote events with no bill (bill is None, e.g. an
+                # organization-only procedural vote) have nothing to attach
+                # the event to and are skipped.
+                if bill is not None:
+                    org_name = org.name if org_openstates_id and org is not None else None
+                    detail = _vote_event_detail(
+                        org_name, motion_text, row.get("result"), yes_count, no_count
+                    )
+                    events.record_event(db, bill.id, events.VOTES, detail)
             else:
                 vote_event = existing
                 if vote_event.id not in vote_records_by_event:

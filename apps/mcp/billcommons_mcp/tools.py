@@ -13,6 +13,7 @@ trigram similarity scores, diff results) and is always labeled as such.
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import difflib
@@ -44,6 +45,7 @@ from billcommons_shared.evidence import (
     snapshot_id,
 )
 from billcommons_shared.normalize import normalize_bill_number
+from billcommons_shared.topics import TOPICS, topic_bill_count
 
 from billcommons_mcp.common import (
     ToolError,
@@ -1256,3 +1258,98 @@ def get_active_sessions(jurisdiction: str | None = None) -> dict[str, Any]:
             db.close()
 
     return _run_tool(body, "get_active_sessions")
+
+
+# ---------------------------------------------------------------------------
+# 11. list_topics
+# ---------------------------------------------------------------------------
+
+
+def _topic_search_hint(topic) -> str:
+    """A representative keyword phrase for search_legislation, derived from
+    the topic's own membership rule rather than hand-picked, so it can never
+    drift out of sync with what the topic actually matches. Always a real
+    phrase, not a LIKE pattern -- title_patterns are `%wrapped%` for SQL,
+    never empty (billcommons_shared.topics.Topic always has at least one)."""
+    return topic.title_patterns[0].strip("%")
+
+
+# list_topics is explicitly advertised as the call-FIRST discovery tool
+# (see its docstring below and search_legislation's), on a server that is
+# public, anonymous, and keyless by design (see rate_limit.py) -- there is
+# no CDN or edge cache in front of it the way apps/web sits in front of the
+# REST /topics list. Each topic's count is a corpus-wide, leading-wildcard
+# LIKE scan (7 of them per call today; see billcommons_shared.topics'
+# membership_clause), so an uncached list_topics reintroduces, on a surface
+# with strictly weaker protection, exactly the class of cost 3d82eee already
+# flagged as worth caching on the web side (there it was Data Cache
+# staleness across deploys, not raw query cost, but the fix here is the same
+# shape: a short TTL cache, in-process since this is a single-process server
+# per rate_limit.py's stated assumption). 300s matches
+# FEED_CACHE_CONTROL/TOPIC_LIST_REVALIDATE elsewhere in this codebase.
+_TOPIC_COUNT_CACHE_TTL_SECONDS = 300
+_topic_count_cache: dict[str, tuple[int, float]] = {}
+_topic_count_cache_lock = threading.Lock()
+
+
+def _cached_topic_bill_count(db, topic) -> int:
+    now = time.monotonic()
+    with _topic_count_cache_lock:
+        cached = _topic_count_cache.get(topic.slug)
+        if cached is not None and (now - cached[1]) < _TOPIC_COUNT_CACHE_TTL_SECONDS:
+            return cached[0]
+    # Query outside the lock: this is a read-only COUNT, and holding the
+    # lock across a DB round trip would serialize every concurrent
+    # list_topics call on the slowest query instead of just the cache dict
+    # access. A harmless race is possible (two callers both miss and both
+    # query), never a correctness issue -- the cache is an optimization on a
+    # tool that reports "how many bills" for reference, not the tool that
+    # returns them.
+    count = topic_bill_count(db, topic)
+    with _topic_count_cache_lock:
+        _topic_count_cache[topic.slug] = (count, now)
+    return count
+
+
+def list_topics() -> dict[str, Any]:
+    """List Bill Commons' curated cross-state topic trackers (e.g. artificial
+    intelligence, youth online safety, cybersecurity, cryptocurrency) -- the
+    DISCOVERY entry point for "what topics does Bill Commons track" and "how
+    do I get every bill in one". Each topic is a title/subject membership
+    rule tuned for precision over recall (see billcommons_shared.topics), not
+    a raw keyword search -- search_legislation is the tool for an arbitrary
+    keyword/phrase the caller supplies themselves. Returns bill_count (live,
+    computed the same way as the public /topics endpoint) and how_to_fetch_bills
+    for each topic; this tool itself does not return bill rows."""
+
+    def body() -> dict[str, Any]:
+        db = get_session()
+        try:
+            items = [
+                {
+                    "slug": topic.slug,
+                    "name": topic.name,
+                    "description": topic.description,
+                    "bill_count": _cached_topic_bill_count(db, topic),
+                    "how_to_fetch_bills": (
+                        f"GET https://api.billcommons.org/api/v1/topics/{topic.slug} "
+                        "for the full paginated bill list (JSON), or "
+                        f"https://billcommons.org/topics/{topic.slug} for the human-"
+                        "readable hub. Within this MCP server, "
+                        f"search_legislation(q={_topic_search_hint(topic)!r}) finds a "
+                        "similar slice via full-text search -- similar, not identical, "
+                        "since this topic's membership rule also matches on subject "
+                        "tags that a keyword search does not see."
+                    ),
+                }
+                for topic in TOPICS.values()
+            ]
+            return {
+                "topics": items,
+                "result_count": len(items),
+                "meta": meta_envelope(),
+            }
+        finally:
+            db.close()
+
+    return _run_tool(body, "list_topics")
