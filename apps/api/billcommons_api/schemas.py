@@ -297,6 +297,86 @@ class AlertSubscribeResponse(BaseModel):
     meta: dict
 
 
+class WebhookCreateRequest(BaseModel):
+    url: str = Field(max_length=2000)
+    email: str = Field(max_length=320)
+    kind: str = Field(description="topic | jurisdiction | bills")
+    target: str = Field(
+        max_length=10000,
+        description=(
+            "topic: a topic slug. jurisdiction: a jurisdiction abbreviation. "
+            "bills: comma-separated bill UUIDs (at most 64, and the "
+            "combined url/kind/target/event_kinds must fit a shared byte "
+            "budget -- see docs/api/webhooks.md)."
+        ),
+    )
+    jurisdiction: str | None = Field(
+        default=None,
+        max_length=2,
+        description="Only used with kind='topic', to scope the topic to one state, e.g. 'FL'.",
+    )
+    event_kinds: str | None = Field(
+        default=None,
+        max_length=200,
+        description=(
+            "Comma-separated subset of created,status,actions,sponsors,text,"
+            "metadata,votes. Omit for all kinds."
+        ),
+    )
+
+
+class WebhookCreateResponse(BaseModel):
+    id: uuid.UUID
+    manage_token: str = Field(
+        description="Shown once. Bearer token for GET/DELETE/reactivate -- store it now."
+    )
+    signing_secret: str = Field(description="HMAC key for verifying delivery signatures.")
+    verified: bool
+    note: str
+
+
+class WebhookDeliveryOut(BaseModel):
+    delivery_id: uuid.UUID
+    first_seq: int | None = None
+    last_seq: int | None = None
+    event_count: int
+    status: int | None = None
+    error: str | None = None
+    duration_ms: int | None = None
+    attempted_at: datetime
+
+
+class WebhookStatusResponse(BaseModel):
+    id: uuid.UUID
+    url: str
+    kind: str
+    target: str
+    event_kinds: str | None = None
+    verified: bool
+    active: bool
+    last_success_at: datetime | None = None
+    last_status: int | None = None
+    last_error: str | None = None
+    consecutive_failures: int
+    failing_since: datetime | None = None
+    disabled_reason: str | None = None
+    disabled_at: datetime | None = None
+    # Approximate -- see billcommons_api.routers.webhooks. An UPPER BOUND on
+    # how many bill_events this subscription is behind, not scoped to its own
+    # topic/jurisdiction/bill filter (that count is corpus-scan expensive);
+    # a narrowly-scoped subscription will see fewer real events than this.
+    cursor_lag_seq: int
+    recent_deliveries: list[WebhookDeliveryOut]
+    meta: dict
+
+
+class WebhookReactivateResponse(BaseModel):
+    id: uuid.UUID
+    active: bool
+    mode: str
+    meta: dict
+
+
 class FeedbackRequest(BaseModel):
     message: str = Field(min_length=3, max_length=5000)
     email: str | None = Field(default=None, max_length=320)

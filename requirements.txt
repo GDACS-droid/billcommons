@@ -30,6 +30,11 @@ pytest==9.1.1
 # code migration, not a version bump.
 mcp==1.28.1
 pypdf==6.14.2
+# Verify round-7 fix #3: real eTLD+1 lookups for the webhooks per-domain
+# quota (billcommons_api.routers.webhooks._registrable_domain). Bundles the
+# ICANN/Mozilla public suffix list DATA in the package itself -- no network
+# fetch at runtime, no new startup dependency shape.
+publicsuffix2==2.20191221
 
 # workspace packages (editable installs, single source of truth for models/utils)
 -e packages/schema

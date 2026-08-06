@@ -20,6 +20,17 @@ is annoying, silent loss is a broken product.
 A BRAND-NEW subscription fast-forwards to the watermark without sending:
 "here is everything that ever happened" is not a useful first email.
 
+Also piggybacks webhook lifecycle notices ("webhook created" /
+"webhook auto-disabled") for workers/webhooks/dispatch_webhooks.py -- that
+worker runs on Railway and has no Resend key by design (see its own module
+docstring: an SSRF escape from a box process reaches the home LAN/tailnet, an
+SSRF escape from a disposable Railway container does not). The dispatcher only
+sets `webhook_subscriptions.notify_pending`; this script drains it, the same
+box-has-the-mail-creds split alerts already use. Guarded by an
+information_schema probe so it no-ops cleanly until migration 0012 exists
+-- see `has_scope`'s probe below for the exact same pattern already in this
+file for migration 0011.
+
 Usage:
     send_alerts.py            # normal nightly run
     send_alerts.py --dry-run  # print what would be sent, send nothing
@@ -41,10 +52,23 @@ FROM_ADDR = "Bill Commons <alerts@billcommons.org>"
 API_BASE = "https://api.billcommons.org"
 SITE = "https://billcommons.org"
 
-# Mirrors billcommons_api.routers.changes.COMMIT_SAFETY_LAG_SECONDS -- the
-# sender must never read the head of bill_events for the same reason the API
-# doesn't (seq visible out of order across commits).
-COMMIT_SAFETY_LAG_SECONDS = 120
+# Mirrors billcommons_shared.watermark.COMMIT_SAFETY_LAG_SECONDS (single
+# source of truth for every OTHER reader of bill_events) -- the sender must
+# never read the head of bill_events for the same reason the API doesn't
+# (seq visible out of order across commits). A literal copy, not an import,
+# for the same reason topic_membership_sql() below is a literal copy of the
+# API's topic registry: this script runs straight from the working tree via
+# a systemd timer with no deploy step and deliberately does not depend on
+# billcommons_shared (see this module's own docstring). Kept in sync by
+# apps/api/tests' own contract test
+# (test_alerts_sender_watermark_matches_shared_constant), the same
+# duplicate-value-plus-contract-test shape test_sender_membership_map_
+# matches_the_api_topics already uses for the topic predicates below.
+#
+# Value + empirical basis: see billcommons_shared/watermark.py's docstring
+# (2026-08-04 pre-ship measurement, spec §8's D14 gate: 452,013 bill_events
+# rows, max observed skew 98.2s, p99.99 97.1s; 240s ~= 2.4x observed max).
+COMMIT_SAFETY_LAG_SECONDS = 240
 
 # Digest at most this many events per email; anything beyond is summarized as
 # a count with a link. An adjournment sweep can retire hundreds of a topic's
@@ -92,6 +116,181 @@ def resend_send(
     )
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.load(r)["id"]
+
+
+def resend_send_plain(api_key: str, to_addr: str, subject: str, html: str, text_body: str) -> str:
+    """Like `resend_send` but without a List-Unsubscribe header -- a webhook
+    lifecycle notice is not a digest subscription and has no unsubscribe
+    link to advertise."""
+    payload = {"from": FROM_ADDR, "to": [to_addr], "subject": subject, "html": html, "text": text_body}
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "billcommons-alerts/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)["id"]
+
+
+def render_webhook_notice(kind: str, sub_id: str, scope: str, disabled_reason: str | None) -> tuple[str, str, str]:
+    """Returns (subject, html, text) for one of the two webhook lifecycle
+    messages -- NEVER the signing_secret or manage_token, which this script
+    has no access to anyway (only the dispatcher and the API touch those
+    columns' plaintext form, and the manage_token is only ever readable at
+    creation, in the API response, not persisted in plaintext at all).
+    """
+    if kind == "created_disabled":
+        # Verify round-3 fix #13: the dispatcher combines an unsent
+        # "created" notice with a same-window auto-disable into this ONE
+        # sentinel value (notify_pending is a single-slot column -- see
+        # workers/webhooks/dispatch_webhooks.py's `_notify_disabled`) rather
+        # than silently overwriting the fact the subscription ever
+        # verified. Render both facts, in order, honestly.
+        subject = "[Bill Commons] Webhook verified, then auto-disabled"
+        reason_text = disabled_reason or "repeated delivery failures"
+        html = f"""<div style="font-family:system-ui,sans-serif;max-width:620px;margin:0 auto">
+<h2 style="margin-bottom:4px">Bill Commons</h2>
+<p>Your webhook subscription verified earlier today -- and has since been
+automatically disabled.</p>
+<ul>
+<li><b>Subscription id:</b> {sub_id}</li>
+<li><b>Scope:</b> {scope}</li>
+<li><b>Disable reason:</b> {reason_text}</li>
+</ul>
+<p>To resume, POST to <code>/api/v1/webhooks/{sub_id}/reactivate?mode=resume</code>
+(keeps the backlog since disable) or <code>?mode=skip</code> (drops the
+backlog, starts from now), with <code>Authorization: Bearer &lt;manage_token&gt;</code>
+using the manage_token from creation. See {SITE}/docs/api/webhooks for details.</p>
+<hr style="border:none;border-top:1px solid #ddd;margin:24px 0">
+<p style="color:#888;font-size:12px">Free and open source -- <a href="{SITE}">billcommons.org</a>.</p>
+</div>"""
+        text_body = (
+            f"Bill Commons -- webhook verified earlier today and has since been "
+            f"auto-disabled.\n\n"
+            f"Subscription id: {sub_id}\nScope: {scope}\nDisable reason: {reason_text}\n\n"
+            f"To resume: POST /api/v1/webhooks/{sub_id}/reactivate?mode=resume "
+            f"(keep the backlog) or ?mode=skip (drop it), with "
+            f"Authorization: Bearer <manage_token> from creation.\n"
+        )
+    elif kind == "created":
+        subject = "[Bill Commons] Webhook subscription created"
+        html = f"""<div style="font-family:system-ui,sans-serif;max-width:620px;margin:0 auto">
+<h2 style="margin-bottom:4px">Bill Commons</h2>
+<p>Your webhook subscription is set up and verified.</p>
+<ul>
+<li><b>Subscription id:</b> {sub_id}</li>
+<li><b>Scope:</b> {scope}</li>
+</ul>
+<p>Your endpoint has already answered the one-time verification challenge, so
+deliveries have begun. Check status any time with
+<code>GET /api/v1/webhooks/{sub_id}</code> using the manage_token you were
+given at creation (shown once, not repeated here).</p>
+<hr style="border:none;border-top:1px solid #ddd;margin:24px 0">
+<p style="color:#888;font-size:12px">Free and open source -- <a href="{SITE}">billcommons.org</a>.</p>
+</div>"""
+        text_body = (
+            f"Bill Commons -- webhook subscription created and verified.\n\n"
+            f"Subscription id: {sub_id}\nScope: {scope}\n\n"
+            f"Your endpoint has already answered the one-time verification "
+            f"challenge, so deliveries have begun. Check status with "
+            f"GET /api/v1/webhooks/{sub_id} using the manage_token from "
+            f"creation.\n"
+        )
+    else:  # "disabled"
+        subject = "[Bill Commons] Webhook subscription auto-disabled"
+        reason_text = disabled_reason or "repeated delivery failures"
+        html = f"""<div style="font-family:system-ui,sans-serif;max-width:620px;margin:0 auto">
+<h2 style="margin-bottom:4px">Bill Commons</h2>
+<p>Your webhook subscription was automatically disabled.</p>
+<ul>
+<li><b>Subscription id:</b> {sub_id}</li>
+<li><b>Scope:</b> {scope}</li>
+<li><b>Reason:</b> {reason_text}</li>
+</ul>
+<p>To resume, POST to <code>/api/v1/webhooks/{sub_id}/reactivate?mode=resume</code>
+(keeps the backlog since disable) or <code>?mode=skip</code> (drops the
+backlog, starts from now), with <code>Authorization: Bearer &lt;manage_token&gt;</code>
+using the manage_token from creation. See {SITE}/docs/api/webhooks for details.</p>
+<hr style="border:none;border-top:1px solid #ddd;margin:24px 0">
+<p style="color:#888;font-size:12px">Free and open source -- <a href="{SITE}">billcommons.org</a>.</p>
+</div>"""
+        text_body = (
+            f"Bill Commons -- webhook subscription auto-disabled.\n\n"
+            f"Subscription id: {sub_id}\nScope: {scope}\nReason: {reason_text}\n\n"
+            f"To resume: POST /api/v1/webhooks/{sub_id}/reactivate?mode=resume "
+            f"(keep the backlog) or ?mode=skip (drop it), with "
+            f"Authorization: Bearer <manage_token> from creation.\n"
+        )
+    return subject, html, text_body
+
+
+def drain_webhook_notifications(conn, get_api_key, *, dry_run: bool = False) -> tuple[int, int]:
+    """Probe-guarded no-op until migration 0012's table exists -- same
+    information_schema pattern `has_scope` below uses for migration 0011.
+    Sends the two lifecycle messages `notify_pending` marks and clears it on
+    success; a crash before the clear means a re-send next night, same
+    duplicate-over-silent-loss trade the topic digest loop above makes.
+    """
+    with conn.cursor() as cur:
+        # Verify round-9 fix #3: schema-qualified, same reasoning as
+        # dispatch_webhooks.py's `_creation_events_table_exists` (round-7
+        # fix #6) -- an unqualified probe can match a same-named table in
+        # ANOTHER schema, wrongly treating migration 0012 as applied.
+        cur.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_name = 'webhook_subscriptions' "
+            "AND table_schema = current_schema()"
+        )
+        if cur.fetchone() is None:
+            return 0, 0
+        cur.execute(
+            "SELECT id, email, kind, target, notify_pending, disabled_reason "
+            "FROM webhook_subscriptions WHERE notify_pending IS NOT NULL ORDER BY id"
+        )
+        rows = cur.fetchall()
+
+    sent = failed = 0
+    api_key: str | None = None
+    for sub_id, email, kind, target, notify_pending, disabled_reason in rows:
+        scope = f"{kind}:{target}"
+        subject, html, text_body = render_webhook_notice(
+            notify_pending, str(sub_id), scope, disabled_reason
+        )
+        if dry_run:
+            print(f"DRY-WEBHOOK {email} {sub_id}: {subject}", flush=True)
+            continue
+        if api_key is None:
+            api_key = get_api_key()
+        try:
+            msg_id = resend_send_plain(api_key, email, subject, html, text_body)
+        except Exception as exc:  # noqa: BLE001 -- one bad address must not kill the run
+            print(f"WEBHOOK-NOTIFY FAIL {email} {sub_id}: {exc}", flush=True)
+            failed += 1
+            continue
+        # Round-2 fix #9: clear with a compare-and-swap on the EXACT value
+        # this loop read (`notify_pending = %s` in the WHERE, not just
+        # `id = %s`) -- the dispatcher can flip `notify_pending` between
+        # this script's SELECT above and this UPDATE (e.g. a subscription
+        # that was 'created' when read gets auto-disabled a moment later,
+        # setting notify_pending='disabled'); a plain `WHERE id = %s` would
+        # clobber that newer, not-yet-sent 'disabled' notice and lose it
+        # silently. A CAS miss (0 rows updated) means exactly that raced --
+        # leave the flag alone; the next nightly run picks up whatever it
+        # is now.
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE webhook_subscriptions SET notify_pending = NULL "
+                "WHERE id = %s AND notify_pending = %s",
+                (sub_id, notify_pending),
+            )
+        conn.commit()
+        sent += 1
+        print(f"WEBHOOK-NOTIFY SENT {email} {sub_id} {notify_pending} (resend {msg_id})", flush=True)
+    return sent, failed
 
 
 def topic_membership_sql() -> dict[str, str]:
@@ -340,9 +539,14 @@ def main() -> int:
             sent += 1
             print(f"SENT {email} {target}: {len(rows)} events (resend {msg_id})", flush=True)
 
+        webhook_sent, webhook_failed = drain_webhook_notifications(
+            conn, get_resend_key, dry_run=args.dry_run
+        )
+
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     print(
-        f"{stamp} done: {sent} sent, {skipped} quiet, {fast_forwarded} new subscriber(s) fast-forwarded",
+        f"{stamp} done: {sent} sent, {skipped} quiet, {fast_forwarded} new subscriber(s) fast-forwarded, "
+        f"{webhook_sent} webhook notice(s) sent, {webhook_failed} webhook notice failure(s)",
         flush=True,
     )
     return 0

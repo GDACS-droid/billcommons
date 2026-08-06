@@ -663,6 +663,172 @@ class AlertSubscription(Base):
     )
 
 
+class WebhookSubscription(Base):
+    """A push-delivery subscription over the change feed (see migration 0012).
+
+    Created by the API with `verified=false`; the API never performs outbound
+    HTTP (see billcommons_api.routers.webhooks). A separate Railway worker
+    (workers/webhooks/dispatch_webhooks.py) challenges it, then drains
+    bill_events into signed POSTs.
+
+    `signing_secret` and `manage_token_hash` are two different secrets on
+    purpose -- see the migration docstring. `last_seq` has no ORM-level
+    default for the same reason: every row must be created with the
+    safety-lag watermark computed at INSERT time, never 0 and never the raw
+    head of bill_events.
+    """
+
+    __tablename__ = "webhook_subscriptions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    host: Mapped[str] = mapped_column(Text, nullable=False)
+    email: Mapped[str] = mapped_column(Text, nullable=False)
+    creator_ip: Mapped[str] = mapped_column(Text, nullable=False)
+    signing_secret: Mapped[str] = mapped_column(Text, nullable=False)
+    manage_token_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    target: Mapped[str] = mapped_column(Text, nullable=False)
+    event_kinds: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    challenge_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    challenge_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    consecutive_failures: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    failing_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    disabled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notify_pending: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # r11 fix #5 / migration 0015 (packages/schema/alembic/versions/0015_
+    # webhook_challenge_attempted_at.py) adds `challenge_attempted_at` to
+    # the TABLE, but it is deliberately NOT mapped as an ORM column here.
+    # This repo's live DB is still on migration 0012 as of this column's
+    # introduction (0013/0014 are also committed-but-not-yet-applied -- see
+    # `_notify_pending_supports_created_disabled`'s and `_creation_events_
+    # table_exists`'s own docstrings for the identical situation). A mapped
+    # column -- even `deferred=True` -- is still included in every INSERT/
+    # UPDATE SQLAlchemy generates for this entity (deferred only excludes a
+    # column from the initial SELECT; it does NOT exclude it from writes),
+    # so mapping it here would break EVERY webhook subscription creation
+    # site-wide the moment this line merged, well before migration 0015 is
+    # ever applied. workers/webhooks/dispatch_webhooks.py instead reads/
+    # writes this column via raw `text()` SQL, gated behind `_challenge_
+    # attempted_at_column_exists`'s probe -- see that function's own
+    # docstring.
+
+    __table_args__ = (
+        CheckConstraint("kind in ('topic','jurisdiction','bills')", name="ck_webhook_kind"),
+        CheckConstraint(
+            # 'created_disabled' added by migration 0013 (verify round-3
+            # fix #13) -- see that migration's docstring.
+            "notify_pending is null or notify_pending in ('created','disabled','created_disabled')",
+            name="ck_webhook_notify_pending",
+        ),
+        UniqueConstraint(
+            "url",
+            "kind",
+            "target",
+            "event_kinds",
+            name="uq_webhook_url_kind_target_event_kinds",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index(
+            "ix_webhook_subscriptions_due",
+            "next_attempt_at",
+            "last_attempt_at",
+            postgresql_where=text("active AND verified"),
+        ),
+        Index("ix_webhook_subscriptions_host", "host", postgresql_where=text("active")),
+        Index("ix_webhook_subscriptions_creator_ip_created_at", "creator_ip", "created_at"),
+    )
+
+
+class WebhookDelivery(Base):
+    """One delivery ATTEMPT for a webhook subscription (see migration 0012).
+
+    Kept for 30 days (pruned by the dispatcher each tick) so
+    GET /api/v1/webhooks/{id} can answer "why didn't we get event X" without
+    the subscriber having to guess from HTTP status codes alone.
+    """
+
+    __tablename__ = "webhook_deliveries"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    subscription_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("webhook_subscriptions.id", ondelete="CASCADE"), nullable=False
+    )
+    delivery_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    first_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    last_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    attempted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_webhook_deliveries_subscription_attempted", "subscription_id", "attempted_at"),
+        Index("ix_webhook_deliveries_attempted_at", "attempted_at"),
+    )
+
+
+class WebhookCreationEvent(Base):
+    """One webhook-creation ATTEMPT that passed input validation and every
+    quota check (see migration 0014) -- verify round-5 fix #4 (kimi #4,
+    opus MED #2).
+
+    `webhook_subscriptions` is a set of SURVIVING rows: a hard `DELETE
+    /api/v1/webhooks/{id}` and the dispatcher's own 24h unverified-GC (see
+    workers/webhooks/dispatch_webhooks.py's `run_challenges`) both remove
+    rows outright. Counting the per-IP daily creation quota against THAT
+    table let one IP loop create -> delete forever, resetting its own
+    quota on every cycle -- unbounded verification-challenge POSTs to an
+    attacker-chosen endpoint (~7,200/day), and repeat "webhook created"
+    emails to a caller-supplied, never-confirmed address. This table is
+    append-only from the API's perspective (`create_webhook` only ever
+    INSERTs); only workers/webhooks/dispatch_webhooks.py's
+    `prune_creation_events` deletes from it, and only rows older than 48h
+    (twice the 24h quota window, so a request straddling midnight always
+    still sees its own full recent history).
+
+    No foreign key to `webhook_subscriptions` on purpose -- this row must
+    outlive the subscription it corresponds to (that survival is the whole
+    point), and an attempt that was itself quota-rejected (429/403) never
+    had a subscription row to begin with.
+    """
+
+    __tablename__ = "webhook_creation_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    creator_ip: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_webhook_creation_events_creator_ip_created_at", "creator_ip", "created_at"),
+    )
+
+
 class Feedback(Base):
     """One site-feedback message (see migration 0007). Write-only from the
     API's perspective: there is no read endpoint; rows are read by the owner

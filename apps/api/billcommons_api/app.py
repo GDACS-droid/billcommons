@@ -30,6 +30,7 @@ from billcommons_api.routers import (
     sources,
     stats,
     topics,
+    webhooks,
 )
 from billcommons_api.settings import get_settings
 
@@ -78,8 +79,10 @@ def create_app() -> FastAPI:
         allow_origins=settings.cors_allow_origins,
         # POST exists for exactly three browser-facing writes: /bills/lookup
         # (large watchlists overflow a query string), /alerts/subscribe and
-        # /feedback.
-        allow_methods=["GET", "POST"],
+        # /feedback. DELETE is for /webhooks/{id} -- a bearer-token-authed
+        # management action, not anonymous like the other three, but still a
+        # browser fetch() if a subscriber manages it from a page.
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["*"],
     )
 
@@ -101,6 +104,7 @@ def create_app() -> FastAPI:
         sitemap.router,
         stats.router,
         topics.router,
+        webhooks.router,
     ):
         app.include_router(router, prefix=API_PREFIX)
 

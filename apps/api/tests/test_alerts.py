@@ -204,3 +204,24 @@ def test_sender_scopes_its_query_by_jurisdiction():
     source = SENDER.read_text()
     assert "j.abbreviation = %s" in source, "sender does not filter by jurisdiction"
     assert "scope_clause" in source
+
+
+def test_alerts_sender_watermark_matches_shared_constant():
+    """send_alerts.py carries a LITERAL copy of COMMIT_SAFETY_LAG_SECONDS
+    (not an import -- see its own docstring on why: it runs straight from
+    the working tree with no deploy step and deliberately doesn't depend on
+    billcommons_shared). A copy that silently drifts from the single source
+    of truth every OTHER bill_events reader (/changes, the Atom feeds, the
+    webhooks API + dispatcher) uses would mean the nightly digest either
+    serves ahead of the safety lag (a bug the whole point of the lag is to
+    prevent) or trails it for no reason -- pin the two values equal here,
+    the same way test_sender_membership_map_matches_the_api_topics above
+    pins the topic predicates."""
+    import re
+
+    from billcommons_shared.watermark import COMMIT_SAFETY_LAG_SECONDS as shared_lag
+
+    source = SENDER.read_text()
+    match = re.search(r"^COMMIT_SAFETY_LAG_SECONDS = (\d+)", source, re.M)
+    assert match, "send_alerts.py's COMMIT_SAFETY_LAG_SECONDS constant not found"
+    assert int(match.group(1)) == shared_lag

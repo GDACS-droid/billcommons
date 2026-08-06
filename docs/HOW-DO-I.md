@@ -70,6 +70,20 @@ for anything beyond that. A brand-new subscription starts from the day it
 was created, not a replay of history. Unsubscribe link is in every email
 (`GET /alerts/unsubscribe?token=...`, no auth required, by design).
 
+## …get pushed events instead of polling `/changes`?
+
+**`POST /api/v1/webhooks`** -- push delivery over the same `bill_events` log
+`/changes` serves, for a topic, one jurisdiction, or up to 64 specific bill
+ids (a smaller cap than `/changes`' own `ids` filter above -- a webhook
+subscription's url/kind/target/event_kinds together have to fit inside a
+Postgres uniqueness index, which `/changes`' stateless `ids` filter never
+does). See `docs/api/webhooks.md` for the full contract (signature
+verification, retry/disable policy, and how to backfill a gap with
+`/changes` using a delivered `cursor`). Short version: creation returns
+`verified: false` immediately -- the API never makes outbound HTTP calls, a
+separate worker verifies your endpoint within a couple of minutes and then
+starts delivering, at-least-once, with an HMAC signature over every POST.
+
 ## …check coverage or jurisdictions before trusting an empty result?
 
 **`GET /jurisdictions`** / **`GET /jurisdictions/{id}`** (accepts either a

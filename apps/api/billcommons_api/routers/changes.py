@@ -15,9 +15,6 @@ mechanism here rather than a hope:
 """
 from __future__ import annotations
 
-import base64
-import binascii
-import json
 import uuid
 from datetime import timedelta
 
@@ -30,6 +27,15 @@ from billcommons_api.errors import bad_request
 from billcommons_api.labels import attach_bill_labels
 from billcommons_api.schemas import ChangeEvent, ChangeFeedEnvelope
 from billcommons_schema.models import Bill, BillEvent, Jurisdiction
+from billcommons_shared.cursor import InvalidCursor
+from billcommons_shared.cursor import encode_cursor as encode_cursor  # noqa: F401 -- re-exported
+from billcommons_shared.cursor import decode_cursor as _decode_cursor_raw
+# Single source of truth -- see billcommons_shared.watermark's docstring for
+# the WHY (unchanged since migration 0005) and the 2026-08-04 empirical basis
+# for the current value. Re-exported under this name (rather than requiring
+# every existing importer to switch to billcommons_shared.watermark) because
+# routers/feeds.py and this whole test suite already import it from here.
+from billcommons_shared.watermark import COMMIT_SAFETY_LAG_SECONDS as COMMIT_SAFETY_LAG_SECONDS  # noqa: F401,E501 -- re-exported
 
 router = APIRouter(tags=["changes"])
 
@@ -37,46 +43,17 @@ MAX_CHANGES_PER_PAGE = 500
 DEFAULT_CHANGES_PER_PAGE = 100
 MAX_IDS = 200
 
-# How far behind the head of the log the feed refuses to serve.
-#
-# `seq` is allocated at INSERT and becomes visible at COMMIT, so a writer that
-# holds a transaction open can own a LOW seq that only appears after HIGHER
-# ones are already visible. A consumer that advanced past it would never see
-# it -- a permanently missed change, reported as "nothing to report", which is
-# the single worst failure a monitoring source can have.
-#
-# So the feed only serves events old enough that any transaction which could
-# hold a lower seq has necessarily finished. This bounds the damage to
-# LATENCY (a change is announced up to this many seconds late) instead of
-# CORRECTNESS (a change is never announced at all). It is only sound while
-# every writing transaction is shorter than this window; the ingest's
-# api_sync commits per jurisdiction, well inside it.
-COMMIT_SAFETY_LAG_SECONDS = 120
-
-_CURSOR_VERSION = 1
-
-
-def encode_cursor(seq: int) -> str:
-    """Opaque cursor. Deliberately not the raw `seq`.
-
-    Consumers persist cursors for months, so whatever shape is published here
-    is frozen. Wrapping it means the ordering key can later change -- to a
-    composite, a different column, a sharded scheme -- without breaking a
-    single stored cursor, and it stops clients from doing arithmetic on a
-    value whose gaps are meaningless (sequences skip on rollback).
-    """
-    raw = json.dumps({"v": _CURSOR_VERSION, "seq": seq}, separators=(",", ":"))
-    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
-
 
 def decode_cursor(cursor: str) -> int:
-    padded = cursor + "=" * (-len(cursor) % 4)
+    """API-facing wrapper: billcommons_shared.cursor.decode_cursor, with the
+    ValueError it raises turned into this router's own 400 error shape. The
+    encode/decode logic itself now lives in billcommons_shared.cursor so
+    workers/webhooks/dispatch_webhooks.py can share the identical
+    implementation -- see that module's docstring for why "identical",
+    not merely "compatible", matters here."""
     try:
-        payload = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
-        if payload.get("v") != _CURSOR_VERSION:
-            raise ValueError(f"unsupported cursor version {payload.get('v')!r}")
-        return int(payload["seq"])
-    except (ValueError, KeyError, TypeError, binascii.Error, UnicodeDecodeError) as exc:
+        return _decode_cursor_raw(cursor)
+    except InvalidCursor as exc:
         raise bad_request(
             "invalid_cursor",
             f"Could not read the cursor. Pass back the `next_cursor` from a "
