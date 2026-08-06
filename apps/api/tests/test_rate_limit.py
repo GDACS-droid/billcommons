@@ -269,6 +269,48 @@ def test_client_ip_canonicalizes_ipv6_bucket_key():
     assert keys == {"2001:db8::1"}
 
 
+def test_client_ip_prefers_public_x_real_ip_over_the_xff_walk():
+    """The live Railway edge (probed 2026-08-06) strips client-supplied
+    X-Forwarded-For and writes "<client>, <edge node>" -- the rightmost-
+    public walk lands on the edge's OWN rotating address, keying every
+    per-IP quota to shared infrastructure. X-Real-Ip arrives overwritten
+    with the true client and a forged value never survives the edge, so a
+    public X-Real-Ip wins over the walk."""
+    from unittest.mock import MagicMock
+
+    from billcommons_api.rate_limit import client_ip
+
+    request = MagicMock()
+    request.headers = {
+        "x-real-ip": "203.0.113.7",
+        "x-forwarded-for": "203.0.113.7, 152.233.30.104",
+    }
+    assert client_ip(request) == "203.0.113.7"
+
+
+def test_client_ip_ignores_non_public_x_real_ip_and_falls_back_to_the_walk():
+    from unittest.mock import MagicMock
+
+    from billcommons_api.rate_limit import client_ip
+
+    request = MagicMock()
+    request.headers = {
+        "x-real-ip": "10.1.2.3",
+        "x-forwarded-for": "203.0.113.7",
+    }
+    assert client_ip(request) == "203.0.113.7"
+
+
+def test_client_ip_canonicalizes_a_bracketed_ipv6_x_real_ip():
+    from unittest.mock import MagicMock
+
+    from billcommons_api.rate_limit import client_ip
+
+    request = MagicMock()
+    request.headers = {"x-real-ip": "[2001:db8::1]", "x-forwarded-for": ""}
+    assert client_ip(request) == "2001:db8::1"
+
+
 def test_spoofed_leading_xff_entries_do_not_change_the_quota_bucket(limited_client):
     """A caller prepending fake entries ahead of its real address must land
     in the SAME per-IP bucket as a caller sending no forged entries at all

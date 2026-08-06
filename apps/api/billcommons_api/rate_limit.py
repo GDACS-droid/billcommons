@@ -223,6 +223,26 @@ def client_ip(request: Request) -> str:
     An entry that fails to parse as an IP at all is unaffected: `_is_public`
     already returns False for it, so it is skipped exactly as before.
     """
+    # X-Real-Ip first. Empirical probe of the live Railway edge (2026-08-06,
+    # throwaway header-echo service on up.railway.app): Railway STRIPS any
+    # client-supplied X-Forwarded-For and X-Real-Ip and writes its own --
+    # X-Forwarded-For arrives as "<true client>, <edge node>" so the
+    # rightmost-public walk below lands on the EDGE's own address (Datacamp
+    # 152.233.x fleet), keying quotas to shared, rotating infrastructure
+    # hops; X-Real-Ip arrives overwritten with the true client address and
+    # a forged value never survives the edge. (X-Envoy-External-Address
+    # passes through UNFILTERED -- never trust it.) A non-public or absent
+    # X-Real-Ip (test suites set only X-Forwarded-For; other deployments
+    # may not send it) falls through to the XFF walk unchanged.
+    real_ip = request.headers.get("x-real-ip", "").strip()
+    if real_ip:
+        unbracketed = (
+            real_ip[1:-1]
+            if real_ip.startswith("[") and real_ip.endswith("]")
+            else real_ip
+        )
+        if _is_public(unbracketed):
+            return ipaddress.ip_address(unbracketed).compressed
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         for entry in reversed(forwarded.split(",")):
