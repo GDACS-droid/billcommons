@@ -88,6 +88,20 @@ MAX_EVIDENCE_VOTES = _env_int("MCP_MAX_EVIDENCE_VOTES", 100)
 MAX_EVIDENCE_HEARINGS = _env_int("MCP_MAX_EVIDENCE_HEARINGS", 100)
 MAX_EVIDENCE_HISTORY_ITEMS = _env_int("MCP_MAX_EVIDENCE_HISTORY_ITEMS", 500)
 
+# Cap on raw full-text matches taken BEFORE ts_rank, mirroring
+# billcommons_api.search.MATCH_CAP (see that module's comment for the full
+# measurement writeup). `ORDER BY ts_rank(...) DESC LIMIT` still has to
+# compute ts_rank -- detoasting a tsvector -- for every ROW that matches the
+# WHERE clause before it can sort and take the top N: for a common word
+# ("act" appears in nearly every bill) that's on the order of the whole
+# corpus. On this public, anonymous-callable MCP server that isn't just
+# slow, it's a directly caller-triggerable cost amplifier (Finding 2 /
+# rate-limiting-and-work-caps hardening, same class of issue as the other
+# caps in this section). search_legislation caps candidate bill ids on a
+# cheap, INDEXED, deterministic order (Bill.id) FIRST, and ranks only that
+# capped set -- see the two-step query there.
+FTS_MATCH_CAP = _env_int("MCP_FTS_MATCH_CAP", 5_000)
+
 
 def _clamp_limit(limit: int | None) -> int:
     if limit is None:
@@ -186,17 +200,29 @@ def search_legislation(
             except ValueError:
                 bill_number_match = None
 
-            stmt = _bill_query_base()
+            # Kept as a plain list, not baked only into `stmt`, so the
+            # full-text branch below can apply the SAME structural filters to
+            # a second, cheap, id-only cap query -- capping on the raw text
+            # match alone and filtering afterward would let a common word
+            # plus a narrow filter fill the whole cap with unfiltered hits
+            # and starve out real filtered matches (the same bug the API's
+            # MATCH_CAP fix caught in cross-family verify).
+            shared_filters = []
             if jurisdiction_row is not None:
-                stmt = stmt.where(Bill.jurisdiction_id == jurisdiction_row.id)
+                shared_filters.append(Bill.jurisdiction_id == jurisdiction_row.id)
             if chamber:
-                stmt = stmt.where(Bill.chamber.ilike(chamber))
+                shared_filters.append(Bill.chamber.ilike(chamber))
             if status:
-                stmt = stmt.where(Bill.status.ilike(status))
+                shared_filters.append(Bill.status.ilike(status))
+
+            stmt = _bill_query_base()
+            for cond in shared_filters:
+                stmt = stmt.where(cond)
 
             match_type = "full_text_search"
             number_ambiguity: dict[str, Any] | None = None
             number_truncated = False
+            search_capped = False
             if bill_number_match:
                 # Deterministic order + a real LIMIT. This path had neither:
                 # "HB 1" with no jurisdiction filter selected every HB 1 in the
@@ -255,14 +281,49 @@ def search_legislation(
                 results = None
 
             if results is None:
-                tsq_stmt = stmt.where(
-                    Bill.search_tsv.op("@@")(func.websearch_to_tsquery("english", q))
-                ).order_by(
-                    func.ts_rank(
-                        Bill.search_tsv, func.websearch_to_tsquery("english", q)
-                    ).desc()
+                tsq_filter = Bill.search_tsv.op("@@")(func.websearch_to_tsquery("english", q))
+                # Step 1: cap-then-rank (see FTS_MATCH_CAP above). A lean
+                # id-only query, ordered by Bill.id (cheap + indexed: lets
+                # Postgres stop scanning once it has FTS_MATCH_CAP matches
+                # rather than ranking the whole match set to sort it), with
+                # the SAME structural filters applied inside it as `stmt`
+                # carries -- not just against the eventual ranked query.
+                #
+                # FTS_MATCH_CAP + 1, not FTS_MATCH_CAP: fetching exactly the
+                # cap can't tell "exactly FTS_MATCH_CAP matches" (genuinely
+                # exhaustive) from "FTS_MATCH_CAP+1 or more" (truly
+                # saturated) -- both return exactly FTS_MATCH_CAP rows. The
+                # extra probe row resolves the boundary (`> FTS_MATCH_CAP`
+                # below) and is trimmed back off before ranking, so it can
+                # never itself reach `results`.
+                candidate_stmt = (
+                    select(Bill.id)
+                    .where(tsq_filter, *shared_filters)
+                    .order_by(Bill.id)
+                    .limit(FTS_MATCH_CAP + 1)
                 )
-                results = list(db.execute(tsq_stmt.limit(limit_n)).unique().scalars().all())
+                candidate_ids = list(db.execute(candidate_stmt).scalars().all())
+                search_capped = len(candidate_ids) > FTS_MATCH_CAP
+                candidate_ids = candidate_ids[:FTS_MATCH_CAP]
+                if candidate_ids:
+                    # Step 2: rank ONLY the capped candidate set -- cheap
+                    # regardless of how common the search term is, since it's
+                    # bounded at FTS_MATCH_CAP rows no matter how large the
+                    # true match set was. `tsq_filter` is re-applied here (not
+                    # just relied on from step 1) because these are two
+                    # separate statements under READ COMMITTED: a bill whose
+                    # search_tsv changed between them (e.g. a concurrent
+                    # ingest write) could otherwise appear in `results`
+                    # despite candidate_ids having been built from a match
+                    # that no longer holds by the time this query runs.
+                    tsq_stmt = (
+                        stmt.where(Bill.id.in_(candidate_ids), tsq_filter)
+                        .order_by(func.ts_rank(Bill.search_tsv, func.websearch_to_tsquery("english", q)).desc())
+                        .limit(limit_n)
+                    )
+                    results = list(db.execute(tsq_stmt).unique().scalars().all())
+                else:
+                    results = []
                 match_type = "full_text_search"
 
             if not results:
@@ -278,10 +339,15 @@ def search_legislation(
             }
             if number_ambiguity:
                 payload["ambiguity"] = number_ambiguity
-            if number_truncated:
+            if number_truncated or search_capped:
                 # Explicit, per the same rule the evidence packet follows: a
                 # list that stops at the limit must say so, or "the list ends
                 # here" and "we stopped here" are indistinguishable.
+                # search_capped specifically means the FULL-TEXT candidate
+                # scan hit FTS_MATCH_CAP -- the `results` returned are ranked
+                # within a SAMPLE of the true match set, not the true top
+                # `limit_n` across the whole corpus (mirrors the API's
+                # full_text_saturation_notice caveat).
                 payload["results_truncated"] = True
             if coverage_warning:
                 payload["coverage_warning"] = coverage_warning

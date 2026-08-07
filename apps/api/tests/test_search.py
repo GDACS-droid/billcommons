@@ -14,6 +14,8 @@ import uuid
 import pytest
 from sqlalchemy import text as sqltext
 
+from billcommons_api import search as search_module
+from billcommons_api.search import SearchFilters, full_text_search
 from billcommons_shared.db import get_session
 
 _BILL_NUMBER_RE = re.compile(r"^[A-Za-z]+\s*\d+$")
@@ -96,6 +98,166 @@ def test_search_common_word_does_not_time_out(client):
     assert resp.status_code == 200
     _assert_envelope(resp.json())
     assert elapsed < 15, f"search for a common word took {elapsed:.1f}s, expected < 15s"
+
+
+def test_search_saturated_query_is_marked_sampled(client):
+    """A capped/saturated full-text match (see MATCH_CAP) must set
+    meta.data_status/notice so a caller learns `total` is a sampled count,
+    not a true corpus-wide one -- the honest-totals half of the MATCH_CAP
+    fix. "act" is common enough to saturate at least one branch against the
+    live corpus (confirmed: bills.search_tsv alone matches 55k+ rows)."""
+    resp = client.get("/api/v1/search", params={"q": "act", "per_page": 20})
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    assert body["meta"]["data_status"] == "sampled"
+    assert body["meta"]["notice"]
+    assert "sample" in body["meta"]["notice"].lower()
+
+
+def test_search_non_saturated_query_is_not_marked_sampled(client):
+    """The flip side of the sampled test: a query that does NOT saturate
+    either branch (a common word narrowed by a real filter) must NOT carry
+    the sampled disclosure -- otherwise every search result would read as
+    "maybe incomplete" and the notice would stop meaning anything."""
+    resp = client.get(
+        "/api/v1/search", params={"q": "act", "jurisdiction": "NC", "per_page": 20}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    assert body["meta"].get("data_status") is None
+    assert body["meta"].get("notice") is None
+
+
+def test_search_saturated_non_relevance_sort_notes_sample_caveat(client):
+    """Regression for item 2 (non-relevance sorts on saturated queries): the
+    capped branches stay id-ordered rather than sort-key-ordered (measured
+    10s+ regression for the bill_documents branch with no supporting index --
+    see the MATCH_CAP comment), so a sort=latest_action search on a saturated
+    query must say, explicitly, that the ordering is only correct within the
+    sampled set -- not silently present a possibly-wrong "top N by latest
+    action" as if it were exhaustive."""
+    resp = client.get(
+        "/api/v1/search",
+        params={"q": "act", "sort": "latest_action", "per_page": 20},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    assert body["meta"]["data_status"] == "sampled"
+    notice = body["meta"]["notice"].lower()
+    assert "sort" in notice and "sample" in notice
+
+
+def test_search_saturated_query_sort_latest_action_stays_fast(client):
+    """Regression for the fallback decision in item 2: even though the
+    capped branches stay id-ordered (not sort-key-ordered) for a saturated
+    query, the response must still come back quickly -- this is the "honesty
+    over heroics" path, not a silently-slow one. 15s mirrors the sibling
+    common-word-does-not-time-out ceiling."""
+    t0 = time.monotonic()
+    resp = client.get(
+        "/api/v1/search",
+        params={"q": "act", "sort": "latest_action", "per_page": 20},
+    )
+    elapsed = time.monotonic() - t0
+    assert resp.status_code == 200
+    assert elapsed < 15, f"saturated sort=latest_action took {elapsed:.1f}s, expected < 15s"
+
+
+@pytest.fixture()
+def capped_boundary_bills():
+    """Insert exactly 3 bills that match one unique FTS token and nothing
+    else in the live corpus, so the exact-boundary saturation tests below can
+    pin MATCH_CAP to a known count around them (3 real matches -- not
+    dependent on the live corpus happening to contain exactly MATCH_CAP
+    matches for some real query, which it may never do)."""
+    token = uuid.uuid4().hex[:12]
+    n = 3
+    db = get_session()
+    jurisdiction_id = None
+    try:
+        jurisdiction_id = db.execute(
+            sqltext(
+                "INSERT INTO jurisdictions (id, name, abbreviation, classification, "
+                "created_at, updated_at) "
+                "VALUES (gen_random_uuid(), :name, :abbr, 'state', now(), now()) "
+                "RETURNING id"
+            ),
+            {"name": f"CapBoundaryJurisdiction{token}", "abbr": f"Y{token[:8]}".upper()},
+        ).scalar_one()
+        session_id = db.execute(
+            sqltext(
+                "INSERT INTO sessions (id, jurisdiction_id, identifier, active, "
+                "created_at, updated_at) "
+                "VALUES (gen_random_uuid(), :jid, :ident, false, now(), now()) "
+                "RETURNING id"
+            ),
+            {"jid": jurisdiction_id, "ident": f"session-{token}"},
+        ).scalar_one()
+        for i in range(n):
+            db.execute(
+                sqltext(
+                    "INSERT INTO bills (id, jurisdiction_id, session_id, identifier, "
+                    "identifier_norm, title, created_at, updated_at) "
+                    "VALUES (gen_random_uuid(), :jid, :sid, :ident, :ident_norm, :title, "
+                    "now(), now())"
+                ),
+                {
+                    "jid": jurisdiction_id,
+                    "sid": session_id,
+                    "ident": f"CB {token[:6]}{i}",
+                    "ident_norm": f"CB{token[:6]}{i}".upper(),
+                    "title": f"CapBoundaryProbe{token} act number {i}",
+                },
+            )
+        db.commit()
+        yield token, n
+    finally:
+        if jurisdiction_id is not None:
+            db.execute(sqltext("DELETE FROM bills WHERE jurisdiction_id = :jid"), {"jid": jurisdiction_id})
+            db.execute(sqltext("DELETE FROM sessions WHERE jurisdiction_id = :jid"), {"jid": jurisdiction_id})
+            db.execute(sqltext("DELETE FROM jurisdictions WHERE id = :jid"), {"jid": jurisdiction_id})
+            db.commit()
+        db.close()
+
+
+def test_exact_match_cap_boundary_is_not_marked_sampled(capped_boundary_bills, monkeypatch):
+    """Regression for the exact-boundary bug caught in verify: `count(*) =
+    :match_cap` on a plain `LIMIT :match_cap` selection cannot distinguish
+    an exactly-MATCH_CAP match set (genuinely exhaustive) from a
+    MATCH_CAP+1-or-more one (truly saturated) -- both return exactly
+    MATCH_CAP rows. MATCH_CAP is monkeypatched to exactly the 3 synthetic
+    matches: total must be the true, exact count, and `capped` must be
+    False -- there is no MATCH_CAP+1'th row to have been dropped."""
+    token, n = capped_boundary_bills
+    monkeypatch.setattr(search_module, "MATCH_CAP", n)
+    db = get_session()
+    try:
+        filters = SearchFilters(q=f"CapBoundaryProbe{token}", per_page=20)
+        rows, total, capped = full_text_search(db, filters)
+    finally:
+        db.close()
+    assert total == n, f"expected exactly {n} matches, got {total}"
+    assert capped is False, "exactly MATCH_CAP matches must NOT be reported as sampled"
+
+
+def test_one_past_match_cap_boundary_is_marked_sampled(capped_boundary_bills, monkeypatch):
+    """The flip side of the boundary test: MATCH_CAP set to one LESS than
+    the true match count (3 matches, cap of 2) must be detected as
+    saturated -- confirming the MATCH_CAP+1 probe-row fetch actually finds
+    the extra row rather than silently truncating it away undetected."""
+    token, n = capped_boundary_bills
+    monkeypatch.setattr(search_module, "MATCH_CAP", n - 1)
+    db = get_session()
+    try:
+        filters = SearchFilters(q=f"CapBoundaryProbe{token}", per_page=20)
+        rows, total, capped = full_text_search(db, filters)
+    finally:
+        db.close()
+    assert total == n - 1, f"expected the capped total ({n - 1}), got {total}"
+    assert capped is True, "MATCH_CAP+1 real matches must be reported as sampled"
 
 
 def test_search_common_word_with_filter_does_not_starve_matches(client):
@@ -232,6 +394,101 @@ def test_search_trigram_fallback_on_zero_fts_matches_returns_200(client):
     _assert_envelope(body)
     for item in body["data"]:
         _assert_result_item_shape(item)
+        assert item["match_type"] in {"fuzzy_title", "full_text", "bill_number"}
+
+
+def test_trigram_fallback_uses_the_percent_operator_directly(client):
+    """Structural regression for item 4 (TRIGRAM FALLBACK % rewrite): the
+    fallback must query with the indexable `%` operator, not a bare
+    `similarity(...) > threshold` predicate that's opaque to the planner and
+    forces a sequential scan of `bills` regardless of ix_bills_title_trgm's
+    presence -- ANDed with a strict `similarity(...) > threshold` recheck
+    (see test_trigram_fallback_percent_operator_matches_old_strict_predicate_
+    exactly for why the recheck is load-bearing, not decorative). Source-
+    inspection rather than EXPLAIN here (no DB handle in this test module) --
+    see the module's live EXPLAIN verification in the implementation notes
+    for the index-usage proof."""
+    import inspect
+
+    from billcommons_api import search as search_module
+
+    src = inspect.getsource(search_module.trigram_fallback)
+    assert "b.title % :q" in src, "trigram_fallback should filter with the % operator"
+    assert "similarity(b.title, :q) > :threshold" in src, (
+        "% alone is INCLUSIVE (>= threshold) -- the STRICT (> threshold) check "
+        "must be re-applied as a recheck to preserve the old predicate's semantics"
+    )
+    assert "set_config('pg_trgm.similarity_threshold'" in src, (
+        "% relies on the session GUC, not a bound argument -- it must be set explicitly"
+    )
+
+
+def test_trigram_fallback_percent_operator_matches_old_strict_predicate_exactly():
+    """Regression for the inclusive-vs-strict bug caught in verify: `b.title
+    % :q` alone is INCLUSIVE (matches rows with similarity >=
+    pg_trgm.similarity_threshold), while the predicate it replaced was
+    STRICT (`similarity(b.title, :q) > threshold`) -- a title landing
+    EXACTLY on the threshold would newly match under `%` alone, silently
+    breaking the change's own stated no-behavior-change invariant. The fix
+    ANDs the strict check back on as a recheck over the (small) index-
+    qualified candidate set.
+
+    A total/count comparison can't catch a boundary bug like this (two
+    different id-sets can share a count by coincidence), so this pins the
+    actual id-SETS: for two independent misspelled queries against the live,
+    growing corpus, the combined `%` + strict-recheck predicate must select
+    EXACTLY the same bills as the old bare `similarity() > threshold` form --
+    not an overlapping-but-different set."""
+    threshold = search_module._TRIGRAM_THRESHOLD
+    queries = ["educatoin fnding", "helth cair reforn"]
+    db = get_session()
+    try:
+        for q in queries:
+            old_sql = sqltext(
+                "SELECT b.id FROM bills b WHERE similarity(b.title, :q) > :threshold"
+            )
+            old_ids = {row[0] for row in db.execute(old_sql, {"q": q, "threshold": threshold})}
+
+            # `%`'s notion of "similar enough" reads the SESSION GUC, not a
+            # bound parameter -- must be set before the query runs, exactly
+            # as trigram_fallback itself does.
+            db.execute(
+                sqltext("SELECT set_config('pg_trgm.similarity_threshold', :t, true)"),
+                {"t": str(threshold)},
+            )
+            new_sql = sqltext(
+                "SELECT b.id FROM bills b "
+                "WHERE b.title % :q AND similarity(b.title, :q) > :threshold"
+            )
+            new_ids = {row[0] for row in db.execute(new_sql, {"q": q, "threshold": threshold})}
+
+            assert new_ids == old_ids, (
+                f"id-set mismatch for q={q!r}: the % + strict-recheck predicate "
+                f"must return EXACTLY the same rows as the old bare "
+                f"similarity() > threshold predicate, not merely the same "
+                f"count (old={len(old_ids)} ids, new={len(new_ids)} ids, "
+                f"symmetric difference={len(old_ids ^ new_ids)})"
+            )
+    finally:
+        db.close()
+
+
+def test_trigram_fallback_preserves_the_historical_threshold(client):
+    """The % rewrite must not silently change WHICH rows match: same query,
+    same threshold as the old `similarity() > 0.15` predicate. Confirmed by
+    the exact id-set parity pin above; this end-to-end variant additionally
+    exercises the real /search route (pagination, envelope, match_type)."""
+    resp = client.get("/api/v1/search", params={"q": "educatoin fnding", "per_page": 1})
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    # Not pinned to the exact prior-measured count (915) since the live,
+    # growing corpus can add/remove matching titles between runs -- but it
+    # must be nonzero (the whole point of the fallback existing) and every
+    # returned row must actually be a trigram/full-text/bill-number match,
+    # not an unrelated row a broken predicate let through.
+    assert body["pagination"]["total"] > 0
+    for item in body["data"]:
         assert item["match_type"] in {"fuzzy_title", "full_text", "bill_number"}
 
 

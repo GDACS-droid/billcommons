@@ -10,7 +10,12 @@ from billcommons_api.errors import bad_request
 from billcommons_api.labels import attach_bill_labels
 from billcommons_api.pagination import MAX_PAGE, Page, clamp_per_page, paginate
 from billcommons_api.schemas import SearchResult
-from billcommons_api.search import VALID_SORTS, SearchFilters, run_search
+from billcommons_api.search import (
+    VALID_SORTS,
+    SearchFilters,
+    full_text_saturation_notice,
+    run_search,
+)
 
 router = APIRouter(tags=["search"])
 
@@ -54,8 +59,17 @@ def search(
         page=page,
         per_page=per_page,
     )
-    rows, total = run_search(db, filters)
+    rows, total, capped = run_search(db, filters)
     items = attach_bill_labels(db, [SearchResult.model_validate(r) for r in rows])
+    # `capped` (see full_text_search/MATCH_CAP) means this response is a
+    # deterministic SAMPLE of the match set, not an exhaustive one -- reuse
+    # the same data_status/notice machinery /people, /committees, /events use
+    # for an empty-result disclosure, here for a non-empty-but-incomplete
+    # one: a bare "total": 8432 on a saturated query looks exact and is not,
+    # and a caller has no other way to learn that short of reading this code.
+    data_status, notice = (None, None)
+    if capped:
+        data_status, notice = "sampled", full_text_saturation_notice(sort)
     return paginate(
         items,
         page=page,
@@ -63,4 +77,6 @@ def search(
         total=total,
         api_version="v1",
         request_id=request.state.request_id,
+        data_status=data_status,
+        notice=notice,
     )

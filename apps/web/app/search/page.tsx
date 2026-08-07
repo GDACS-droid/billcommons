@@ -90,9 +90,21 @@ export default async function SearchPage({ searchParams }: Props) {
           </p>
         ) : (
           <>
+            {/* A saturated full-text match (see billcommons_api.search.
+                MATCH_CAP) makes `pagination.total` a sampled/deduplicated
+                count, not an exhaustive corpus-wide one -- "8,432 results"
+                reads as exact and isn't. The "+" is the honest signal that
+                this is a floor, not the true count; the notice underneath
+                spells out why (and, for a non-relevance sort, that the
+                ordering itself is only correct within the sample). */}
             <p className="text-sm tabular-nums text-slate-500">
-              {result.data.pagination.total.toLocaleString()} results
+              {result.data.meta.data_status === "sampled"
+                ? `${result.data.pagination.total.toLocaleString()}+ results`
+                : `${result.data.pagination.total.toLocaleString()} results`}
             </p>
+            {result.data.meta.data_status === "sampled" && result.data.meta.notice ? (
+              <p className="mt-1 text-xs text-amber-700">{result.data.meta.notice}</p>
+            ) : null}
             <ul className="mt-3 space-y-3">
               {result.data.data.map((bill) => (
                 <BillListItem key={bill.id} bill={bill} />

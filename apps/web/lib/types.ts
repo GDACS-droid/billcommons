@@ -14,6 +14,13 @@ export interface ResponseMeta {
   source_freshness?: string | null;
   api_version?: string;
   request_id?: string;
+  // Present only when the response needs an explanation a bare payload
+  // can't carry -- e.g. /search reporting `data_status: "sampled"` when a
+  // full-text match was capped (see billcommons_api.search.MATCH_CAP):
+  // `pagination.total` on that response is a sampled/deduplicated count,
+  // not an exhaustive corpus-wide one, and `notice` states that plainly.
+  data_status?: string | null;
+  notice?: string | null;
 }
 
 export interface ListEnvelope<T> {

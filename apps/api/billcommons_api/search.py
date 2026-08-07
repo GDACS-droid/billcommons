@@ -98,7 +98,55 @@ _TS_HEADLINE_OPTIONS = (
 # no filter is set): bills.jurisdiction_id/session_id are NOT NULL with
 # enforced FK constraints, and prod has zero NULL or orphaned rows (verified
 # directly against the live DB), so this join cannot silently drop a bill.
+#
+# Non-relevance sort on a saturated query (see full_text_saturation_notice
+# below): the obviously-more-correct fix would ORDER BY the requested sort
+# key (e.g. b.latest_action_date DESC) INSIDE these capped subqueries too,
+# so the cap itself keeps the globally correct top-N-by-sort instead of an
+# arbitrary id-ordered slice that's merely re-sorted afterward. Measured
+# against the live corpus for q=act&sort=latest_action: the bills-only
+# branch stays cheap (~0.2s, the GIN bitmap scan + top-N heapsort handles
+# it fine), but the bill_documents branch costs 10s+, because nothing
+# indexes (bill_documents match) x (bills.latest_action_date) together --
+# Postgres must seq-scan and sort the ~490k-row raw match set before the
+# LIMIT can apply. That's well past what a request should cost, with no
+# cheap indexed alternative available in this batch, so the cap stays
+# id-ordered for both branches; full_text_saturation_notice says so
+# explicitly instead. Honesty over heroics.
 MATCH_CAP = 5_000
+
+
+def full_text_saturation_notice(sort: str) -> str:
+    """ResponseMeta notice for a full-text search whose match set was
+    saturated at MATCH_CAP (see above) in at least one branch.
+
+    Always true regardless of sort: `total` on a saturated query is the
+    sampled/deduped count, not a true corpus-wide count, and an exact-looking
+    number like "8,432 results" invites a caller to treat it as one anyway.
+
+    When `sort` isn't "relevance", a second and sharper caveat applies: the
+    capped branches are id-ordered, not sort-key-ordered (see the MATCH_CAP
+    comment for why), so a non-relevance sort is only correct WITHIN the
+    id-ordered sample -- it is not guaranteed to surface the true top results
+    by that sort across the full corpus. Narrowing the query is the honest
+    way to get a globally accurate sort order back.
+    """
+    notice = (
+        f"This query matched more than {MATCH_CAP:,} bills in at least one "
+        "search branch. Results are a deterministic sample of the match set, "
+        "not the full corpus: the total above is the sampled/deduplicated "
+        "count, not a true corpus-wide total, and pagination stops at the "
+        "end of that sample."
+    )
+    if sort != "relevance":
+        notice += (
+            f" Because the match set is sampled, sorting by {sort!r} is only "
+            "correct within that sample -- it is not guaranteed to be the "
+            "true top results by this sort across the full corpus. Narrow "
+            "the query (jurisdiction, session, date range, sponsor, etc.) "
+            "for a globally accurate sort order."
+        )
+    return notice
 
 
 @dataclass
@@ -216,14 +264,27 @@ def bill_number_lookup(db: Session, f: SearchFilters) -> tuple[list[dict], int] 
     return [dict(r) | {"match_type": "bill_number", "rank": None, "highlight": None} for r in rows], count
 
 
-def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
+def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int, bool]:
     """websearch_to_tsquery over bills.search_tsv, UNIONed with matches in
-    bill_documents.text_tsv (mapped back to their parent bill), ranked."""
+    bill_documents.text_tsv (mapped back to their parent bill), ranked.
+
+    Returns (rows, total, capped) -- `capped` is True when either branch hit
+    MATCH_CAP, i.e. the result is a sample rather than an exhaustive match
+    (see full_text_saturation_notice, wired into the response by the router)."""
     where, params = _filter_clause(f)
     where_sql = f" AND {where}" if where else ""
     params["q"] = f.q or ""
     params["headline_options"] = _TS_HEADLINE_OPTIONS
     params["match_cap"] = MATCH_CAP
+    # Fetch one extra row past MATCH_CAP so saturation is DETECTED, not
+    # inferred from a count that equals the cap by coincidence. `count(*) =
+    # :match_cap` on a plain `LIMIT :match_cap` selection cannot tell an
+    # exactly-MATCH_CAP match set (genuinely exhaustive, `total` IS exact)
+    # from a MATCH_CAP+1-or-more one (truly saturated) -- both return
+    # exactly MATCH_CAP rows. Selecting MATCH_CAP+1 and testing `> :match_cap`
+    # resolves the boundary; the extra probe row is trimmed back off before
+    # it reaches ranking/pagination (see bills_matches/docs_matches below).
+    params["match_cap_plus_one"] = MATCH_CAP + 1
 
     order = _order_by(f.sort)
 
@@ -246,19 +307,44 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
     # underlying capped sample, in this request and (given the deterministic
     # ORDER BY on `matches` above) across repeated requests too.
     sql = text(f"""
-        WITH matches AS (
-            (
-                SELECT b.id AS bill_id,
-                       ts_rank(b.search_tsv, websearch_to_tsquery('english', :q)) AS rank
-                FROM bills b
-                JOIN jurisdictions j ON j.id = b.jurisdiction_id
-                JOIN sessions s ON s.id = b.session_id
-                WHERE b.search_tsv @@ websearch_to_tsquery('english', :q){where_sql}
-                ORDER BY b.id
-                LIMIT :match_cap
-            )
-            UNION ALL
-            (
+        WITH bills_matches_probe AS MATERIALIZED (
+            -- MATCH_CAP+1, not MATCH_CAP: see the match_cap_plus_one comment
+            -- above. This CTE is the exact-boundary fix -- it is deliberately
+            -- ONE ROW LARGER than the sample that actually feeds ranking.
+            SELECT b.id AS bill_id,
+                   ts_rank(b.search_tsv, websearch_to_tsquery('english', :q)) AS rank
+            FROM bills b
+            JOIN jurisdictions j ON j.id = b.jurisdiction_id
+            JOIN sessions s ON s.id = b.session_id
+            WHERE b.search_tsv @@ websearch_to_tsquery('english', :q){where_sql}
+            ORDER BY b.id
+            LIMIT :match_cap_plus_one
+        ),
+        bills_matches AS (
+            -- The actual sample: the probe row past MATCH_CAP (if any) is
+            -- trimmed back off here, so it can never reach ranking/pagination
+            -- -- it exists only to answer "was there a MATCH_CAP+1'th row".
+            SELECT bill_id, rank FROM bills_matches_probe
+            ORDER BY bill_id
+            LIMIT :match_cap
+        ),
+        docs_matches_probe AS MATERIALIZED (
+            -- DISTINCT-BILL cap: dedupe document-row matches down to one row
+            -- per bill_id BEFORE the LIMIT, so a bill with many matching
+            -- document versions consumes exactly one slot of MATCH_CAP
+            -- instead of crowding OTHER bills' documents out of the sample
+            -- (the raw per-document cap this replaced could do that -- a
+            -- bill with 40 matching amendment versions used to eat 40 slots
+            -- other bills never got a chance at). This costs a real
+            -- aggregate over the full, uncapped matching-document set before
+            -- the LIMIT can apply -- nothing indexes (matched document) x
+            -- (bill_id) together, so there's no cheap early-stopping
+            -- alternative -- but it's a bounded, one-time cost per request
+            -- (measured ~0.5-2.7s against the live corpus for a saturating
+            -- term) for a real correctness fix, not a hot loop. MATCH_CAP+1
+            -- here for the same exact-boundary reason as bills_matches_probe.
+            SELECT bill_id, max(rank) AS rank
+            FROM (
                 SELECT bv.bill_id AS bill_id,
                        ts_rank(bd.text_tsv, websearch_to_tsquery('english', :q)) AS rank
                 FROM bill_documents bd
@@ -267,9 +353,36 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
                 JOIN jurisdictions j ON j.id = b.jurisdiction_id
                 JOIN sessions s ON s.id = b.session_id
                 WHERE bd.text_tsv @@ websearch_to_tsquery('english', :q){where_sql}
-                ORDER BY bv.bill_id, bd.id
-                LIMIT :match_cap
-            )
+            ) doc_matches
+            GROUP BY bill_id
+            ORDER BY bill_id
+            LIMIT :match_cap_plus_one
+        ),
+        docs_matches AS (
+            -- Trim the probe row -- see bills_matches.
+            SELECT bill_id, rank FROM docs_matches_probe
+            ORDER BY bill_id
+            LIMIT :match_cap
+        ),
+        matches AS (
+            SELECT bill_id, rank FROM bills_matches
+            UNION ALL
+            SELECT bill_id, rank FROM docs_matches
+        ),
+        cap_status AS (
+            -- Test against the PROBE CTEs (MATCH_CAP+1 rows each), not the
+            -- trimmed bills_matches/docs_matches (always <= MATCH_CAP rows,
+            -- so `count(*) = :match_cap` on those could never distinguish
+            -- "exactly MATCH_CAP matches" from "MATCH_CAP+1 or more" -- both
+            -- look identical after trimming). `> :match_cap` on the probe's
+            -- untrimmed count is the actual saturation test: it's only true
+            -- when a MATCH_CAP+1'th row existed to fetch.
+            -- Still cheap: the probe CTEs are MATERIALIZED and already
+            -- capped at MATCH_CAP+1 rows each above, so these counts are
+            -- over at-most-(MATCH_CAP+1) rows, not the underlying (possibly
+            -- corpus-sized) match set.
+            SELECT (SELECT count(*) FROM bills_matches_probe) > :match_cap AS bills_capped,
+                   (SELECT count(*) FROM docs_matches_probe) > :match_cap AS docs_capped
         ),
         ranked AS (
             SELECT bill_id, max(rank) AS rank
@@ -297,8 +410,9 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
                p.identifier_norm, p.title, p.short_title, p.bill_type, p.status,
                p.status_date, p.introduced_date, p.latest_action_text,
                p.latest_action_date, p.source_url, p.rank, hl.highlight,
-               rt.total_count
+               rt.total_count, cs.bills_capped, cs.docs_capped
         FROM ranked_total rt
+        CROSS JOIN cap_status cs
         LEFT JOIN page p ON true
         LEFT JOIN LATERAL (
             -- One highlight per bill: prefer the title/description snippet
@@ -341,26 +455,71 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
 
     offset = (f.page - 1) * f.per_page
     raw_rows = db.execute(sql, {**params, "limit": f.per_page, "offset": offset}).mappings().all()
-    # Always exactly one row minimum (the ranked_total cross join): p.id is
-    # NULL on that row when the page is empty (zero real matches at this
-    # offset, e.g. a page past the end of the capped/filtered result set).
+    # Always exactly one row minimum (the ranked_total/cap_status cross
+    # joins): p.id is NULL on that row when the page is empty (zero real
+    # matches at this offset, e.g. a page past the end of the capped/filtered
+    # result set).
     total = raw_rows[0]["total_count"] if raw_rows else 0
+    capped = bool(raw_rows[0]["bills_capped"] or raw_rows[0]["docs_capped"]) if raw_rows else False
     rows = [
-        {k: v for k, v in dict(r).items() if k != "total_count"} | {"match_type": "full_text"}
+        {k: v for k, v in dict(r).items() if k not in ("total_count", "bills_capped", "docs_capped")}
+        | {"match_type": "full_text"}
         for r in raw_rows
         if r["id"] is not None
     ]
-    return rows, total
+    return rows, total, capped
+
+
+# Trigram similarity threshold shared by the `%` operator (below) and the
+# `similarity()` call used only for ORDER BY. Kept as one named constant so
+# the two can never drift apart -- see trigram_fallback for why they must
+# agree.
+_TRIGRAM_THRESHOLD = 0.15
 
 
 def trigram_fallback(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
     """Fuzzy title search via pg_trgm similarity, used only when the
-    full-text branch returns zero rows."""
+    full-text branch returns zero rows.
+
+    Predicate is the indexable `%` operator (not a bare `similarity(...) >
+    threshold` function call) ANDed with the original strict `similarity(...)
+    > threshold` check as a recheck. `%` is an operator pg_trgm's GIN opclass
+    (ix_bills_title_trgm) actually knows how to accelerate -- a bare
+    `similarity()` call is opaque to the planner and forces a sequential scan
+    regardless of the index's presence -- but `%` alone is INCLUSIVE (>=
+    threshold, per the GUC below) while the predicate it replaced was STRICT
+    (> threshold), so `%` is used only to get the index-qualified candidate
+    rows and the strict `similarity() > threshold` recheck is re-applied on
+    top of it to keep the matched set identical to the old behavior; the
+    recheck only runs over the (small) index-qualified row set, so the perf
+    win survives. `%`'s notion of "similar enough" is controlled by the
+    SESSION GUC `pg_trgm.similarity_threshold` (default 0.3), not by an
+    operator argument, so it has to be set explicitly to match this
+    endpoint's historical 0.15 threshold -- `set_config(..., true)` scopes
+    that to the current transaction only, so it can never leak into an
+    unrelated request sharing the same pooled connection. Verified via
+    EXPLAIN against the live DB that the query still uses ix_bills_title_trgm
+    (Bitmap Index Scan) with the recheck applied, and that the resulting
+    id-set is identical to the old `similarity() > 0.15` form for the same
+    query -- this is an index-usability fix, not a behavior change.
+    """
     where, params = _filter_clause(f)
     where_sql = f" AND {where}" if where else ""
     params["q"] = f.q or ""
-    params["threshold"] = 0.15
+    params["threshold_str"] = str(_TRIGRAM_THRESHOLD)
+    params["threshold"] = _TRIGRAM_THRESHOLD
 
+    set_threshold_sql = text(
+        "SELECT set_config('pg_trgm.similarity_threshold', :threshold_str, true)"
+    )
+    # `b.title % :q` alone is INCLUSIVE (>= threshold, per pg_trgm.similarity_
+    # threshold), while the predicate it replaced was STRICT (similarity(...)
+    # > threshold) -- a title landing exactly on the threshold would newly
+    # match. `%` still does the work of getting ix_bills_title_trgm's Bitmap
+    # Index Scan into the plan (that's the whole point of using it), but the
+    # strict boundary is re-applied as a recheck on top of it so the matched
+    # set is unchanged from the old behavior; the recheck only runs over the
+    # (small) index-qualified row set, so the perf win survives.
     sql = text(f"""
         SELECT b.id, b.jurisdiction_id, b.session_id, b.chamber, b.identifier,
                b.identifier_norm, b.title, b.short_title, b.bill_type, b.status,
@@ -369,7 +528,7 @@ def trigram_fallback(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
         FROM bills b
         JOIN jurisdictions j ON j.id = b.jurisdiction_id
         JOIN sessions s ON s.id = b.session_id
-        WHERE similarity(b.title, :q) > :threshold{where_sql}
+        WHERE b.title % :q AND similarity(b.title, :q) > :threshold{where_sql}
         ORDER BY rank DESC, b.id
         LIMIT :limit OFFSET :offset
     """)
@@ -377,9 +536,10 @@ def trigram_fallback(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
         SELECT count(*) FROM bills b
         JOIN jurisdictions j ON j.id = b.jurisdiction_id
         JOIN sessions s ON s.id = b.session_id
-        WHERE similarity(b.title, :q) > :threshold{where_sql}
+        WHERE b.title % :q AND similarity(b.title, :q) > :threshold{where_sql}
     """)
 
+    db.execute(set_threshold_sql, params)
     count = db.execute(count_sql, params).scalar_one()
     offset = (f.page - 1) * f.per_page
     rows = db.execute(sql, {**params, "limit": f.per_page, "offset": offset}).mappings().all()
@@ -388,20 +548,31 @@ def trigram_fallback(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
     ], count
 
 
-def run_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
-    """Run the tiered search strategy and return (rows, total_count)."""
+def run_search(db: Session, f: SearchFilters) -> tuple[list[dict], int, bool]:
+    """Run the tiered search strategy and return (rows, total_count, capped).
+
+    `capped` (see full_text_search/MATCH_CAP) is only ever True for the
+    full-text branch -- the router uses it to attach the honest-totals
+    ResponseMeta notice."""
     if f.q:
         fast_path = bill_number_lookup(db, f)
         if fast_path is not None:
             rows, count = fast_path
             if rows or count:
-                return rows, count
+                return rows, count, False
 
-        rows, count = full_text_search(db, f)
+        rows, count, capped = full_text_search(db, f)
+        # `rows or count` is also, deliberately, the trigram-skip condition
+        # for a saturated query: `capped` can only be True when the branch
+        # hit MATCH_CAP, which requires MATCH_CAP real matches to exist, so
+        # `capped` implies `count > 0` and this branch is always taken --
+        # the trigram fallback below is reached only on a genuinely empty
+        # full-text result, never as a "there might be more/better matches"
+        # second opinion on a saturated one.
         if rows or count:
-            return rows, count
+            return rows, count, capped
 
-        return trigram_fallback(db, f)
+        return (*trigram_fallback(db, f), False)
 
     # No query text: browse mode, filters only, over the base bills table.
     where, params = _filter_clause(f)
@@ -417,4 +588,4 @@ def run_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
     rows = db.execute(sql, {**params, "limit": f.per_page, "offset": offset}).mappings().all()
     return [
         dict(r) | {"match_type": "browse", "rank": None, "highlight": None} for r in rows
-    ], count
+    ], count, False
