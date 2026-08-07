@@ -32,6 +32,19 @@ interface CompareResponse {
 // texts, and it is linked from every bill page, so crawlers reach it.
 const COMPARE_REVALIDATE = 86_400;
 
+// NOTE: apiGet's AbortSignal timeout only ever attaches to the UNCACHED
+// (no-store) fetch path -- see lib/api.ts. Both calls below pass
+// `revalidate`, so they take the cached path and get NO signal on their
+// primary request; a `timeoutMs` option here would be dead code (caught in
+// cross-family verify -- an earlier version of this diff set one and
+// claimed a 25s bound that did not actually apply). /compare's own difflib
+// run over two full bill texts is flagged by the comment above as "the most
+// expensive page on the site," and a cold-cache request that hangs past the
+// platform's function limit is still unbounded -- that is PRE-EXISTING
+// behavior, unchanged by this fix batch, and a known follow-up (needs its
+// own no-store-with-timeout path, or a real content-length/complexity guard
+// on the API side, not a same-shaped timeoutMs option that silently does
+// nothing on a cached call).
 async function getVersions(id: string) {
   return apiGet<BillVersion[]>(`/api/v1/bills/${id}/versions`, undefined, {
     revalidate: COMPARE_REVALIDATE,

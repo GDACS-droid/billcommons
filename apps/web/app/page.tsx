@@ -237,8 +237,18 @@ function StatCard({ label, value }: { label: string; value: string }) {
 }
 
 /**
- * WebSite + SearchAction: tells search engines the site has its own search, and
- * is the entry point that ties the domain to the "Bill Commons" name.
+ * WebSite: ties the domain to the "Bill Commons" name for search engines.
+ *
+ * This used to also carry a SearchAction (potentialAction) advertising
+ * `/search?q={search_term_string}` as a crawlable entry point -- which is
+ * exactly what it sounds like: an open invitation for search engines and
+ * generic bots to construct arbitrary /search?q=... requests. /search is
+ * deliberately uncached (results are query-driven) and results are already
+ * `noindex` (see app/search/page.tsx), so there was no SEO upside, only a
+ * standing amplifier for crawler traffic onto the one uncached, unbounded
+ * surface on an otherwise heavily-cached site. The /search route and page
+ * are unaffected -- sent links and real users searching still work exactly
+ * as before; only the crawler-facing sitelinks entry point is gone.
  */
 function siteJsonLd() {
   return {
@@ -251,14 +261,6 @@ function siteJsonLd() {
       "Free, open-source, nonpartisan search over US state legislation — bill text, sponsors, votes and status from official records.",
     inLanguage: "en",
     isAccessibleForFree: true,
-    potentialAction: {
-      "@type": "SearchAction",
-      target: {
-        "@type": "EntryPoint",
-        urlTemplate: `${SITE_URL}/search?q={search_term_string}`,
-      },
-      "query-input": "required name=search_term_string",
-    },
   };
 }
 

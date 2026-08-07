@@ -51,6 +51,55 @@ _TS_HEADLINE_OPTIONS = (
     f"StartSel={HIGHLIGHT_START_SENTINEL}, StopSel={HIGHLIGHT_STOP_SENTINEL}"
 )
 
+# Per-branch cap on raw full-text matches, taken BEFORE ts_rank/GROUP BY.
+#
+# A common English word ("act" appears in nearly every bill's "AN ACT...")
+# matches on the order of the entire corpus. Measured against the live prod
+# document table: capping via `ORDER BY rank DESC LIMIT` still cost ~10s,
+# because Postgres must compute ts_rank (detoasting a tsvector) for every one
+# of ~490k matching rows before it can sort and take the top N. Taking the
+# LIMIT on a cheap, INDEXED, deterministic order instead -- `ORDER BY b.id`
+# for the bills branch, `ORDER BY bv.bill_id, bd.id` for the bill_documents
+# branch -- lets the planner stop scanning early (measured ~0.4-1.9s per
+# branch, still a >5x cut) while making the sample stable: the same query
+# with the same params always selects the same MATCH_CAP rows, so the data
+# page, its total, and repeated requests for the same page all agree. (An
+# earlier version used a plain unordered LIMIT -- ~0.1-1.7s, faster still --
+# but Postgres is then free to pick a DIFFERENT arbitrary MATCH_CAP subset
+# per statement/request: the result page and its total could describe
+# different samples, and page reloads could reshuffle. Caught in cross-family
+# verify; the ORDER BY cost was worth paying for correctness.)
+#
+# Tradeoff: for a term this common, the capped sample is not guaranteed to
+# contain the globally highest-ranked matches (it's "the first MATCH_CAP rows
+# by bill id," not "top MATCH_CAP by rank"), so relevance ordering among
+# results is only correct within the sample, and `total` (see
+# full_text_search below) reports the capped count, not a true corpus-wide
+# count. For the overwhelming majority of real queries (anything that isn't
+# a near-universal word) the match set is already well under MATCH_CAP and
+# this has no effect at all.
+#
+# The bill_documents branch caps on document ROWS, not distinct bills -- a
+# bill with many matching document versions can consume more than one slot
+# of the cap, other bills' documents unseen. Capping on DISTINCT bill_id
+# instead (dedupe-then-limit) was measured at ~2.7s, a real latency cost for
+# a correctness edge case with no observed prod impact; documented here as a
+# known limitation rather than implemented.
+#
+# The structural filters (jurisdiction/session/chamber/status/sponsor/
+# subject/committee/date -- see _filter_clause) are applied INSIDE each
+# capped branch, not just in the outer query, on purpose: capping on the raw
+# text match alone and filtering afterward would fill the whole MATCH_CAP
+# sample with unfiltered hits, then filter it down -- for a common word plus
+# a narrow filter (e.g. q=act, sponsor=Smith) that can starve real, existing
+# filtered matches out of the sample entirely and return a false near-empty
+# result. The capped branches also unconditionally INNER JOIN jurisdictions/
+# sessions (needed for where_sql, which can reference j./s. columns even when
+# no filter is set): bills.jurisdiction_id/session_id are NOT NULL with
+# enforced FK constraints, and prod has zero NULL or orphaned rows (verified
+# directly against the live DB), so this join cannot silently drop a bill.
+MATCH_CAP = 5_000
+
 
 @dataclass
 class SearchFilters:
@@ -174,6 +223,7 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
     where_sql = f" AND {where}" if where else ""
     params["q"] = f.q or ""
     params["headline_options"] = _TS_HEADLINE_OPTIONS
+    params["match_cap"] = MATCH_CAP
 
     order = _order_by(f.sort)
 
@@ -183,23 +233,51 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
     # appears in essentially every bill) that is a quarter-million headline
     # calls to return one row, and it blew the statement timeout in prod the
     # week the text corpus reached 126k bills. Rank is cheap; headline is not.
+    #
+    # Single statement, no separate count query: `ranked_total` counts the
+    # already-small, already-filtered/capped `ranked` set once (cheap -- see
+    # MATCH_CAP), and is cross-joined ahead of `page` so it's present even
+    # when the requested page is past the end (`page` returns zero rows, but
+    # `ranked_total rt LEFT JOIN page p` still returns exactly one row, with
+    # every p.* column NULL). This replaces two independently-executed
+    # queries (a real inconsistency risk even with a deterministic ORDER BY,
+    # if a write lands between them) with one query against one MVCC
+    # snapshot -- rows and total are now guaranteed to describe the same
+    # underlying capped sample, in this request and (given the deterministic
+    # ORDER BY on `matches` above) across repeated requests too.
     sql = text(f"""
         WITH matches AS (
-            SELECT b.id AS bill_id,
-                   ts_rank(b.search_tsv, websearch_to_tsquery('english', :q)) AS rank
-            FROM bills b
-            WHERE b.search_tsv @@ websearch_to_tsquery('english', :q)
+            (
+                SELECT b.id AS bill_id,
+                       ts_rank(b.search_tsv, websearch_to_tsquery('english', :q)) AS rank
+                FROM bills b
+                JOIN jurisdictions j ON j.id = b.jurisdiction_id
+                JOIN sessions s ON s.id = b.session_id
+                WHERE b.search_tsv @@ websearch_to_tsquery('english', :q){where_sql}
+                ORDER BY b.id
+                LIMIT :match_cap
+            )
             UNION ALL
-            SELECT bv.bill_id AS bill_id,
-                   ts_rank(bd.text_tsv, websearch_to_tsquery('english', :q)) AS rank
-            FROM bill_documents bd
-            JOIN bill_versions bv ON bv.id = bd.bill_version_id
-            WHERE bd.text_tsv @@ websearch_to_tsquery('english', :q)
+            (
+                SELECT bv.bill_id AS bill_id,
+                       ts_rank(bd.text_tsv, websearch_to_tsquery('english', :q)) AS rank
+                FROM bill_documents bd
+                JOIN bill_versions bv ON bv.id = bd.bill_version_id
+                JOIN bills b ON b.id = bv.bill_id
+                JOIN jurisdictions j ON j.id = b.jurisdiction_id
+                JOIN sessions s ON s.id = b.session_id
+                WHERE bd.text_tsv @@ websearch_to_tsquery('english', :q){where_sql}
+                ORDER BY bv.bill_id, bd.id
+                LIMIT :match_cap
+            )
         ),
         ranked AS (
             SELECT bill_id, max(rank) AS rank
             FROM matches
             GROUP BY bill_id
+        ),
+        ranked_total AS (
+            SELECT count(*) AS total_count FROM ranked
         ),
         page AS (
             SELECT b.id, b.jurisdiction_id, b.session_id, b.chamber, b.identifier,
@@ -218,12 +296,18 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
         SELECT p.id, p.jurisdiction_id, p.session_id, p.chamber, p.identifier,
                p.identifier_norm, p.title, p.short_title, p.bill_type, p.status,
                p.status_date, p.introduced_date, p.latest_action_text,
-               p.latest_action_date, p.source_url, p.rank, hl.highlight
-        FROM page p
+               p.latest_action_date, p.source_url, p.rank, hl.highlight,
+               rt.total_count
+        FROM ranked_total rt
+        LEFT JOIN page p ON true
         LEFT JOIN LATERAL (
             -- One highlight per bill: prefer the title/description snippet
             -- (what the old max(highlight) usually surfaced), fall back to
-            -- the best-ranked matching document's text.
+            -- the best-ranked matching document's text. p.id is NULL on the
+            -- single placeholder row of an empty page (see above) -- every
+            -- correlated condition below then compares against NULL and
+            -- matches nothing, so this LATERAL correctly no-ops (highlight
+            -- stays NULL) instead of erroring.
             SELECT h.highlight
             FROM (
                 SELECT 0 AS pri,
@@ -255,29 +339,18 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int]:
         ORDER BY p.ord
     """)
 
-    count_sql = text(f"""
-        WITH matches AS (
-            SELECT b.id AS bill_id
-            FROM bills b
-            WHERE b.search_tsv @@ websearch_to_tsquery('english', :q)
-            UNION
-            SELECT bv.bill_id AS bill_id
-            FROM bill_documents bd
-            JOIN bill_versions bv ON bv.id = bd.bill_version_id
-            WHERE bd.text_tsv @@ websearch_to_tsquery('english', :q)
-        )
-        SELECT count(*)
-        FROM matches m
-        JOIN bills b ON b.id = m.bill_id
-        JOIN jurisdictions j ON j.id = b.jurisdiction_id
-        JOIN sessions s ON s.id = b.session_id
-        WHERE 1=1{where_sql}
-    """)
-
-    count = db.execute(count_sql, params).scalar_one()
     offset = (f.page - 1) * f.per_page
-    rows = db.execute(sql, {**params, "limit": f.per_page, "offset": offset}).mappings().all()
-    return [dict(r) | {"match_type": "full_text"} for r in rows], count
+    raw_rows = db.execute(sql, {**params, "limit": f.per_page, "offset": offset}).mappings().all()
+    # Always exactly one row minimum (the ranked_total cross join): p.id is
+    # NULL on that row when the page is empty (zero real matches at this
+    # offset, e.g. a page past the end of the capped/filtered result set).
+    total = raw_rows[0]["total_count"] if raw_rows else 0
+    rows = [
+        {k: v for k, v in dict(r).items() if k != "total_count"} | {"match_type": "full_text"}
+        for r in raw_rows
+        if r["id"] is not None
+    ]
+    return rows, total
 
 
 def trigram_fallback(db: Session, f: SearchFilters) -> tuple[list[dict], int]:

@@ -8,6 +8,7 @@ contract, not fixed row counts or emptiness."""
 from __future__ import annotations
 
 import re
+import time
 import uuid
 
 import pytest
@@ -79,6 +80,84 @@ def test_search_free_text_falls_through_to_full_text_search(client):
     _assert_envelope(body)
     for item in body["data"]:
         _assert_result_item_shape(item)
+
+
+def test_search_common_word_does_not_time_out(client):
+    """Regression for the 18s+ unbounded full-text scan (see MATCH_CAP in
+    billcommons_api.search): "act" appears in nearly every bill's "AN ACT..."
+    title/text, so before the per-branch match cap this query alone touched
+    ~the whole corpus and blew past Vercel's function timeout on every hit.
+    15s is a generous ceiling (measured ~2-3s locally against the live DB
+    post-fix, vs. 18+ before) -- tight enough to catch a regression back to
+    an unbounded scan, loose enough not to flake on a slower box/network."""
+    t0 = time.monotonic()
+    resp = client.get("/api/v1/search", params={"q": "act", "per_page": 20})
+    elapsed = time.monotonic() - t0
+    assert resp.status_code == 200
+    _assert_envelope(resp.json())
+    assert elapsed < 15, f"search for a common word took {elapsed:.1f}s, expected < 15s"
+
+
+def test_search_common_word_with_filter_does_not_starve_matches(client):
+    """Regression for a MATCH_CAP bug caught in cross-family verify: the
+    capped match CTEs originally capped on the raw text match ALONE, with
+    the structural filter (sponsor/subject/jurisdiction/etc.) applied only
+    in the outer query. For a common word plus a narrow filter, that filled
+    the whole MATCH_CAP sample with unfiltered hits and then filtered it --
+    starving out real matches. Confirmed against the live DB: "act" +
+    sponsor=Smith has 1,484+ true bills.search_tsv-only matches (and more
+    once bill_documents is included); the buggy filter-after-cap query
+    returned 327 for the combined total, the fixed filter-inside-cap query
+    returns 2,400+. 1,000 is a floor well under the fixed count and well
+    above what a starved/buggy cap could produce, so this fails loudly if
+    the filter-inside-cap fix regresses -- not just on data drift."""
+    resp = client.get(
+        "/api/v1/search", params={"q": "act", "sponsor": "smith", "per_page": 20}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    _assert_envelope(body)
+    assert body["pagination"]["total"] > 1_000, (
+        f"expected >1,000 filtered matches for a common word + broad sponsor "
+        f"filter, got {body['pagination']['total']} -- looks like the "
+        f"structural filter is being applied AFTER the match cap again"
+    )
+    assert body["data"], "expected at least one row on page 1"
+    for item in body["data"]:
+        _assert_result_item_shape(item)
+
+
+def test_search_common_word_is_deterministic_across_requests(client):
+    """Regression for a second MATCH_CAP bug caught in cross-family verify:
+    an earlier version capped each branch with a plain unordered `LIMIT`, so
+    Postgres was free to pick a DIFFERENT arbitrary MATCH_CAP-row sample per
+    statement -- the data query and its separately-executed count query
+    could describe different samples (total inconsistent with rows), and
+    repeated requests for the same page could reshuffle. The fix adds a
+    deterministic ORDER BY on an indexed key inside each capped branch and
+    computes total in the SAME statement as the page (see
+    billcommons_api.search.full_text_search). Two independent requests for
+    "act" page 1 must return the identical first page, in the identical
+    order, with the identical total -- not just the same COUNT of rows."""
+    params = {"q": "act", "per_page": 20, "page": 1}
+    resp1 = client.get("/api/v1/search", params=params)
+    resp2 = client.get("/api/v1/search", params=params)
+    assert resp1.status_code == 200 and resp2.status_code == 200
+    body1, body2 = resp1.json(), resp2.json()
+    _assert_envelope(body1)
+    _assert_envelope(body2)
+
+    assert body1["pagination"]["total"] == body2["pagination"]["total"], (
+        "same query returned different totals across two requests -- "
+        "the capped sample is not deterministic"
+    )
+    ids1 = [item["id"] for item in body1["data"]]
+    ids2 = [item["id"] for item in body2["data"]]
+    assert ids1 == ids2, (
+        "same query returned a different page 1 (different ids and/or "
+        "different order) across two requests -- the capped sample is not "
+        "deterministic"
+    )
 
 
 def test_search_result_items_would_include_match_type_field(client):
