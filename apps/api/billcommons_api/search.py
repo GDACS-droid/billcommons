@@ -224,6 +224,92 @@ def _order_by(sort: str) -> str:
     return "rank DESC, b.id"  # relevance (default)
 
 
+# ORDER BY for the bills_matches_probe CTE (see MATCH_CAP comment's
+# "Non-relevance sort on a saturated query" paragraph): when `sort` is a
+# DATE sort (latest_action/introduced), the probe orders by that same key
+# instead of always by id, so the MATCH_CAP-sized sample the cap keeps IS
+# the global top-MATCH_CAP under that sort -- not an arbitrary id-ordered
+# slice that merely gets re-sorted afterward. Both date columns have a
+# supporting composite btree index (migration 0016), so this keeps the
+# probe's early-stop property.
+#
+# sort=jurisdiction is DELIBERATELY excluded and stays id-ordered, for two
+# independent reasons caught in cross-family verify on the first cut of this
+# fix: (a) `j.abbreviation ASC, b.identifier_norm ASC` has no unique
+# tiebreaker -- identifier_norm recurs across sessions ("HB 1" exists in
+# both a 2023 and a 2025 session), so the probe's LIMIT cutoff and the trim
+# CTE's re-sort of that same set are not guaranteed to agree on which rows
+# landed on either side of a tie (Postgres sorts are not stable), and the
+# trim could drop a row the probe's cutoff had kept. (b) far worse:
+# `j.abbreviation` lives on `jurisdictions`, a joined table -- no index can
+# serve `ORDER BY j.abbreviation, ...` the way the two date indexes serve
+# their sorts, so a saturated sort=jurisdiction query would lose the probe's
+# early-stop entirely and have to materialize + sort the WHOLE match set,
+# exactly the 10s+ cost class MATCH_CAP exists to prevent. Adding a
+# tiebreaker alone would not fix (b), so this is left id-ordered rather than
+# half-fixed; a saturated sort=jurisdiction query keeps the old,
+# honestly-caveated id-ordered sample (full_text_saturation_notice still
+# applies to it).
+#
+# This is applied ONLY to the bills_matches_probe/bills_matches pair -- the
+# `bills b` branch is a single indexed-GIN-bitmap-scan-then-heapsort, which
+# the module docstring's own measurement notes stays cheap (~0.2s) even for
+# a saturating term. docs_matches_probe/docs_matches (the bill_documents
+# branch) deliberately keep the OLD id-order: sorting that branch by a
+# `bills` column would need the bill_documents match set ordered by a
+# column that lives on a DIFFERENT, only-joined table with no supporting
+# index across (matched document) x (bills.latest_action_date) -- exactly
+# the 10s+ cost the "Non-relevance sort" paragraph measured and explicitly
+# declined to pay. Net effect: a query saturating only the bills branch,
+# sorted by a DATE sort, now gets a globally correct sorted sample; every
+# other saturated case (bill_documents branch, or sort=jurisdiction) keeps
+# the old, honestly-caveated id-ordered sample.
+#
+# Measured cost property for the two DATE sorts (migration 0016's indexes):
+# MATCH_CAP bounds the probe's result CARDINALITY, not its COST -- the probe
+# COST is bounded by corpus size, because the planner walks ix_bills_
+# latest_action_date_id/ix_bills_introduced_date_id in date order with the
+# FTS predicate applied as a per-row recheck filter (when it estimates the
+# term saturates), and only early-stops once MATCH_CAP+1 matches have
+# accumulated. A term that never accumulates that many forces a full
+# index walk to the end. Measured on the live 209,908-row corpus
+# (2026-08-07, EXPLAIN ANALYZE BUFFERS): a saturating common term returned
+# in 47ms (13.6k index rows walked, early-stopped at the cap); the
+# planner-forced absolute worst case -- a term that can never fill the cap,
+# so the walk runs the full ~210k rows with a per-row recheck, measured
+# cold-ish cache -- came in at 578ms; a sub-cap (non-saturating) term skips
+# this plan entirely and gets the GIN bitmap + top-N sort plan instead
+# (~22ms). Both are two orders of magnitude inside the 15s ceiling today,
+# but the walk cost grows linearly with corpus size (bounded by rows, not
+# by MATCH_CAP) -- at roughly 10-50x the current corpus this property needs
+# revisiting (a composite/partial-index strategy, or dropping global-sort
+# fidelity for saturated date-sorted queries the way sort=jurisdiction and
+# the bill_documents branch already do above).
+def _capped_probe_order(sort: str) -> str:
+    """ORDER BY for bills_matches_probe -- references the joined `b`/`j`
+    aliases directly."""
+    if sort == "latest_action":
+        return "b.latest_action_date DESC NULLS LAST, b.id"
+    if sort == "introduced":
+        return "b.introduced_date DESC NULLS LAST, b.id"
+    return "b.id"  # relevance and jurisdiction: unchanged id-order sample
+
+
+def _capped_trim_order(sort: str) -> str:
+    """ORDER BY for bills_matches, which selects FROM bills_matches_probe --
+    plain column names, no b./j. prefix. Must mirror _capped_probe_order's
+    columns exactly (same columns, same alias names) so trimming the probe's
+    MATCH_CAP+1 rows down to MATCH_CAP preserves the probe's own cutoff
+    instead of re-sorting into a different order right before the final
+    LIMIT, which would silently reintroduce an arbitrary (not globally
+    top-N) sample."""
+    if sort == "latest_action":
+        return "latest_action_date DESC NULLS LAST, bill_id"
+    if sort == "introduced":
+        return "introduced_date DESC NULLS LAST, bill_id"
+    return "bill_id"  # relevance and jurisdiction: unchanged
+
+
 _BASE_SELECT = """
     SELECT b.id, b.jurisdiction_id, b.session_id, b.chamber, b.identifier,
            b.identifier_norm, b.title, b.short_title, b.bill_type, b.status,
@@ -287,6 +373,8 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int, bo
     params["match_cap_plus_one"] = MATCH_CAP + 1
 
     order = _order_by(f.sort)
+    bills_probe_order = _capped_probe_order(f.sort)
+    bills_trim_order = _capped_trim_order(f.sort)
 
     # ts_headline is computed ONLY for the page being returned, never inside
     # the match CTE. The original query headlined the FULL extracted text of
@@ -311,21 +399,37 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int, bo
             -- MATCH_CAP+1, not MATCH_CAP: see the match_cap_plus_one comment
             -- above. This CTE is the exact-boundary fix -- it is deliberately
             -- ONE ROW LARGER than the sample that actually feeds ranking.
+            --
+            -- ORDER BY follows the REQUESTED sort (see _capped_probe_order)
+            -- when sort isn't "relevance", not always b.id -- see the
+            -- _capped_probe_order docstring for why: this is what makes the
+            -- MATCH_CAP-sized sample the true global top-MATCH_CAP under a
+            -- saturated non-relevance sort, instead of an arbitrary
+            -- id-ordered slice that only gets re-sorted afterward. The extra
+            -- sort columns are cheap to carry (no extra join -- b/j are
+            -- already joined here for the WHERE/ORDER BY) and only actually
+            -- used for ordering when the corresponding sort is active.
             SELECT b.id AS bill_id,
-                   ts_rank(b.search_tsv, websearch_to_tsquery('english', :q)) AS rank
+                   ts_rank(b.search_tsv, websearch_to_tsquery('english', :q)) AS rank,
+                   b.latest_action_date, b.introduced_date, b.identifier_norm,
+                   j.abbreviation AS jurisdiction_abbreviation
             FROM bills b
             JOIN jurisdictions j ON j.id = b.jurisdiction_id
             JOIN sessions s ON s.id = b.session_id
             WHERE b.search_tsv @@ websearch_to_tsquery('english', :q){where_sql}
-            ORDER BY b.id
+            ORDER BY {bills_probe_order}
             LIMIT :match_cap_plus_one
         ),
         bills_matches AS (
             -- The actual sample: the probe row past MATCH_CAP (if any) is
             -- trimmed back off here, so it can never reach ranking/pagination
             -- -- it exists only to answer "was there a MATCH_CAP+1'th row".
+            -- ORDER BY here MUST mirror bills_matches_probe's own order
+            -- (see _capped_trim_order) -- trimming needs to keep the FIRST
+            -- MATCH_CAP rows in the probe's own order, not re-sort into a
+            -- different one right before the cut.
             SELECT bill_id, rank FROM bills_matches_probe
-            ORDER BY bill_id
+            ORDER BY {bills_trim_order}
             LIMIT :match_cap
         ),
         docs_matches_probe AS MATERIALIZED (
@@ -343,6 +447,19 @@ def full_text_search(db: Session, f: SearchFilters) -> tuple[list[dict], int, bo
             -- (measured ~0.5-2.7s against the live corpus for a saturating
             -- term) for a real correctness fix, not a hot loop. MATCH_CAP+1
             -- here for the same exact-boundary reason as bills_matches_probe.
+            --
+            -- Deliberately still ORDER BY bill_id, NOT the requested sort
+            -- (unlike bills_matches_probe above): sorting THIS branch by a
+            -- `bills` column would need the matching-document set ordered
+            -- by a column that lives on a different, only-joined table with
+            -- no supporting index across (matched document) x
+            -- (bills.latest_action_date) -- exactly the 10s+ cost measured
+            -- and declined in the "Non-relevance sort" paragraph above.
+            -- Known limitation: a query that saturates ONLY the bills
+            -- branch (the common case) now gets a globally correct sorted
+            -- sample; one that saturates the bill_documents branch keeps
+            -- the old id-ordered sample (full_text_saturation_notice still
+            -- applies to it).
             SELECT bill_id, max(rank) AS rank
             FROM (
                 SELECT bv.bill_id AS bill_id,

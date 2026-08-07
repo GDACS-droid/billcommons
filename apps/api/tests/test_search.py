@@ -260,6 +260,123 @@ def test_one_past_match_cap_boundary_is_marked_sampled(capped_boundary_bills, mo
     assert capped is True, "MATCH_CAP+1 real matches must be reported as sampled"
 
 
+@pytest.fixture()
+def capped_dated_boundary_bills():
+    """Insert 12 bills matching one unique FTS token, each with a DISTINCT
+    latest_action_date/introduced_date, and nothing else in the live corpus.
+    Unlike capped_boundary_bills, ids are random UUIDs uncorrelated with
+    insertion order or date -- so under the OLD id-ordered capped sample, a
+    cap of 3 would keep an ARBITRARY 3-of-12, not necessarily the newest.
+    12-vs-3 (not 5-vs-3, the first cut's ratio) so a reverted/broken fix
+    can't pass by luck: an arbitrary 3-of-12 draw matching the true newest 3
+    IN ORDER is ~1-in-220 (1/C(12,3)), not the ~1-in-10 (1/C(5,3)) the
+    original 5-vs-3 ratio left on the table. Yields (token, dates) where
+    dates[i] is bill i's latest_action_date/introduced_date, oldest first."""
+    token = uuid.uuid4().hex[:12]
+    n = 12
+    db = get_session()
+    jurisdiction_id = None
+    try:
+        jurisdiction_id = db.execute(
+            sqltext(
+                "INSERT INTO jurisdictions (id, name, abbreviation, classification, "
+                "created_at, updated_at) "
+                "VALUES (gen_random_uuid(), :name, :abbr, 'state', now(), now()) "
+                "RETURNING id"
+            ),
+            {"name": f"CapDatedJurisdiction{token}", "abbr": f"D{token[:8]}".upper()},
+        ).scalar_one()
+        session_id = db.execute(
+            sqltext(
+                "INSERT INTO sessions (id, jurisdiction_id, identifier, active, "
+                "created_at, updated_at) "
+                "VALUES (gen_random_uuid(), :jid, :ident, false, now(), now()) "
+                "RETURNING id"
+            ),
+            {"jid": jurisdiction_id, "ident": f"session-{token}"},
+        ).scalar_one()
+        dates = [f"2020-01-{i + 1:02d}" for i in range(n)]  # oldest -> newest
+        for i, d in enumerate(dates):
+            db.execute(
+                sqltext(
+                    "INSERT INTO bills (id, jurisdiction_id, session_id, identifier, "
+                    "identifier_norm, title, latest_action_date, introduced_date, "
+                    "created_at, updated_at) "
+                    "VALUES (gen_random_uuid(), :jid, :sid, :ident, :ident_norm, :title, "
+                    ":date, :date, now(), now())"
+                ),
+                {
+                    "jid": jurisdiction_id,
+                    "sid": session_id,
+                    "ident": f"CD {token[:6]}{i}",
+                    "ident_norm": f"CD{token[:6]}{i}".upper(),
+                    "title": f"CapDatedProbe{token} act number {i}",
+                    "date": d,
+                },
+            )
+        db.commit()
+        yield token, dates
+    finally:
+        if jurisdiction_id is not None:
+            db.execute(sqltext("DELETE FROM bills WHERE jurisdiction_id = :jid"), {"jid": jurisdiction_id})
+            db.execute(sqltext("DELETE FROM sessions WHERE jurisdiction_id = :jid"), {"jid": jurisdiction_id})
+            db.execute(sqltext("DELETE FROM jurisdictions WHERE id = :jid"), {"jid": jurisdiction_id})
+            db.commit()
+        db.close()
+
+
+def test_capped_latest_action_sort_returns_globally_newest_rows(capped_dated_boundary_bills, monkeypatch):
+    """Regression for item 4 (sorted-sample under a saturated cap): with
+    MATCH_CAP shrunk below the true match count and sort=latest_action, the
+    capped sample must be the true global top-MATCH_CAP by latest_action_date
+    -- the 3 NEWEST of the 12 inserted bills, in newest-first order -- not an
+    arbitrary id-ordered slice that happens to get re-sorted afterward. Ids
+    are random UUIDs uncorrelated with date, so this only passes if the
+    capped candidate CTE itself orders by the requested sort key (see the
+    fixture docstring for the 12-vs-3 false-pass-rate rationale)."""
+    token, dates = capped_dated_boundary_bills
+    cap = 3
+    monkeypatch.setattr(search_module, "MATCH_CAP", cap)
+    db = get_session()
+    try:
+        filters = SearchFilters(
+            q=f"CapDatedProbe{token}", sort="latest_action", per_page=20
+        )
+        rows, total, capped = full_text_search(db, filters)
+    finally:
+        db.close()
+    assert total == cap
+    assert capped is True
+    assert len(rows) == cap
+    expected_dates = sorted(dates, reverse=True)[:cap]
+    actual_dates = [r["latest_action_date"].isoformat() for r in rows]
+    assert actual_dates == expected_dates, (
+        f"capped sample under sort=latest_action must be the globally newest "
+        f"{cap} rows in newest-first order; expected {expected_dates}, got {actual_dates}"
+    )
+
+
+def test_capped_introduced_sort_returns_globally_newest_rows(capped_dated_boundary_bills, monkeypatch):
+    """Same regression as above, for sort=introduced (the other date-sort
+    the capped candidate CTE now follows)."""
+    token, dates = capped_dated_boundary_bills
+    cap = 3
+    monkeypatch.setattr(search_module, "MATCH_CAP", cap)
+    db = get_session()
+    try:
+        filters = SearchFilters(
+            q=f"CapDatedProbe{token}", sort="introduced", per_page=20
+        )
+        rows, total, capped = full_text_search(db, filters)
+    finally:
+        db.close()
+    assert total == cap
+    assert capped is True
+    expected_dates = sorted(dates, reverse=True)[:cap]
+    actual_dates = [r["introduced_date"].isoformat() for r in rows]
+    assert actual_dates == expected_dates
+
+
 def test_search_common_word_with_filter_does_not_starve_matches(client):
     """Regression for a MATCH_CAP bug caught in cross-family verify: the
     capped match CTEs originally capped on the raw text match ALONE, with
@@ -444,23 +561,38 @@ def test_trigram_fallback_percent_operator_matches_old_strict_predicate_exactly(
     db = get_session()
     try:
         for q in queries:
-            old_sql = sqltext(
-                "SELECT b.id FROM bills b WHERE similarity(b.title, :q) > :threshold"
-            )
-            old_ids = {row[0] for row in db.execute(old_sql, {"q": q, "threshold": threshold})}
-
             # `%`'s notion of "similar enough" reads the SESSION GUC, not a
             # bound parameter -- must be set before the query runs, exactly
-            # as trigram_fallback itself does.
+            # as trigram_fallback itself does. `true` scopes it to the
+            # current transaction, so it stays in effect for the combined
+            # query below without needing to be re-set mid-statement.
             db.execute(
                 sqltext("SELECT set_config('pg_trgm.similarity_threshold', :t, true)"),
                 {"t": str(threshold)},
             )
-            new_sql = sqltext(
-                "SELECT b.id FROM bills b "
-                "WHERE b.title % :q AND similarity(b.title, :q) > :threshold"
+            # Both id-sets computed in ONE statement (a single MVCC snapshot
+            # under READ COMMITTED), not two independently-executed queries:
+            # the previous two-statement form could flake under concurrent
+            # ingest -- a bill title changing between the old-predicate query
+            # and the new-predicate query could land the two sets on
+            # different snapshots and produce a spurious mismatch that has
+            # nothing to do with the predicate rewrite this test exists to
+            # pin.
+            combined_sql = sqltext(
+                "WITH old_match AS ("
+                "    SELECT b.id FROM bills b WHERE similarity(b.title, :q) > :threshold"
+                "), new_match AS ("
+                "    SELECT b.id FROM bills b "
+                "    WHERE b.title % :q AND similarity(b.title, :q) > :threshold"
+                ") "
+                "SELECT 'old' AS which, id FROM old_match "
+                "UNION ALL "
+                "SELECT 'new' AS which, id FROM new_match"
             )
-            new_ids = {row[0] for row in db.execute(new_sql, {"q": q, "threshold": threshold})}
+            old_ids: set = set()
+            new_ids: set = set()
+            for which, bill_id in db.execute(combined_sql, {"q": q, "threshold": threshold}):
+                (old_ids if which == "old" else new_ids).add(bill_id)
 
             assert new_ids == old_ids, (
                 f"id-set mismatch for q={q!r}: the % + strict-recheck predicate "

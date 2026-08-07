@@ -103,6 +103,20 @@ MAX_EVIDENCE_HISTORY_ITEMS = _env_int("MCP_MAX_EVIDENCE_HISTORY_ITEMS", 500)
 FTS_MATCH_CAP = _env_int("MCP_FTS_MATCH_CAP", 5_000)
 
 
+def _clamped_fts_match_cap() -> int:
+    """Clamp FTS_MATCH_CAP at the point of use, not just where the env var
+    is parsed. `_env_int` already floors a non-positive MCP_FTS_MATCH_CAP
+    env value back to the default, but that guard is bypassed by any direct
+    override of the module constant (tests do this via
+    `monkeypatch.setattr(tools, "FTS_MATCH_CAP", ...)`, and nothing stops a
+    future caller doing the same). An unclamped 0 or negative cap would
+    fetch a `.limit(cap + 1)` <= 1-row probe, immediately mark
+    search_capped=True (since 1 > 0 or 1 > a negative number), then trim
+    candidate_ids to an empty list -- returning zero results mislabeled as
+    `results_truncated` rather than the honest `no_match` outcome."""
+    return max(1, int(FTS_MATCH_CAP))
+
+
 def _clamp_limit(limit: int | None) -> int:
     if limit is None:
         return DEFAULT_LIMIT
@@ -281,30 +295,40 @@ def search_legislation(
                 results = None
 
             if results is None:
+                # Clamp at read time -- see _clamped_fts_match_cap's
+                # docstring for why this can't just rely on _env_int's
+                # env-parsing floor. A DISTINCT local name (not a shadow of
+                # the module constant): Python function scoping is
+                # per-function, not per-block, so assigning to a local named
+                # `FTS_MATCH_CAP` here would make that name local for the
+                # ENTIRE function -- any reference on another code path
+                # (present or future) would raise UnboundLocalError instead
+                # of falling back to the module constant.
+                fts_match_cap = _clamped_fts_match_cap()
                 tsq_filter = Bill.search_tsv.op("@@")(func.websearch_to_tsquery("english", q))
                 # Step 1: cap-then-rank (see FTS_MATCH_CAP above). A lean
                 # id-only query, ordered by Bill.id (cheap + indexed: lets
-                # Postgres stop scanning once it has FTS_MATCH_CAP matches
+                # Postgres stop scanning once it has fts_match_cap matches
                 # rather than ranking the whole match set to sort it), with
                 # the SAME structural filters applied inside it as `stmt`
                 # carries -- not just against the eventual ranked query.
                 #
-                # FTS_MATCH_CAP + 1, not FTS_MATCH_CAP: fetching exactly the
-                # cap can't tell "exactly FTS_MATCH_CAP matches" (genuinely
-                # exhaustive) from "FTS_MATCH_CAP+1 or more" (truly
-                # saturated) -- both return exactly FTS_MATCH_CAP rows. The
-                # extra probe row resolves the boundary (`> FTS_MATCH_CAP`
+                # fts_match_cap + 1, not fts_match_cap: fetching exactly the
+                # cap can't tell "exactly fts_match_cap matches" (genuinely
+                # exhaustive) from "fts_match_cap+1 or more" (truly
+                # saturated) -- both return exactly fts_match_cap rows. The
+                # extra probe row resolves the boundary (`> fts_match_cap`
                 # below) and is trimmed back off before ranking, so it can
                 # never itself reach `results`.
                 candidate_stmt = (
                     select(Bill.id)
                     .where(tsq_filter, *shared_filters)
                     .order_by(Bill.id)
-                    .limit(FTS_MATCH_CAP + 1)
+                    .limit(fts_match_cap + 1)
                 )
                 candidate_ids = list(db.execute(candidate_stmt).scalars().all())
-                search_capped = len(candidate_ids) > FTS_MATCH_CAP
-                candidate_ids = candidate_ids[:FTS_MATCH_CAP]
+                search_capped = len(candidate_ids) > fts_match_cap
+                candidate_ids = candidate_ids[:fts_match_cap]
                 if candidate_ids:
                     # Step 2: rank ONLY the capped candidate set -- cheap
                     # regardless of how common the search term is, since it's
@@ -328,6 +352,31 @@ def search_legislation(
 
             if not results:
                 match_type = "no_match"
+                # A capped candidate set that ends up with zero rows after
+                # re-applying tsq_filter (e.g. every candidate's search_tsv
+                # changed between the two statements -- see
+                # test_rank_query_reapplies_the_fts_predicate) is an empty
+                # result, not a truncated one: `results_truncated` on an
+                # empty `results` list would tell a caller there's MORE to
+                # see when there is nothing to see at all.
+                search_capped = False
+                # Deliberately UNHANDLED partial case: if that same
+                # concurrent write drops SOME (not all) candidates between
+                # the two statements, `results` comes back non-empty but
+                # shorter than it would have been, and results_truncated
+                # can be stale-True for that one response. Not cheaply
+                # fixable: `results` is already page-limited (limit_n is
+                # typically << fts_match_cap), so "fewer results than the
+                # cap" is the NORMAL shape of a saturated response --
+                # distinguishing "fewer because paginated" from "fewer
+                # because some candidates vanished mid-race" would need an
+                # extra surviving-candidate count query per search, to
+                # correct a race window that's milliseconds wide and
+                # self-corrects on a requery anyway. The zero-row case
+                # above is different and worth the fix: an EMPTY page
+                # claiming more results exist is self-contradictory, and
+                # free to detect (no extra query -- `not results` already
+                # tells you).
 
             payload = {
                 "query": q,
