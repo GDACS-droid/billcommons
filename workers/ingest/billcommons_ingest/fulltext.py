@@ -38,6 +38,7 @@ from urllib.robotparser import RobotFileParser
 
 import httpx
 from sqlalchemy import Text, case, cast, exists, func, or_, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest import events
@@ -84,6 +85,17 @@ STATUS_EMPTY_URL = "empty_url"
 STATUS_UNSUPPORTED_REDIRECT_SCHEME = "unsupported_redirect_scheme"
 STATUS_TOO_MANY_REDIRECTS = "too_many_redirects"
 STATUS_MALFORMED_URL = "malformed_url"
+STATUS_PERMANENTLY_FAILED = "permanently_failed"
+# Recorded when a fetch_text job died of something that is OUR fault, not the
+# document's: the database blinked, the object store 500ed, a bug in this
+# worker. Non-terminal (the document is still worth fetching) and -- unlike
+# STATUS_FETCH_ERROR -- it NEVER burns a fetch attempt, because an
+# infrastructure outage would otherwise spend the entire retry budget of
+# every document that happened to be in flight and exclude them permanently.
+# Kept as its own greppable value so ops can tell the two apart:
+#   select license_note, count(*) from bill_documents
+#    where license_note like 'fulltext_status=%' group by 1;
+STATUS_WORKER_ERROR = "worker_error"
 
 # Statuses that will NEVER change on a retry -- the document's URL/robots.txt/
 # content shape is a fixed fact about that source, not a transient condition.
@@ -93,7 +105,10 @@ STATUS_MALFORMED_URL = "malformed_url"
 # and STATUS_TOO_MANY_REDIRECTS are deliberately excluded -- a network/HTTP
 # error and a redirect loop are both transient conditions worth retrying (the
 # target site's redirect chain today doesn't guarantee its redirect chain
-# tomorrow).
+# tomorrow); fetch errors instead stay retryable but are now BOUNDED by
+# `BillDocument.fetch_attempts` -- once a document accumulates
+# MAX_FETCH_ATTEMPTS recorded failures it is marked STATUS_PERMANENTLY_FAILED
+# (which IS terminal) instead of retrying forever.
 TERMINAL_STATUSES = frozenset(
     {
         STATUS_ROBOTS_DISALLOWED,
@@ -102,6 +117,7 @@ TERMINAL_STATUSES = frozenset(
         STATUS_UNSUPPORTED_TYPE,
         STATUS_UNSUPPORTED_REDIRECT_SCHEME,
         STATUS_MALFORMED_URL,
+        STATUS_PERMANENTLY_FAILED,
     }
 )
 
@@ -124,6 +140,70 @@ class UnfetchableDocument(RuntimeError):
         super().__init__(message)
         self.document_id = document_id
         self.status = status
+
+
+class DocumentFetchError(RuntimeError):
+    """A failure that is a fact about THIS DOCUMENT -- its URL is dead, its
+    host 500s, its bytes crash the parser.
+
+    Retryable (a host that is down today may be up tomorrow), so NOT terminal,
+    but every occurrence spends one of the document's MAX_FETCH_ATTEMPTS: that
+    is the whole mechanism that stops a permanently-broken URL from being
+    re-fetched forever (observed: 220 attempts on one document, 84,344 dead
+    fetch_text rows over 36,085 documents).
+
+    It exists as its own type precisely so the worker can tell it apart from a
+    bare Exception escaping the job. Those two used to be indistinguishable, so
+    charging the document for either meant an hour of expired object-store
+    credentials or a flapping DB connection could spend the full budget of
+    every in-flight document and mark them permanently_failed -- unrecoverable
+    without hand-written UPDATEs. See is_document_specific_failure and
+    `reset-fetch-attempts`.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        document_id: str | None = None,
+        status: str = STATUS_FETCH_ERROR,
+    ) -> None:
+        super().__init__(message)
+        self.document_id = document_id
+        self.status = status
+
+
+# SQLSTATE classes that mean "this row's DATA is the problem" rather than "the
+# database is having a bad day": 22 data exception (invalid byte sequence, NUL
+# in text), 23 integrity constraint violation, 54 program limit exceeded --
+# which is the class of `string is too long for tsvector`, the failure that
+# cost 309 documents their extracted_text. Everything else (08 connection
+# failure, 53 insufficient resources, 57 operator intervention, 58 system
+# error, XX internal error) is infrastructure and must never be charged to a
+# document's retry budget.
+DOCUMENT_SPECIFIC_SQLSTATE_CLASSES = ("22", "23", "54")
+
+
+def is_document_specific_failure(exc: BaseException) -> bool:
+    """Does this failure justify spending one of the document's fetch attempts?
+
+    True only when the failure is attributable to the document itself. The
+    default answer is False: an unrecognized exception is treated as OUR bug or
+    OUR outage, which costs a retry (cheap, self-healing) instead of a
+    document (permanent, and previously unrecoverable).
+    """
+    if isinstance(exc, (DocumentFetchError, UnfetchableDocument)):
+        return True
+    # psycopg3 exposes .sqlstate, psycopg2 .pgcode; SQLAlchemy wraps both and
+    # keeps the driver exception on .orig.
+    candidates = [exc]
+    if isinstance(exc, DBAPIError) and exc.orig is not None:
+        candidates.append(exc.orig)
+    for candidate in candidates:
+        code = getattr(candidate, "sqlstate", None) or getattr(candidate, "pgcode", None)
+        if isinstance(code, str) and code[:2] in DOCUMENT_SPECIFIC_SQLSTATE_CLASSES:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +545,7 @@ def enqueue_fulltext_jobs(
                 BillDocument.license_note.is_(None),
                 BillDocument.license_note.not_in(terminal_license_notes),
             ),
+            BillDocument.fetch_attempts < MAX_FETCH_ATTEMPTS,
             ~exists(already_queued),
         )
     )
@@ -530,6 +611,12 @@ class FetchTextResult:
 
 
 MAX_REDIRECT_HOPS = 5
+
+# queue.DEFAULT_MAX_ATTEMPTS = 5, so 15 = 3 full dead-letter cycles. In-cycle
+# backoff is 60/120/240/480s; three cycles spread across the enqueue loop's
+# cadence spans hours-to-days -- ample for a real transient outage -- while
+# bounding worst case at 15 fetches instead of the observed 220.
+MAX_FETCH_ATTEMPTS = 15
 
 
 class FullTextFetcher:
@@ -693,7 +780,15 @@ def process_fetch_text_job(
     except httpx.HTTPError as exc:
         _mark_status(document, STATUS_FETCH_ERROR)
         db.flush()
-        raise RuntimeError(f"fetch failed for {document.url}: {exc}") from exc
+        # DocumentFetchError, not a bare RuntimeError: this is the document's
+        # own host failing, so it SHOULD spend one of its MAX_FETCH_ATTEMPTS.
+        # A bare RuntimeError is indistinguishable from our own worker
+        # crashing, which must not cost the document anything.
+        raise DocumentFetchError(
+            f"fetch failed for {document.url}: {exc}",
+            document_id=str(document.id),
+            status=STATUS_FETCH_ERROR,
+        ) from exc
 
     raw = response.content
     # Raw-byte archival is best-effort. The full-document corpus (~730k docs)
@@ -717,8 +812,24 @@ def process_fetch_text_job(
         except OSError as exc:  # e.g. ENOSPC — never fail extraction over archival
             print(f"fulltext: raw archival skipped for {document.id}: {exc}", flush=True)
 
-    content_type = sniff_content_type(response.headers.get("content-type"), document.url, raw)
-    outcome = extract_document_text(content_type, raw)
+    try:
+        content_type = sniff_content_type(response.headers.get("content-type"), document.url, raw)
+        outcome = extract_document_text(content_type, raw)
+    except Exception as exc:  # noqa: BLE001 - classify, then re-raise
+        # A parser that dies on THIS document's bytes (the unhandled pypdf
+        # crashes behind most of the 84k dead fetch_text rows) is a fact about
+        # the document, so it burns an attempt and eventually goes terminal.
+        # Left as a bare exception it reached cmd_worker's generic handler,
+        # which had no document identity and could not record anything -- the
+        # document stayed forever "never attempted" and was re-enqueued for
+        # ever.
+        _mark_status(document, STATUS_FETCH_ERROR)
+        db.flush()
+        raise DocumentFetchError(
+            f"text extraction failed for {document.url}: {exc}",
+            document_id=str(document.id),
+            status=STATUS_FETCH_ERROR,
+        ) from exc
 
     had_text_before = bool(document.extracted_text)
     document.extracted_text = outcome.extracted_text
@@ -728,6 +839,8 @@ def process_fetch_text_job(
     document.raw_ref = raw_ref
     document.checksum = outcome.checksum
     document.parser_version = PARSER_VERSION
+    if outcome.status == STATUS_OK:
+        document.fetch_attempts = 0
     _mark_status(document, outcome.status)
     db.flush()
 

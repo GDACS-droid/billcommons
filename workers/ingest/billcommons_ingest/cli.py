@@ -10,6 +10,11 @@ Subcommands (per BRIEF-wave2.md):
                                        docs/state-coverage/coverage-latest.json.
     enqueue-fulltext [--limit N]      Enqueue fetch_text jobs for bill_documents
                                        lacking extracted_text (idempotent).
+    reset-fetch-attempts [filters]    Hand documents their fetch retry budget
+                                       back (clears fetch_attempts + the
+                                       permanently_failed note) after an
+                                       outage or a fixed source. Requires an
+                                       explicit filter; --dry-run reports.
     validate --state XX [--sample N]  QA-sample bills against source-of-truth
                                        (search API + official source_url) and
                                        record validation_runs + coverage.
@@ -35,10 +40,11 @@ import socket
 import sys
 import time
 import traceback
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import case, func, or_, select, text, update
 
 from billcommons_ingest import api_sync as api_sync_mod
 from billcommons_ingest import coverage as coverage_mod
@@ -433,6 +439,118 @@ def cmd_enqueue_fulltext(args: argparse.Namespace) -> int:
         db.close()
 
 
+RESETTABLE_DEFAULT_STATUSES = ("permanently_failed", "worker_error")
+
+
+def cmd_reset_fetch_attempts(args: argparse.Namespace) -> int:
+    """Give documents their fetch-retry budget back.
+
+    `bill_documents.fetch_attempts` is what stops a permanently-broken URL from
+    being re-fetched forever, but a counter with no way DOWN turns any wide
+    failure into permanent, silent data loss: an hour of expired object-store
+    credentials, a flapping connection pool, or one bad deploy can charge
+    MAX_FETCH_ATTEMPTS failures to whatever documents were in flight, stamp
+    them `fulltext_status=permanently_failed` (terminal, so
+    enqueue_fulltext_jobs never offers them again), and nothing in the system
+    would ever retry them. The same applies, less dramatically, when a state
+    finally fixes a source that 404ed for a week.
+
+    cmd_worker only charges failures it can attribute to the document itself
+    (fulltext.is_document_specific_failure), so this should be rare -- but
+    "should be rare" is not a recovery plan, and hand-written UPDATEs against
+    production are not one either.
+
+    Deliberately explicit: one of --document-id / --url-like / --all is
+    REQUIRED. The unfiltered form would hand every one of ~690k documents a
+    fresh budget and re-open the poison loop the counter exists to close.
+
+    Only license_note values named by --status (default: permanently_failed
+    and worker_error -- the self-inflicted ones) are cleared. A
+    robots_disallowed document keeps its note unless an operator names it by
+    hand: a politeness verdict is not collateral damage of an outage cleanup.
+    """
+    statuses = args.status or list(RESETTABLE_DEFAULT_STATUSES)
+    notes = [f"fulltext_status={s}" for s in statuses]
+
+    filters = []
+    if args.document_id:
+        try:
+            ids = [uuid.UUID(str(value)) for value in args.document_id]
+        except ValueError as exc:
+            print(f"reset-fetch-attempts: bad --document-id ({exc})")
+            return 2
+        filters.append(BillDocument.id.in_(ids))
+    if args.url_like:
+        filters.append(BillDocument.url.like(args.url_like))
+    if not filters and not args.all:
+        print(
+            "reset-fetch-attempts: refusing to run unfiltered -- pass "
+            "--document-id/--url-like, or --all if you really mean every document"
+        )
+        return 2
+
+    # Nothing to reset unless the document actually carries state: either a
+    # spent budget or one of the resettable notes. Keeps --all from rewriting
+    # (and bumping updated_at on) hundreds of thousands of untouched rows.
+    filters.append(
+        or_(BillDocument.fetch_attempts > 0, BillDocument.license_note.in_(notes))
+    )
+
+    db = get_session()
+    try:
+        breakdown = db.execute(
+            select(
+                BillDocument.license_note,
+                func.count().label("n"),
+                func.sum(case((BillDocument.fetch_attempts > 0, 1), else_=0)).label("with_attempts"),
+            )
+            .where(*filters)
+            .group_by(BillDocument.license_note)
+            .order_by(func.count().desc())
+        ).all()
+        total = sum(row.n for row in breakdown)
+        print(f"reset-fetch-attempts: {total:,} document(s) match")
+        for row in breakdown:
+            print(f"  {str(row.license_note):45} {row.n:>8,}  ({row.with_attempts or 0:,} with attempts)")
+        if args.dry_run:
+            print("reset-fetch-attempts: --dry-run, nothing written")
+            return 0
+        if total == 0:
+            return 0
+
+        scope = list(filters)
+        if args.limit:
+            ids = db.execute(select(BillDocument.id).where(*filters).limit(args.limit)).scalars().all()
+            scope = [BillDocument.id.in_(ids)]
+
+        result = db.execute(
+            update(BillDocument)
+            .where(*scope)
+            .values(
+                fetch_attempts=0,
+                # Only the named notes are cleared; every other status keeps
+                # its meaning (robots_disallowed stays disallowed).
+                license_note=case(
+                    (BillDocument.license_note.in_(notes), None),
+                    else_=BillDocument.license_note,
+                ),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        db.commit()
+        print(
+            f"reset-fetch-attempts: reset {result.rowcount:,} document(s); they become "
+            f"eligible again on the next enqueue-fulltext / worker top-up pass"
+        )
+        return 0
+    except Exception:
+        db.rollback()
+        traceback.print_exc()
+        return 1
+    finally:
+        db.close()
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     worker_id = args.worker_id or f"{socket.gethostname()}-{sys.argv[0]}"
     poll_interval = args.poll_interval
@@ -588,6 +706,12 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 # every 30s indefinitely, holding `queued` above the top-up
                 # floor so no new work could ever be enqueued either.
                 claimed_attempts = job.attempts
+                # Total function on purpose -- see _fetch_text_document_id.
+                # Anything that can RAISE here raises OUTSIDE the try below,
+                # escapes the worker loop, and leaves the job stuck `running`
+                # forever, which is the exact starvation shape the comment
+                # above documents.
+                claimed_document_id = _fetch_text_document_id(job)
                 try:
                     # Dispatch by kind is intentionally minimal here; concrete
                     # job kinds (bootstrap/api-sync/recompute-coverage) are
@@ -667,20 +791,106 @@ def cmd_worker(args: argparse.Namespace) -> int:
                         terminal=exc.status in fulltext_mod.TERMINAL_STATUSES,
                         document_id=exc.document_id,
                         document_status=exc.status,
+                        # Document-specific by construction. Matters for the
+                        # NON-terminal member of this family,
+                        # too_many_redirects: without a budget it is its own
+                        # poison loop, retried for ever on a site whose
+                        # redirect chain is permanently circular.
+                        count_attempt=True,
                     )
-                except Exception as exc:  # noqa: BLE001 - job-level failure isolation
+                except fulltext_mod.DocumentFetchError as exc:
+                    # The document's own host/bytes failed. Retryable, but it
+                    # spends one of the document's MAX_FETCH_ATTEMPTS so a
+                    # permanently-broken URL stops being re-fetched forever.
                     db.rollback()
                     record_job_failure(
                         job.id,
                         type(job),
                         claimed_attempts=claimed_attempts,
                         error=str(exc),
+                        document_id=exc.document_id or claimed_document_id,
+                        document_status=exc.status,
+                        count_attempt=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - job-level failure isolation
+                    # Unclassified. It may be the document's fault -- a data
+                    # error on ITS row (SQLSTATE 22/23/54, e.g. the
+                    # tsvector-too-long write that cost 309 documents their
+                    # text) -- or it may be ours: a DB blip, an expired
+                    # object-store credential, a bug on this line. Only the
+                    # first kind may spend the document's budget. Charging the
+                    # second kind would let a one-hour outage mark every
+                    # in-flight document permanently_failed, which nothing in
+                    # the system would ever retry (see `reset-fetch-attempts`
+                    # for the recovery path that must never be needed).
+                    db.rollback()
+                    document_status, count_attempt = classify_job_failure(
+                        claimed_document_id, exc
+                    )
+                    if claimed_document_id and not count_attempt:
+                        print(
+                            f"worker {worker_id}: fetch_text {claimed_document_id} failed with an "
+                            f"UNCLASSIFIED error -- recording {document_status} WITHOUT charging "
+                            f"the document a fetch attempt: {exc!r}",
+                            flush=True,
+                        )
+                    record_job_failure(
+                        job.id,
+                        type(job),
+                        claimed_attempts=claimed_attempts,
+                        error=str(exc),
+                        document_id=claimed_document_id,
+                        document_status=document_status,
+                        count_attempt=count_attempt,
                     )
             finally:
                 db.close()
     except KeyboardInterrupt:
         print(f"worker {worker_id}: stopping")
         return 0
+
+
+def classify_job_failure(
+    document_id: str | None, exc: BaseException
+) -> tuple[str | None, bool]:
+    """What does this failed fetch_text job cost the document?
+
+    Returns the `fulltext_status` to record and whether it may spend one of the
+    document's MAX_FETCH_ATTEMPTS. Extracted from cmd_worker's generic handler
+    so the decision is unit-testable rather than a conditional buried in an
+    except block -- getting it wrong is not a cosmetic bug: charging an
+    infrastructure outage to the documents that happened to be in flight walks
+    them to `permanently_failed`, which is terminal, so nothing in the system
+    would ever offer them again.
+    """
+    if not document_id:
+        return (None, False)
+    if fulltext_mod.is_document_specific_failure(exc):
+        # DocumentFetchError/UnfetchableDocument carry the specific condition;
+        # a data error on this row (SQLSTATE 22/23/54) does not, and is a
+        # fetch_error for reporting purposes.
+        status = getattr(exc, "status", None) or fulltext_mod.STATUS_FETCH_ERROR
+        return (status, True)
+    return (fulltext_mod.STATUS_WORKER_ERROR, False)
+
+
+def _fetch_text_document_id(job) -> str | None:
+    """The document a claimed job is about, or None -- never raises.
+
+    `job.payload` is written by enqueue_fulltext_jobs and is always a dict
+    today, but this runs OUTSIDE the worker's per-job try/except: a NULL or
+    non-dict payload on one hand-inserted row would raise AttributeError with
+    no handler, escape the worker loop, and leave that job `running` forever,
+    holding a queue slot above the top-up floor so no new work could be
+    enqueued either. Cheaper to be total than to re-live that.
+    """
+    if job.kind != fulltext_mod.FETCH_TEXT_KIND:
+        return None
+    payload = job.payload
+    if not isinstance(payload, dict):
+        return None
+    document_id = payload.get("document_id")
+    return str(document_id) if document_id else None
 
 
 def record_job_failure(
@@ -692,6 +902,7 @@ def record_job_failure(
     terminal: bool = False,
     document_id: str | None = None,
     document_status: str | None = None,
+    count_attempt: bool = False,
     session_factory=get_session,
 ) -> None:
     """Record a claimed job's failure in a FRESH session, after the claiming
@@ -716,15 +927,41 @@ def record_job_failure(
     so the `license_note` write that the rollback discarded is re-applied
     durably here -- otherwise the document keeps looking never-attempted and
     `enqueue_fulltext_jobs` re-enqueues it forever despite the dead-letter.
+
+    `count_attempt` decides whether this failure spends one of the document's
+    MAX_FETCH_ATTEMPTS. It defaults to FALSE so that a future caller has to opt
+    in deliberately: the budget is what makes a document permanently_failed
+    (terminal, never re-enqueued), so charging the wrong failure to it -- an
+    outage, a bug in this worker -- silently drops documents from the corpus.
+    Only failures the fetcher itself classified as the document's own (see
+    fulltext.is_document_specific_failure) pass True.
     """
     db = session_factory()
     try:
         if document_id and document_status:
-            document = db.get(BillDocument, document_id)
+            # FOR UPDATE: two workers can be recording failures for the same
+            # document at the same moment, and a plain read-modify-write loses
+            # one of the increments. That can only DELAY the cap, never break
+            # it, but the lock is one row held for microseconds -- cheaper than
+            # reasoning about it again later.
+            document = db.get(BillDocument, document_id, with_for_update=True)
             if document is not None:
-                document.license_note = f"fulltext_status={document_status}"
+                status = document_status
+                if count_attempt and status not in fulltext_mod.TERMINAL_STATUSES:
+                    document.fetch_attempts = (document.fetch_attempts or 0) + 1
+                    if document.fetch_attempts >= fulltext_mod.MAX_FETCH_ATTEMPTS:
+                        status = fulltext_mod.STATUS_PERMANENTLY_FAILED
+                        terminal = True
+                document.license_note = f"fulltext_status={status}"
         job = db.get(job_cls, job_id)
         if job is None:
+            # Commit anyway: the document write above is the durable record of
+            # this failure and must not be discarded just because the job row
+            # vanished (the 84k dead fetch_text rows are slated for a purge, so
+            # a cleanup racing a failure record is a real sequence). Without
+            # this the increment is rolled back on close() and the document
+            # keeps its poison-loop eligibility forever.
+            db.commit()
             return
         job.attempts = claimed_attempts
         if terminal:
@@ -1609,6 +1846,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=None, help="max number of documents to enqueue (default: no limit)"
     )
     p_enqueue_fulltext.set_defaults(func=cmd_enqueue_fulltext)
+
+    p_reset_fetch = sub.add_parser(
+        "reset-fetch-attempts",
+        help=(
+            "clear bill_documents.fetch_attempts (and the permanently_failed/"
+            "worker_error notes) so documents excluded by the retry cap get a "
+            "fresh budget -- the recovery path after an outage or a fixed source"
+        ),
+    )
+    p_reset_fetch.add_argument(
+        "--document-id", action="append", default=None, help="repeatable; a specific bill_documents.id"
+    )
+    p_reset_fetch.add_argument(
+        "--url-like",
+        default=None,
+        help="SQL LIKE pattern against bill_documents.url, e.g. 'https://leg.state.xx.us/%%'",
+    )
+    p_reset_fetch.add_argument(
+        "--status",
+        action="append",
+        default=None,
+        help=(
+            "repeatable fulltext_status value whose license_note is cleared "
+            f"(default: {' + '.join(RESETTABLE_DEFAULT_STATUSES)})"
+        ),
+    )
+    p_reset_fetch.add_argument(
+        "--all", action="store_true", help="every document (required if no other filter is given)"
+    )
+    p_reset_fetch.add_argument("--limit", type=int, default=None, help="cap the number of rows written")
+    p_reset_fetch.add_argument(
+        "--dry-run", action="store_true", help="report the matching documents without writing"
+    )
+    p_reset_fetch.set_defaults(func=cmd_reset_fetch_attempts)
 
     p_validate = sub.add_parser("validate", help="QA-sample bills against source-of-truth and record validation_runs")
     p_validate.add_argument("--state", default=None, help="two-letter state code, e.g. AK")

@@ -19,20 +19,33 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 from pypdf import PdfWriter
+from sqlalchemy import text
 
 from billcommons_ingest import fulltext as fulltext_mod
+from billcommons_ingest.cli import (
+    _fetch_text_document_id,
+    classify_job_failure,
+    cmd_reset_fetch_attempts,
+    record_job_failure,
+)
 from billcommons_ingest.fulltext import (
+    STATUS_FETCH_ERROR,
     STATUS_MALFORMED_URL,
     STATUS_OK,
+    STATUS_PERMANENTLY_FAILED,
     STATUS_ROBOTS_DISALLOWED,
     STATUS_SCANNED_PDF_NO_TEXT,
     STATUS_TOO_MANY_REDIRECTS,
     STATUS_UNSUPPORTED_REDIRECT_SCHEME,
+    STATUS_WORKER_ERROR,
+    MAX_FETCH_ATTEMPTS,
     TERMINAL_STATUSES,
     FETCH_TEXT_KIND,
+    DocumentFetchError,
     FullTextFetcher,
     RobotsCache,
     UnfetchableDocument,
+    is_document_specific_failure,
     enqueue_fulltext_jobs,
     extract_document_text,
     extract_text_from_html,
@@ -42,7 +55,9 @@ from billcommons_ingest.fulltext import (
     process_fetch_text_job,
     sniff_content_type,
 )
+from billcommons_ingest.queue import claim_job, enqueue
 from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob, Jurisdiction, Session as SessionModel
+from billcommons_shared.db import get_session
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +65,9 @@ from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob
 # ---------------------------------------------------------------------------
 
 
-def _make_bill_document(db_session, *, url="https://example-legislature.gov/bill.pdf", abbr=None):
+def _make_bill_document(
+    db_session, *, url="https://example-legislature.gov/bill.pdf", abbr=None, fetch_attempts: int = 0
+):
     if abbr is None:
         abbr = f"ZQ_FT_{uuid.uuid4().hex[:8].upper()}"
     jurisdiction = Jurisdiction(name="Fulltext Test State", abbreviation=abbr, classification="state")
@@ -71,7 +88,9 @@ def _make_bill_document(db_session, *, url="https://example-legislature.gov/bill
     version = BillVersion(bill_id=bill.id, note="introduced")
     db_session.add(version)
     db_session.flush()
-    document = BillDocument(bill_version_id=version.id, url=url, media_type=None)
+    document = BillDocument(
+        bill_version_id=version.id, url=url, media_type=None, fetch_attempts=fetch_attempts
+    )
     db_session.add(document)
     db_session.flush()
     return document
@@ -497,6 +516,8 @@ def test_terminal_statuses_include_malformed_and_unsupported_scheme_but_not_redi
     assert STATUS_MALFORMED_URL in TERMINAL_STATUSES
     assert STATUS_UNSUPPORTED_REDIRECT_SCHEME in TERMINAL_STATUSES
     assert STATUS_TOO_MANY_REDIRECTS not in TERMINAL_STATUSES
+    assert STATUS_PERMANENTLY_FAILED in TERMINAL_STATUSES
+    assert STATUS_FETCH_ERROR not in TERMINAL_STATUSES
 
 
 def test_process_fetch_text_job_persists_actual_status_not_always_robots_disallowed(db_session, rawstore):
@@ -936,3 +957,587 @@ def test_robots_is_re_read_after_a_repair_and_still_obeyed(monkeypatch):
     assert excinfo.value.status == fulltext_mod.STATUS_ROBOTS_DISALLOWED
     assert robots.invalidated == ["https://www.cga.ct.gov"]
     assert repaired_client.calls == [], "must not fetch a disallowed URL after repair"
+
+
+# ---------------------------------------------------------------------------
+# Bounded retry (fetch_attempts / MAX_FETCH_ATTEMPTS / STATUS_PERMANENTLY_FAILED)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_error_status_survives_rollback_via_record_job_failure(unique_kind):
+    """Proves (c): a fetch_text job claimed then rolled back must still land
+    a durable STATUS_FETCH_ERROR license_note + an incremented fetch_attempts
+    once record_job_failure runs in a fresh session -- mirrors cli.py's
+    generic `except Exception` handler in cmd_worker."""
+    kind = unique_kind()
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url="https://example-legislature.gov/rollback.pdf")
+        document_id = document.id
+        job = enqueue(setup, kind, {"document_id": str(document_id)})
+        setup.commit()
+        job_id = job.id
+    finally:
+        setup.close()
+
+    claiming = get_session()
+    try:
+        claimed = claim_job(claiming, "worker-under-test", kind=kind)
+        assert claimed is not None
+        claimed_attempts = claimed.attempts
+        claiming.rollback()
+    finally:
+        claiming.close()
+
+    try:
+        record_job_failure(
+            job_id,
+            IngestJob,
+            claimed_attempts=claimed_attempts,
+            error="connection reset",
+            document_id=str(document_id),
+            document_status=STATUS_FETCH_ERROR,
+            count_attempt=True,
+            session_factory=get_session,
+        )
+
+        check = get_session()
+        try:
+            doc = check.get(BillDocument, document_id)
+            assert doc.license_note == "fulltext_status=fetch_error"
+            assert doc.fetch_attempts == 1
+        finally:
+            check.close()
+    finally:
+        cleanup = get_session()
+        try:
+            row = cleanup.get(IngestJob, job_id)
+            if row is not None:
+                cleanup.delete(row)
+                cleanup.commit()
+        finally:
+            cleanup.close()
+
+
+def test_fetch_attempts_increments_on_each_recorded_failure(unique_kind):
+    kind = unique_kind()
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url="https://example-legislature.gov/increments.pdf")
+        document_id = document.id
+        job = enqueue(setup, kind, {"document_id": str(document_id)})
+        setup.commit()
+        job_id = job.id
+    finally:
+        setup.close()
+
+    try:
+        for attempt in range(1, 4):
+            record_job_failure(
+                job_id,
+                IngestJob,
+                claimed_attempts=attempt,
+                error="transient failure",
+                document_id=str(document_id),
+                document_status=STATUS_FETCH_ERROR,
+                count_attempt=True,
+                session_factory=get_session,
+            )
+
+        check = get_session()
+        try:
+            doc = check.get(BillDocument, document_id)
+            assert doc.fetch_attempts == 3
+            assert doc.license_note == "fulltext_status=fetch_error"
+            job = check.get(IngestJob, job_id)
+            assert job.status != "dead"
+        finally:
+            check.close()
+    finally:
+        cleanup = get_session()
+        try:
+            row = cleanup.get(IngestJob, job_id)
+            if row is not None:
+                cleanup.delete(row)
+                cleanup.commit()
+        finally:
+            cleanup.close()
+
+
+def test_document_at_fetch_attempt_cap_is_marked_permanently_failed_and_dead_lettered(unique_kind):
+    kind = unique_kind()
+    setup = get_session()
+    try:
+        document = _make_bill_document(
+            setup,
+            url="https://example-legislature.gov/atcap.pdf",
+            fetch_attempts=MAX_FETCH_ATTEMPTS - 1,
+        )
+        document_id = document.id
+        job = enqueue(setup, kind, {"document_id": str(document_id)})
+        setup.commit()
+        job_id = job.id
+    finally:
+        setup.close()
+
+    try:
+        record_job_failure(
+            job_id,
+            IngestJob,
+            claimed_attempts=1,
+            error="one more failure to tip it over the cap",
+            document_id=str(document_id),
+            document_status=STATUS_FETCH_ERROR,
+            count_attempt=True,
+            session_factory=get_session,
+        )
+
+        check = get_session()
+        try:
+            doc = check.get(BillDocument, document_id)
+            assert doc.license_note == "fulltext_status=permanently_failed"
+            assert doc.fetch_attempts == MAX_FETCH_ATTEMPTS
+            job = check.get(IngestJob, job_id)
+            assert job.status == "dead"
+        finally:
+            check.close()
+    finally:
+        cleanup = get_session()
+        try:
+            row = cleanup.get(IngestJob, job_id)
+            if row is not None:
+                cleanup.delete(row)
+                cleanup.commit()
+        finally:
+            cleanup.close()
+
+
+def test_enqueue_fulltext_jobs_skips_document_at_fetch_attempt_cap(db_session):
+    """Proves (a): fetch_attempts alone is enough to stop re-enqueueing, even
+    with a null license_note (never marked terminal by status)."""
+    document = _make_bill_document(
+        db_session,
+        url="https://example-legislature.gov/capped.pdf",
+        fetch_attempts=MAX_FETCH_ATTEMPTS,
+    )
+
+    count = enqueue_fulltext_jobs(db_session, document_ids=[document.id])
+    assert count == 0
+
+
+def test_enqueue_fulltext_jobs_still_retries_transient_failure_under_cap(db_session):
+    """Proves (b): a document one attempt under the cap, marked fetch_error,
+    is still eligible for another try."""
+    document = _make_bill_document(
+        db_session,
+        url="https://example-legislature.gov/undercap.pdf",
+        fetch_attempts=MAX_FETCH_ATTEMPTS - 1,
+    )
+    document.license_note = f"fulltext_status={STATUS_FETCH_ERROR}"
+    db_session.flush()
+
+    count = enqueue_fulltext_jobs(db_session, document_ids=[document.id])
+    assert count == 1
+    jobs = _fetch_text_jobs_for(db_session, [document.id])
+    assert len(jobs) == 1
+
+
+def test_oversized_extracted_text_is_stored_whole_and_indexed_within_tsvector_limit(db_session):
+    """Bug 2: a document whose extracted_text would produce >1,048,575 bytes
+    of lexeme data under the OLD unbounded tsvector expression must still
+    flush without error under migration 0018's bounded expression, and the
+    full (untruncated) extracted_text must be stored -- only the tsvector
+    input is bounded, never extracted_text itself."""
+    document = _make_bill_document(db_session, url="https://example-legislature.gov/huge.txt")
+    big_text = " ".join(f"w{i}" for i in range(200_000))  # ~1.4MB, all-distinct lexemes
+    document.extracted_text = big_text
+    db_session.flush()
+
+    db_session.refresh(document)
+    assert len(document.extracted_text) == len(big_text)
+
+    has_tsv = db_session.execute(
+        text("select text_tsv is not null from bill_documents where id = :id"),
+        {"id": document.id},
+    ).scalar()
+    assert has_tsv is True
+
+
+# ---------------------------------------------------------------------------
+# Which failures may spend a document's retry budget (review finding 1)
+# ---------------------------------------------------------------------------
+
+
+def test_only_document_specific_failures_are_classified_as_budget_burning():
+    """The whole safety property in one assertion set: a failure that is the
+    DOCUMENT's (its host, its bytes, a data error on its own row) may cost it
+    an attempt; a failure that is OURS (connection dropped, disk full, a bug
+    in this worker) may not -- otherwise an infra outage marks every in-flight
+    document permanently_failed, which nothing re-enqueues."""
+
+    class _FakeDriverError(Exception):
+        def __init__(self, sqlstate):
+            super().__init__(sqlstate)
+            self.sqlstate = sqlstate
+
+    assert is_document_specific_failure(DocumentFetchError("host 500s", document_id="x")) is True
+    assert is_document_specific_failure(UnfetchableDocument("robots", status=STATUS_ROBOTS_DISALLOWED)) is True
+    # 54000 program_limit_exceeded == "string is too long for tsvector", the
+    # failure that cost 309 documents their text: that IS this document's data.
+    assert is_document_specific_failure(_FakeDriverError("54000")) is True
+    assert is_document_specific_failure(_FakeDriverError("22021")) is True  # invalid byte sequence
+    assert is_document_specific_failure(_FakeDriverError("23505")) is True  # unique violation
+    # ...and the ones that must never be charged to a document:
+    assert is_document_specific_failure(_FakeDriverError("08006")) is False  # connection failure
+    assert is_document_specific_failure(_FakeDriverError("53100")) is False  # disk full
+    assert is_document_specific_failure(_FakeDriverError("57014")) is False  # statement timeout
+    assert is_document_specific_failure(RuntimeError("some new bug of ours")) is False
+    assert is_document_specific_failure(MemoryError()) is False
+
+
+def test_dbapi_error_is_classified_from_the_wrapped_driver_exception():
+    """SQLAlchemy wraps the driver exception; the SQLSTATE lives on .orig."""
+    from sqlalchemy.exc import DBAPIError
+
+    class _Orig(Exception):
+        sqlstate = "54000"
+
+    wrapped = DBAPIError("UPDATE bill_documents ...", {}, _Orig())
+    assert is_document_specific_failure(wrapped) is True
+
+    class _OrigConn(Exception):
+        sqlstate = "08006"
+
+    assert is_document_specific_failure(DBAPIError("stmt", {}, _OrigConn())) is False
+
+
+def test_infrastructure_failure_records_worker_error_without_spending_the_budget(unique_kind):
+    """The outage scenario from the review: the failure is recorded (so it is
+    visible and greppable) but fetch_attempts does NOT move, so an hour of
+    dead credentials cannot exhaust a document's budget, and the document
+    stays eligible for the next enqueue pass."""
+    kind = unique_kind()
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url="https://example-legislature.gov/outage.pdf")
+        document_id = document.id
+        job = enqueue(setup, kind, {"document_id": str(document_id)})
+        setup.commit()
+        job_id = job.id
+    finally:
+        setup.close()
+
+    try:
+        for _ in range(MAX_FETCH_ATTEMPTS + 5):
+            record_job_failure(
+                job_id,
+                IngestJob,
+                claimed_attempts=1,
+                error="connection pool exhausted",
+                document_id=str(document_id),
+                document_status=STATUS_WORKER_ERROR,
+                count_attempt=False,
+                session_factory=get_session,
+            )
+
+        check = get_session()
+        try:
+            doc = check.get(BillDocument, document_id)
+            assert doc.fetch_attempts == 0, "an infra failure must not spend the document's budget"
+            assert doc.license_note == f"fulltext_status={STATUS_WORKER_ERROR}"
+            assert STATUS_WORKER_ERROR not in TERMINAL_STATUSES
+            assert enqueue_fulltext_jobs(check, document_ids=[document_id]) == 1
+            check.rollback()
+        finally:
+            check.close()
+    finally:
+        cleanup = get_session()
+        try:
+            row = cleanup.get(IngestJob, job_id)
+            if row is not None:
+                cleanup.delete(row)
+                cleanup.commit()
+        finally:
+            cleanup.close()
+
+
+def test_http_failure_raises_document_fetch_error_carrying_the_document(db_session, rawstore):
+    """A dead host is the document's own problem, so the worker must be able
+    to tell -- a bare RuntimeError was indistinguishable from our own crash."""
+    document = _make_bill_document(db_session, url="https://example-legislature.gov/dead.pdf")
+
+    def _handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        raise httpx.ConnectError("connection refused", request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(_handler))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    with pytest.raises(DocumentFetchError) as excinfo:
+        process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert excinfo.value.status == STATUS_FETCH_ERROR
+    assert excinfo.value.document_id == str(document.id)
+    assert is_document_specific_failure(excinfo.value) is True
+
+
+def test_extraction_crash_is_attributed_to_the_document(db_session, rawstore, monkeypatch):
+    """The unhandled pypdf crash behind most of the 84k dead fetch_text rows:
+    it used to escape as a bare exception into the worker's generic handler,
+    which had no document identity, so nothing was ever recorded and the
+    document was re-enqueued for ever."""
+    document = _make_bill_document(db_session, url="https://example-legislature.gov/poison.pdf")
+    client = _robots_client("User-agent: *\nAllow: /\n", doc_body=b"%PDF-1.4 broken", doc_content_type="application/pdf")
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    def _boom(content_type, raw):
+        raise ValueError("pypdf exploded on this document")
+
+    monkeypatch.setattr(fulltext_mod, "extract_document_text", _boom)
+
+    with pytest.raises(DocumentFetchError) as excinfo:
+        process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert excinfo.value.document_id == str(document.id)
+    assert excinfo.value.status == STATUS_FETCH_ERROR
+
+
+def test_document_failure_survives_a_purged_job_row(unique_kind):
+    """Review finding 5: the 84k dead ingest_jobs rows are slated for a purge,
+    so a cleanup can race a failure record. If record_job_failure returns
+    early on the missing job WITHOUT committing, the increment and the
+    permanently_failed transition are silently discarded and the document
+    keeps its poison-loop eligibility."""
+    setup = get_session()
+    try:
+        document = _make_bill_document(
+            setup,
+            url="https://example-legislature.gov/purged-job.pdf",
+            fetch_attempts=MAX_FETCH_ATTEMPTS - 1,
+        )
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    record_job_failure(
+        uuid.uuid4(),  # a job row that does not exist (already purged)
+        IngestJob,
+        claimed_attempts=1,
+        error="host is gone",
+        document_id=str(document_id),
+        document_status=STATUS_FETCH_ERROR,
+        count_attempt=True,
+        session_factory=get_session,
+    )
+
+    check = get_session()
+    try:
+        doc = check.get(BillDocument, document_id)
+        assert doc.fetch_attempts == MAX_FETCH_ATTEMPTS
+        assert doc.license_note == f"fulltext_status={STATUS_PERMANENTLY_FAILED}"
+    finally:
+        check.close()
+
+
+def test_claimed_document_id_helper_never_raises_on_a_malformed_payload():
+    """Review finding 4: this runs OUTSIDE the worker's per-job try/except, so
+    an AttributeError here escapes the worker loop entirely and leaves the job
+    `running` for ever, holding a queue slot above the top-up floor."""
+
+    class _Job:
+        def __init__(self, kind, payload):
+            self.kind = kind
+            self.payload = payload
+
+    assert _fetch_text_document_id(_Job(FETCH_TEXT_KIND, None)) is None
+    assert _fetch_text_document_id(_Job(FETCH_TEXT_KIND, ["not", "a", "dict"])) is None
+    assert _fetch_text_document_id(_Job(FETCH_TEXT_KIND, {})) is None
+    assert _fetch_text_document_id(_Job("api_sync", {"document_id": "x"})) is None
+    assert _fetch_text_document_id(_Job(FETCH_TEXT_KIND, {"document_id": "abc"})) == "abc"
+
+
+# ---------------------------------------------------------------------------
+# reset-fetch-attempts: the operational way back (review finding 1)
+# ---------------------------------------------------------------------------
+
+
+def _reset_args(**kw):
+    import argparse
+
+    return argparse.Namespace(
+        **{
+            "document_id": None,
+            "url_like": None,
+            "status": None,
+            "all": False,
+            "limit": None,
+            "dry_run": False,
+            **kw,
+        }
+    )
+
+
+def test_reset_fetch_attempts_makes_a_permanently_failed_document_eligible_again():
+    marker = f"https://reset-test-{uuid.uuid4().hex}.gov/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=MAX_FETCH_ATTEMPTS)
+        document.license_note = f"fulltext_status={STATUS_PERMANENTLY_FAILED}"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    check = get_session()
+    try:
+        assert enqueue_fulltext_jobs(check, document_ids=[document_id]) == 0, "precondition: excluded"
+        check.rollback()
+    finally:
+        check.close()
+
+    assert cmd_reset_fetch_attempts(_reset_args(url_like=marker)) == 0
+
+    after = get_session()
+    try:
+        doc = after.get(BillDocument, document_id)
+        assert doc.fetch_attempts == 0
+        assert doc.license_note is None
+        assert enqueue_fulltext_jobs(after, document_ids=[document_id]) == 1
+        after.rollback()
+    finally:
+        after.close()
+
+
+def test_reset_fetch_attempts_refuses_to_run_unfiltered():
+    """An unfiltered reset hands ~690k documents a fresh budget and re-opens
+    the poison loop the counter exists to close."""
+    assert cmd_reset_fetch_attempts(_reset_args()) == 2
+
+
+def test_reset_fetch_attempts_leaves_a_robots_disallowed_verdict_alone():
+    """Politeness is not collateral damage of an outage cleanup: only the
+    statuses named by --status (default permanently_failed/worker_error) are
+    cleared."""
+    marker = f"https://reset-robots-{uuid.uuid4().hex}.gov/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=3)
+        document.license_note = f"fulltext_status={STATUS_ROBOTS_DISALLOWED}"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    assert cmd_reset_fetch_attempts(_reset_args(url_like=marker)) == 0
+
+    after = get_session()
+    try:
+        doc = after.get(BillDocument, document_id)
+        assert doc.fetch_attempts == 0, "the counter is reset"
+        assert doc.license_note == f"fulltext_status={STATUS_ROBOTS_DISALLOWED}", (
+            "a robots.txt verdict must survive an operational reset"
+        )
+    finally:
+        after.close()
+
+
+def test_reset_fetch_attempts_dry_run_writes_nothing():
+    marker = f"https://reset-dry-{uuid.uuid4().hex}.gov/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=MAX_FETCH_ATTEMPTS)
+        document.license_note = f"fulltext_status={STATUS_PERMANENTLY_FAILED}"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    assert cmd_reset_fetch_attempts(_reset_args(url_like=marker, dry_run=True)) == 0
+
+    after = get_session()
+    try:
+        doc = after.get(BillDocument, document_id)
+        assert doc.fetch_attempts == MAX_FETCH_ATTEMPTS
+        assert doc.license_note == f"fulltext_status={STATUS_PERMANENTLY_FAILED}"
+    finally:
+        after.close()
+
+
+# ---------------------------------------------------------------------------
+# tsvector bound (review finding 2)
+# ---------------------------------------------------------------------------
+
+
+def test_hyphen_dense_document_at_the_guard_threshold_still_writes(db_session):
+    """Review finding 2, made executable. The first version of migration 0018
+    indexed the whole text up to 1,000,000 BYTES on the premise that lexeme
+    storage <= input bytes. It is not: the default parser emits the whole
+    hyphenated word AND each part, and Postgres also charges ~4 bytes of
+    position data per lexeme. Measured on PG16: 2.69x for hyphen-dense text,
+    so a 666,017-byte document produced 1,702,046 bytes and failed the write
+    -- losing its extracted_text entirely, which is the ORIGINAL bug.
+
+    This pins the guard: text at the threshold, in the worst shape we could
+    construct, must still write."""
+    document = _make_bill_document(db_session, url="https://example-legislature.gov/hyphen-dense.txt")
+    # ~666KB of distinct hyphenated compounds: the exact shape that broke the
+    # 1,000,000-byte guard.
+    hyphen_dense = " ".join(f"aa{i}-bb{i}" for i in range(100_000, 137_000))
+    assert len(hyphen_dense.encode()) > 600_000
+    document.extracted_text = hyphen_dense
+    db_session.flush()
+
+    db_session.refresh(document)
+    assert document.extracted_text == hyphen_dense, "extracted_text is never truncated"
+    indexed = db_session.execute(
+        text("select text_tsv is not null and length(text_tsv) > 0 from bill_documents where id = :id"),
+        {"id": document.id},
+    ).scalar()
+    assert indexed is True
+
+
+def test_multibyte_document_beyond_the_guard_still_writes(db_session):
+    """The ELSE branch: 4-bytes-per-character text can blow the byte budget at
+    a quarter of the character count, so it takes the 62,500-character window.
+    Full text still stored."""
+    document = _make_bill_document(db_session, url="https://example-legislature.gov/multibyte.txt")
+    # 200k x 5 chars of astral-plane text = 1M chars / 3.6MB
+    big = "\U0001d51e\U0001d51f-\U0001d520\U0001d521 " * 200_000
+    document.extracted_text = big
+    db_session.flush()
+
+    db_session.refresh(document)
+    assert document.extracted_text == big
+    indexed = db_session.execute(
+        text("select text_tsv is not null from bill_documents where id = :id"),
+        {"id": document.id},
+    ).scalar()
+    assert indexed is True
+
+
+def test_worker_charges_only_document_specific_failures_to_the_document():
+    """The wiring, not just the classifier: what cmd_worker's generic handler
+    records and whether it spends the budget."""
+
+    class _ConnectionLost(Exception):
+        sqlstate = "08006"
+
+    class _TsvectorTooLong(Exception):
+        sqlstate = "54000"
+
+    # ours -> recorded, but free
+    assert classify_job_failure("doc-1", _ConnectionLost()) == (STATUS_WORKER_ERROR, False)
+    assert classify_job_failure("doc-1", RuntimeError("new bug")) == (STATUS_WORKER_ERROR, False)
+    # the document's -> charged
+    assert classify_job_failure("doc-1", _TsvectorTooLong()) == (STATUS_FETCH_ERROR, True)
+    assert classify_job_failure("doc-1", DocumentFetchError("dead host", document_id="doc-1")) == (
+        STATUS_FETCH_ERROR,
+        True,
+    )
+    assert classify_job_failure(
+        "doc-1", UnfetchableDocument("loop", status=STATUS_TOO_MANY_REDIRECTS)
+    ) == (STATUS_TOO_MANY_REDIRECTS, True)
+    # not a fetch_text job at all -> nothing to record
+    assert classify_job_failure(None, RuntimeError("api_sync blew up")) == (None, False)

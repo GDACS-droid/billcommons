@@ -205,11 +205,16 @@ class BillDocument(UUIDPkMixin, TimestampMixin, ProvenanceMixin, Base):
     media_type: Mapped[str | None] = mapped_column(Text, nullable=True)
     url: Mapped[str | None] = mapped_column(Text, nullable=True)
     extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fetch_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
-    # Generated column: owned/created by raw DDL in migration 0001.
+    # Generated column: owned/created by raw DDL in migration 0001, bounded by
+    # migration 0018 (see 0018's docstring for the byte-vs-truncation math).
     text_tsv: Mapped[str | None] = mapped_column(
         TSVECTOR,
-        Computed("to_tsvector('english', coalesce(extracted_text, ''))", persisted=True),
+        Computed(
+            "to_tsvector('english', CASE WHEN octet_length(coalesce(extracted_text, '')) <= 250000 THEN coalesce(extracted_text, '') WHEN octet_length(coalesce(extracted_text, '')) = char_length(coalesce(extracted_text, '')) THEN left(coalesce(extracted_text, ''), 250000) ELSE left(coalesce(extracted_text, ''), 62500) END)",
+            persisted=True,
+        ),
         nullable=True,
     )
 

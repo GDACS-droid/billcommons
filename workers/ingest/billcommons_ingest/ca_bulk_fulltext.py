@@ -71,6 +71,12 @@ OVERWRITABLE_TERMINAL_NOTES = frozenset(
         "fulltext_status=too_many_redirects",
         "fulltext_status=unsupported_type",
         "fulltext_status=scanned_pdf_no_text",
+        # A document the polite fetcher gave up on after MAX_FETCH_ATTEMPTS,
+        # and one whose last failure was OUR worker's fault, are both exactly
+        # what a bulk source is for -- leaving them out would let the retry cap
+        # permanently hide CA documents this adapter can fill for free.
+        "fulltext_status=permanently_failed",
+        "fulltext_status=worker_error",
     }
 )
 
