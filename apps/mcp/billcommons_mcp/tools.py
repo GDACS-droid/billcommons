@@ -555,12 +555,19 @@ def compare_bill_versions(
                 raise ToolError("bill_not_found", f"No bill found with id {bill_id!r}")
 
             # Collect (version, text) pairs where extracted_text is present,
-            # picking the first document with text per version.
+            # picking the first document with text per version. Track which
+            # versions' chosen text came from a malformed PDF with unreadable
+            # pages (worker records it in license_note; mirrored literal, same
+            # convention as elsewhere -- apps don't import from workers).
+            partial_note = "fulltext_status=ok_partial_pdf"
+            partial_version_ids: set[str] = set()
             texted_versions: list[tuple[BillVersion, str]] = []
             for v in sorted(bill.versions, key=lambda v: (v.date or utcnow().date())):
                 for doc in v.documents:
                     if doc.extracted_text:
                         texted_versions.append((v, doc.extracted_text))
+                        if doc.license_note == partial_note:
+                            partial_version_ids.add(str(v.id))
                         break
 
             if len(texted_versions) < 2:
@@ -607,6 +614,10 @@ def compare_bill_versions(
                     limit_bytes=MAX_COMPARE_TEXT_BYTES,
                 )
 
+            chosen_partial_ids = [
+                str(v.id) for v in (version_a, version_b) if str(v.id) in partial_version_ids
+            ]
+
             lines_a = text_a.splitlines()
             lines_b = text_b.splitlines()
             unified = list(
@@ -651,6 +662,18 @@ def compare_bill_versions(
                     "structured_changes": structured,
                 },
                 "meta": meta_envelope(),
+                **(
+                    {
+                        "partial_text_warning": (
+                            f"Version(s) {', '.join(chosen_partial_ids)} were extracted "
+                            "from a malformed PDF with unreadable pages -- this diff may "
+                            "show sections as added/removed that are actually just "
+                            "missing from the partial text."
+                        )
+                    }
+                    if chosen_partial_ids
+                    else {}
+                ),
             }
         finally:
             db.close()

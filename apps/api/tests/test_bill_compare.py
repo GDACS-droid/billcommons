@@ -5,6 +5,8 @@ apps/web/app/bills/[id]/compare/page.tsx's CompareResponse exactly:
 Empty-DB tolerant: no fixture rows are assumed to exist."""
 from __future__ import annotations
 
+import pytest
+
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
 
 
@@ -64,3 +66,19 @@ def test_compare_response_shape_when_bill_exists_but_no_versions_match(client):
         "version_not_found",
         "extracted_text_unavailable",
     }
+
+
+def test_documents_expose_the_text_is_partial_flag(client):
+    """Every document row must carry text_is_partial so consumers can tell
+    salvaged-from-malformed-PDF text (incomplete by construction) from
+    complete extractions before quoting or diffing it."""
+    res = client.get("/api/v1/bills", params={"per_page": 1})
+    assert res.status_code == 200
+    items = res.json().get("data") or []
+    if not items:
+        pytest.skip("no bills in the test database")
+    docs = client.get(f"/api/v1/bills/{items[0]['id']}/documents")
+    assert docs.status_code == 200
+    for doc in docs.json():
+        assert "text_is_partial" in doc
+        assert isinstance(doc["text_is_partial"], bool)

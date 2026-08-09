@@ -77,6 +77,13 @@ SCANNED_PDF_MIN_CHARS = 100
 # machine-readable tag (schema has no dedicated fetch-status column; see
 # `_set_status` below for the encoding convention).
 STATUS_OK = "ok"
+# Text was extracted, but one or more PDF pages crashed pypdf (malformed page
+# internals) and contributed nothing. The salvaged text is real and searchable,
+# but consumers must not treat it as the complete document -- a diff against a
+# partial text can show a phantom "removed" section. Kept distinct from
+# STATUS_OK so partial documents stay greppable/countable; the document is
+# never re-enqueued (it has text) and a retry would not fix the broken pages.
+STATUS_OK_PARTIAL_PDF = "ok_partial_pdf"
 STATUS_ROBOTS_DISALLOWED = "robots_disallowed"
 STATUS_SCANNED_PDF_NO_TEXT = "scanned_pdf_no_text"
 STATUS_FETCH_ERROR = "fetch_error"
@@ -343,6 +350,7 @@ class PdfExtractionResult:
     text: str
     page_count: int
     scanned_no_text: bool
+    broken_pages: int = 0
 
 
 def extract_text_from_pdf(raw: bytes) -> PdfExtractionResult:
@@ -357,11 +365,25 @@ def extract_text_from_pdf(raw: bytes) -> PdfExtractionResult:
     reader = PdfReader(io.BytesIO(raw))
     page_count = len(reader.pages)
     page_texts = []
+    broken_pages = 0
     for page in reader.pages:
-        page_texts.append(page.extract_text() or "")
+        try:
+            page_texts.append(page.extract_text() or "")
+        except Exception:  # noqa: BLE001
+            # pypdf raises on malformed page internals (seen in prod:
+            # "unsupported operand type(s) for +: 'float' and 'IndirectObject'").
+            # One broken page must not discard the readable rest of the bill;
+            # count it so the caller can downgrade the outcome to
+            # STATUS_OK_PARTIAL_PDF. If EVERY page is broken the joined text
+            # stays empty and the scanned_no_text flag downgrades the whole
+            # document, so garbage is still never presented as text.
+            broken_pages += 1
+            page_texts.append("")
     joined = _normalize_text("\n".join(page_texts))
     scanned_no_text = page_count > 0 and len(joined.strip()) < SCANNED_PDF_MIN_CHARS
-    return PdfExtractionResult(text=joined, page_count=page_count, scanned_no_text=scanned_no_text)
+    return PdfExtractionResult(
+        text=joined, page_count=page_count, scanned_no_text=scanned_no_text, broken_pages=broken_pages
+    )
 
 
 def _normalize_text(raw: str) -> str:
@@ -453,6 +475,13 @@ def extract_document_text(content_type: str, raw: bytes) -> ExtractionOutcome:
         if result.scanned_no_text:
             return ExtractionOutcome(
                 status=STATUS_SCANNED_PDF_NO_TEXT, extracted_text=None, checksum=checksum
+            )
+        if result.broken_pages:
+            return ExtractionOutcome(
+                status=STATUS_OK_PARTIAL_PDF,
+                extracted_text=result.text,
+                checksum=checksum,
+                error=f"{result.broken_pages}/{result.page_count} pages unreadable (malformed PDF internals)",
             )
         return ExtractionOutcome(status=STATUS_OK, extracted_text=result.text, checksum=checksum)
     if content_type == "html":
@@ -839,7 +868,7 @@ def process_fetch_text_job(
     document.raw_ref = raw_ref
     document.checksum = outcome.checksum
     document.parser_version = PARSER_VERSION
-    if outcome.status == STATUS_OK:
+    if outcome.status in (STATUS_OK, STATUS_OK_PARTIAL_PDF):
         document.fetch_attempts = 0
     _mark_status(document, outcome.status)
     db.flush()

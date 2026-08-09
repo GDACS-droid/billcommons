@@ -602,6 +602,14 @@ def list_bill_subjects(bill_id: uuid.UUID, db: OrmSession = Depends(get_db)) -> 
     )
 
 
+# The ingest worker records extraction status in license_note (bill_documents
+# rows never carry real license text; see workers' fulltext._mark_status).
+# This value marks text salvaged from a malformed PDF with unreadable pages.
+# Mirrored literal, same convention as ca_bulk_fulltext -- apps don't import
+# from workers.
+PARTIAL_TEXT_NOTE = "fulltext_status=ok_partial_pdf"
+
+
 @router.get("/{bill_id}/documents", response_model=list[BillDocumentOut])
 def list_bill_documents(bill_id: uuid.UUID, db: OrmSession = Depends(get_db)) -> list[BillDocumentOut]:
     _get_bill_or_404(db, bill_id)
@@ -627,6 +635,7 @@ def list_bill_documents(bill_id: uuid.UUID, db: OrmSession = Depends(get_db)) ->
                 (BillDocument.extracted_text.isnot(None))
                 & (BillDocument.extracted_text != "")
             ).label("has_extracted_text"),
+            (BillDocument.license_note == PARTIAL_TEXT_NOTE).label("text_is_partial"),
         )
         .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
         .where(BillVersion.bill_id == bill_id)
@@ -638,6 +647,7 @@ def list_bill_documents(bill_id: uuid.UUID, db: OrmSession = Depends(get_db)) ->
             media_type=r.media_type,
             url=r.url,
             has_extracted_text=bool(r.has_extracted_text),
+            text_is_partial=bool(r.text_is_partial),
         )
         for r in rows
     ]
@@ -676,16 +686,16 @@ def compare_bill_versions(
                 "version_not_found", f"No version {vid} found for bill {bill_id}"
             )
 
-    def extracted_text(version: BillVersion) -> str | None:
+    def extracted_text(version: BillVersion) -> tuple[str | None, bool]:
         for doc in version.documents:
             if doc.extracted_text:
-                return doc.extracted_text
-        return None
+                return doc.extracted_text, doc.license_note == PARTIAL_TEXT_NOTE
+        return None, False
 
     from_version = by_id[from_]
     to_version = by_id[to]
-    text_from = extracted_text(from_version)
-    text_to = extracted_text(to_version)
+    text_from, partial_from = extracted_text(from_version)
+    text_to, partial_to = extracted_text(to_version)
 
     missing = [
         str(v.id) for v, t in ((from_version, text_from), (to_version, text_to)) if t is None
@@ -722,10 +732,19 @@ def compare_bill_versions(
         to_version_id=to_version.id,
         diff_lines=diff_lines,
     )
-    return BillCompareEnvelope(
-        data=result,
-        meta={"api_version": "v1", "request_id": request.state.request_id},
-    )
+    meta: dict = {"api_version": "v1", "request_id": request.state.request_id}
+    partial_ids = [
+        str(v.id)
+        for v, p in ((from_version, partial_from), (to_version, partial_to))
+        if p
+    ]
+    if partial_ids:
+        meta["partial_text_warning"] = (
+            f"Version(s) {', '.join(partial_ids)} were extracted from a malformed "
+            "PDF with unreadable pages -- this diff may show sections as added/"
+            "removed that are actually just missing from the partial text."
+        )
+    return BillCompareEnvelope(data=result, meta=meta)
 
 
 @router.get("/{bill_id}/evidence")

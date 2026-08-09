@@ -32,6 +32,7 @@ from billcommons_ingest.fulltext import (
     STATUS_FETCH_ERROR,
     STATUS_MALFORMED_URL,
     STATUS_OK,
+    STATUS_OK_PARTIAL_PDF,
     STATUS_PERMANENTLY_FAILED,
     STATUS_ROBOTS_DISALLOWED,
     STATUS_SCANNED_PDF_NO_TEXT,
@@ -261,6 +262,114 @@ def test_extract_text_from_pdf_scanned_flags_no_text():
     result = extract_text_from_pdf(pdf_bytes)
     assert result.page_count == 1
     assert result.scanned_no_text is True, "a page-having PDF with ~0 extractable chars must be flagged scanned"
+
+
+def test_extract_text_from_pdf_salvages_pages_around_a_crashing_page(monkeypatch):
+    """pypdf dies on malformed page internals (prod: "unsupported operand
+    type(s) for +: 'float' and 'IndirectObject'"). A single broken page must
+    not throw away the readable rest of the bill."""
+
+    class _GoodPage:
+        def extract_text(self):
+            return "Section 1. The readable bill text survives. " * 10
+
+    class _BrokenPage:
+        def extract_text(self):
+            raise TypeError("unsupported operand type(s) for +: 'float' and 'IndirectObject'")
+
+    class _FakeReader:
+        def __init__(self, *_a, **_k):
+            self.pages = [_GoodPage(), _BrokenPage(), _GoodPage()]
+
+    monkeypatch.setattr("pypdf.PdfReader", _FakeReader)
+    result = extract_text_from_pdf(b"%PDF-fake")
+    assert result.page_count == 3
+    assert result.scanned_no_text is False
+    assert result.broken_pages == 1
+    assert "readable bill text survives" in result.text
+
+
+def test_extract_document_text_partial_pdf_is_not_presented_as_fully_ok(monkeypatch):
+    """Salvaged-but-incomplete text must carry STATUS_OK_PARTIAL_PDF, never
+    plain STATUS_OK -- a consumer diffing versions against a silently-partial
+    text would see a phantom "removed" section (codex verify finding)."""
+
+    class _GoodPage:
+        def extract_text(self):
+            return "Section 1. The readable bill text survives. " * 10
+
+    class _BrokenPage:
+        def extract_text(self):
+            raise TypeError("unsupported operand type(s) for +: 'float' and 'IndirectObject'")
+
+    class _FakeReader:
+        def __init__(self, *_a, **_k):
+            self.pages = [_GoodPage(), _BrokenPage()]
+
+    monkeypatch.setattr("pypdf.PdfReader", _FakeReader)
+    outcome = extract_document_text("pdf", b"%PDF-fake")
+    assert outcome.status == STATUS_OK_PARTIAL_PDF
+    assert "readable bill text survives" in outcome.extracted_text
+    assert "1/2 pages unreadable" in outcome.error
+
+
+def test_extract_text_from_pdf_all_pages_crashing_flags_scanned(monkeypatch):
+    """If EVERY page crashes, no text is salvageable -- the document must be
+    downgraded via the scanned_no_text flag, never crash the worker and never
+    present empty garbage as extracted text."""
+
+    class _BrokenPage:
+        def extract_text(self):
+            raise TypeError("unsupported operand type(s) for +: 'float' and 'IndirectObject'")
+
+    class _FakeReader:
+        def __init__(self, *_a, **_k):
+            self.pages = [_BrokenPage(), _BrokenPage()]
+
+    monkeypatch.setattr("pypdf.PdfReader", _FakeReader)
+    result = extract_text_from_pdf(b"%PDF-fake")
+    assert result.page_count == 2
+    assert result.scanned_no_text is True
+
+
+def test_process_fetch_text_job_persists_partial_pdf_status(db_session, rawstore, monkeypatch):
+    """End-to-end: a malformed-but-salvageable PDF must persist the salvaged
+    text with fulltext_status=ok_partial_pdf (never plain ok) and reset
+    fetch_attempts like any successful extraction."""
+
+    class _GoodPage:
+        def extract_text(self):
+            return "Section 1. The readable bill text survives. " * 10
+
+    class _BrokenPage:
+        def extract_text(self):
+            raise TypeError("unsupported operand type(s) for +: 'float' and 'IndirectObject'")
+
+    class _FakeReader:
+        def __init__(self, *_a, **_k):
+            self.pages = [_GoodPage(), _BrokenPage()]
+
+    monkeypatch.setattr("pypdf.PdfReader", _FakeReader)
+
+    routes = {
+        "https://origin.gov/robots.txt": httpx.Response(200, text="User-agent: *\nAllow: /\n"),
+        "https://origin.gov/partial.pdf": httpx.Response(
+            200, content=b"%PDF-1.4 fake", headers={"content-type": "application/pdf"}
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    document = _make_bill_document(db_session, url="https://origin.gov/partial.pdf")
+    document.fetch_attempts = 3
+
+    result = process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert result.status == STATUS_OK_PARTIAL_PDF
+    db_session.refresh(document)
+    assert document.license_note == f"fulltext_status={STATUS_OK_PARTIAL_PDF}"
+    assert "readable bill text survives" in document.extracted_text
+    assert document.fetch_attempts == 0, "partial salvage is a success -- must reset the budget"
 
 
 def test_extract_document_text_scanned_pdf_never_presents_garbage_as_text():

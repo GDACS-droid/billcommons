@@ -410,6 +410,14 @@ class BillDocumentOut(OrmModel):
     media_type: str | None = None
     url: str | None = None
     has_extracted_text: bool = False
+    text_is_partial: bool = Field(
+        default=False,
+        description=(
+            "True when text was extracted from a malformed PDF with one or "
+            "more unreadable pages -- the text is real but incomplete, so "
+            "diffs/quotes against it may be missing sections."
+        ),
+    )
 
 
 class RelatedBillOut(OrmModel):
