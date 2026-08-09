@@ -332,7 +332,8 @@ def cmd_api_sync(args: argparse.Namespace) -> int:
             f"api-sync {args.state}: pages={result.pages_fetched} "
             f"created={result.bills_created} updated={result.bills_updated} "
             f"unchanged={result.bills_unchanged} actions={result.actions} "
-            f"sponsorships={result.sponsorships}"
+            f"sponsorships={result.sponsorships} versions={result.versions} "
+            f"documents={result.documents} next_page={result.next_page}"
         )
         if result.warnings:
             print(f"api-sync {args.state}: {len(result.warnings)} warning(s):")
@@ -345,6 +346,184 @@ def cmd_api_sync(args: argparse.Namespace) -> int:
         return 1
     finally:
         db.close()
+
+
+_BACKFILL_TOTAL_KEYS = (
+    "bills_created",
+    "bills_updated",
+    "bills_unchanged",
+    "actions",
+    "sponsorships",
+    "versions",
+    "documents",
+    "pages_fetched",
+)
+
+
+def run_api_versions_backfill(
+    state: str,
+    since: str,
+    *,
+    start_page: int = 1,
+    page_budget: int = 10,
+    commit_pages: int = 5,
+    client: api_sync_mod.OpenStatesClient | None = None,
+    session_factory=get_session,
+) -> dict:
+    """Page-resumable one-shot replay of the Open States v3 API for one
+    jurisdiction, from an explicit `--since` timestamp, to backfill
+    `bill_versions`/`bill_documents` a metadata-only `api_sync` run missed
+    (see the "catch-up design" doc). Calls `api_sync.sync_state` directly,
+    chunked at `commit_pages` pages per transaction, and NEVER writes an
+    `ingestion_runs(source_name='openstates_api_sync')` row -- the ordinary
+    incremental-sync watermark must not move, and must not even be read,
+    for this explicit-`--since` path (`sync_state`'s
+    `updated_since_override` bypasses it entirely). Never enqueues fulltext
+    directly -- the crawl worker's existing periodic top-up discovers the
+    new `bill_documents` rows on its own schedule.
+
+    Constructs exactly ONE `OpenStatesClient` for the whole invocation (its
+    6/minute token bucket must span every chunk's requests) -- never one
+    per page/chunk.
+
+    Returns a dict of aggregate counters plus `status` (`"complete"` once
+    `next_page` comes back `None`, `"partial"` if the page budget ran out
+    first, `"error"` if a chunk raised) and `resume_page`/`next_page`. A
+    later chunk's failure is reported (and the resume point printed) rather
+    than raised, so callers can inspect `result["status"]` and choose their
+    own exit code; earlier committed chunks are preserved untouched.
+    """
+    if commit_pages > page_budget:
+        commit_pages = page_budget
+
+    client = client or api_sync_mod.OpenStatesClient()
+
+    resolve_db = session_factory()
+    try:
+        jurisdiction_row = resolve_db.execute(
+            select(Jurisdiction).where(Jurisdiction.abbreviation == state.upper())
+        ).scalar_one_or_none()
+        if jurisdiction_row is None:
+            raise ValueError(f"no jurisdiction row for state {state!r}; run seed-registry first")
+        jurisdiction_id = jurisdiction_row.id
+    finally:
+        resolve_db.close()
+
+    totals = {key: 0 for key in _BACKFILL_TOTAL_KEYS}
+    page = start_page
+    remaining = page_budget
+    max_page_seen = 0
+    next_page = None
+    status = "complete"
+    resume_page = None
+    error = None
+
+    while remaining > 0:
+        chunk_pages = min(commit_pages, remaining)
+        db = session_factory()
+        try:
+            jurisdiction = db.get(Jurisdiction, jurisdiction_id)
+            result = api_sync_mod.sync_state(
+                db,
+                jurisdiction,
+                client=client,
+                max_pages=chunk_pages,
+                updated_since_override=since,
+                start_page=page,
+            )
+            db.commit()
+        except Exception as exc:  # noqa: BLE001 - reported as resume point, not raised
+            db.rollback()
+            status = "error"
+            error = str(exc)
+            resume_page = page
+            print(
+                f"backfill-api-versions {state}: chunk starting at page {page} FAILED: {exc}",
+                flush=True,
+            )
+            print(
+                f"backfill-api-versions {state}: resume point is page {resume_page}",
+                flush=True,
+            )
+            break
+        finally:
+            db.close()
+
+        for key in _BACKFILL_TOTAL_KEYS:
+            totals[key] += getattr(result, key)
+        max_page_seen = max(max_page_seen, result.max_page_seen)
+        next_page = result.next_page
+        remaining -= result.pages_fetched
+        print(
+            f"backfill-api-versions {state}: chunk page={page} pages_fetched={result.pages_fetched} "
+            f"created={result.bills_created} updated={result.bills_updated} "
+            f"unchanged={result.bills_unchanged} actions={result.actions} "
+            f"sponsorships={result.sponsorships} versions={result.versions} "
+            f"documents={result.documents} max_page_seen={result.max_page_seen} "
+            f"next_page={result.next_page}",
+            flush=True,
+        )
+
+        if next_page is None:
+            status = "complete"
+            break
+        page = next_page
+        if remaining <= 0:
+            status = "partial"
+            break
+
+    if status == "partial":
+        print(
+            f"backfill-api-versions {state}: PARTIAL -- page budget exhausted before "
+            f"next_page was None. Resume with: python -m billcommons_ingest "
+            f"backfill-api-versions --state {state} --since {since} --start-page {next_page} "
+            f"--page-budget {page_budget} --commit-pages {commit_pages}",
+            flush=True,
+        )
+    elif status == "complete":
+        print(
+            f"backfill-api-versions {state}: COMPLETE -- next_page is None, replay window "
+            f"fully covered",
+            flush=True,
+        )
+
+    return {
+        "status": status,
+        "resume_page": resume_page,
+        "next_page": next_page,
+        "max_page_seen": max_page_seen,
+        "error": error,
+        **totals,
+    }
+
+
+def cmd_backfill_api_versions(args: argparse.Namespace) -> int:
+    try:
+        datetime.fromisoformat(args.since)
+    except ValueError:
+        print(f"backfill-api-versions: --since {args.since!r} is not a valid ISO-8601 timestamp")
+        return 1
+    if args.start_page < 1:
+        print("backfill-api-versions: --start-page must be >= 1")
+        return 1
+    if args.page_budget < 1:
+        print("backfill-api-versions: --page-budget must be >= 1")
+        return 1
+    if args.commit_pages < 1:
+        print("backfill-api-versions: --commit-pages must be >= 1")
+        return 1
+    try:
+        result = run_api_versions_backfill(
+            args.state,
+            args.since,
+            start_page=args.start_page,
+            page_budget=args.page_budget,
+            commit_pages=args.commit_pages,
+        )
+    except ValueError:
+        traceback.print_exc()
+        return 1
+    return 0 if result["status"] in ("complete", "partial") else 1
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -1456,9 +1635,13 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                         print(
                             f"sync-worker {worker_id}: api_sync {result.state} "
                             f"created={result.bills_created} updated={result.bills_updated} "
-                            f"unchanged={result.bills_unchanged} actions={result.actions}",
+                            f"unchanged={result.bills_unchanged} actions={result.actions} "
+                            f"versions={result.versions} documents={result.documents} "
+                            f"next_page={result.next_page}",
                             flush=True,
                         )
+                        for warning in result.warnings:
+                            print(f"api-sync WARNING: {warning}", flush=True)
                     except Exception as exc:  # noqa: BLE001 - per-job isolation
                         db.rollback()
                         failed += 1
@@ -1834,6 +2017,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_api = sub.add_parser("api-sync", help="incremental sync via the v3 API")
     p_api.add_argument("--state", required=True)
     p_api.set_defaults(func=cmd_api_sync)
+
+    p_backfill_versions = sub.add_parser(
+        "backfill-api-versions",
+        help=(
+            "page-resumable one-shot v3 API replay for ONE state, from an explicit --since, "
+            "to backfill bill_versions/bill_documents an ordinary api_sync run missed -- "
+            "never reads/advances the normal incremental-sync watermark"
+        ),
+    )
+    p_backfill_versions.add_argument("--state", required=True, help="two-letter state code, e.g. CA")
+    p_backfill_versions.add_argument(
+        "--since", required=True, help="ISO-8601 updated_since, used verbatim for every chunk"
+    )
+    p_backfill_versions.add_argument("--start-page", type=int, default=1, help="first page to fetch (default 1)")
+    p_backfill_versions.add_argument(
+        "--page-budget",
+        type=int,
+        default=10,
+        help="max API pages this invocation may consume (default 10; a quota budget, not proof of completion)",
+    )
+    p_backfill_versions.add_argument(
+        "--commit-pages",
+        type=int,
+        default=5,
+        help="pages per transaction (default 5, never greater than --page-budget)",
+    )
+    p_backfill_versions.set_defaults(func=cmd_backfill_api_versions)
 
     p_cov = sub.add_parser("recompute-coverage", help="recompute coverage + write report JSON")
     p_cov.add_argument("--output", default=None, help=f"output path (default {DEFAULT_COVERAGE_OUTPUT})")

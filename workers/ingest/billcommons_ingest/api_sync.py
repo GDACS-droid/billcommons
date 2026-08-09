@@ -9,18 +9,23 @@ changed rows.
 
 Quota discipline is a hard requirement here (v3's free tier is ~6 req/min /
 250/day, shared across every jurisdiction's sync): each call defaults to
-`per_page=20`, caps at `MAX_PAGES_PER_RUN` (10) pages per state per run, and
-stops paginating early once a page's bills are all older than
-`updated_since` (v3 returns bills newest-updated-first by default, so this
-is a correct, not just an optimistic, early-exit).
+`per_page=20` and caps at `MAX_PAGES_PER_RUN` (10) pages per state per run.
+Pagination stops only on an empty page, upstream's own `pagination.max_page`,
+or that page budget -- NOT on a page whose bills all had an unchanged core
+checksum: a version/document can change upstream without moving a bill's
+core fields, so a core-unchanged page is not evidence later pages hold no
+changes (this WAS an early-exit here; removed, see `sync_state`'s docstring
+and `result.next_page`/`result.max_page_seen`, which expose a budget-truncated
+run instead of silently treating it as complete).
 
-Upsert scope for this round (a modest, api-specific upsert -- reusing
-`openstates_bulk`'s CSV-row-shaped helpers isn't a clean fit since the v3
-JSON shape differs from the CSV columns): bills (core fields + latest
-action derived from `actions`), bill_actions, and sponsorships. Versions/
-documents/votes/subjects are left to the bulk-CSV bootstrap path and a
-future incremental-fulltext pass -- logged clearly as a known gap, not
-silently dropped.
+Upsert scope for this round: bills (core fields + latest action derived
+from `actions`), bill_actions, sponsorships, and -- as of the
+versions/documents repair -- bill_versions and bill_documents, upserted by
+`_upsert_versions_and_documents` using the exact same natural keys and
+placeholder-version convention as `openstates_bulk`'s bulk-CSV bootstrap
+path (see that module's "Versions + version links" / "Documents + document
+links" sections). Votes/subjects remain out of scope for this incremental
+path and are left to the bulk-CSV bootstrap.
 
 Auth: requires `OPENSTATES_API_KEY` in the environment (see
 `openstates_api.OpenStatesClient._resolve_api_key`); a missing/invalid key
@@ -41,9 +46,12 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest.openstates_api import OpenStatesClient
+from billcommons_ingest.openstates_bulk import _parse_date_field
 from billcommons_schema.models import (
     Bill,
     BillAction,
+    BillDocument,
+    BillVersion,
     IngestionRun,
     Jurisdiction,
     Session as SessionModel,
@@ -55,7 +63,7 @@ from billcommons_shared.normalize import normalize_bill_number
 SOURCE_NAME = "openstates_api_sync"
 DEFAULT_PER_PAGE = 20
 MAX_PAGES_PER_RUN = 10
-INCLUDE = ["sponsorships", "actions", "sources"]
+INCLUDE = ["sponsorships", "actions", "sources", "versions", "documents"]
 
 
 @dataclass
@@ -66,7 +74,19 @@ class ApiSyncResult:
     bills_unchanged: int = 0
     actions: int = 0
     sponsorships: int = 0
+    versions: int = 0
+    documents: int = 0
     pages_fetched: int = 0
+    # Largest `pagination.max_page` this call actually observed from
+    # upstream (across all pages fetched this call, not just the last).
+    max_page_seen: int = 0
+    # The next page a caller should ask for to continue this same
+    # updated_since/override window -- None means this call's own budget
+    # reached upstream's own max_page (or an empty page), i.e. genuinely
+    # caught up, not merely "we stopped". Non-None means the page budget
+    # ended before upstream did; this is a resumable cursor, not a claim of
+    # completeness.
+    next_page: int | None = None
     warnings: list[str] = field(default_factory=list)
     # Bills this run created or wrote actions to. Reported explicitly rather
     # than re-derived afterwards from `updated_at >= <cycle start>`: that test
@@ -158,10 +178,31 @@ def sync_state(
     client: OpenStatesClient | None = None,
     per_page: int = DEFAULT_PER_PAGE,
     max_pages: int = MAX_PAGES_PER_RUN,
+    updated_since_override: str | None = None,
+    start_page: int = 1,
 ) -> ApiSyncResult:
     """Incrementally sync one jurisdiction via the v3 API. Caller commits.
 
-    `updated_since` is THIS sync pipeline's own watermark: the `started_at`
+    `max_pages` is the number of pages THIS CALL is allowed to fetch,
+    starting at `start_page` -- not an absolute page number. The largest
+    `pagination.max_page` this call observed from upstream is recorded on
+    `result.max_page_seen`; if the budget runs out before reaching it,
+    `result.next_page` is set to the next page a caller should resume from
+    (else left `None`, meaning this call's own requests genuinely reached
+    upstream's last page or an empty page -- caught up, not merely stopped).
+
+    `updated_since_override`, if given, is used verbatim as the `updated_since`
+    query param instead of the computed watermark below, and this call does
+    NOT read/derive the normal watermark from `ingestion_runs` at all in that
+    case. This is the explicit-`--since` catch-up/replay path
+    (`backfill-api-versions` in cli.py): it must never read or advance the
+    ordinary incremental-sync watermark, so ordinary `run_api_sync_job` calls
+    (which never pass this) are completely unaffected by any replay.
+
+    `start_page`, similarly, only matters to that same replay path -- ordinary
+    calls always start at page 1 (the default).
+
+    Absent an override, `updated_since` is THIS sync pipeline's own watermark: the `started_at`
     (NOT `finished_at`) of the jurisdiction's most recent SUCCESSFUL
     `ingestion_runs` row with `source_name == SOURCE_NAME`
     ("openstates_api_sync"). Falls back to None (a full `per_page`*`max_pages`
@@ -192,20 +233,28 @@ def sync_state(
     between two real syncs would silently advance the watermark past
     upstream changes that occurred in that window, and api_sync would never
     ask the API about them again."""
+    if start_page < 1:
+        raise ValueError(f"start_page must be >= 1, got {start_page!r}")
+    if max_pages < 1:
+        raise ValueError(f"max_pages must be >= 1, got {max_pages!r}")
+
     client = client or OpenStatesClient()
     result = ApiSyncResult(state=jurisdiction.abbreviation)
     retrieved_at = datetime.now(timezone.utc)
 
-    last_successful_run_started_at = db.execute(
-        select(func.max(IngestionRun.started_at)).where(
-            IngestionRun.jurisdiction_id == jurisdiction.id,
-            IngestionRun.source_name == SOURCE_NAME,
-            IngestionRun.status == "success",
+    if updated_since_override is not None:
+        updated_since = updated_since_override
+    else:
+        last_successful_run_started_at = db.execute(
+            select(func.max(IngestionRun.started_at)).where(
+                IngestionRun.jurisdiction_id == jurisdiction.id,
+                IngestionRun.source_name == SOURCE_NAME,
+                IngestionRun.status == "success",
+            )
+        ).scalar_one_or_none()
+        updated_since = (
+            last_successful_run_started_at.isoformat() if last_successful_run_started_at is not None else None
         )
-    ).scalar_one_or_none()
-    updated_since = (
-        last_successful_run_started_at.isoformat() if last_successful_run_started_at is not None else None
-    )
 
     # Every session row for this jurisdiction, keyed by its own `identifier`
     # -- v3's bill `session` field is a string session identifier, and this
@@ -245,9 +294,21 @@ def sync_state(
         for b in db.execute(select(Bill).where(Bill.jurisdiction_id == jurisdiction.id)).scalars()
     }
 
-    page = 1
-    stop_early = False
-    while page <= max_pages and not stop_early:
+    # `page` walks from `start_page`; `pages_fetched_this_call` bounds THIS
+    # call's own request count at `max_pages`, independent of `page`'s
+    # absolute value (a replay chunk starting at page 37 with max_pages=5
+    # must fetch exactly 5 pages, not stop at page 5).
+    #
+    # No unchanged-page early exit here (removed, see module docstring):
+    # a page can be entirely core-checksum-unchanged while still carrying a
+    # NEW version/document for one of its bills (a version/document change
+    # doesn't move `_bill_checksum`'s fields), so "every bill on this page
+    # was core-unchanged" is not evidence later pages hold no changes.
+    # Pagination now stops only on an empty result, upstream's own
+    # `pagination.max_page`, or this call's page budget.
+    page = start_page
+    pages_fetched_this_call = 0
+    while pages_fetched_this_call < max_pages:
         payload = client.search_bills(
             jurisdiction=jurisdiction.abbreviation.lower(),
             updated_since=updated_since,
@@ -256,21 +317,15 @@ def sync_state(
             per_page=per_page,
         )
         result.pages_fetched += 1
+        pages_fetched_this_call += 1
+        pagination = payload.get("pagination", {})
+        upstream_max_page = pagination.get("max_page", page)
+        result.max_page_seen = max(result.max_page_seen, upstream_max_page)
+
         bills_payload = payload.get("results", [])
         if not bills_payload:
+            result.next_page = None
             break
-
-        # Recorded per-bill AT THE MOMENT each bill is classified
-        # created/updated/unchanged (before its checksum is overwritten to
-        # match the incoming payload) -- re-deriving "was this bill
-        # unchanged" AFTER the loop by comparing bill.checksum against
-        # _bill_checksum(payload) is always true by then for every bill on
-        # the page (created bills get the new checksum on creation, updated
-        # bills get it reassigned), so that comparison can never actually
-        # observe a "changed" bill and always trips true. Track it here
-        # instead, where "unchanged" genuinely means "not created, not
-        # updated".
-        page_unchanged_flags: list[bool] = []
 
         for bill_payload in bills_payload:
             identifier_raw = (bill_payload.get("identifier") or "").strip()
@@ -305,7 +360,6 @@ def sync_state(
                         f"no session row resolved for {jurisdiction.abbreviation} bill "
                         f"{identifier_raw!r} (session={bill_payload.get('session')!r}); skipped"
                     )
-                    page_unchanged_flags.append(False)
                     continue
                 bill = Bill(
                     jurisdiction_id=jurisdiction.id,
@@ -331,10 +385,8 @@ def sync_state(
                 result.bills_created += 1
                 result.touched_bill_ids.add(bill.id)
                 events.record_event(db, bill.id, events.CREATED, identifier_raw)
-                page_unchanged_flags.append(False)
             elif bill.checksum == checksum:
                 result.bills_unchanged += 1
-                page_unchanged_flags.append(True)
                 # Unchanged -- but v3 pagination is newest-updated-first, so
                 # once we've hit a batch of all-unchanged bills we've likely
                 # walked past the `updated_since` boundary; still let this
@@ -369,26 +421,177 @@ def sync_state(
                 result.bills_updated += 1
                 result.touched_bill_ids.add(bill.id)
                 events.record_event(db, bill.id, events.METADATA)
-                page_unchanged_flags.append(False)
                 if bill.openstates_id:
                     bill_by_openstates_id[bill.openstates_id] = bill
 
+            # Called for EVERY bill on the page, including the
+            # checksum-unchanged branch above: `_bill_checksum` covers only
+            # identifier/title/classification/latest-action, so a bill whose
+            # core fields didn't move can still have a new version or
+            # document upstream.
+            _upsert_versions_and_documents(
+                db, bill, bill_payload.get("versions") or [], bill_payload.get("documents") or [], result, retrieved_at
+            )
             _upsert_actions(db, bill, bill_payload.get("actions") or [], result, retrieved_at)
             _upsert_sponsorships(db, bill, bill_payload.get("sponsorships") or [], result, retrieved_at)
 
-        # Early-exit: v3 sorts by most-recently-updated first, so once we've
-        # seen a full page where every bill was already unchanged, further
-        # pages are strictly older than what we've already synced -- no
-        # point spending quota walking the rest of the state's bills.
-        all_unchanged_this_page = bool(page_unchanged_flags) and all(page_unchanged_flags)
-        pagination = payload.get("pagination", {})
-        max_page = pagination.get("max_page", page)
-        if all_unchanged_this_page or page >= max_page:
-            stop_early = True
+        if page >= upstream_max_page:
+            result.next_page = None
+            break
+        if pages_fetched_this_call >= max_pages:
+            result.next_page = page + 1
+            break
         page += 1
+
+    if updated_since_override is None and result.next_page is not None:
+        result.warnings.append(
+            f"api-sync {jurisdiction.abbreviation}: TRUNCATED -- this run's page budget "
+            f"({max_pages}) ended before upstream's own last page (max_page_seen="
+            f"{result.max_page_seen}); result.next_page={result.next_page} was NOT followed "
+            f"(ordinary sync only ever starts at page 1 next time). Some upstream-changed "
+            f"bills/versions/documents beyond this run's budget may not have been synced this "
+            f"cycle -- this is NOT silent: see backfill-api-versions for an explicit, bounded "
+            f"catch-up replay of a specific --since window."
+        )
 
     db.flush()
     return result
+
+
+def _upsert_versions_and_documents(
+    db: OrmSession,
+    bill: Bill,
+    version_payloads: list[dict],
+    document_payloads: list[dict],
+    result: ApiSyncResult,
+    retrieved_at: datetime,
+) -> bool:
+    """Upsert one bill's v3 `versions[]`/`documents[]` into `bill_versions`/
+    `bill_documents`, using EXACTLY the same natural keys and
+    placeholder-version convention as `openstates_bulk`'s bulk-CSV bootstrap
+    (see that module's "Versions + version links" / "Documents + document
+    links" sections) -- this is the same canonical representation, just fed
+    from the v3 JSON shape instead of CSV rows, so the two paths can never
+    produce two different representations of the same upstream fact.
+
+    Real versions (`versions[]`) key on `(bill_id, note, date)`, same as
+    bulk. Standalone documents (`documents[]`, not tied to any version) all
+    land under one synthetic placeholder version per bill --
+    `note="(document, no version)"`, `date=None` -- deduplicated by URL,
+    never one placeholder per document object.
+
+    Append/idempotent-upsert only: never deletes a local version/document
+    just because it's absent from one API response (matches bulk; protects
+    live printed/shared URLs from an incomplete upstream page).
+
+    Returns True iff at least one BillVersion/BillDocument row was added,
+    so the caller can mark `bill.id` touched. Flushes once before
+    returning so a caller-added `bill.id` reference (if any) sees the
+    child rows. Caller (`sync_state`) owns commit/rollback.
+    """
+    if not version_payloads and not document_payloads:
+        return False
+
+    added_any = False
+
+    # ONE preload query per bill for each of versions/documents -- never an
+    # existence SELECT per nested link.
+    existing_versions: dict[tuple, BillVersion] = {
+        (v.bill_id, v.note, v.date): v
+        for v in db.execute(select(BillVersion).where(BillVersion.bill_id == bill.id)).scalars()
+    }
+    version_ids = [v.id for v in existing_versions.values()]
+    existing_documents: set[tuple] = set()
+    if version_ids:
+        existing_documents = {
+            (d.bill_version_id, d.url)
+            for d in db.execute(
+                select(BillDocument).where(BillDocument.bill_version_id.in_(version_ids))
+            ).scalars()
+        }
+
+    for version_payload in version_payloads:
+        note = version_payload.get("note") or ""
+        version_date = _parse_date_field(version_payload.get("date"))
+        key = (bill.id, note, version_date)
+        version = existing_versions.get(key)
+        if version is None:
+            # Client-side id so nested links can reference it before flush
+            # (mirrors openstates_bulk's identical VoteEvent/BillVersion
+            # pattern -- avoids a flush-per-version round trip).
+            version = BillVersion(
+                id=uuid.uuid4(),
+                bill_id=bill.id,
+                note=note,
+                date=version_date,
+                source_name=SOURCE_NAME,
+                retrieved_at=retrieved_at,
+            )
+            db.add(version)
+            existing_versions[key] = version
+            result.versions += 1
+            added_any = True
+
+        for link in version_payload.get("links") or []:
+            url = link.get("url")
+            if not url:
+                continue
+            doc_key = (version.id, url)
+            if doc_key not in existing_documents:
+                db.add(
+                    BillDocument(
+                        bill_version_id=version.id,
+                        media_type=link.get("media_type"),
+                        url=url,
+                        source_name=SOURCE_NAME,
+                        retrieved_at=retrieved_at,
+                    )
+                )
+                existing_documents.add(doc_key)
+                result.documents += 1
+                added_any = True
+
+    if document_payloads:
+        placeholder_key = (bill.id, "(document, no version)", None)
+        placeholder = existing_versions.get(placeholder_key)
+        for document_payload in document_payloads:
+            for link in document_payload.get("links") or []:
+                url = link.get("url")
+                if not url:
+                    continue
+                if placeholder is None:
+                    placeholder = BillVersion(
+                        id=uuid.uuid4(),
+                        bill_id=bill.id,
+                        note="(document, no version)",
+                        date=None,
+                        source_name=SOURCE_NAME,
+                        retrieved_at=retrieved_at,
+                        license_note="synthetic placeholder: doc had no matching version row",
+                    )
+                    db.add(placeholder)
+                    existing_versions[placeholder_key] = placeholder
+                    added_any = True
+                doc_key = (placeholder.id, url)
+                if doc_key not in existing_documents:
+                    db.add(
+                        BillDocument(
+                            bill_version_id=placeholder.id,
+                            media_type=link.get("media_type"),
+                            url=url,
+                            source_name=SOURCE_NAME,
+                            retrieved_at=retrieved_at,
+                        )
+                    )
+                    existing_documents.add(doc_key)
+                    result.documents += 1
+                    added_any = True
+
+    if added_any:
+        result.touched_bill_ids.add(bill.id)
+
+    db.flush()
+    return added_any
 
 
 def _upsert_actions(

@@ -58,15 +58,34 @@ def test_search_bills_builds_query_params():
 
     def handler(request):
         captured["url"] = str(request.url)
+        captured["params"] = request.url.params
         return httpx.Response(200, json={"results": [], "pagination": {"max_page": 1}})
 
     client = _client_with_handler(handler)
-    client.search_bills(jurisdiction="nc", session="2025-2026", include=["sponsorships", "actions"])
+    client.search_bills(
+        jurisdiction="nc",
+        session="2025-2026",
+        include=["sponsorships", "actions", "sources", "versions", "documents"],
+    )
 
     assert "jurisdiction=nc" in captured["url"]
     assert "session=2025-2026" in captured["url"]
     assert "include=sponsorships" in captured["url"]
     assert "include=actions" in captured["url"]
+    # `include` is v3's repeated query param, not a comma-joined single value
+    # -- api_sync.py's INCLUDE list (sponsorships/actions/sources/versions/
+    # documents, per the versions/documents repair) must serialize as one
+    # `include=` entry PER value, all present simultaneously, not the last
+    # one clobbering the rest.
+    assert "include=versions" in captured["url"]
+    assert "include=documents" in captured["url"]
+    assert captured["params"].get_list("include") == [
+        "sponsorships",
+        "actions",
+        "sources",
+        "versions",
+        "documents",
+    ]
 
 
 def test_iter_bills_paginates_across_pages():
