@@ -7,11 +7,23 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from billcommons_ingest import openstates_api as openstates_api_mod
 from billcommons_ingest.openstates_api import (
     OpenStatesAPIError,
     OpenStatesAuthError,
     OpenStatesClient,
+    OpenStatesDailyBudgetExceeded,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_daily_budget_counter():
+    """The daily-budget counter is a module-global dict so it survives
+    across tests in the same process -- reset it before AND after every
+    test so test order can never leak counts between tests."""
+    openstates_api_mod._daily_request_counts.clear()
+    yield
+    openstates_api_mod._daily_request_counts.clear()
 
 
 def _client_with_handler(handler, api_key="test-key") -> OpenStatesClient:
@@ -139,3 +151,109 @@ def test_4xx_error_raises_api_error():
     client = _client_with_handler(handler)
     with pytest.raises(OpenStatesAPIError):
         client.get_bill("ocd-bill/nonexistent")
+
+
+def test_read_timeout_then_success_retries_and_paces_the_limiter():
+    calls = {"count": 0, "acquires": 0}
+
+    def handler(request):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, json={"results": []})
+
+    client = _client_with_handler(handler)
+
+    def counting_acquire(host):
+        # Counts calls without the real limiter's throttling delay (burst=1
+        # means a second real acquire would sleep ~10s waiting for a token).
+        calls["acquires"] += 1
+
+    client.rate_limiter.acquire = counting_acquire  # type: ignore[method-assign]
+    result = client.get_jurisdictions()
+
+    assert result == {"results": []}
+    assert calls["count"] == 2
+    assert calls["acquires"] == 2  # each retry re-acquires the limiter token
+
+
+def test_three_consecutive_502s_raises_after_three_requests():
+    calls = {"count": 0}
+
+    def handler(request):
+        calls["count"] += 1
+        return httpx.Response(502, text="bad gateway")
+
+    client = _client_with_handler(handler)
+    client.rate_limiter.acquire = lambda host: None  # type: ignore[method-assign]
+
+    with pytest.raises(OpenStatesAPIError):
+        client.get_jurisdictions()
+    assert calls["count"] == 3
+
+
+def test_429_retry_is_independent_of_the_http_retry_loop():
+    """A 429 followed by two 502s followed by success must still succeed --
+    the 429 backoff counter and the timeout/5xx retry counter must not
+    share state, or a 429 would silently eat into the 5xx retry budget (or
+    vice versa)."""
+    calls = {"count": 0}
+
+    def handler(request):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        if calls["count"] in (2, 3):
+            return httpx.Response(502, text="bad gateway")
+        return httpx.Response(200, json={"results": []})
+
+    client = _client_with_handler(handler)
+    client.rate_limiter.acquire = lambda host: None  # type: ignore[method-assign]
+
+    result = client.get_jurisdictions()
+    assert result == {"results": []}
+    assert calls["count"] == 4
+
+
+def test_daily_budget_exhausted_raises_without_sending(monkeypatch):
+    monkeypatch.setenv("OPENSTATES_DAILY_BUDGET", "3")
+    calls = {"count": 0}
+
+    def handler(request):
+        calls["count"] += 1
+        return httpx.Response(200, json={"results": []})
+
+    client = _client_with_handler(handler)
+    client.rate_limiter.acquire = lambda host: None  # type: ignore[method-assign]
+
+    client.get_jurisdictions()
+    client.get_jurisdictions()
+    client.get_jurisdictions()
+    assert calls["count"] == 3
+
+    with pytest.raises(OpenStatesDailyBudgetExceeded):
+        client.get_jurisdictions()
+    assert calls["count"] == 3  # the 4th call never reached the transport
+
+
+def test_retries_count_against_the_daily_budget(monkeypatch):
+    monkeypatch.setenv("OPENSTATES_DAILY_BUDGET", "2")
+    calls = {"count": 0}
+
+    def handler(request):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, json={"results": []})
+
+    client = _client_with_handler(handler)
+    client.rate_limiter.acquire = lambda host: None  # type: ignore[method-assign]
+
+    result = client.get_jurisdictions()
+    assert result == {"results": []}
+    assert calls["count"] == 2  # ReadTimeout attempt + the retry that succeeded
+
+    # The budget (2) is now fully consumed by that one retry cycle.
+    with pytest.raises(OpenStatesDailyBudgetExceeded):
+        client.get_jurisdictions()
+    assert calls["count"] == 2

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 import argparse
+import random
 import socket
 import sys
 import time
@@ -55,6 +56,7 @@ from billcommons_ingest import registry as registry_mod
 from billcommons_ingest import scheduler as scheduler_mod
 from billcommons_ingest import status as status_mod
 from billcommons_ingest import validation as validation_mod
+from billcommons_ingest.openstates_api import OpenStatesDailyBudgetExceeded
 from billcommons_ingest.openstates_bulk import ingest_session_csv_zip, peek_session_slug
 from billcommons_ingest.session_match import (
     MatchPath,
@@ -1152,6 +1154,68 @@ def record_job_failure(
         db.close()
 
 
+def _next_utc_midnight_with_jitter(*, now: datetime | None = None) -> datetime:
+    """Next UTC midnight plus up to 5 minutes of jitter, so a whole cycle's
+    worth of budget-deferred jobs don't all wake and re-claim in the same
+    instant."""
+    now = now or datetime.now(timezone.utc)
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight + timedelta(seconds=random.randint(0, 300))
+
+
+def defer_job_for_budget(
+    job_id,
+    job_cls,
+    *,
+    claimed_attempts: int,
+    run_after: datetime,
+    session_factory=get_session,
+) -> bool:
+    """Requeue a claimed job that hit OpenStatesDailyBudgetExceeded without
+    burning an attempt.
+
+    Budget exhaustion is an outage of our own making, not the job's fault --
+    the invariant is that it must never contribute to dead-lettering. Runs
+    in a FRESH session for the same reason `record_job_failure` does: the
+    claiming transaction already rolled back and expired that instance.
+    `claimed_attempts` is `claim_job`'s post-increment count; the row's
+    rollback already undid that increment, so `claimed_attempts - 1` is
+    what `attempts` should read on the still-unclaimed row.
+
+    That rollback also means there is a gap, between this job's claiming
+    transaction rolling back the row to `queued` and this function's fresh
+    transaction locking it, during which a second concurrent sync-worker can
+    claim (or even complete) the same row. Writing unconditionally here
+    would clobber whatever that worker did -- reset its `running`/`done`
+    status back to `queued`, erase its lock fields, restore a stale
+    `attempts`. So the row is fetched WITH a row lock and the deferral is
+    only applied if the row still looks exactly like the unclaimed,
+    just-rolled-back state this job left it in; otherwise it is left
+    completely untouched.
+
+    Returns True if the row was deferred, False if it was left alone
+    because it no longer matched that expected state (already re-claimed,
+    or gone).
+    """
+    db = session_factory()
+    try:
+        job = db.get(job_cls, job_id, with_for_update=True)
+        if job is None:
+            db.commit()
+            return False
+        expected_attempts = max(0, claimed_attempts - 1)
+        if job.status != "queued" or job.attempts != expected_attempts or job.locked_by is not None:
+            # Someone else already claimed (or completed) this row in the
+            # gap -- leave it alone.
+            db.rollback()
+            return False
+        job.run_after = run_after
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
 def recompute_status_for_bills(
     db, bill_ids: list, counts: dict[str, int] | None = None, *, stamp: bool = True
 ) -> tuple[int, int]:
@@ -1642,6 +1706,28 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                         )
                         for warning in result.warnings:
                             print(f"api-sync WARNING: {warning}", flush=True)
+                    except OpenStatesDailyBudgetExceeded:
+                        # Not a job failure -- our own daily brake tripped.
+                        # Requeue for tomorrow without touching `attempts`,
+                        # so budget exhaustion can never dead-letter a job.
+                        db.rollback()
+                        run_after = _next_utc_midnight_with_jitter()
+                        deferred = defer_job_for_budget(
+                            job_id,
+                            IngestJob,
+                            claimed_attempts=claimed_attempts,
+                            run_after=run_after,
+                        )
+                        if deferred:
+                            print(
+                                f"api-sync BUDGET: {state} deferred to {run_after}",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"api-sync BUDGET: {state} defer skipped (row re-claimed concurrently)",
+                                flush=True,
+                            )
                     except Exception as exc:  # noqa: BLE001 - per-job isolation
                         db.rollback()
                         failed += 1

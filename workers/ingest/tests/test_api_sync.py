@@ -11,7 +11,7 @@ incremental sync actually did.
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -1293,3 +1293,140 @@ def test_sync_state_unchanged_backfill_does_not_touch_already_resolved_bill(db_s
 
     refreshed = db_session.get(Bill, resolved_bill_id)
     assert refreshed.openstates_id == "ocd-bill/already-resolved"
+
+
+# --- cmd_sync_worker budget-deferral (Change 4) ---------------------------
+#
+# There is no existing cmd_sync_worker test in this suite (it is a
+# long-running worker loop, not something the rest of this file exercises),
+# so per the spec these test the smallest extracted helpers cmd_sync_worker
+# calls on OpenStatesDailyBudgetExceeded -- `_next_utc_midnight_with_jitter`
+# and `defer_job_for_budget` -- against a fully stubbed session, never a
+# real IngestJob row or the live DB.
+#
+# The concurrency regression test below is the FakeSession-simulation
+# variant, not two real sessions against the live DB: this suite's
+# db_session fixture (conftest.py) gives every test exactly one connection
+# wrapped in an outer transaction + SAVEPOINT that always rolls back, so a
+# second, genuinely independent, durably-committing session isn't available
+# without either opening a raw second connection directly against the live
+# shared DB (real writes to a real ingest_jobs row that a real worker could
+# also claim -- exactly the kind of prod-DB side effect this task's hard
+# rules say to avoid) or bypassing the fixture's isolation. Simulating the
+# contested state (mutate the fake job to look like a second-claimer already
+# has it, then call defer_job_for_budget and assert it declines) exercises
+# the same guard without either risk.
+
+
+class _FakeJob:
+    def __init__(self, job_id, attempts, status="running", locked_by="worker-1"):
+        self.id = job_id
+        self.attempts = attempts
+        self.status = status
+        self.run_after = None
+        self.locked_by = locked_by
+        self.locked_at = datetime(2026, 8, 8, tzinfo=timezone.utc)
+
+
+class _FakeSession:
+    def __init__(self, job):
+        self._job = job
+        self.committed = False
+        self.rolled_back = False
+        self.closed = False
+
+    def get(self, cls, job_id, with_for_update=False):
+        return self._job if job_id == self._job.id else None
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        self.rolled_back = True
+
+    def close(self):
+        self.closed = True
+
+
+def test_next_utc_midnight_with_jitter_is_tomorrow_within_five_minutes():
+    now = datetime(2026, 8, 8, 15, 30, tzinfo=timezone.utc)
+    run_after = cli_mod._next_utc_midnight_with_jitter(now=now)
+
+    midnight = datetime(2026, 8, 9, 0, 0, tzinfo=timezone.utc)
+    assert midnight <= run_after <= midnight + timedelta(minutes=5)
+
+
+def test_defer_job_for_budget_requeues_without_burning_an_attempt():
+    # claim_job bumped attempts 1 -> 2, then the claiming transaction rolled
+    # back on OpenStatesDailyBudgetExceeded -- which puts the row back to
+    # exactly this state: queued, unlocked, attempts reverted to 1.
+    job = _FakeJob(job_id="job-1", attempts=1, status="queued", locked_by=None)
+    job.locked_at = None
+    session = _FakeSession(job)
+    tomorrow = datetime(2026, 8, 9, 0, 3, tzinfo=timezone.utc)
+
+    deferred = cli_mod.defer_job_for_budget(
+        "job-1",
+        object,
+        claimed_attempts=2,
+        run_after=tomorrow,
+        session_factory=lambda: session,
+    )
+
+    assert deferred is True
+    assert job.status == "queued"
+    assert job.run_after == tomorrow
+    assert job.attempts == 1, "net attempts across the cycle must be unchanged"
+    assert job.locked_by is None
+    assert session.committed is True
+    assert session.closed is True
+
+
+def test_defer_job_for_budget_missing_job_still_commits_and_closes():
+    job = _FakeJob(job_id="job-1", attempts=1, status="queued", locked_by=None)
+    session = _FakeSession(job)
+
+    deferred = cli_mod.defer_job_for_budget(
+        "some-other-job",
+        object,
+        claimed_attempts=1,
+        run_after=datetime(2026, 8, 9, tzinfo=timezone.utc),
+        session_factory=lambda: session,
+    )
+
+    assert deferred is False
+    assert session.committed is True
+    assert session.closed is True
+    assert job.status == "queued"  # untouched -- id didn't match
+    assert job.run_after is None
+
+
+def test_defer_job_for_budget_declines_when_row_reclaimed_concurrently():
+    """Regression for the codex-verify finding: between this job's claiming
+    transaction rolling back (row -> queued, attempts=1, unlocked) and
+    defer_job_for_budget's fresh transaction locking the row, a second
+    sync-worker claimed it (status='running', attempts back to 2,
+    locked_by='worker-2'). Writing the deferral unconditionally would
+    clobber that worker's claim; the guard must leave the row untouched and
+    report it as not deferred."""
+    job = _FakeJob(job_id="job-1", attempts=2, status="running", locked_by="worker-2")
+    session = _FakeSession(job)
+    tomorrow = datetime(2026, 8, 9, 0, 3, tzinfo=timezone.utc)
+
+    deferred = cli_mod.defer_job_for_budget(
+        "job-1",
+        object,
+        claimed_attempts=2,  # the FIRST worker's claim -- expects attempts==1
+        run_after=tomorrow,
+        session_factory=lambda: session,
+    )
+
+    assert deferred is False
+    # Nothing about the second worker's claim was touched.
+    assert job.status == "running"
+    assert job.attempts == 2
+    assert job.locked_by == "worker-2"
+    assert job.run_after is None
+    assert session.rolled_back is True
+    assert session.committed is False
+    assert session.closed is True
