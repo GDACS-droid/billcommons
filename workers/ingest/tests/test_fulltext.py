@@ -13,6 +13,7 @@ robots-cache -- no real network calls in this file.
 from __future__ import annotations
 
 import io
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -30,6 +31,7 @@ from billcommons_ingest.cli import (
 )
 from billcommons_ingest.fulltext import (
     STATUS_FETCH_ERROR,
+    STATUS_MA_DOCKET_NO_BILL_NUMBER,
     STATUS_MALFORMED_URL,
     STATUS_OK,
     STATUS_OK_PARTIAL_PDF,
@@ -46,6 +48,8 @@ from billcommons_ingest.fulltext import (
     FullTextFetcher,
     RobotsCache,
     UnfetchableDocument,
+    _fetch_best_candidate,
+    _resolve_ma_document,
     is_document_specific_failure,
     enqueue_fulltext_jobs,
     extract_document_text,
@@ -57,6 +61,7 @@ from billcommons_ingest.fulltext import (
     sniff_content_type,
 )
 from billcommons_ingest.queue import claim_job, enqueue
+from billcommons_ingest.url_resolvers import MaDocumentUrl, ma_docket_from_url
 from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob, Jurisdiction, Session as SessionModel
 from billcommons_shared.db import get_session
 
@@ -1480,6 +1485,8 @@ def _reset_args(**kw):
             "document_id": None,
             "url_like": None,
             "status": None,
+            "jurisdiction": None,
+            "only_permanently_failed": False,
             "all": False,
             "limit": None,
             "dry_run": False,
@@ -1650,3 +1657,348 @@ def test_worker_charges_only_document_specific_failures_to_the_document():
     ) == (STATUS_TOO_MANY_REDIRECTS, True)
     # not a fetch_text job at all -> nothing to record
     assert classify_job_failure(None, RuntimeError("api_sync blew up")) == (None, False)
+
+
+# ---------------------------------------------------------------------------
+# _fetch_best_candidate: chain-continuation + first-non-empty-wins semantics
+# ---------------------------------------------------------------------------
+
+
+def _json_response(body: dict) -> httpx.Response:
+    return httpx.Response(200, headers={"content-type": "application/json"}, content=json.dumps(body).encode())
+
+
+def _ma_robots_allow_all() -> dict:
+    return {"https://malegislature.gov/robots.txt": httpx.Response(200, text="User-agent: *\nAllow: /\n")}
+
+
+def test_fetch_best_candidate_continues_past_an_http_error_to_the_next_candidate():
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/a.pdf": httpx.Response(404),
+        "https://malegislature.gov/b.pdf": httpx.Response(
+            200, headers={"content-type": "text/plain"}, content=b"real text from b"
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    response, url, outcome = _fetch_best_candidate(
+        fetcher, ["https://malegislature.gov/a.pdf", "https://malegislature.gov/b.pdf"]
+    )
+    assert url == "https://malegislature.gov/b.pdf"
+    assert outcome.extracted_text == "real text from b"
+
+
+def test_fetch_best_candidate_continues_past_an_unfetchable_document_to_the_next_candidate():
+    """Previously an UnfetchableDocument (robots disallow, malformed URL,
+    etc.) from one candidate aborted the whole chain immediately. It must
+    now continue -- a per-candidate verdict does not necessarily hold for
+    every candidate (e.g. only one rewritten candidate has a malformed
+    path)."""
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/good.pdf": httpx.Response(
+            200, headers={"content-type": "text/plain"}, content=b"good text"
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    response, url, outcome = _fetch_best_candidate(
+        fetcher, ["not-a-url", "https://malegislature.gov/good.pdf"]
+    )
+    assert url == "https://malegislature.gov/good.pdf"
+    assert outcome.extracted_text == "good text"
+
+
+def test_fetch_best_candidate_skips_empty_200_and_returns_first_non_empty():
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/empty.pdf": httpx.Response(
+            200, headers={"content-type": "text/plain"}, content=b""
+        ),
+        "https://malegislature.gov/real.pdf": httpx.Response(
+            200, headers={"content-type": "text/plain"}, content=b"the actual text"
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    response, url, outcome = _fetch_best_candidate(
+        fetcher, ["https://malegislature.gov/empty.pdf", "https://malegislature.gov/real.pdf"]
+    )
+    assert url == "https://malegislature.gov/real.pdf"
+    assert outcome.extracted_text == "the actual text"
+
+
+def test_fetch_best_candidate_returns_the_empty_result_when_every_candidate_is_empty():
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/empty1.pdf": httpx.Response(
+            200, headers={"content-type": "text/plain"}, content=b""
+        ),
+        "https://malegislature.gov/empty2.pdf": httpx.Response(
+            200, headers={"content-type": "text/plain"}, content=b""
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    response, url, outcome = _fetch_best_candidate(
+        fetcher, ["https://malegislature.gov/empty1.pdf", "https://malegislature.gov/empty2.pdf"]
+    )
+    # Last candidate's (empty) result, not a raise -- no candidate ever
+    # produced usable text, but none of them errored either.
+    assert url == "https://malegislature.gov/empty2.pdf"
+    assert not outcome.extracted_text
+
+
+def test_fetch_best_candidate_raises_the_most_informative_error_once_all_fail():
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/a.pdf": httpx.Response(404),
+        "https://malegislature.gov/b.pdf": httpx.Response(500),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    with pytest.raises(httpx.HTTPError):
+        _fetch_best_candidate(fetcher, ["https://malegislature.gov/a.pdf", "https://malegislature.gov/b.pdf"])
+
+
+def test_fetch_best_candidate_wraps_an_all_candidates_extraction_crash_as_document_fetch_error(monkeypatch):
+    """A parser crash on every candidate must still spend the document's
+    fetch_attempts budget (item 3: "so fetch_attempts accounting still
+    happens") -- never escape as a bare, unattributable exception."""
+
+    def _boom(_content_type, _raw):
+        raise TypeError("boom")
+
+    monkeypatch.setattr(fulltext_mod, "extract_document_text", _boom)
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/a.pdf": httpx.Response(
+            200, headers={"content-type": "text/plain"}, content=b"whatever"
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    with pytest.raises(DocumentFetchError) as excinfo:
+        _fetch_best_candidate(fetcher, ["https://malegislature.gov/a.pdf"])
+    assert excinfo.value.status == STATUS_FETCH_ERROR
+
+
+# ---------------------------------------------------------------------------
+# MA docket -> authoritative bill-number resolution (_resolve_ma_document)
+#
+# The scenario these tests are built around is real and live-verified
+# (2026-08-21): docket HD177 was never assigned a bill number, but the OLD
+# code guessed its bill id was H177 by shape alone -- H177 IS a real,
+# unrelated bill (an Act on a local cannabis transaction fee) whose OWN
+# docket is HD4189. A guess-based resolver would have 200ed against H177
+# and stored ITS text under HD177's document row. The new resolver never
+# derives a bill id from a docket id's shape -- it reads the docket's own
+# `BillNumber` field from the API and cross-checks the resolved bill's
+# `DocketNumber` before ever accepting its text.
+# ---------------------------------------------------------------------------
+
+
+def _ma_document_url(doc_id: str, *, court: str = "194") -> MaDocumentUrl:
+    parsed = ma_docket_from_url(f"https://malegislature.gov/Bills/{court}/{doc_id}.pdf")
+    assert parsed is not None
+    return parsed
+
+
+def test_ma_docket_resolves_via_authoritative_bill_number_and_cross_checks_it():
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/SD123": _json_response(
+            {"DocketNumber": "SD123", "BillNumber": "S2045", "DocumentText": ""}
+        ),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/S2045": _json_response(
+            {"DocketNumber": "SD123", "BillNumber": "S2045", "DocumentText": "SECTION 1. Tuition deduction."}
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    response, url, resolver_name, outcome = _resolve_ma_document(fetcher, _ma_document_url("SD123"))
+    assert url == "https://malegislature.gov/api/GeneralCourts/194/Documents/S2045"
+    assert resolver_name == "ma_bill_json"
+    assert outcome.extracted_text == "SECTION 1. Tuition deduction."
+
+
+def test_ma_docket_never_derives_a_bill_id_from_the_dockets_shape():
+    """The regression test for the actual bug: HD177 (never assigned a
+    bill number) must NEVER cause a request to /Documents/H177 -- the
+    derived-by-shape id. Registering NO route for it means the mock
+    transport raises if the old guessing behavior ever came back."""
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/HD177": _json_response(
+            {"DocketNumber": "HD177", "BillNumber": None, "DocumentText": ""}
+        ),
+        # Deliberately NO route for /Documents/H177 -- if the resolver ever
+        # guesses and fetches it, this test fails with "no canned route".
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    with pytest.raises(DocumentFetchError) as excinfo:
+        _resolve_ma_document(fetcher, _ma_document_url("HD177"))
+    assert excinfo.value.status == STATUS_MA_DOCKET_NO_BILL_NUMBER
+    assert STATUS_MA_DOCKET_NO_BILL_NUMBER not in TERMINAL_STATUSES, (
+        "a docket may be assigned a bill number on a LATER day -- must stay retryable"
+    )
+
+
+def test_ma_docket_with_no_bill_number_but_its_own_text_uses_the_docket_json():
+    # A procedural filing/report (no bill number) can still carry its own
+    # DocumentText -- SD3668, a real commission report, verified live.
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/SD3668": _json_response(
+            {"DocketNumber": "SD3668", "BillNumber": None, "DocumentText": "A commission report."}
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    response, url, resolver_name, outcome = _resolve_ma_document(fetcher, _ma_document_url("SD3668"))
+    assert resolver_name == "ma_docket_json"
+    assert outcome.extracted_text == "A commission report."
+
+
+def test_ma_cross_check_mismatch_never_stores_text_under_the_wrong_bill():
+    """Belt-and-braces: even if a docket's API record names a BillNumber,
+    the bill's OWN record must independently reference the SAME docket
+    before its text is accepted -- an API inconsistency (or a bug) must
+    fail loudly rather than silently store a mismatched bill's text."""
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/HD9999": _json_response(
+            {"DocketNumber": "HD9999", "BillNumber": "H177", "DocumentText": ""}
+        ),
+        # H177's own record: a REAL bill, but its real docket is HD4189, not
+        # HD9999 -- the cross-check must catch this mismatch.
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/H177": _json_response(
+            {"DocketNumber": "HD4189", "BillNumber": "H177", "DocumentText": "Unrelated cannabis fee bill text."}
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    with pytest.raises(DocumentFetchError, match="does not match expected"):
+        _resolve_ma_document(fetcher, _ma_document_url("HD9999"))
+
+
+def test_ma_malformed_docket_json_is_non_terminal():
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/HD177": httpx.Response(
+            200, headers={"content-type": "application/json"}, content=b"{not valid json"
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    with pytest.raises(DocumentFetchError) as excinfo:
+        _resolve_ma_document(fetcher, _ma_document_url("HD177"))
+    assert excinfo.value.status == STATUS_FETCH_ERROR
+    assert excinfo.value.status not in TERMINAL_STATUSES
+
+
+def test_ma_bill_json_empty_falls_back_to_the_bills_pdf_page():
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/SD123": _json_response(
+            {"DocketNumber": "SD123", "BillNumber": "S2045", "DocumentText": ""}
+        ),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/S2045": _json_response(
+            {"DocketNumber": "SD123", "BillNumber": "S2045", "DocumentText": ""}
+        ),
+        "https://malegislature.gov/Bills/194/S2045.pdf": httpx.Response(
+            200, headers={"content-type": "text/plain"}, content=b"bill text only on the page"
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    response, url, resolver_name, outcome = _resolve_ma_document(fetcher, _ma_document_url("SD123"))
+    assert url == "https://malegislature.gov/Bills/194/S2045.pdf"
+    assert resolver_name == "ma_bill_pdf"
+    assert outcome.extracted_text == "bill text only on the page"
+
+
+def test_ma_already_bill_style_url_skips_the_docket_step_entirely():
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/H177": _json_response(
+            {"DocketNumber": "HD4189", "BillNumber": "H177", "DocumentText": "Cannabis fee bill text."}
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    response, url, resolver_name, outcome = _resolve_ma_document(fetcher, _ma_document_url("H177"))
+    assert resolver_name == "ma_bill_json"
+    assert outcome.extracted_text == "Cannabis fee bill text."
+
+
+# ---------------------------------------------------------------------------
+# process_fetch_text_job end-to-end via the MA path (jurisdiction_code
+# faked via monkeypatch -- a real "MA" Jurisdiction row would collide with
+# the live jurisdiction this same DB already carries; see conftest.py's
+# ZZ_/ZQ_ test-abbreviation convention)
+# ---------------------------------------------------------------------------
+
+
+def test_process_fetch_text_job_resolves_ma_docket_end_to_end(db_session, rawstore, monkeypatch):
+    monkeypatch.setattr(fulltext_mod, "_jurisdiction_and_identifier", lambda db, document: ("ma", "S 5"))
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/SD123": _json_response(
+            {"DocketNumber": "SD123", "BillNumber": "S2045", "DocumentText": ""}
+        ),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/S2045": _json_response(
+            {"DocketNumber": "SD123", "BillNumber": "S2045", "DocumentText": "SECTION 1. Real bill text."}
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    document = _make_bill_document(db_session, url="https://malegislature.gov/Bills/194/SD123.pdf")
+    result = process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert result.status == STATUS_OK
+    db_session.refresh(document)
+    assert document.extracted_text == "SECTION 1. Real bill text."
+    assert document.license_note == f"fulltext_status={STATUS_OK} url_resolver=ma_bill_json"
+    assert document.fetch_attempts == 0
+
+
+def test_process_fetch_text_job_ma_docket_no_bill_number_is_retryable_not_terminal(db_session, rawstore, monkeypatch):
+    monkeypatch.setattr(fulltext_mod, "_jurisdiction_and_identifier", lambda db, document: ("ma", "HD 177"))
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/HD177": _json_response(
+            {"DocketNumber": "HD177", "BillNumber": None, "DocumentText": ""}
+        ),
+        # No route for /Documents/H177 -- proves the fix end-to-end through
+        # the real process_fetch_text_job entry point, not just the
+        # resolver in isolation.
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    document = _make_bill_document(db_session, url="https://malegislature.gov/Bills/194/HD177.pdf")
+    with pytest.raises(DocumentFetchError) as excinfo:
+        process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert excinfo.value.status == STATUS_MA_DOCKET_NO_BILL_NUMBER
+    db_session.refresh(document)
+    assert document.license_note == f"fulltext_status={STATUS_MA_DOCKET_NO_BILL_NUMBER}"
+    assert document.extracted_text is None
+    assert STATUS_MA_DOCKET_NO_BILL_NUMBER not in TERMINAL_STATUSES

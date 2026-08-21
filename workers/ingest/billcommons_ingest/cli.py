@@ -14,7 +14,14 @@ Subcommands (per BRIEF-wave2.md):
                                        back (clears fetch_attempts + the
                                        permanently_failed note) after an
                                        outage or a fixed source. Requires an
-                                       explicit filter; --dry-run reports.
+                                       explicit filter (--document-id /
+                                       --url-like / --jurisdiction / --all);
+                                       --dry-run reports. --only-permanently-
+                                       failed narrows to just that status
+                                       (excludes worker_error) -- e.g.
+                                       `reset-fetch-attempts --jurisdiction MA
+                                       --only-permanently-failed` after a
+                                       url_resolvers.py fix.
     validate --state XX [--sample N]  QA-sample bills against source-of-truth
                                        (search API + official source_url) and
                                        record validation_runs + coverage.
@@ -68,6 +75,7 @@ from billcommons_schema.models import (
     Bill,
     BillAction,
     BillDocument,
+    BillVersion,
     IngestJob,
     IngestionRun,
     Jurisdiction,
@@ -641,16 +649,25 @@ def cmd_reset_fetch_attempts(args: argparse.Namespace) -> int:
     "should be rare" is not a recovery plan, and hand-written UPDATEs against
     production are not one either.
 
-    Deliberately explicit: one of --document-id / --url-like / --all is
-    REQUIRED. The unfiltered form would hand every one of ~690k documents a
-    fresh budget and re-open the poison loop the counter exists to close.
+    Deliberately explicit: one of --document-id / --url-like / --jurisdiction
+    / --all is REQUIRED. The unfiltered form would hand every one of ~690k
+    documents a fresh budget and re-open the poison loop the counter exists
+    to close.
 
     Only license_note values named by --status (default: permanently_failed
     and worker_error -- the self-inflicted ones) are cleared. A
     robots_disallowed document keeps its note unless an operator names it by
     hand: a politeness verdict is not collateral damage of an outage cleanup.
+    --only-permanently-failed narrows that further to JUST permanently_failed
+    (excluding worker_error) -- the requeue path after a URL-resolver fix
+    (see url_resolvers.py), where the fix is document-specific and a
+    worker_error is unrelated infrastructure noise that shouldn't be
+    conflated with it.
     """
-    statuses = args.status or list(RESETTABLE_DEFAULT_STATUSES)
+    if args.only_permanently_failed:
+        statuses = [fulltext_mod.STATUS_PERMANENTLY_FAILED]
+    else:
+        statuses = args.status or list(RESETTABLE_DEFAULT_STATUSES)
     notes = [f"fulltext_status={s}" for s in statuses]
 
     filters = []
@@ -663,10 +680,22 @@ def cmd_reset_fetch_attempts(args: argparse.Namespace) -> int:
         filters.append(BillDocument.id.in_(ids))
     if args.url_like:
         filters.append(BillDocument.url.like(args.url_like))
+    if args.jurisdiction:
+        abbreviations = [abbr.upper() for abbr in args.jurisdiction]
+        jurisdiction_doc_ids = (
+            select(BillDocument.id)
+            .select_from(BillDocument)
+            .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
+            .join(Bill, Bill.id == BillVersion.bill_id)
+            .join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id)
+            .where(Jurisdiction.abbreviation.in_(abbreviations))
+        )
+        filters.append(BillDocument.id.in_(jurisdiction_doc_ids))
     if not filters and not args.all:
         print(
             "reset-fetch-attempts: refusing to run unfiltered -- pass "
-            "--document-id/--url-like, or --all if you really mean every document"
+            "--document-id/--url-like/--jurisdiction, or --all if you really "
+            "mean every document"
         )
         return 2
 
@@ -2166,6 +2195,20 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "repeatable fulltext_status value whose license_note is cleared "
             f"(default: {' + '.join(RESETTABLE_DEFAULT_STATUSES)})"
+        ),
+    )
+    p_reset_fetch.add_argument(
+        "--jurisdiction",
+        action="append",
+        default=None,
+        help="repeatable; two-letter jurisdiction abbreviation, e.g. --jurisdiction MA",
+    )
+    p_reset_fetch.add_argument(
+        "--only-permanently-failed",
+        action="store_true",
+        help=(
+            "narrow --status to JUST permanently_failed (excludes worker_error) -- the "
+            "requeue path after a url_resolvers.py fix, where the fix is document-specific"
         ),
     )
     p_reset_fetch.add_argument(

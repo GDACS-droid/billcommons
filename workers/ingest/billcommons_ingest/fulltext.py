@@ -26,6 +26,7 @@ evaluated, or treated as instructions.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import time
@@ -42,7 +43,15 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest import events
-from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob
+from billcommons_ingest.url_resolvers import (
+    MaDocumentUrl,
+    is_ma_docket_id,
+    ma_api_url,
+    ma_docket_from_url,
+    resolve_fetch_url,
+    resolver_name_for_candidate,
+)
+from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob, Jurisdiction
 from billcommons_shared.aia import AiaRepairCache, is_missing_issuer_error
 from billcommons_shared.httpc import USER_AGENT, RateLimiter, new_client
 from billcommons_shared.rawstore import RawStore
@@ -93,6 +102,27 @@ STATUS_UNSUPPORTED_REDIRECT_SCHEME = "unsupported_redirect_scheme"
 STATUS_TOO_MANY_REDIRECTS = "too_many_redirects"
 STATUS_MALFORMED_URL = "malformed_url"
 STATUS_PERMANENTLY_FAILED = "permanently_failed"
+# The document fetched fine (200) via the MA JSON document API, but its
+# `DocumentText` field is empty. Reachable only via the generic
+# `extract_document_text` "json" branch (see `sniff_content_type` /
+# `_is_ma_document_api_url`) -- the actual MA docket/bill resolution path
+# (`_resolve_ma_document`) never produces this status; a docket with no
+# bill number and no text of its own gets STATUS_MA_DOCKET_NO_BILL_NUMBER
+# instead (see below), which is explicitly NOT terminal, because a docket
+# that hasn't been assigned a bill number today may be assigned one on a
+# later day -- unlike this status, kept for a genuinely no-text JSON body
+# reached some other way.
+STATUS_NO_DOCUMENT_TEXT = "no_document_text"
+# A MA docket has not yet been assigned a bill number (its `BillNumber`
+# field is null upstream) AND its own record carries no `DocumentText`
+# either (see `_resolve_ma_document`). This is NOT the same fact as
+# STATUS_NO_DOCUMENT_TEXT -- a docket can be assigned a bill number (and
+# therefore real text) on any later day, so treating "not assigned yet" as
+# a permanent verdict (the bug this status replaces) would permanently
+# dead-letter a document that is merely early in MA's legislative process.
+# Deliberately excluded from TERMINAL_STATUSES; retried like any other
+# fetch error, up to MAX_FETCH_ATTEMPTS.
+STATUS_MA_DOCKET_NO_BILL_NUMBER = "ma_docket_no_bill_number"
 # Recorded when a fetch_text job died of something that is OUR fault, not the
 # document's: the database blinked, the object store 500ed, a bug in this
 # worker. Non-terminal (the document is still worth fetching) and -- unlike
@@ -125,6 +155,7 @@ TERMINAL_STATUSES = frozenset(
         STATUS_UNSUPPORTED_REDIRECT_SCHEME,
         STATUS_MALFORMED_URL,
         STATUS_PERMANENTLY_FAILED,
+        STATUS_NO_DOCUMENT_TEXT,
     }
 )
 
@@ -345,6 +376,31 @@ def extract_text_from_plain(raw: bytes, encoding: str = "utf-8") -> str:
     return _normalize_text(raw.decode(encoding, errors="replace"))
 
 
+def extract_text_from_ma_document_json(raw: bytes) -> str:
+    """Extract the `DocumentText` field from a malegislature.gov
+    `/api/GeneralCourts/{court}/Documents/{id}` response (see
+    `_resolve_ma_document`).
+
+    Raises `ValueError` for a MALFORMED body (not valid JSON, or a JSON
+    value that isn't an object) -- a body that fails to even parse says
+    nothing about whether the SOURCE document has text, so it must never
+    be treated as a permanent "no text" verdict (see `extract_document_text`
+    below, which converts this into a non-terminal, retryable outcome
+    rather than STATUS_NO_DOCUMENT_TEXT).
+
+    Returns `""` (never raises) for a well-formed object whose
+    `DocumentText` is absent or not a string -- that IS a real, stable
+    fact the caller may treat as "no text", same as every other extractor
+    in this module never fabricating text."""
+    data = json.loads(raw.decode("utf-8", errors="replace"))  # json.JSONDecodeError is a ValueError
+    if not isinstance(data, dict):
+        raise ValueError("MA document API body is valid JSON but not an object")
+    text_value = data.get("DocumentText")
+    if not isinstance(text_value, str):
+        return ""
+    return _normalize_text(text_value)
+
+
 @dataclass
 class PdfExtractionResult:
     text: str
@@ -422,11 +478,31 @@ def _normalize_text(raw: str) -> str:
     return "\n".join(out_lines).strip("\n")
 
 
+def _is_ma_document_api_url(url: str) -> bool:
+    """True for the malegislature.gov JSON document-API endpoint (see
+    `_resolve_ma_document` / https://malegislature.gov/api/swagger).
+
+    Deliberately scoped to this one host+path shape rather than sniffing
+    "json" generically for every fetch: this pipeline has never needed a
+    general JSON extractor, and a generic one could silently misclassify an
+    unrelated JSON response from some other jurisdiction's site as
+    full bill text.
+    """
+    parsed = urlparse(url)
+    return parsed.netloc.lower().endswith("malegislature.gov") and "/api/" in parsed.path and "/Documents/" in parsed.path
+
+
 def sniff_content_type(content_type_header: str | None, url: str, raw: bytes) -> str:
-    """Return one of "html", "xml", "pdf", "text" based on the response
-    Content-Type header (preferred), falling back to URL extension, falling
-    back to magic-byte sniffing of the body."""
+    """Return one of "html", "xml", "pdf", "text", "json" based on the
+    response Content-Type header (preferred), falling back to URL extension,
+    falling back to magic-byte sniffing of the body. "json" is only ever
+    returned for the MA document-API URL shape (see
+    `_is_ma_document_api_url`) -- every other host keeps its prior
+    behavior unchanged."""
     header = (content_type_header or "").lower()
+    is_ma_api = _is_ma_document_api_url(url)
+    if "json" in header and is_ma_api:
+        return "json"
     if "pdf" in header:
         return "pdf"
     if "html" in header:
@@ -453,6 +529,8 @@ def sniff_content_type(content_type_header: str | None, url: str, raw: bytes) ->
         return "xml"
     if stripped.startswith(b"<!doctype html") or b"<html" in stripped:
         return "html"
+    if is_ma_api and stripped.startswith(b"{"):
+        return "json"
     return "text"
 
 
@@ -496,6 +574,25 @@ def extract_document_text(content_type: str, raw: bytes) -> ExtractionOutcome:
         return ExtractionOutcome(
             status=STATUS_OK, extracted_text=extract_text_from_plain(raw), checksum=checksum
         )
+    if content_type == "json":
+        try:
+            text_value = extract_text_from_ma_document_json(raw)
+        except ValueError as exc:
+            # Malformed/non-object JSON is a fact about THIS FETCH, not the
+            # document -- never no_document_text (item 2: that would
+            # permanently dead-letter a document over what might be a
+            # one-off truncated/garbled response). Raising here (rather
+            # than returning a status) means this flows through the same
+            # extraction-exception handling every other parser crash in
+            # this module already gets in process_fetch_text_job -- it
+            # spends one of the document's MAX_FETCH_ATTEMPTS and stays
+            # retryable, never terminal.
+            raise DocumentFetchError(
+                f"malformed MA document API JSON: {exc}", status=STATUS_FETCH_ERROR
+            ) from exc
+        if not text_value.strip():
+            return ExtractionOutcome(status=STATUS_NO_DOCUMENT_TEXT, extracted_text=None, checksum=checksum)
+        return ExtractionOutcome(status=STATUS_OK, extracted_text=text_value, checksum=checksum)
     return ExtractionOutcome(status=STATUS_UNSUPPORTED_TYPE, extracted_text=None, checksum=checksum)
 
 
@@ -787,8 +884,26 @@ def process_fetch_text_job(
             f"document {document_id} has no url", document_id=str(document.id), status=STATUS_EMPTY_URL
         )
 
+    jurisdiction_code, bill_identifier = _jurisdiction_and_identifier(db, document)
+
+    # A MA docket/bill-shaped URL takes a dedicated resolution path
+    # (`_resolve_ma_document`): the real bill number for a docket is only
+    # ever known by calling MA's JSON document API and reading it -- it is
+    # NOT derivable from the docket id's shape (docket and bill numbers are
+    # independent sequences; see url_resolvers module docstring) -- so it
+    # cannot be expressed as the static candidate-URL list every other
+    # jurisdiction uses (`resolve_fetch_url` / `_fetch_best_candidate`).
+    ma_url = ma_docket_from_url(document.url) if jurisdiction_code == "ma" else None
+
     try:
-        response = fetcher.fetch(document.url)
+        if ma_url is not None:
+            response, fetched_url, resolver_name, outcome = _resolve_ma_document(fetcher, ma_url)
+        else:
+            candidate_urls = resolve_fetch_url(jurisdiction_code, document.url, bill_identifier)
+            response, fetched_url, outcome = _fetch_best_candidate(fetcher, candidate_urls)
+            resolver_name = resolver_name_for_candidate(
+                jurisdiction_code, document.url, fetched_url, bill_identifier
+            )
     except UnfetchableDocument as exc:
         # `fetcher.fetch` sets `.status` to the SPECIFIC condition it hit
         # (robots_disallowed / malformed_url / unsupported_redirect_scheme /
@@ -806,17 +921,25 @@ def process_fetch_text_job(
             document_id=str(document.id),
             status=status,
         )
-    except httpx.HTTPError as exc:
-        _mark_status(document, STATUS_FETCH_ERROR)
-        db.flush()
+    except (httpx.HTTPError, DocumentFetchError) as exc:
         # DocumentFetchError, not a bare RuntimeError: this is the document's
-        # own host failing, so it SHOULD spend one of its MAX_FETCH_ATTEMPTS.
-        # A bare RuntimeError is indistinguishable from our own worker
-        # crashing, which must not cost the document anything.
+        # own host/data failing, so it SHOULD spend one of its
+        # MAX_FETCH_ATTEMPTS. A bare RuntimeError is indistinguishable from
+        # our own worker crashing, which must not cost the document
+        # anything. `exc.status`, when the failure already carries one (a
+        # DocumentFetchError raised by `_resolve_ma_document` for e.g. a
+        # docket with no bill number yet, or a cross-check mismatch),
+        # is preserved rather than collapsed to the generic
+        # STATUS_FETCH_ERROR -- every OTHER raise site in this function
+        # already follows that rule (see the UnfetchableDocument branch
+        # above).
+        status = getattr(exc, "status", None) or STATUS_FETCH_ERROR
+        _mark_status(document, status)
+        db.flush()
         raise DocumentFetchError(
             f"fetch failed for {document.url}: {exc}",
             document_id=str(document.id),
-            status=STATUS_FETCH_ERROR,
+            status=status,
         ) from exc
 
     raw = response.content
@@ -841,25 +964,6 @@ def process_fetch_text_job(
         except OSError as exc:  # e.g. ENOSPC — never fail extraction over archival
             print(f"fulltext: raw archival skipped for {document.id}: {exc}", flush=True)
 
-    try:
-        content_type = sniff_content_type(response.headers.get("content-type"), document.url, raw)
-        outcome = extract_document_text(content_type, raw)
-    except Exception as exc:  # noqa: BLE001 - classify, then re-raise
-        # A parser that dies on THIS document's bytes (the unhandled pypdf
-        # crashes behind most of the 84k dead fetch_text rows) is a fact about
-        # the document, so it burns an attempt and eventually goes terminal.
-        # Left as a bare exception it reached cmd_worker's generic handler,
-        # which had no document identity and could not record anything -- the
-        # document stayed forever "never attempted" and was re-enqueued for
-        # ever.
-        _mark_status(document, STATUS_FETCH_ERROR)
-        db.flush()
-        raise DocumentFetchError(
-            f"text extraction failed for {document.url}: {exc}",
-            document_id=str(document.id),
-            status=STATUS_FETCH_ERROR,
-        ) from exc
-
     had_text_before = bool(document.extracted_text)
     document.extracted_text = outcome.extracted_text
     document.media_type = document.media_type or response.headers.get("content-type")
@@ -870,7 +974,7 @@ def process_fetch_text_job(
     document.parser_version = PARSER_VERSION
     if outcome.status in (STATUS_OK, STATUS_OK_PARTIAL_PDF):
         document.fetch_attempts = 0
-    _mark_status(document, outcome.status)
+    _mark_status(document, outcome.status, resolver=resolver_name)
     db.flush()
 
     # A bill going from "we have no text" to "text available" is the moment it
@@ -896,13 +1000,285 @@ def process_fetch_text_job(
     )
 
 
-def _mark_status(document: BillDocument, status: str) -> None:
+def _mark_status(document: BillDocument, status: str, *, resolver: str | None = None) -> None:
     """Record the fetch/extraction outcome. The schema has no dedicated
     fetch-status column, so we encode it in `license_note` with a stable
     prefix -- kept human-readable and greppable, never overloaded with
     anything license-related for this row type (bill_documents rows never
-    otherwise use license_note)."""
-    document.license_note = f"fulltext_status={status}"
+    otherwise use license_note).
+
+    `resolver`, if given, is appended as `url_resolver=<name>` -- but ONLY
+    for a successful (STATUS_OK / STATUS_OK_PARTIAL_PDF) outcome. Every
+    OTHER status value must stay byte-identical to `f"fulltext_status={status}"`:
+    `enqueue_fulltext_jobs` and `coverage.py` both skip-terminal-status
+    documents via an EXACT string match against
+    `f"fulltext_status={status}"` for each member of TERMINAL_STATUSES (see
+    both modules). Appending a suffix to a terminal note would silently
+    break that match and re-enqueue a permanently-dead document forever.
+    """
+    note = f"fulltext_status={status}"
+    if resolver and status in (STATUS_OK, STATUS_OK_PARTIAL_PDF):
+        note = f"{note} url_resolver={resolver}"
+    document.license_note = note
+
+
+def _jurisdiction_and_identifier(db: OrmSession, document: BillDocument) -> tuple[str | None, str | None]:
+    """Look up the jurisdiction abbreviation (lowercased, for
+    `resolve_fetch_url`) and bill identifier for `document`'s bill, or
+    `(None, None)` if the chain can't be resolved (never expected in
+    practice -- every bill_documents row has a bill_version_id -> bill_id ->
+    jurisdiction_id -- but resolve_fetch_url treats `None` the same as "no
+    matching rule", so this degrades to today's unresolved-URL behavior
+    rather than raising."""
+    row = db.execute(
+        select(Jurisdiction.abbreviation, Bill.identifier)
+        .select_from(BillDocument)
+        .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
+        .join(Bill, Bill.id == BillVersion.bill_id)
+        .join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id)
+        .where(BillDocument.id == document.id)
+    ).first()
+    if row is None:
+        return None, None
+    abbreviation, identifier = row
+    return (abbreviation.lower() if abbreviation else None), identifier
+
+
+def _fetch_best_candidate(
+    fetcher: "FullTextFetcher", candidates: list[str]
+) -> tuple[httpx.Response, str, "ExtractionOutcome"]:
+    """Try each candidate URL in order (see `url_resolvers.resolve_fetch_url`)
+    -- the first one that fetches AND yields non-empty extracted text wins.
+
+    Neither an `httpx.HTTPError` (e.g. a 404 from a stale docket-style URL)
+    NOR an `UnfetchableDocument` (robots disallow, malformed URL, unsupported
+    scheme, too-many-redirects) from ONE candidate aborts the chain -- both
+    continue to the next candidate. (Previously an `UnfetchableDocument` was
+    raised immediately on the theory that every candidate for a jurisdiction
+    shares a host, so a host-level verdict would just repeat -- but a
+    redirect loop or a URL malformed only in ONE candidate's specific
+    rewritten form doesn't hold for every candidate, so stopping early could
+    give up on a candidate that would have worked.) A candidate that fetches
+    fine (200) but whose extracted text comes back empty (e.g. a stale
+    docket's placeholder/error page, or a MA JSON document whose text
+    field is empty) ALSO continues to the next candidate rather than
+    accepting the empty result -- first candidate with NON-EMPTY text wins.
+
+    Only once EVERY candidate is exhausted without ever producing non-empty
+    text does this raise -- the MOST INFORMATIVE failure seen (the last
+    exception, if any candidate raised one; otherwise the empty-but-200
+    result from the last candidate, as a `DocumentFetchError`) -- as one of
+    `UnfetchableDocument` / `httpx.HTTPError` / `DocumentFetchError`, so
+    `process_fetch_text_job`'s existing exception handling (and, for a bare
+    extraction crash, its own `except Exception` -> `DocumentFetchError`
+    conversion) still spends the document's fetch_attempts budget exactly
+    as before -- this function never silently swallows a failure into a
+    result that looks like success.
+    """
+    last_exc: BaseException | None = None
+    last_empty: tuple[httpx.Response, str, "ExtractionOutcome"] | None = None
+    for url in candidates:
+        try:
+            response = fetcher.fetch(url)
+        except (httpx.HTTPError, UnfetchableDocument) as exc:
+            last_exc = exc
+            continue
+        try:
+            content_type = sniff_content_type(response.headers.get("content-type"), url, response.content)
+            outcome = extract_document_text(content_type, response.content)
+        except Exception as exc:  # noqa: BLE001 - try the next candidate; classified below if none work
+            last_exc = exc
+            continue
+        if outcome.extracted_text and outcome.extracted_text.strip():
+            return response, url, outcome
+        last_empty = (response, url, outcome)
+    if last_empty is not None:
+        return last_empty
+    assert last_exc is not None  # candidates is never empty (original url always present)
+    if isinstance(last_exc, (httpx.HTTPError, UnfetchableDocument)):
+        raise last_exc
+    # A bare extraction crash (e.g. the unhandled pypdf crashes behind most
+    # of the 84k dead fetch_text rows) is a fact about the document, so it
+    # burns an attempt and eventually goes terminal -- never left as a bare
+    # exception, which process_fetch_text_job's outer handling could not
+    # otherwise attribute to a status.
+    raise DocumentFetchError(f"text extraction failed for {url}: {last_exc}", status=STATUS_FETCH_ERROR) from last_exc
+
+
+# ---------------------------------------------------------------------------
+# Massachusetts: docket -> authoritative bill-number resolution
+# ---------------------------------------------------------------------------
+
+
+def _parse_ma_document(response: httpx.Response, url: str) -> dict:
+    """Parse a malegislature.gov JSON document-API response body into its
+    dict, for field access (`BillNumber`/`DocketNumber`) beyond the
+    `DocumentText` that `extract_text_from_ma_document_json` reads.
+
+    Raises `DocumentFetchError` (STATUS_FETCH_ERROR, non-terminal -- see
+    item 2 of the review this resolver was written for) for a malformed
+    body: a response that fails to even parse says nothing about whether
+    the SOURCE document has text, so it must never be treated as a
+    permanent verdict."""
+    try:
+        data = json.loads(response.content.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise DocumentFetchError(
+            f"malformed JSON from MA document API {url}: {exc}", status=STATUS_FETCH_ERROR
+        ) from exc
+    if not isinstance(data, dict):
+        raise DocumentFetchError(f"MA document API {url} did not return a JSON object", status=STATUS_FETCH_ERROR)
+    return data
+
+
+def _assert_ma_field(data: dict, field: str, expected: str, url: str) -> None:
+    """Cross-check that `data[field]` (a `DocketNumber` or `BillNumber`
+    from a malegislature.gov API response) matches `expected` before its
+    `DocumentText` is ever accepted as real bill text.
+
+    This is the check that catches storing the WRONG bill's text: MA
+    docket (HD/SD) and bill (H/S) numbers are independent sequences, so a
+    derived-from-shape guess (the bug this resolver replaces) can 200 and
+    hand back a real, completely unrelated bill's text -- e.g. docket
+    HD177 was never assigned a bill number at all, but a naive `HD177 ->
+    H177` guess would 200 against H177, a real bill whose OWN docket is
+    HD4189 (verified live 2026-08-21). Raises `DocumentFetchError` (never
+    terminal -- a mismatch here is either a transient API inconsistency or
+    a bug in this resolver, not a fact about the document) rather than
+    silently accepting a text mismatch."""
+    actual = data.get(field)
+    if not isinstance(actual, str) or actual.strip().upper() != expected.strip().upper():
+        raise DocumentFetchError(
+            f"MA document API {url} {field}={actual!r} does not match expected "
+            f"{expected!r} -- refusing to store text under the wrong bill/docket",
+            status=STATUS_FETCH_ERROR,
+        )
+
+
+def _clean_ma_document_text(data: dict) -> str | None:
+    text_value = data.get("DocumentText")
+    if not isinstance(text_value, str):
+        return None
+    normalized = _normalize_text(text_value)
+    return normalized if normalized.strip() else None
+
+
+def _resolve_ma_document(
+    fetcher: "FullTextFetcher", ma_url: "MaDocumentUrl"
+) -> tuple[httpx.Response, str, str | None, "ExtractionOutcome"]:
+    """Resolve a MA docket/bill-shaped `bill_documents.url` to real,
+    authoritative text via malegislature.gov's keyless JSON document API
+    (https://malegislature.gov/api/swagger).
+
+    NEVER derives a bill number from the docket id's shape (the bug this
+    replaces: `HD177 -> H177` is a guess, and docket/bill numbers are
+    independent sequences -- see `_assert_ma_field`'s docstring for the
+    live-verified counterexample). Instead: call the API with the DOCKET id
+    first, read the AUTHORITATIVE `BillNumber` field, and only then fetch
+    the bill's own record (cross-checking it references the SAME docket
+    before accepting its text) -- falling back to the bill's PDF/HTML page
+    only if the bill's JSON record itself has no text.
+
+    Returns `(response, fetched_url, resolver_name, outcome)` for the
+    request that ended up carrying real text. Raises `DocumentFetchError`,
+    always non-terminal, for:
+      * a docket that has not been assigned a bill number yet AND has no
+        text of its own (STATUS_MA_DOCKET_NO_BILL_NUMBER -- a real,
+        time-bound fact about the source, not a fetch failure, but NOT a
+        permanent one either: the docket may be assigned a bill number on
+        a later day, so this must stay retryable, never STATUS_NO_DOCUMENT_
+        TEXT);
+      * a malformed API body at either step;
+      * a cross-check mismatch between the resolved bill and the original
+        docket;
+      * no usable text via EITHER the bill's JSON record or its PDF page.
+    Raises `httpx.HTTPError` / `UnfetchableDocument` untouched from
+    `fetcher.fetch` for a genuine transport-level failure (404, robots
+    disallow, etc.) at any step -- `process_fetch_text_job`'s existing
+    handling for those types applies unchanged.
+    """
+    if not is_ma_docket_id(ma_url.doc_id):
+        # Already bill-style (e.g. "H177", no "D") -- nothing to resolve
+        # from a docket; fetch it directly as the target bill.
+        return _resolve_ma_bill(
+            fetcher,
+            ma_url.court,
+            ma_url.doc_id,
+            expected_docket=None,
+            path_prefix=ma_url.path_prefix,
+            path_suffix=ma_url.path_suffix,
+        )
+
+    docket_url = ma_api_url(ma_url.court, ma_url.doc_id)
+    docket_response = fetcher.fetch(docket_url)
+    docket_data = _parse_ma_document(docket_response, docket_url)
+    _assert_ma_field(docket_data, "DocketNumber", ma_url.doc_id, docket_url)
+
+    bill_number = docket_data.get("BillNumber")
+    if not bill_number:
+        own_text = _clean_ma_document_text(docket_data)
+        if own_text is not None:
+            checksum = hashlib.sha256(docket_response.content).hexdigest()
+            outcome = ExtractionOutcome(status=STATUS_OK, extracted_text=own_text, checksum=checksum)
+            return docket_response, docket_url, "ma_docket_json", outcome
+        raise DocumentFetchError(
+            f"MA docket {ma_url.doc_id} (court {ma_url.court}) has not been assigned a bill "
+            "number yet -- docket not yet assigned a bill number, nothing to fetch",
+            status=STATUS_MA_DOCKET_NO_BILL_NUMBER,
+        )
+
+    if not isinstance(bill_number, str):
+        raise DocumentFetchError(
+            f"MA document API {docket_url} BillNumber={bill_number!r} is not a string",
+            status=STATUS_FETCH_ERROR,
+        )
+
+    return _resolve_ma_bill(
+        fetcher,
+        ma_url.court,
+        bill_number,
+        expected_docket=ma_url.doc_id,
+        path_prefix=ma_url.path_prefix,
+        path_suffix=ma_url.path_suffix,
+    )
+
+
+def _resolve_ma_bill(
+    fetcher: "FullTextFetcher",
+    court: str,
+    bill_number: str,
+    *,
+    expected_docket: str | None,
+    path_prefix: str,
+    path_suffix: str,
+) -> tuple[httpx.Response, str, str | None, "ExtractionOutcome"]:
+    bill_url = ma_api_url(court, bill_number)
+    bill_response = fetcher.fetch(bill_url)
+    bill_data = _parse_ma_document(bill_response, bill_url)
+    _assert_ma_field(bill_data, "BillNumber", bill_number, bill_url)
+    if expected_docket is not None:
+        _assert_ma_field(bill_data, "DocketNumber", expected_docket, bill_url)
+
+    bill_text = _clean_ma_document_text(bill_data)
+    if bill_text is not None:
+        checksum = hashlib.sha256(bill_response.content).hexdigest()
+        outcome = ExtractionOutcome(status=STATUS_OK, extracted_text=bill_text, checksum=checksum)
+        return bill_response, bill_url, "ma_bill_json", outcome
+
+    # The bill's own JSON record 200ed with no text -- fall back to its
+    # PDF/HTML page (never the docket's page: the docket-style path is what
+    # went stale in the first place).
+    page_url = f"{path_prefix}{court}/{bill_number}{path_suffix}"
+    page_response = fetcher.fetch(page_url)
+    content_type = sniff_content_type(page_response.headers.get("content-type"), page_url, page_response.content)
+    page_outcome = extract_document_text(content_type, page_response.content)
+    if page_outcome.extracted_text and page_outcome.extracted_text.strip():
+        return page_response, page_url, "ma_bill_pdf", page_outcome
+    raise DocumentFetchError(
+        f"MA bill {bill_number} (docket {expected_docket or bill_number}) has no usable text "
+        f"via its JSON API record or page {page_url} (page status={page_outcome.status})",
+        status=STATUS_FETCH_ERROR,
+    )
 
 
 def run_worker_batch(
