@@ -45,6 +45,9 @@ def create_app() -> FastAPI:
     # application_limits + middleware did not reliably throttle in practice).
     limiter = Limiter(key_func=get_remote_address, default_limits=[settings.rate_limit_default])
     rate_limit_num = int(settings.rate_limit_default.split("/")[0])
+    rate_limit_subnet_num = int(settings.rate_limit_subnet.split("/")[0])
+    rate_limit_heavy_num = int(settings.rate_limit_heavy.split("/")[0])
+    rate_limit_heavy_subnet_num = int(settings.rate_limit_heavy_subnet.split("/")[0])
 
     app = FastAPI(
         title=settings.title,
@@ -68,7 +71,14 @@ def create_app() -> FastAPI:
     app.add_middleware(GZipMiddleware, minimum_size=1000)
     app.add_middleware(SecureHeadersMiddleware, api_version=settings.api_version)
     app.add_middleware(RequestIDMiddleware)
-    app.add_middleware(RateLimitMiddleware, limit=rate_limit_num, window=60.0)
+    app.add_middleware(
+        RateLimitMiddleware,
+        limit=rate_limit_num,
+        subnet_limit=rate_limit_subnet_num,
+        heavy_limit=rate_limit_heavy_num,
+        heavy_subnet_limit=rate_limit_heavy_subnet_num,
+        window=60.0,
+    )
     # Outermost of the two limiters: a request rejected for overload should not
     # first consume a rate-limit token, and shedding should happen before any
     # per-request setup. Starlette applies middleware in reverse order of

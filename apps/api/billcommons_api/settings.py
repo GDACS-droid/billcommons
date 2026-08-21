@@ -27,6 +27,32 @@ class Settings(BaseSettings):
     # per IP) keeps a floor under abuse while letting the API be used for
     # monitoring, which is the point of publishing it.
     rate_limit_default: str = "300/minute"
+    # 2026-08-21 bleed-stop: a single scraper spread ~500 req/min across 4
+    # AWS IPs (~125/min each) never tripped the 300/minute PER-IP ceiling
+    # above. This second bucket keys on the containing subnet (IPv4 /24,
+    # IPv6 /48) instead of the exact address, so addresses rotated within
+    # one small block share a budget. A request must pass both buckets.
+    # Same BILLCOMMONS_API_ prefix / naming convention as `rate_limit_default`
+    # above -- env var is BILLCOMMONS_API_RATE_LIMIT_SUBNET.
+    #
+    # Verify round fd9997c, finding #7: 600/minute would NOT have caught the
+    # actual incident on a light route -- ~500 req/min aggregate across 4
+    # IPs, each individually under the 300/minute per-IP ceiling, still sits
+    # under a 600/minute subnet ceiling. 450/minute sits below the observed
+    # attack volume while comfortably clearing normal traffic (4 real
+    # visitors behind one NAT/office /24 hitting light routes).
+    rate_limit_subnet: str = "450/minute"
+    # Heavy tier: the expensive per-bill/search routes the same scraper was
+    # enumerating (bill detail's /full, /versions, /compare, plus the
+    # /bills list and /search endpoints) get a tighter ceiling than the
+    # general default, on top of it -- both must pass. Env vars:
+    # BILLCOMMONS_API_RATE_LIMIT_HEAVY / BILLCOMMONS_API_RATE_LIMIT_HEAVY_SUBNET.
+    rate_limit_heavy: str = "60/minute"
+    # Verify round fd9997c, finding #7: raised from 120 to 180/minute in the
+    # same direction as `rate_limit_subnet` above, for the same reason --
+    # scaled down from the (also-raised) subnet default rather than left at
+    # a number picked before that incident math was worked through.
+    rate_limit_heavy_subnet: str = "180/minute"
     environment: str = "development"
 
 

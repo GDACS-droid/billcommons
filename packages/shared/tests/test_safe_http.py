@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime
 import http.server
+import ipaddress
 import socket
 import ssl
 import threading
@@ -62,6 +63,48 @@ def test_rejects_disallowed_address(ip):
 @pytest.mark.parametrize("ip", ACCEPTED_ADDRESSES)
 def test_accepts_public_address(ip):
     assert safe_http._is_publicly_routable(ip) is True
+
+
+# ---------------------------------------------------------------------------
+# Verify round d1357cd, finding #4: `_embedded_ipv4` did not cover NAT64
+# (RFC 6052) at all -- `_is_publicly_routable` above still rejects every
+# NAT64 address outright via its own `_NAT64_NETWORKS` membership check
+# (run BEFORE `_embedded_ipv4` is ever called there), so that existing
+# behavior is unchanged by this addition. This closes the gap for other
+# callers that need the embedded v4 itself (e.g.
+# `billcommons_api.rate_limit.subnet_bucket`).
+# ---------------------------------------------------------------------------
+
+
+def test_embedded_ipv4_covers_the_nat64_well_known_prefix():
+    addr = ipaddress.IPv6Address("64:ff9b::c000:22d")  # embeds 192.0.2.45
+    assert safe_http._embedded_ipv4(addr) == ipaddress.IPv4Address("192.0.2.45")
+
+
+def test_embedded_ipv4_covers_the_nat64_local_use_prefix():
+    # Constructed per RFC 6052 section 2.2's PL=48 row to embed 192.0.2.45:
+    # group3 = v4 hi16 (0xc000), group4's low byte + group5's high byte =
+    # v4 lo16 (0x022d), with the reserved 'u' byte (group4's high byte) 0.
+    addr = ipaddress.IPv6Address("64:ff9b:1:c000:2:2d00::")
+    assert safe_http._embedded_ipv4(addr) == ipaddress.IPv4Address("192.0.2.45")
+
+
+def test_embedded_ipv4_still_covers_mapped_6to4_and_teredo():
+    """Regression guard: the NAT64 addition must not have disturbed the
+    three pre-existing branches."""
+    assert safe_http._embedded_ipv4(
+        ipaddress.IPv6Address("::ffff:8.8.8.8")
+    ) == ipaddress.IPv4Address("8.8.8.8")
+    assert safe_http._embedded_ipv4(
+        ipaddress.IPv6Address("2002:c000:022d::")
+    ) == ipaddress.IPv4Address("192.0.2.45")
+    assert safe_http._embedded_ipv4(
+        ipaddress.IPv6Address("2001:0:4136:e378:8000:63bf:3fff:fdd2")
+    ) == ipaddress.IPv4Address("192.0.2.45")
+
+
+def test_embedded_ipv4_returns_none_for_a_plain_public_ipv6_address():
+    assert safe_http._embedded_ipv4(ipaddress.IPv6Address("2001:4860:4860::8888")) is None
 
 
 # ---------------------------------------------------------------------------
