@@ -632,8 +632,8 @@ class _RouteTier:
 # Bulk-access sales message, 2026-08-21 bleed-stop: a 429 should state what
 # happened AND sell the door we actually want that traffic to use instead.
 _BULK_ACCESS_MESSAGE = (
-    "Rate limit exceeded. Higher limits via API keys and full-corpus "
-    "snapshots: https://billcommons.org/docs/bulk"
+    "Rate limit exceeded. Buy higher limits or a full-corpus snapshot "
+    "(from $299/mo or $499 one-time): https://billcommons.org/docs/bulk"
 )
 _BULK_ACCESS_DOCS_URL = "https://billcommons.org/docs/bulk"
 

@@ -44,13 +44,38 @@ export default function BulkAccessPage() {
       </section>
 
       <section className="mt-8">
-        <p className="text-sm text-slate-600">
-          Request a snapshot, or early access to API keys, via the{" "}
+        <h2 className="text-base font-semibold text-slate-900">Buy now</h2>
+        <ul className="mt-3 space-y-2 text-sm text-slate-700">
+          <li>
+            <a
+              href="https://checkout.frontlinehq.vote/b/3cIdRbbp620l4wT3qJco005"
+              className="underline font-medium"
+            >
+              Full-corpus snapshot — $499 one-time
+            </a>{" "}
+            — all 50 states + DC: bills, versions, full text, actions, votes,
+            as Parquet with a manifest. Signed download link within one
+            business day. Refundable until the link is sent.
+          </li>
+          <li>
+            <a
+              href="https://checkout.frontlinehq.vote/b/3cI6oJ50IcEZ5AXf9rco006"
+              className="underline font-medium"
+            >
+              Scale API access — $299/month
+            </a>{" "}
+            — 500,000 requests/day, 100,000 heavy (full-text/diff) requests/day,
+            nightly snapshots included. API key delivered within one business
+            day.
+          </li>
+        </ul>
+        <p className="mt-3 text-sm text-slate-600">
+          Need a single state, a different volume, or redistribution rights?
+          Use the{" "}
           <Link href="/feedback" className="underline">
             feedback form
           </Link>{" "}
-          — tell us what you&apos;re building and how much data you need;
-          that also shapes which tier we roll out first.
+          and say what you&apos;re building.
         </p>
       </section>
     </div>

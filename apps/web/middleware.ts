@@ -51,7 +51,7 @@ const WINDOW_MS = 60_000;
 const PER_IP_LIMIT = 300;
 const PER_SUBNET_LIMIT = 600;
 const BULK_ACCESS_MESSAGE =
-  "Rate limit exceeded. Higher limits via API keys and full-corpus snapshots: https://billcommons.org/docs/bulk";
+  "Rate limit exceeded. Buy higher limits or a full-corpus snapshot (from $299/mo or $499 one-time): https://billcommons.org/docs/bulk";
 const BULK_ACCESS_DOCS_URL = "https://billcommons.org/docs/bulk";
 
 // Verify round c4400ea, finding #1: an unbounded Map growing once per
