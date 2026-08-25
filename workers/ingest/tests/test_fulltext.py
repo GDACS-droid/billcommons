@@ -1706,6 +1706,33 @@ def test_record_job_failure_treats_naive_created_at_as_utc():
     assert document.fetch_attempts == 1
 
 
+def test_record_job_failure_charges_missing_created_at_outside_grace():
+    document = SimpleNamespace(created_at=None, fetch_attempts=0, license_note=None)
+
+    class FakeSession:
+        def get(self, _model, _id, *, with_for_update=False):
+            return document if with_for_update else None
+
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+    record_job_failure(
+        "missing-job",
+        object,
+        claimed_attempts=1,
+        error="MA docket has not yet been assigned a bill number",
+        document_id="document-id",
+        document_status=STATUS_MA_DOCKET_NO_BILL_NUMBER,
+        count_attempt=True,
+        session_factory=FakeSession,
+    )
+
+    assert document.fetch_attempts == 1
+
+
 def test_claimed_document_id_helper_never_raises_on_a_malformed_payload():
     """Review finding 4: this runs OUTSIDE the worker's per-job try/except, so
     an AttributeError here escapes the worker loop entirely and leaves the job
@@ -2060,6 +2087,75 @@ def test_fetch_best_candidate_prefers_an_error_over_a_later_empty_result():
         _fetch_best_candidate(
             fetcher, ["https://malegislature.gov/stale.pdf", "https://malegislature.gov/empty.pdf"]
         )
+
+
+@pytest.mark.parametrize(
+    ("case", "initial_exc", "results", "expected"),
+    [
+        (
+            "original terminal without initial retryable",
+            None,
+            {"original": UnfetchableDocument("original terminal", status=STATUS_MALFORMED_URL)},
+            "terminal",
+        ),
+        (
+            "initial retryable suppresses original terminal",
+            httpx.ReadTimeout("initial retryable"),
+            {"original": UnfetchableDocument("original terminal", status=STATUS_MALFORMED_URL)},
+            "initial",
+        ),
+        (
+            "original retryable wins over last retryable",
+            httpx.ReadTimeout("initial retryable"),
+            {"original": httpx.ReadTimeout("original retryable"), "alternate": httpx.ReadTimeout("last retryable")},
+            "original",
+        ),
+        (
+            "original empty wins over alternate terminal",
+            None,
+            {
+                "original": httpx.Response(200, headers={"content-type": "text/plain"}, content=b""),
+                "alternate": UnfetchableDocument("alternate terminal", status=STATUS_MALFORMED_URL),
+            },
+            "empty",
+        ),
+        (
+            "all empty returns original empty",
+            None,
+            {
+                "original": httpx.Response(200, headers={"content-type": "text/plain"}, content=b""),
+                "alternate": httpx.Response(200, headers={"content-type": "text/plain"}, content=b""),
+            },
+            "empty",
+        ),
+    ],
+)
+def test_fetch_best_candidate_exhaustion_precedence(case, initial_exc, results, expected):
+    """T6-3: enumerate the single precedence order for exhausted candidates."""
+
+    class StubFetcher:
+        def fetch(self, url):
+            result = results[url]
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+    if expected == "empty":
+        _response, url, outcome = _fetch_best_candidate(
+            StubFetcher(), list(results), initial_exc=initial_exc, original_url="original"
+        )
+        assert url == "original", case
+        assert not outcome.extracted_text
+    else:
+        expected_message = f"{expected} retryable" if expected != "terminal" else "original terminal"
+        with pytest.raises(Exception, match=expected_message) as excinfo:
+            _fetch_best_candidate(
+                StubFetcher(), list(results), initial_exc=initial_exc, original_url="original"
+            )
+        if expected == "original":
+            context = "\n".join(excinfo.value.__notes__)
+            assert "original" in context
+            assert "alternate" in context
 
 
 @pytest.mark.parametrize(
@@ -2571,6 +2667,44 @@ def test_ma_bill_api_5xx_and_malformed_stored_url_stays_retryable(db_session, ra
     assert excinfo.value.status == STATUS_FETCH_ERROR
     db_session.refresh(document)
     assert document.license_note == f"fulltext_status={STATUS_FETCH_ERROR}"
+
+
+def test_ma_resolved_page_robots_disallowed_does_not_run_direct_url_fallback(
+    db_session, rawstore, monkeypatch
+):
+    """T6-2: terminal page-stage verdicts must not enter stored-URL fallback."""
+    monkeypatch.setattr(fulltext_mod, "_jurisdiction_and_identifier", lambda db, document: ("ma", "SD 123"))
+    stored_url = "https://malegislature.gov/Bills/194/SD123.pdf"
+    resolved_page_url = "https://malegislature.gov/Bills/194/H177.pdf"
+    requests: list[str] = []
+    routes = {
+        "https://malegislature.gov/robots.txt": httpx.Response(
+            200, text="User-agent: *\nDisallow: /Bills/194/H177.pdf\n"
+        ),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/SD123": _json_response(
+            {"DocketNumber": "SD123", "BillNumber": "H177", "DocumentText": ""}
+        ),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/H177": _json_response(
+            {"DocketNumber": "SD123", "BillNumber": "H177", "DocumentText": ""}
+        ),
+    }
+
+    def handler(request):
+        url = str(request.url)
+        requests.append(url)
+        route = routes[url]
+        return httpx.Response(route.status_code, headers=route.headers, content=route.content, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+    document = _make_bill_document(db_session, url=stored_url)
+
+    with pytest.raises(UnfetchableDocument) as excinfo:
+        process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert excinfo.value.status == STATUS_ROBOTS_DISALLOWED
+    assert stored_url not in requests
+    assert resolved_page_url not in requests, "robots must block before the page request"
 
 
 def test_ma_resolved_page_timeout_falls_back_when_page_url_differs(db_session, rawstore, monkeypatch):

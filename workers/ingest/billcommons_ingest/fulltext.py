@@ -1107,24 +1107,19 @@ def _fetch_best_candidate(
     field is empty) ALSO continues to the next candidate rather than
     accepting the empty result -- first candidate with NON-EMPTY text wins.
 
-    Only once EVERY candidate is exhausted without ever producing non-empty
-    text does this raise -- the MOST INFORMATIVE failure seen (the last
-    exception, if any candidate raised one; otherwise the empty-but-200
-    result from the last candidate, as a `DocumentFetchError`) -- as one of
-    `UnfetchableDocument` / `httpx.HTTPError` / `DocumentFetchError`, so
-    `process_fetch_text_job`'s existing exception handling (and, for a bare
-    extraction crash, its own `except Exception` -> `DocumentFetchError`
-    conversion) still spends the document's fetch_attempts budget exactly
-    as before -- this function never silently swallows a failure into a
-    result that looks like success.
+    Once EVERY candidate is exhausted, failure selection has one total order:
+    (1) a terminal verdict for the ORIGINAL URL wins when there was no
+    retryable `initial_exc`; (2) `initial_exc` suppresses terminal verdicts;
+    (3) retryable errors rank as the ORIGINAL URL's own error, then
+    `initial_exc`, then the LAST seen candidate error; (4) an ORIGINAL empty
+    result wins over terminal alternate verdicts; (5) if all results are
+    empty, return the ORIGINAL empty result. Other retryable failures are
+    retained as exception notes, including their URLs, so the surfaced error
+    preserves the complete attempted-path context.
     """
     original_url = original_url or candidates[0]
     outcomes: dict[str, list[tuple[str, BaseException | tuple[httpx.Response, str, "ExtractionOutcome"]]]] = {}
     retryable_outcomes: list[tuple[str, BaseException]] = []
-
-    if initial_exc is not None:
-        outcomes.setdefault(original_url, []).append(("retryable", initial_exc))
-        retryable_outcomes.append((original_url, initial_exc))
 
     for url in candidates:
         try:
@@ -1148,17 +1143,11 @@ def _fetch_best_candidate(
         empty_outcome = (response, url, outcome)
         outcomes.setdefault(url, []).append(("empty", empty_outcome))
 
-    # `initial_exc` represents the primary MA API/page resolution attempt;
-    # this candidate list is only its secondary fallback.  A fixed terminal
-    # fact about that secondary URL must not dead-letter while the primary
-    # source is transiently unavailable.
-    if initial_exc is not None:
-        raise initial_exc
-
     original_outcomes = outcomes.get(original_url, [])
-    for outcome_type, outcome_value in original_outcomes:
-        if outcome_type == "terminal":
-            raise outcome_value
+    if initial_exc is None:
+        for outcome_type, outcome_value in original_outcomes:
+            if outcome_type == "terminal":
+                raise outcome_value
 
     original_retryable = next(
         (outcome_value for outcome_type, outcome_value in original_outcomes if outcome_type == "retryable"),
@@ -1166,12 +1155,19 @@ def _fetch_best_candidate(
     )
     if original_retryable is not None:
         retryable_exc = (original_url, original_retryable)
+    elif initial_exc is not None:
+        retryable_exc = (original_url, initial_exc)
     elif retryable_outcomes:
         retryable_exc = retryable_outcomes[-1]
     else:
         retryable_exc = None
     if retryable_exc is not None:
         _error_url, exc = retryable_exc
+        retryable_context = list(retryable_outcomes)
+        if initial_exc is not None and all(other_exc is not initial_exc for _, other_exc in retryable_context):
+            retryable_context.insert(0, (original_url, initial_exc))
+        for failed_url, failed_exc in retryable_context:
+            exc.add_note(f"retryable failure for {failed_url}: {failed_exc}")
         if isinstance(exc, (httpx.HTTPError, DocumentFetchError)):
             raise exc
         # Failing candidates' bytes are deliberately not archived; only the
@@ -1393,6 +1389,11 @@ def _resolve_ma_bill(
         page_response = fetcher.fetch(page_url)
         content_type = sniff_content_type(page_response.headers.get("content-type"), page_url, page_response.content)
         page_outcome = extract_document_text(content_type, page_response.content)
+    except UnfetchableDocument:
+        # This is a terminal verdict about the resolved official bill page.
+        # It must reach process_fetch_text_job unchanged rather than being
+        # laundered into the retryable stored-URL fallback below.
+        raise
     except (httpx.HTTPError, DocumentFetchError) as exc:
         raise MaPageLookupError(
             f"fetch failed for MA bill page {page_url}: {exc}",
