@@ -2093,6 +2093,8 @@ def test_r5_new_paid_subscription_replaces_dunning_incumbent(client, app_and_db,
     db.close()
     canceled = []
     monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+    # R8: the row-None swap now consults live Stripe status first.
+    monkeypatch.setattr(stripe.Subscription, "retrieve", staticmethod(lambda sub_id: {"status": "active"}))
     res = _post_webhook(
         client,
         _stripe_event(
@@ -2306,6 +2308,8 @@ def test_r7_permanent_incumbent_cancel_error_rolls_back_swap(client, app_and_db,
         "cancel",
         staticmethod(lambda sub_id: (_ for _ in ()).throw(stripe.InvalidRequestError("subscription cancel rejected", None))),
     )
+    # R8: the row-None swap now consults live Stripe status first.
+    monkeypatch.setattr(stripe.Subscription, "retrieve", staticmethod(lambda sub_id: {"status": "active"}))
     event = _stripe_event(
         "customer.subscription.created",
         {"id": "sub_r7_new", "customer": "cus_r7_permanent_swap", "status": "active", "metadata": {"app": "billcommons", "plan": "builder"}},
@@ -2340,6 +2344,8 @@ def test_r7_integrity_error_branch_still_cancels_deferred_incumbent(client, app_
 
     canceled: list[str] = []
     monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+    # R8: the row-None swap now consults live Stripe status first.
+    monkeypatch.setattr(stripe.Subscription, "retrieve", staticmethod(lambda sub_id: {"status": "active"}))
 
     from sqlalchemy import update as sa_update
     from sqlalchemy.exc import IntegrityError
@@ -2428,3 +2434,107 @@ def test_r7_cancel_access_no_subscriptions_left_respects_entitlement_watermark(c
     ).scalar_one()
     db.close()
     assert entitlement.expires_at is None
+
+
+def test_r8_row_none_swap_consults_live_stripe_status_before_canceling_incumbent(client, app_and_db, monkeypatch):
+    """R8: a stale/delayed active|trialing event for a subscription that has
+    never been persisted locally (`row is None`) must not cancel the
+    customer's live past_due incumbent when Stripe itself already reports
+    the newcomer as canceled -- the staleness check above is gated on
+    `row is not None` and never runs for this case."""
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r8-stale-newcomer@example.com", "cus_r8_stale_newcomer")
+    db = SessionLocal()
+    db.add(ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r8_incumbent", plan="builder", status="past_due"))
+    db.commit()
+    db.close()
+    canceled = []
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "retrieve",
+        staticmethod(lambda sub_id: {"status": "canceled"}),
+    )
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "customer.subscription.created",
+            {"id": "sub_r8_stale_newcomer", "customer": "cus_r8_stale_newcomer", "status": "active", "metadata": {"app": "billcommons", "plan": "builder"}},
+        ),
+    )
+    assert res.status_code == 200
+    assert res.json()["outcome"] == "processed"
+    assert canceled == []
+    assert _subscription_row(SessionLocal, "sub_r8_incumbent").status == "past_due"
+    assert _subscription_row(SessionLocal, "sub_r8_stale_newcomer") is None
+
+
+def test_r8_row_none_swap_proceeds_when_live_stripe_status_is_active(client, app_and_db, monkeypatch):
+    """R8 twin: when the live Stripe status confirms the newcomer really is
+    active|trialing, the row-None swap proceeds exactly as before R8."""
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r8-live-newcomer@example.com", "cus_r8_live_newcomer")
+    db = SessionLocal()
+    db.add(ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r8_incumbent2", plan="builder", status="past_due"))
+    db.commit()
+    db.close()
+    canceled = []
+    retrieved = []
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "retrieve",
+        staticmethod(lambda sub_id: retrieved.append(sub_id) or {"status": "active"}),
+    )
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "customer.subscription.created",
+            {"id": "sub_r8_live_newcomer", "customer": "cus_r8_live_newcomer", "status": "active", "metadata": {"app": "billcommons", "plan": "builder"}},
+        ),
+    )
+    assert res.status_code == 200
+    assert retrieved == ["sub_r8_live_newcomer"]
+    assert canceled == ["sub_r8_incumbent2"]
+    assert _subscription_row(SessionLocal, "sub_r8_incumbent2").status == "canceled"
+    assert _subscription_row(SessionLocal, "sub_r8_live_newcomer").status == "active"
+
+
+def test_r8_row_not_none_swap_never_consults_live_stripe_status(client, app_and_db, monkeypatch):
+    """R8: the live-status check is scoped to the row-None swap path only --
+    a resync/update of an already-locally-known subscription that still
+    triggers an incumbent swap must not call `_live_subscription_status`
+    at all."""
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r8-known-newcomer@example.com", "cus_r8_known_newcomer")
+    db = SessionLocal()
+    db.add_all(
+        [
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r8_incumbent3", plan="builder", status="past_due"),
+            # `incomplete` sits outside the partial unique index, so this
+            # already-known-but-not-yet-authoritative row can coexist with
+            # the past_due incumbent above -- exactly the "resync of an
+            # already-accepted subscription" case D2's comment describes.
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r8_known_newcomer", plan="builder", status="incomplete"),
+        ]
+    )
+    db.commit()
+    db.close()
+    canceled = []
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+
+    def _boom(sub_id):
+        raise AssertionError("_live_subscription_status must not be called when row is not None")
+
+    monkeypatch.setattr(billing, "_live_subscription_status", _boom)
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "customer.subscription.updated",
+            {"id": "sub_r8_known_newcomer", "customer": "cus_r8_known_newcomer", "status": "active", "metadata": {"app": "billcommons", "plan": "builder"}},
+        ),
+    )
+    assert res.status_code == 200
+    assert canceled == ["sub_r8_incumbent3"]
+    assert _subscription_row(SessionLocal, "sub_r8_incumbent3").status == "canceled"
+    assert _subscription_row(SessionLocal, "sub_r8_known_newcomer").status == "active"

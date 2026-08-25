@@ -971,6 +971,19 @@ def _ensure_provisioned_for_subscription(
     return _ProvisioningResult(True, False)
 
 
+def _live_subscription_status(sub_id: str) -> str | None:
+    """R8 (row-None swap guard) helper: current status of `sub_id` at Stripe,
+    or `None` if Stripe no longer knows about it. Only `InvalidRequestError`
+    (missing subscription) is swallowed; every other Stripe error propagates
+    so the webhook retries instead of silently trusting a possibly-transient
+    failure."""
+    _configure_stripe()
+    try:
+        return stripe.Subscription.retrieve(sub_id).get("status")
+    except stripe.InvalidRequestError:
+        return None
+
+
 def _apply_subscription_event(
     db: OrmSession,
     customer: ApiCustomer,
@@ -1046,6 +1059,26 @@ def _apply_subscription_event(
         and existing_other.status in ("past_due", "unpaid")
         and incoming_status in ("active", "trialing")
     )
+    # R8 (row-None swap guard): when this Stripe subscription id has never
+    # been seen locally (`row is None`), the staleness check above -- gated
+    # on `row is not None` -- never ran, so a delayed/out-of-order
+    # active|trialing event for a subscription that is ALREADY canceled at
+    # Stripe would otherwise sail straight into the incumbent swap below and
+    # cancel the customer's live past_due/unpaid subscription. Consult
+    # Stripe directly for this one row-None case before touching the
+    # incumbent; if it's no longer active/trialing there, leave the
+    # incumbent alone -- the newcomer's own terminal event (already
+    # delivered or still in flight) handles its own row.
+    if swap_needed and row is None:
+        live = _live_subscription_status(sub_id)
+        if live not in ("active", "trialing"):
+            logger.warning(
+                "ignoring stale swap-triggering event for subscription %s: live Stripe status is %r",
+                sub_id,
+                live,
+            )
+            return "processed"
+
     # R7 fix (finding #1): the incumbent-swap savepoint must stay open
     # across the newcomer's own write AND the deferred incumbent Stripe
     # cancel below -- a `_PermanentWebhookError` raised by that cancel call
