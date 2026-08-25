@@ -43,6 +43,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest import events
+from billcommons_ingest import host_auth as host_auth_mod
 from billcommons_ingest.url_resolvers import (
     MaDocumentUrl,
     is_ma_docket_id,
@@ -807,6 +808,7 @@ class FullTextFetcher:
         robots_cache: RobotsCache | None = None,
         rate_per_sec: float = DEFAULT_RATE_PER_SEC,
         aia_cache: AiaRepairCache | None = None,
+        host_auth: host_auth_mod.HostAuth | None = None,
     ) -> None:
         self.client = client or new_client(timeout=DEFAULT_TIMEOUT)
         self.rate_limiter = rate_limiter or RateLimiter(rate_per_sec=rate_per_sec, burst=1)
@@ -818,6 +820,18 @@ class FullTextFetcher:
         self.robots_cache = robots_cache or RobotsCache(
             client=self.client, client_for=self._client_for_origin
         )
+        self.host_auth = host_auth
+        self.last_fetch_robots_exempt = False
+
+    def _headers_for(self, url: str) -> dict[str, str]:
+        if self.host_auth is not None:
+            return self.host_auth.headers_for(url)
+        return host_auth_mod.headers_for(url)
+
+    def _robots_exempt(self, url: str) -> bool:
+        if self.host_auth is not None:
+            return self.host_auth.robots_exempt(url)
+        return host_auth_mod.robots_exempt(url)
 
     def _client_for_origin(self, origin: str) -> httpx.Client:
         return self._repaired_clients.get(urlparse(origin).netloc) or self.client
@@ -838,8 +852,15 @@ class FullTextFetcher:
         """
         netloc = parsed.netloc
         client = self._repaired_clients.get(netloc) or self.client
+        request_kwargs = {"follow_redirects": False}
+        # Configured auth headers are host-matched only, with no scheme
+        # check -- never attach them to a plain http:// URL (or an
+        # https->http downgrade redirect) for a configured host.
+        headers = self._headers_for(url) if parsed.scheme == "https" else {}
+        if headers:
+            request_kwargs["headers"] = headers
         try:
-            return client.get(url, follow_redirects=False)
+            return client.get(url, **request_kwargs)
         except httpx.HTTPError as exc:
             already_repaired = netloc in self._repaired_clients
             if already_repaired or parsed.scheme != "https" or not is_missing_issuer_error(exc):
@@ -854,11 +875,11 @@ class FullTextFetcher:
             # we can, re-read it before fetching anything else here.
             self.robots_cache.invalidate(f"{parsed.scheme}://{netloc}")
             print(f"fulltext: recovered missing TLS intermediate for {netloc}", flush=True)
-            if not self.robots_cache.can_fetch(url):
+            if not self._robots_exempt(url) and not self.robots_cache.can_fetch(url):
                 raise UnfetchableDocument(
                     f"robots.txt disallows fetching {url}", status=STATUS_ROBOTS_DISALLOWED
                 )
-            return repaired.get(url, follow_redirects=False)
+            return repaired.get(url, **request_kwargs)
 
     def fetch(self, url: str) -> httpx.Response:
         """Fetch `url`, following redirects HOP-BY-HOP (not via httpx's own
@@ -871,6 +892,7 @@ class FullTextFetcher:
         skip that second host's robots.txt or consume none of its rate-limit
         budget just because the first hop was cleared."""
         current_url = url
+        self.last_fetch_robots_exempt = False
         for _ in range(MAX_REDIRECT_HOPS + 1):
             parsed = urlparse(current_url)
             scheme = parsed.scheme
@@ -885,7 +907,14 @@ class FullTextFetcher:
                     status=STATUS_UNSUPPORTED_REDIRECT_SCHEME,
                 )
 
-            if not self.robots_cache.can_fetch(current_url):
+            exempt = self._robots_exempt(current_url)
+            # Reflect THIS hop's exemption status unconditionally (not just
+            # when exempt) -- otherwise an exempt hop earlier in the same
+            # redirect chain leaves the flag stuck True even after a later,
+            # non-exempt hop is the one that actually fails, mislabeling that
+            # failure's audit note as `robots=api_token_exempt`.
+            self.last_fetch_robots_exempt = exempt
+            if not exempt and not self.robots_cache.can_fetch(current_url):
                 raise UnfetchableDocument(
                     f"robots.txt disallows fetching {current_url}", status=STATUS_ROBOTS_DISALLOWED
                 )
@@ -990,7 +1019,7 @@ def process_fetch_text_job(
         # AND wrongly make it eligible for permanent dead-lettering (see
         # TERMINAL_STATUSES: too_many_redirects is deliberately NOT terminal).
         status = exc.status or STATUS_ROBOTS_DISALLOWED
-        _mark_status(document, status)
+        _mark_status(document, status, robots_exempt=fetcher.last_fetch_robots_exempt)
         db.flush()
         raise UnfetchableDocument(
             str(exc),
@@ -1010,7 +1039,7 @@ def process_fetch_text_job(
         # already follows that rule (see the UnfetchableDocument branch
         # above).
         status = getattr(exc, "status", None) or STATUS_FETCH_ERROR
-        _mark_status(document, status)
+        _mark_status(document, status, robots_exempt=fetcher.last_fetch_robots_exempt)
         db.flush()
         raise DocumentFetchError(
             f"fetch failed for {document.url}: {exc}",
@@ -1032,6 +1061,7 @@ def process_fetch_text_job(
         outcome=outcome,
         rawstore=rawstore,
         resolver=resolver_name,
+        robots_exempt=fetcher.last_fetch_robots_exempt,
     )
 
 
@@ -1047,6 +1077,7 @@ def persist_extraction_outcome(
     success_status: str | None = None,
     resolver: str | None = None,
     provenance: str | None = None,
+    robots_exempt: bool = False,
 ) -> FetchTextResult:
     """Persist one extracted document using the shared full-text success tail.
 
@@ -1088,7 +1119,13 @@ def persist_extraction_outcome(
     status = success_status if success_status and outcome.status == STATUS_OK else outcome.status
     if status in SUCCESS_STATUSES:
         document.fetch_attempts = 0
-    _mark_status(document, status, resolver=resolver, provenance=provenance)
+    _mark_status(
+        document,
+        status,
+        resolver=resolver,
+        provenance=provenance,
+        robots_exempt=robots_exempt,
+    )
     db.flush()
 
     # A bill going from "we have no text" to "text available" is the moment it
@@ -1120,6 +1157,7 @@ def _mark_status(
     *,
     resolver: str | None = None,
     provenance: str | None = None,
+    robots_exempt: bool = False,
     browser_attempted_at: str | None = None,
 ) -> None:
     """Record the fetch/extraction outcome. The schema has no dedicated
@@ -1130,12 +1168,17 @@ def _mark_status(
 
     `resolver` and browser `provenance`, if given, are appended only for a
     successful (STATUS_OK / STATUS_OK_BROWSER / STATUS_OK_PARTIAL_PDF)
-    outcome.  A browser retry timestamp is the sole terminal-status suffix:
-    `enqueue_fulltext_jobs` recognizes its permanently_failed form as
+    outcome. An authorized robots exemption is recorded as
+    `robots=api_token_exempt`, except for terminal statuses: terminal notes
+    must remain exact so the enqueue and coverage queries keep recognizing
+    them as terminal. A browser retry timestamp is the sole terminal-status
+    suffix: `enqueue_fulltext_jobs` recognizes its permanently_failed form as
     terminal, while browser-fetch uses it to defer re-selection for seven
     days.
     """
     note = f"fulltext_status={status}"
+    if robots_exempt and status not in TERMINAL_STATUSES:
+        note = f"{note} robots=api_token_exempt"
     if resolver and status in SUCCESS_STATUSES:
         note = f"{note} url_resolver={resolver}"
     if provenance and status in SUCCESS_STATUSES:

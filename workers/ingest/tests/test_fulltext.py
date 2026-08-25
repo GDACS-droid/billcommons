@@ -21,8 +21,9 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from pypdf import PdfWriter
-from sqlalchemy import text
+from sqlalchemy import select, text
 
+from billcommons_ingest import cli as cli_mod
 from billcommons_ingest import fulltext as fulltext_mod
 from billcommons_ingest.cli import (
     _fetch_text_document_id,
@@ -1878,6 +1879,226 @@ def test_reset_fetch_attempts_leaves_a_robots_disallowed_verdict_alone():
         after.close()
 
 
+def test_reset_fetch_attempts_requeues_robots_only_for_a_configured_exempt_host(monkeypatch):
+    configured_marker = f"https://configured-{uuid.uuid4().hex}.gov/bill.pdf"
+    unknown_marker = f"https://unknown-{uuid.uuid4().hex}.gov/bill.pdf"
+    configured_host = configured_marker.split("/")[2]
+    setup = get_session()
+    try:
+        configured = _make_bill_document(setup, url=configured_marker, fetch_attempts=2)
+        unknown = _make_bill_document(setup, url=unknown_marker, fetch_attempts=2)
+        configured.license_note = f"fulltext_status={STATUS_ROBOTS_DISALLOWED}"
+        unknown.license_note = f"fulltext_status={STATUS_ROBOTS_DISALLOWED}"
+        configured_id, unknown_id = configured.id, unknown.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    monkeypatch.setattr(
+        "billcommons_ingest.cli.host_auth_mod.robots_exempt_hosts", lambda: frozenset({configured_host})
+    )
+    assert cli_mod.host_auth_mod.robots_exempt_hosts() == frozenset({configured_host})
+    precheck = get_session()
+    try:
+        assert precheck.execute(
+            select(BillDocument.id).where(
+                BillDocument.id == configured_id,
+                BillDocument.license_note == f"fulltext_status={STATUS_ROBOTS_DISALLOWED}",
+                cli_mod._robots_exempt_url_filter(frozenset({configured_host})),
+            )
+        ).scalar_one() == configured_id
+    finally:
+        precheck.close()
+    assert cmd_reset_fetch_attempts(
+        _reset_args(url_like=configured_marker, status=STATUS_ROBOTS_DISALLOWED)
+    ) == 0
+    assert cmd_reset_fetch_attempts(
+        _reset_args(url_like=unknown_marker, status=STATUS_ROBOTS_DISALLOWED)
+    ) == 0
+
+    check = get_session()
+    try:
+        assert check.get(BillDocument, configured_id).license_note is None
+        assert check.get(BillDocument, unknown_id).license_note == f"fulltext_status={STATUS_ROBOTS_DISALLOWED}"
+    finally:
+        check.close()
+
+
+def test_reset_fetch_attempts_requeues_robots_for_a_bare_host_url_no_path_no_query(monkeypatch):
+    """R2 fixlist #2: the LIKE filter used to require a literal `/` or `:`
+    right after the host, so a stored URL with no path/query/port at all
+    (`https://{host}` exactly) matched none of the four patterns even though
+    `urlsplit(url).hostname` at runtime treats it as the exempt host -- such
+    a row would stay terminally robots_disallowed forever."""
+    configured_host = f"bare-host-{uuid.uuid4().hex}.gov"
+    marker = f"https://{configured_host}"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=2)
+        document.license_note = f"fulltext_status={STATUS_ROBOTS_DISALLOWED}"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    monkeypatch.setattr(
+        "billcommons_ingest.cli.host_auth_mod.robots_exempt_hosts", lambda: frozenset({configured_host})
+    )
+    assert cmd_reset_fetch_attempts(
+        _reset_args(url_like=marker, status=STATUS_ROBOTS_DISALLOWED)
+    ) == 0
+
+    check = get_session()
+    try:
+        doc = check.get(BillDocument, document_id)
+        assert doc.fetch_attempts == 0
+        assert doc.license_note is None
+    finally:
+        check.close()
+
+
+def test_reset_fetch_attempts_leaves_an_http_url_note_robots_disallowed(monkeypatch):
+    """R3 fixlist #4: the reset filter is https-only -- `host_auth.robots_exempt`
+    always returns False for a non-https URL, so an http:// stored row for an
+    otherwise-configured, exempt host must never satisfy the host-exemption
+    filter: its `robots_disallowed` license_note must survive the reset (it
+    would otherwise be cleared here and immediately re-marked
+    robots_disallowed on the next fetch, wasting a cycle)."""
+    configured_host = f"http-only-{uuid.uuid4().hex}.gov"
+    marker = f"http://{configured_host}/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=2)
+        document.license_note = f"fulltext_status={STATUS_ROBOTS_DISALLOWED}"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    monkeypatch.setattr(
+        "billcommons_ingest.cli.host_auth_mod.robots_exempt_hosts", lambda: frozenset({configured_host})
+    )
+    assert cmd_reset_fetch_attempts(
+        _reset_args(url_like=marker, status=STATUS_ROBOTS_DISALLOWED)
+    ) == 0
+
+    check = get_session()
+    try:
+        doc = check.get(BillDocument, document_id)
+        assert doc.license_note == f"fulltext_status={STATUS_ROBOTS_DISALLOWED}", (
+            "an http:// row must never be treated as exempt-host-authorized"
+        )
+    finally:
+        check.close()
+
+
+def test_robots_exempt_url_filter_emits_no_http_pattern():
+    """R3 fixlist #4: the reset filter's compiled SQL must contain no
+    `http://` LIKE pattern at all -- only https:// belongs in an https-only
+    exemption filter."""
+    compiled = str(
+        cli_mod._robots_exempt_url_filter(frozenset({"example.gov"})).compile(
+            compile_kwargs={"literal_binds": True}
+        )
+    )
+    assert "http://" not in compiled
+    assert "https://" in compiled
+
+
+def test_reset_fetch_attempts_url_like_filter_does_not_over_match_underscore_host(monkeypatch):
+    """R2 fixlist #2: `_` is a SQL LIKE wildcard; a configured host string
+    must be escaped before being embedded in the LIKE pattern, or a
+    differently-spelled host in a stored URL (any single char where the
+    configured host has `_`) would over-match."""
+    configured_host = f"under_score-{uuid.uuid4().hex}.gov"
+    lookalike_host = configured_host.replace("_", "X", 1)
+    marker = f"https://{lookalike_host}/bill.pdf"
+    setup = get_session()
+    try:
+        # fetch_attempts=0: this row's scope-eligibility for the reset
+        # depends ENTIRELY on the resettable_note_filter (robots status +
+        # host LIKE filter) under test -- not on the always-true
+        # `fetch_attempts > 0` branch of the reset's OR-scope, which would
+        # mask the host-filter bug being proven here.
+        document = _make_bill_document(setup, url=marker, fetch_attempts=0)
+        document.license_note = f"fulltext_status={STATUS_ROBOTS_DISALLOWED}"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    monkeypatch.setattr(
+        "billcommons_ingest.cli.host_auth_mod.robots_exempt_hosts", lambda: frozenset({configured_host})
+    )
+    assert cmd_reset_fetch_attempts(
+        _reset_args(document_id=[str(document_id)], status=STATUS_ROBOTS_DISALLOWED)
+    ) == 0
+
+    check = get_session()
+    try:
+        doc = check.get(BillDocument, document_id)
+        assert doc.fetch_attempts == 0, "a differently-spelled host must not over-match"
+        assert doc.license_note == f"fulltext_status={STATUS_ROBOTS_DISALLOWED}"
+    finally:
+        check.close()
+
+
+def test_reset_fetch_attempts_single_statement_closes_concurrent_note_race(monkeypatch):
+    """R2 fixlist #3: a row OUTSIDE the reset's scope when it starts (spent
+    counter == 0 with a non-resettable note) must never end up with a spent
+    counter that looks fresh (fetch_attempts == 1) AND a silently-erased
+    note, even if a concurrent worker session commits fetch_attempts=1 plus
+    a resettable note for that same row in the middle of the reset. Folding
+    both writes into one UPDATE closes the gap a two-statement reset left
+    open."""
+    from sqlalchemy.orm import Session as OrmSession
+    from sqlalchemy.sql.dml import Update
+
+    marker = f"https://reset-race-{uuid.uuid4().hex}.gov/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=0)
+        document.license_note = "manual_review"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    original_execute = OrmSession.execute
+    injected = {"done": False}
+
+    def racing_execute(self, statement, *args, **kwargs):
+        if (
+            not injected["done"]
+            and isinstance(statement, Update)
+            and statement.table.name == "bill_documents"
+        ):
+            injected["done"] = True
+            concurrent = get_session()
+            try:
+                row = concurrent.get(BillDocument, document_id)
+                row.fetch_attempts = 1
+                row.license_note = "fulltext_status=worker_error"
+                concurrent.commit()
+            finally:
+                concurrent.close()
+        return original_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(OrmSession, "execute", racing_execute)
+
+    assert cmd_reset_fetch_attempts(_reset_args(url_like=marker)) == 0
+
+    after = get_session()
+    try:
+        doc = after.get(BillDocument, document_id)
+        assert not (doc.fetch_attempts == 1 and doc.license_note is None), (
+            "the row must never end up with a spent counter that looks "
+            "fresh AND a silently-erased note"
+        )
+    finally:
+        after.close()
+
+
 def test_reset_fetch_attempts_dry_run_writes_nothing():
     marker = f"https://reset-dry-{uuid.uuid4().hex}.gov/bill.pdf"
     setup = get_session()
@@ -1934,6 +2155,136 @@ def test_reset_fetch_attempts_only_permanently_failed_branch_and_status_conflict
             ]
         )
     assert excinfo.value.code == 2
+
+
+def test_reset_fetch_attempts_note_clear_re_evaluates_the_predicate_at_write_time(monkeypatch):
+    """R1 fixlist #1: the note-clear step must be a single set-based UPDATE
+    that reuses `resettable_note_filter` in its own WHERE clause, not a
+    SELECT-then-`id IN (...)` pair -- the two-statement form re-checks
+    nothing at write time (a fresh note written between the SELECT and the
+    UPDATE gets silently clobbered) and materializes an unbounded id list in
+    Python (exceeding the bind-parameter cap at "hundreds of thousands of
+    rows" scale, per the command's own docstring)."""
+    from sqlalchemy import event
+
+    from billcommons_shared.db import get_engine
+
+    marker = f"https://reset-race-{uuid.uuid4().hex}.gov/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=2)
+        document.license_note = f"fulltext_status={STATUS_WORKER_ERROR}"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    statements: list[str] = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        assert cmd_reset_fetch_attempts(_reset_args(url_like=marker)) == 0
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    note_clear_updates = [
+        s for s in statements if "SET license_note" in s or "license_note=" in s.replace(" ", "")
+    ]
+    assert note_clear_updates, "expected exactly one note-clearing UPDATE"
+    for stmt in note_clear_updates:
+        # The predicate must be re-checked IN THIS statement's WHERE clause
+        # (license_note appears again outside the SET list) -- not a blind
+        # `id IN (...)` scoped by a value snapshotted in an earlier SELECT.
+        assert stmt.count("license_note") >= 2, stmt
+        assert "bill_documents.id IN" not in stmt.replace("\n", " "), stmt
+
+    # No separate id-snapshotting SELECT feeds this UPDATE: every SELECT this
+    # command issues is either the breakdown-by-note aggregate or (with
+    # --limit) an explicit id-capping query -- never a bare
+    # `SELECT bill_documents.id ... WHERE <resettable_note_filter>` whose
+    # result is later replayed into an `id IN (...)` bind list.
+    bare_id_selects = [
+        s
+        for s in statements
+        if s.strip().upper().startswith("SELECT")
+        and "license_note" in s
+        and "count(" not in s.lower()
+        and "GROUP BY" not in s.upper()
+    ]
+    assert bare_id_selects == [], bare_id_selects
+
+    after = get_session()
+    try:
+        doc = after.get(BillDocument, document_id)
+        assert doc.fetch_attempts == 0
+        assert doc.license_note is None
+    finally:
+        after.close()
+
+
+def test_reset_fetch_attempts_status_predicate_matches_exempt_suffixed_note(monkeypatch):
+    """R1 fixlist #2: `_mark_status` appends ` robots=api_token_exempt` to a
+    non-terminal status's note for a fetch that touched a configured exempt
+    host. `worker_error` is non-terminal AND one of the two
+    RESETTABLE_DEFAULT_STATUSES -- a worker_error on an exempt host must
+    still be reachable by the default `reset-fetch-attempts` reset."""
+    marker = f"https://reset-exempt-suffix-{uuid.uuid4().hex}.gov/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=2)
+        document.license_note = f"fulltext_status={STATUS_WORKER_ERROR} robots=api_token_exempt"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    assert cmd_reset_fetch_attempts(
+        _reset_args(url_like=marker, status=STATUS_WORKER_ERROR)
+    ) == 0
+
+    after = get_session()
+    try:
+        doc = after.get(BillDocument, document_id)
+        assert doc.fetch_attempts == 0
+        assert doc.license_note is None
+    finally:
+        after.close()
+
+
+def test_reset_fetch_attempts_host_filter_matches_uppercase_document_url(monkeypatch):
+    """R1 fixlist #4: the reset host filter must lowercase both sides -- the
+    runtime exemption check (`host_auth._hostname`) lowercases the parsed
+    hostname, so a stored URL with a different host case must still match or
+    it stays terminally robots_disallowed forever even though the worker
+    would fetch it fine."""
+    host = f"reset-case-{uuid.uuid4().hex}.gov"
+    marker = f"https://{host.upper()}/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=1)
+        document.license_note = f"fulltext_status={STATUS_ROBOTS_DISALLOWED}"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    monkeypatch.setattr(
+        "billcommons_ingest.cli.host_auth_mod.robots_exempt_hosts", lambda: frozenset({host})
+    )
+    assert cmd_reset_fetch_attempts(
+        _reset_args(url_like=marker, status=STATUS_ROBOTS_DISALLOWED)
+    ) == 0
+
+    after = get_session()
+    try:
+        doc = after.get(BillDocument, document_id)
+        assert doc.license_note is None
+    finally:
+        after.close()
 
 
 # ---------------------------------------------------------------------------
