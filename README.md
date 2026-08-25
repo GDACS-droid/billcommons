@@ -4,7 +4,11 @@ Bill Commons is a public, open-source legislative search platform covering the
 current session/biennium for all 50 U.S. states plus DC. It provides a web
 search UI, a REST API, an MCP (Model Context Protocol) server, and a public
 status/coverage page. Public infrastructure first: no paywall on ordinary
-search or reasonable API use.
+search or reasonable API use — anonymous callers get a generous daily cap
+(2,000 requests/day per IP, 5,000/day per /24 subnet); a free API key raises
+that further, and only high-volume/bulk use is paid. See
+[`/docs/bulk`](https://billcommons.org/docs/bulk) for API keys and
+full-corpus snapshots.
 
 See [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md)
 for the locked architecture and data model.

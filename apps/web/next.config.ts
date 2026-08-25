@@ -1,6 +1,30 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  async headers() {
+    return [
+      {
+        // B1 (2026-08-21 monetization spec): `/account*` pages carry a
+        // one-time key reveal and account/billing state gated on a
+        // session cookie -- never cache them, and never leak the path
+        // (which can carry a magic-link/reveal token in a query string
+        // upstream of a client redirect) via a Referer header to a
+        // third-party resource these pages might load.
+        source: "/account/:path*",
+        headers: [
+          { key: "Cache-Control", value: "no-store" },
+          { key: "Referrer-Policy", value: "no-referrer" },
+        ],
+      },
+      {
+        source: "/account",
+        headers: [
+          { key: "Cache-Control", value: "no-store" },
+          { key: "Referrer-Policy", value: "no-referrer" },
+        ],
+      },
+    ];
+  },
   async redirects() {
     return [
       {

@@ -61,6 +61,16 @@ export default function SiteFooter() {
                   MCP server
                 </Link>
               </li>
+              <li>
+                <Link className="transition-colors hover:text-blue-800" href="/docs/api-keys">
+                  API keys
+                </Link>
+              </li>
+              <li>
+                <Link className="transition-colors hover:text-blue-800" href="/docs/bulk">
+                  Bulk data
+                </Link>
+              </li>
             </ul>
           </div>
           <div>
@@ -89,6 +99,11 @@ export default function SiteFooter() {
               <li>
                 <Link className="transition-colors hover:text-blue-800" href="/feedback">
                   Feedback
+                </Link>
+              </li>
+              <li>
+                <Link className="transition-colors hover:text-blue-800" href="/terms">
+                  Terms
                 </Link>
               </li>
             </ul>

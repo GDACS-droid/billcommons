@@ -733,6 +733,17 @@ class WebhookSubscription(Base):
     # writes this column via raw `text()` SQL, gated behind `_challenge_
     # attempted_at_column_exists`'s probe -- see that function's own
     # docstring.
+    #
+    # Migration 0019 (monetization) adds a SECOND such column,
+    # `customer_id` (nullable FK -> api_customers, Codex R9: ownership
+    # attaches to the account, not to an API key) -- same reasoning, same
+    # fix: deliberately NOT mapped here. The live DB is migrated by the
+    # operator on their own schedule, and mapping it would put `customer_id`
+    # into every INSERT this ORM entity generates before that migration
+    # lands, breaking webhook subscription creation site-wide in the
+    # meantime. Phase 2 (which is the first code to ever populate this
+    # column) reads/writes it via raw `text()` SQL, the same way
+    # `challenge_attempted_at` is handled above.
 
     __table_args__ = (
         CheckConstraint("kind in ('topic','jurisdiction','bills')", name="ck_webhook_kind"),
@@ -878,3 +889,413 @@ class ToolInvocation(Base):
     error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     client_family: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# Monetization (2026-08-21 spec, migration 0019). No user system: identity is
+# an email; the account system is Stripe (Phase 2). Phase 1 (this branch)
+# only reads/writes ApiCustomer, ApiKey, ApiKeyUsage, ApiKeyUsageSubnet, and
+# AccountLoginToken -- the rest are created now so Phase 2/3 are additive.
+# ---------------------------------------------------------------------------
+
+
+class ApiCustomer(Base):
+    """One customer identity, keyed by (lowercased) email (see migration
+    0019, amendment A1: upsert key is `lower(email)`, so a Developer-key
+    holder who later buys Builder keeps one row).
+
+    `extra_requests_per_day` / `extra_heavy_per_day` / `override_expires_at`
+    are a manual founder support override (Codex R9) -- added to the plan
+    limit while `override_expires_at > now()` (amendment A12e). `suspended_at`
+    / `suspension_reason` are the operator kill switch: every keyed request
+    is refused 403 `account_suspended` while `suspended_at` is set (A12e).
+    Both folded onto this row rather than a separate table so the auth hot
+    path (`billcommons_api.api_keys.resolve_key`) stays one query.
+    """
+
+    __tablename__ = "api_customers"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    email: Mapped[str] = mapped_column(Text, nullable=False)
+    stripe_customer_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    extra_requests_per_day: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    extra_heavy_per_day: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    override_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    suspended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    suspension_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("email = lower(email)", name="ck_api_customers_email_lowercase"),
+        Index("uq_api_customers_email", "email", unique=True),
+    )
+
+
+class ApiKey(Base):
+    """One API key (see migration 0019).
+
+    `plan` is DENORMALIZED on purpose: the auth hot path must be one indexed
+    lookup, not a three-table join; the Stripe webhook (Phase 2) is its only
+    writer once billing exists. `key_prefix` (first 16 chars, unique,
+    display-safe) is the O(1) lookup column; `key_hash` (sha256 hex of the
+    full key) is compared with `hmac.compare_digest`, never `==`. The full
+    plaintext key is never stored except transiently, Fernet-encrypted, in
+    `reveal_ciphertext` between mint and reveal (B1) -- nulled (along with
+    `reveal_token_hash`/`reveal_expires_at`) the moment it is revealed or the
+    24h reveal window lapses.
+
+    `status` in `active`/`rotating`/`revoked`. Usable = `active` OR
+    (`rotating` AND `revoke_at > now()`); ceiling is 3 usable keys per
+    customer (2 active + 1 rotating) -- B3, supersedes the earlier "rotating
+    doesn't count" draft (A9).
+    """
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    customer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_customers.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'default'"))
+    key_prefix: Mapped[str] = mapped_column(Text, nullable=False)
+    key_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    environment: Mapped[str] = mapped_column(Text, nullable=False)
+    plan: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'developer'"))
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'active'"))
+    rotated_from: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    revoke_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reveal_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reveal_token_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reveal_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # E6/Gate A (migration 0021): which `api_subscriptions` row this key
+    # was minted FOR, if any (null for a Developer key minted at first
+    # login/via `POST /account/keys`, or for a key predating this column).
+    # `ON DELETE SET NULL` -- a key must never be destroyed by its
+    # subscription row disappearing. Lets `billing._ensure_provisioned_
+    # for_subscription` make "did we already mint a paid key for THIS
+    # subscription" idempotent per subscription rather than per customer.
+    subscription_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_subscriptions.id", ondelete="SET NULL"), nullable=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("environment in ('live','test')", name="ck_api_keys_environment"),
+        CheckConstraint(
+            "plan in ('developer','builder','scale','enterprise')", name="ck_api_keys_plan"
+        ),
+        CheckConstraint("status in ('active','rotating','revoked')", name="ck_api_keys_status"),
+        Index("uq_api_keys_key_prefix", "key_prefix", unique=True),
+        Index("uq_api_keys_key_hash", "key_hash", unique=True),
+        Index("ix_api_keys_customer_id", "customer_id"),
+        Index("ix_api_keys_status_plan", "status", "plan"),
+        Index("ix_api_keys_subscription_id", "subscription_id"),
+        Index(
+            "uq_api_keys_one_live_per_subscription",
+            "subscription_id",
+            unique=True,
+            postgresql_where=text("status IN ('active', 'rotating') AND subscription_id IS NOT NULL"),
+            sqlite_where=text("status IN ('active', 'rotating') AND subscription_id IS NOT NULL"),
+        ),
+    )
+
+
+class ApiSubscription(Base):
+    """One Stripe subscription's synced state (Phase 2; table exists now so
+    Phase 1's `api_keys.plan` denormalization has somewhere to read from
+    later without another migration).
+
+    `past_due_since` (A3) anchors the 7-day dunning window: 402 fires once
+    `status='past_due' AND now() - past_due_since > 7 days`, or `status in
+    ('canceled','unpaid')`. `last_event_created_at` (A4) makes every
+    subscription-event handler idempotent against Stripe delivering events
+    out of order: a handler applies an event only if `event.created >=` this
+    column. At most one non-canceled subscription per customer (B4) --
+    enforced by a partial unique index on `customer_id`.
+    """
+
+    __tablename__ = "api_subscriptions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    customer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_customers.id", ondelete="CASCADE"), nullable=False
+    )
+    stripe_subscription_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    plan: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    past_due_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_event_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("plan in ('builder','scale','enterprise')", name="ck_api_subscriptions_plan"),
+        Index("ix_api_subscriptions_customer_status", "customer_id", "status"),
+        Index(
+            "uq_api_subscriptions_one_active_per_customer",
+            "customer_id",
+            unique=True,
+            postgresql_where=text("status IN ('active', 'trialing', 'past_due', 'unpaid')"),
+            sqlite_where=text("status IN ('active', 'trialing', 'past_due', 'unpaid')"),
+        ),
+    )
+
+
+class ApiKeyUsage(Base):
+    """One (key, day) counter row -- the billable read/write path
+    (`billcommons_api.quota.QuotaMiddleware`). PK `(key_id, usage_date)` so
+    the post-response accounting statement (B6) is a single `INSERT ... ON
+    CONFLICT DO UPDATE` per keyed request: both `requests` and
+    `heavy_requests` move atomically in one statement.
+    """
+
+    __tablename__ = "api_key_usage"
+
+    key_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_keys.id", ondelete="CASCADE"), primary_key=True
+    )
+    usage_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    heavy_requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    mcp_calls: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    __table_args__ = (Index("ix_api_key_usage_usage_date", "usage_date"),)
+
+
+class ApiKeyUsageSubnet(Base):
+    """Key-sharing telemetry (amendment A6): one (key, day, subnet) counter,
+    upserted per keyed request alongside `ApiKeyUsage`. The admin usage
+    endpoint reads `count(distinct subnet)` to flag a key used from more
+    than ~20 distinct /24s in a day -- flag only, never auto-blocked.
+    """
+
+    __tablename__ = "api_key_usage_subnets"
+
+    key_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_keys.id", ondelete="CASCADE"), primary_key=True
+    )
+    usage_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    subnet: Mapped[str] = mapped_column(Text, primary_key=True)
+    requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    __table_args__ = (Index("ix_api_key_usage_subnets_usage_date", "usage_date"),)
+
+
+class ApiCustomerUsage(Base):
+    """Round-2 amendment C1: quota is enforced per CUSTOMER, not per key --
+    a customer with two active keys shares ONE daily budget across both,
+    so `QuotaMiddleware`'s pre-check `SELECT` and post-response upsert (B6)
+    target THIS table. `ApiKeyUsage` stays a per-key REPORTING breakdown
+    only (what the admin usage endpoint groups by), written in the same
+    transaction as this table's row. `X-Quota-*` response headers report
+    this table's counter, never `ApiKeyUsage`'s.
+    """
+
+    __tablename__ = "api_customer_usage"
+
+    customer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_customers.id", ondelete="CASCADE"), primary_key=True
+    )
+    usage_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    heavy_requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    __table_args__ = (Index("ix_api_customer_usage_usage_date", "usage_date"),)
+
+
+class StripeEvent(Base):
+    """Stripe webhook idempotency ledger (Phase 2; table exists now).
+
+    First statement on delivery is `INSERT ... ON CONFLICT (id) DO NOTHING
+    RETURNING id` -- no row back means already processed, return 200 at
+    once. `outcome='skipped_foreign_app'` records an event whose object
+    lacks `metadata.app == "billcommons"` -- this Stripe account also runs
+    the owner's other sub-businesses (R7's HIGH finding); every object we
+    create is tagged, and anything untagged is presumed foreign and ignored.
+    """
+
+    __tablename__ = "stripe_events"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Round-3 amendment D5: error CLASS only, never the raw message -- same
+    # convention as `WebhookSubscription.last_error` / `ToolInvocation.error_code`.
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome is null or outcome in "
+            "('processed','skipped_foreign_app','duplicate_subscription_canceled','permanent_error')",
+            name="ck_stripe_events_outcome",
+        ),
+        Index("ix_stripe_events_processed_at", "processed_at"),
+    )
+
+
+class AccountLoginToken(Base):
+    """One single-use, short-TTL token backing both magic-link login
+    (`purpose='login'`) and the post-checkout key-reveal flow
+    (`purpose='reveal'`, B1) -- both are "prove you own this email, once,
+    briefly", so one table, one shape. `token_hash` is sha256 of the token
+    sent by email; the plaintext token itself is never stored. 15-minute
+    TTL, single use (`used_at` set on consumption).
+    """
+
+    __tablename__ = "account_login_tokens"
+
+    token_hash: Mapped[str] = mapped_column(Text, primary_key=True)
+    email: Mapped[str] = mapped_column(Text, nullable=False)
+    purpose: Mapped[str] = mapped_column(Text, nullable=False)
+    stripe_session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    request_ip: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("purpose in ('login','reveal')", name="ck_account_login_tokens_purpose"),
+        Index("ix_account_login_tokens_expires_at", "expires_at"),
+        Index("ix_account_login_tokens_email", "email"),
+    )
+
+
+class SnapshotArtifact(Base):
+    """One built snapshot file (Phase 3; table exists now, unused until the
+    nightly builder ships). Parquet per table + manifest; `object_key` is
+    the R2 key (`v1/{YYYY-MM-DD}/{scope}/...`)."""
+
+    __tablename__ = "snapshot_artifacts"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    jurisdiction: Mapped[str | None] = mapped_column(Text, nullable=True)
+    built_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    object_key: Mapped[str] = mapped_column(Text, nullable=False)
+    bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    row_counts: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    format: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'parquet'"))
+
+    __table_args__ = (
+        CheckConstraint("scope in ('full','jurisdiction')", name="ck_snapshot_artifacts_scope"),
+        Index("uq_snapshot_artifacts_object_key", "object_key", unique=True),
+        Index(
+            "ix_snapshot_artifacts_scope_jurisdiction_built_at",
+            "scope",
+            "jurisdiction",
+            text("built_at DESC"),
+        ),
+    )
+
+
+class SnapshotEntitlement(Base):
+    """One customer's right to a snapshot (Phase 2/3; table exists now,
+    unused until checkout/download endpoints ship).
+
+    `delivered_at` (B5, supersedes A7's originally-proposed `fulfilled_at`
+    name -- same column, same rule) is set by the manual runbook once the
+    7-day R2 link is emailed; `charge.refunded` for a one-time snapshot
+    revokes the entitlement iff `delivered_at IS NULL`. `stripe_payment_
+    intent_id` (A7) is how a `charge.refunded` event (which carries a
+    charge, not a checkout session) finds this row: charge -> payment_intent
+    -> this column.
+    """
+
+    __tablename__ = "snapshot_entitlements"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    customer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_customers.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    jurisdiction: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    stripe_checkout_session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    stripe_payment_intent_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("kind in ('subscription','one_time')", name="ck_snapshot_entitlements_kind"),
+        Index("ix_snapshot_entitlements_customer_id", "customer_id"),
+        # 2026-08-21 fix-pass item 22: this partial unique index already
+        # exists in production (migration 0019's raw
+        # `uq_snapshot_entitlements_payment_intent`) but, like every other
+        # Stripe-id partial index in this file, was deliberately never
+        # mapped here -- mapped now (same name, same predicate) SOLELY so
+        # `billing._handle_snapshot_payment`'s `ON CONFLICT (
+        # stripe_payment_intent_id) WHERE ...` insert has a matching index
+        # to target under BOTH dialects (`billcommons_api.tests.
+        # _monetization_sqlite`'s SQLite harness only ever creates indexes
+        # declared here via `Base.metadata.create_all`, never migration
+        # 0019's raw SQL). Alembic never autogenerates from this file
+        # (every migration here is hand-written), so mapping this does not
+        # emit or require a new migration.
+        Index(
+            "uq_snapshot_entitlements_payment_intent",
+            "stripe_payment_intent_id",
+            unique=True,
+            postgresql_where=text("stripe_payment_intent_id IS NOT NULL"),
+            sqlite_where=text("stripe_payment_intent_id IS NOT NULL"),
+        ),
+    )
+
+
+class SnapshotDownload(Base):
+    """One snapshot download (Phase 3; table exists now, unused until the
+    download endpoint ships). Cap: 10 downloads/customer/day."""
+
+    __tablename__ = "snapshot_downloads"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    customer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_customers.id", ondelete="CASCADE"), nullable=False
+    )
+    artifact_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("snapshot_artifacts.id", ondelete="CASCADE"), nullable=False
+    )
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    ip: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        Index("ix_snapshot_downloads_customer_requested_at", "customer_id", "requested_at"),
+    )

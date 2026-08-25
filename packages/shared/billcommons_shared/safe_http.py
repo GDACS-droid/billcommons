@@ -295,15 +295,41 @@ def admit_url(url: str, *, port: int = DEFAULT_PORT) -> _AdmittedUrl:
 
 
 def _embedded_ipv4(addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
-    """The IPv4 address embedded in an IPv4-mapped, 6to4, or Teredo IPv6
-    address, or None if `addr` carries none of those. Checked independently
-    of `addr`'s own is_global result -- see module docstring."""
+    """The IPv4 address embedded in an IPv4-mapped, 6to4, Teredo, or NAT64
+    IPv6 address, or None if `addr` carries none of those. Checked
+    independently of `addr`'s own is_global result -- see module docstring.
+
+    Verify round d1357cd, finding #4: NAT64 (RFC 6052) was NOT covered here
+    -- `_is_publicly_routable` (below) still rejects every NAT64 address
+    outright via its own `_NAT64_NETWORKS` membership check, run BEFORE
+    this function is ever called, so that caller's behavior is unchanged
+    (a NAT64 address never reaches this function's NAT64 branch through
+    that path). This is added for callers that need the embedded v4 ITSELF
+    -- e.g. `billcommons_api.rate_limit.subnet_bucket`, which buckets a
+    caller on its embedded v4's /24 rather than a raw IPv6 /48 -- and for
+    this function to be a complete, correct utility on its own rather than
+    one with a silent gap for exactly the address class this module's own
+    module docstring calls out as needing special handling.
+    """
     if addr.ipv4_mapped is not None:
         return addr.ipv4_mapped
     if addr.sixtofour is not None:
         return addr.sixtofour
     if addr.teredo is not None:
         return addr.teredo[1]  # (server_ipv4, client_ipv4)
+    packed = int(addr)
+    # NAT64 Well-Known Prefix (RFC 6052 section 2.1), 64:ff9b::/96: the
+    # embedded v4 is exactly the low 32 bits, no reserved byte to skip.
+    if addr in _NAT64_NETWORKS[0]:
+        return ipaddress.IPv4Address(packed & 0xFFFFFFFF)
+    # NAT64 Local-Use prefix (RFC 6052 section 2.2, PL=48 row), 64:ff9b:1::/48:
+    # v4 bits 0-15 occupy bits 48-63 (immediately after the /48 prefix), an
+    # 8-bit reserved 'u' byte (bits 64-71, must be 0) is skipped, then v4
+    # bits 16-31 occupy bits 72-87; the remaining suffix bits are reserved.
+    if addr in _NAT64_NETWORKS[1]:
+        v4_hi = (packed >> 64) & 0xFFFF
+        v4_lo = (packed >> 40) & 0xFFFF
+        return ipaddress.IPv4Address((v4_hi << 16) | v4_lo)
     return None
 
 
