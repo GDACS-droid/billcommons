@@ -149,6 +149,8 @@ def test_ma_docket_from_url_is_anchored_to_the_official_ma_hosts():
     # on its own direct-fetch path rather than being resolved through MA's API.
     assert ma_docket_from_url("https://archive.example/Bills/194/H100.pdf") is None
     assert ma_docket_from_url("https://www.malegislature.gov/Bills/194/H100.pdf") is not None
+    assert ma_docket_from_url("https://malegislature.gov:443/Bills/194/HD177.pdf") is not None
+    assert ma_docket_from_url("https://user@www.malegislature.gov/Bills/194/HD177.pdf") is not None
 
 
 def test_is_ma_docket_id_distinguishes_docket_from_bill_shape():

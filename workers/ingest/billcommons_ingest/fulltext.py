@@ -135,8 +135,10 @@ STATUS_MA_DOCKET_NO_BILL_NUMBER = "ma_docket_no_bill_number"
 STATUS_WORKER_ERROR = "worker_error"
 
 # A docket that has not yet received a bill number is intentionally retried
-# on later sweeps, but is not a failed fetch and therefore must never consume
-# its retry budget while that upstream assignment is pending.
+# on later sweeps, but is not a failed fetch and therefore does not consume
+# its retry budget while that upstream assignment is pending. The worker
+# starts charging it after this grace period; see record_job_failure.
+MA_DOCKET_NO_BILL_NUMBER_GRACE_DAYS = 180
 NO_FETCH_ATTEMPT_CHARGE_STATUSES = frozenset({STATUS_MA_DOCKET_NO_BILL_NUMBER})
 
 # Statuses that will NEVER change on a retry -- the document's URL/robots.txt/
@@ -495,7 +497,7 @@ def _is_ma_document_api_url(url: str) -> bool:
     """
     parsed = urlparse(url)
     return (
-        parsed.netloc.lower() in {"malegislature.gov", "www.malegislature.gov"}
+        parsed.hostname in {"malegislature.gov", "www.malegislature.gov"}
         and "/api/" in parsed.path
         and "/Documents/" in parsed.path
     )
@@ -908,14 +910,16 @@ def process_fetch_text_job(
         if ma_url is not None:
             try:
                 response, fetched_url, resolver_name, outcome = _resolve_ma_document(fetcher, ma_url)
-            except (httpx.HTTPError, DocumentFetchError):
+            except (httpx.HTTPError, MaApiLookupError) as exc:
                 if is_ma_docket_id(ma_url.doc_id):
                     raise
                 # A bill-shaped URL already identifies a real bill, so an
                 # unavailable MA API must not prevent a working stored PDF
                 # from being fetched directly. Docket-shaped URLs remain
                 # API-only because their stored page is not authoritative bill text.
-                response, fetched_url, outcome = _fetch_best_candidate(fetcher, [document.url])
+                response, fetched_url, outcome = _fetch_best_candidate(
+                    fetcher, [document.url], initial_exc=exc
+                )
                 resolver_name = None
         else:
             candidate_urls = resolve_fetch_url(jurisdiction_code, document.url, bill_identifier)
@@ -1064,7 +1068,11 @@ def _jurisdiction_and_identifier(db: OrmSession, document: BillDocument) -> tupl
 
 
 def _fetch_best_candidate(
-    fetcher: "FullTextFetcher", candidates: list[str]
+    fetcher: "FullTextFetcher",
+    candidates: list[str],
+    *,
+    initial_exc: httpx.HTTPError | DocumentFetchError | None = None,
+    original_url: str | None = None,
 ) -> tuple[httpx.Response, str, "ExtractionOutcome"]:
     """Try each candidate URL in order (see `url_resolvers.resolve_fetch_url`)
     -- the first one that fetches AND yields non-empty extracted text wins.
@@ -1094,29 +1102,54 @@ def _fetch_best_candidate(
     as before -- this function never silently swallows a failure into a
     result that looks like success.
     """
-    last_exc: BaseException | None = None
+    original_url = original_url or candidates[0]
+    last_exc: tuple[str | None, BaseException] | None = (
+        (None, initial_exc) if initial_exc is not None else None
+    )
+    retryable_exc: tuple[str | None, BaseException] | None = last_exc
+    terminal_exceptions: list[tuple[str, UnfetchableDocument]] = []
     last_empty: tuple[httpx.Response, str, "ExtractionOutcome"] | None = None
     for url in candidates:
         try:
             response = fetcher.fetch(url)
         except (httpx.HTTPError, UnfetchableDocument) as exc:
-            last_exc = exc
+            last_exc = (url, exc)
+            if isinstance(exc, httpx.HTTPError):
+                retryable_exc = last_exc
+            else:
+                terminal_exceptions.append((url, exc))
             continue
         try:
             content_type = sniff_content_type(response.headers.get("content-type"), url, response.content)
             outcome = extract_document_text(content_type, response.content)
         except Exception as exc:  # noqa: BLE001 - try the next candidate; classified below if none work
-            last_exc = exc
+            last_exc = (url, exc)
+            retryable_exc = last_exc
             continue
         if outcome.extracted_text and outcome.extracted_text.strip():
             return response, url, outcome
         last_empty = (response, url, outcome)
-    if last_exc is not None:
-        if isinstance(last_exc, (httpx.HTTPError, UnfetchableDocument)):
-            raise last_exc
+    if retryable_exc is not None:
+        _error_url, exc = retryable_exc
+        if isinstance(exc, (httpx.HTTPError, DocumentFetchError)):
+            raise exc
         # Failing candidates' bytes are deliberately not archived; only the
         # winning candidate's raw document is retained below.
-        raise DocumentFetchError(f"text extraction failed for {url}: {last_exc}", status=STATUS_FETCH_ERROR) from last_exc
+        raise DocumentFetchError(
+            f"text extraction failed for {_error_url}: {exc}", status=STATUS_FETCH_ERROR
+        ) from exc
+    if terminal_exceptions:
+        # A terminal verdict from a speculative rewrite must not turn an
+        # original URL's real 200 response into a charged failure. The
+        # original URL defaults to candidate #1; T2-2's original-error case
+        # still reaches the retryable branch above.
+        if (
+            last_empty is not None
+            and last_empty[1] == original_url
+            and all(url != original_url for url, _exc in terminal_exceptions)
+        ):
+            return last_empty
+        raise terminal_exceptions[-1][1]
     assert last_empty is not None  # candidates is never empty (original url always present)
     return last_empty
 
@@ -1259,6 +1292,14 @@ def _resolve_ma_document(
     )
 
 
+class MaApiLookupError(DocumentFetchError):
+    """A retryable DocumentFetchError produced while querying MA's API.
+
+    Bill-shaped stored URLs may safely fall back to direct fetching after
+    these failures; errors from the resolved bill page must not do so.
+    """
+
+
 def _resolve_ma_bill(
     fetcher: "FullTextFetcher",
     court: str,
@@ -1269,11 +1310,14 @@ def _resolve_ma_bill(
     path_suffix: str,
 ) -> tuple[httpx.Response, str, str | None, "ExtractionOutcome"]:
     bill_url = ma_api_url(court, bill_number)
-    bill_response = fetcher.fetch(bill_url)
-    bill_data = _parse_ma_document(bill_response, bill_url)
-    _assert_ma_field(bill_data, "BillNumber", bill_number, bill_url)
-    if expected_docket is not None:
-        _assert_ma_field(bill_data, "DocketNumber", expected_docket, bill_url)
+    try:
+        bill_response = fetcher.fetch(bill_url)
+        bill_data = _parse_ma_document(bill_response, bill_url)
+        _assert_ma_field(bill_data, "BillNumber", bill_number, bill_url)
+        if expected_docket is not None:
+            _assert_ma_field(bill_data, "DocketNumber", expected_docket, bill_url)
+    except DocumentFetchError as exc:
+        raise MaApiLookupError(str(exc), status=exc.status) from exc
 
     bill_text = _clean_ma_document_text(bill_data)
     if bill_text is not None:

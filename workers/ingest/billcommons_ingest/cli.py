@@ -1160,7 +1160,12 @@ def record_job_failure(
                 if (
                     count_attempt
                     and status not in fulltext_mod.TERMINAL_STATUSES
-                    and status not in fulltext_mod.NO_FETCH_ATTEMPT_CHARGE_STATUSES
+                    and (
+                        status not in fulltext_mod.NO_FETCH_ATTEMPT_CHARGE_STATUSES
+                        or document.created_at
+                        <= datetime.now(timezone.utc)
+                        - timedelta(days=fulltext_mod.MA_DOCKET_NO_BILL_NUMBER_GRACE_DAYS)
+                    )
                 ):
                     document.fetch_attempts = (document.fetch_attempts or 0) + 1
                     if document.fetch_attempts >= fulltext_mod.MAX_FETCH_ATTEMPTS:

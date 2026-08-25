@@ -15,7 +15,7 @@ from __future__ import annotations
 import io
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -1586,9 +1586,8 @@ def test_document_failure_survives_a_purged_job_row(unique_kind):
         check.close()
 
 
-def test_ma_docket_without_bill_number_never_spends_fetch_attempts(unique_kind):
-    """T2-6: repeated sweeps can observe the pending docket indefinitely
-    without converting its non-terminal state into permanently_failed."""
+def test_recent_ma_docket_without_bill_number_does_not_spend_fetch_attempts(unique_kind):
+    """T2-6: recent pending dockets stay free while MA assigns a bill number."""
     kind = unique_kind()
     setup = get_session()
     try:
@@ -1619,6 +1618,51 @@ def test_ma_docket_without_bill_number_never_spends_fetch_attempts(unique_kind):
             assert document.fetch_attempts == 0
             assert document.license_note == f"fulltext_status={STATUS_MA_DOCKET_NO_BILL_NUMBER}"
             assert document.license_note != f"fulltext_status={STATUS_PERMANENTLY_FAILED}"
+        finally:
+            check.close()
+    finally:
+        cleanup = get_session()
+        try:
+            job = cleanup.get(IngestJob, job_id)
+            if job is not None:
+                cleanup.delete(job)
+                cleanup.commit()
+        finally:
+            cleanup.close()
+
+
+def test_old_ma_docket_without_bill_number_starts_spending_fetch_attempts(unique_kind):
+    """T3-5: the no-charge retry exemption expires after 180 days."""
+    kind = unique_kind()
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url="https://malegislature.gov/Bills/194/HD177.pdf")
+        document.created_at = datetime.now(timezone.utc) - timedelta(days=181)
+        document_id = document.id
+        job = enqueue(setup, kind, {"document_id": str(document_id)})
+        job_id = job.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    try:
+        for _ in range(MAX_FETCH_ATTEMPTS):
+            record_job_failure(
+                job_id,
+                IngestJob,
+                claimed_attempts=1,
+                error="MA docket has not yet been assigned a bill number",
+                document_id=str(document_id),
+                document_status=STATUS_MA_DOCKET_NO_BILL_NUMBER,
+                count_attempt=True,
+                session_factory=get_session,
+            )
+
+        check = get_session()
+        try:
+            document = check.get(BillDocument, document_id)
+            assert document.fetch_attempts == MAX_FETCH_ATTEMPTS
+            assert document.license_note == f"fulltext_status={STATUS_PERMANENTLY_FAILED}"
         finally:
             check.close()
     finally:
@@ -1986,6 +2030,29 @@ def test_fetch_best_candidate_prefers_an_error_over_a_later_empty_result():
         )
 
 
+@pytest.mark.parametrize(
+    "candidates",
+    [
+        ["https://malegislature.gov/original.pdf", "not-a-url"],
+        ["not-a-url", "https://malegislature.gov/original.pdf"],
+    ],
+)
+def test_fetch_best_candidate_keeps_original_empty_over_terminal_alternate(candidates):
+    """T3-2: a speculative terminal rewrite cannot defeat a real original 200."""
+    original_url = "https://malegislature.gov/original.pdf"
+    routes = {
+        **_ma_robots_allow_all(),
+        original_url: httpx.Response(200, headers={"content-type": "text/plain"}, content=b""),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    _response, url, outcome = _fetch_best_candidate(fetcher, candidates, original_url=original_url)
+
+    assert url == original_url
+    assert not outcome.extracted_text
+
+
 def test_fetch_best_candidate_raises_the_most_informative_error_once_all_fail():
     routes = {
         **_ma_robots_allow_all(),
@@ -1997,6 +2064,30 @@ def test_fetch_best_candidate_raises_the_most_informative_error_once_all_fail():
 
     with pytest.raises(httpx.HTTPError):
         _fetch_best_candidate(fetcher, ["https://malegislature.gov/a.pdf", "https://malegislature.gov/b.pdf"])
+
+
+def test_fetch_best_candidate_extraction_error_names_the_failing_url(monkeypatch):
+    """T3-3: an earlier extraction error must not name the later empty URL."""
+    failed_url = "https://malegislature.gov/failed.pdf"
+    empty_url = "https://malegislature.gov/empty.pdf"
+
+    def _boom(_content_type, raw):
+        if raw == b"boom":
+            raise TypeError("boom")
+        return fulltext_mod.ExtractionOutcome(STATUS_FETCH_ERROR, None, "checksum")
+
+    monkeypatch.setattr(fulltext_mod, "extract_document_text", _boom)
+    routes = {
+        **_ma_robots_allow_all(),
+        failed_url: httpx.Response(200, headers={"content-type": "text/plain"}, content=b"boom"),
+        empty_url: httpx.Response(200, headers={"content-type": "text/plain"}, content=b"empty"),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    with pytest.raises(DocumentFetchError, match=failed_url) as excinfo:
+        _fetch_best_candidate(fetcher, [failed_url, empty_url])
+    assert empty_url not in str(excinfo.value)
 
 
 def test_fetch_best_candidate_wraps_an_all_candidates_extraction_crash_as_document_fetch_error(monkeypatch):
@@ -2236,14 +2327,13 @@ def test_process_fetch_text_job_ma_docket_no_bill_number_is_retryable_not_termin
     assert STATUS_MA_DOCKET_NO_BILL_NUMBER not in TERMINAL_STATUSES
 
 
-def test_ma_bill_url_falls_back_to_its_stored_pdf_when_the_api_fails(db_session, rawstore, monkeypatch):
-    """T2-5: bill-shaped URLs are safe to fetch directly; an unavailable MA
-    API cannot make an otherwise healthy stored PDF fail."""
+def test_ma_bill_url_falls_back_to_its_stored_pdf_when_the_api_5xxs(db_session, rawstore, monkeypatch):
+    """T3-1: a retryable API failure preserves the direct-URL fallback."""
     monkeypatch.setattr(fulltext_mod, "_jurisdiction_and_identifier", lambda db, document: ("ma", "H 177"))
     stored_url = "https://malegislature.gov/Bills/194/H177.pdf"
     routes = {
         **_ma_robots_allow_all(),
-        "https://malegislature.gov/api/GeneralCourts/194/Documents/H177": httpx.Response(400),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/H177": httpx.Response(500),
         stored_url: httpx.Response(
             200, headers={"content-type": "text/plain"}, content=b"official bill text from stored PDF"
         ),
@@ -2258,3 +2348,56 @@ def test_ma_bill_url_falls_back_to_its_stored_pdf_when_the_api_fails(db_session,
     db_session.refresh(document)
     assert document.extracted_text == "official bill text from stored PDF"
     assert document.fetch_attempts == 0
+
+
+def test_ma_bill_api_5xx_and_empty_stored_url_preserves_existing_text(db_session, rawstore, monkeypatch):
+    """T3-1: an empty fallback must re-raise the charged API error."""
+    monkeypatch.setattr(fulltext_mod, "_jurisdiction_and_identifier", lambda db, document: ("ma", "H 177"))
+    stored_url = "https://malegislature.gov/Bills/194/H177.pdf"
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/H177": httpx.Response(500),
+        stored_url: httpx.Response(200, headers={"content-type": "text/plain"}, content=b""),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+    document = _make_bill_document(db_session, url=stored_url)
+    document.extracted_text = "previously extracted official text"
+
+    with pytest.raises(DocumentFetchError) as excinfo:
+        process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert excinfo.value.status == STATUS_FETCH_ERROR
+    db_session.refresh(document)
+    assert document.license_note == f"fulltext_status={STATUS_FETCH_ERROR}"
+    assert document.extracted_text == "previously extracted official text"
+
+
+def test_ma_bill_resolved_page_empty_is_not_fetched_a_second_time(db_session, rawstore, monkeypatch):
+    """T3-1: page no-text is final for this attempt, not an API fallback."""
+    monkeypatch.setattr(fulltext_mod, "_jurisdiction_and_identifier", lambda db, document: ("ma", "H 177"))
+    stored_url = "https://malegislature.gov/Bills/194/H177.pdf"
+    requests: list[str] = []
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/H177": _json_response(
+            {"BillNumber": "H177", "DocumentText": ""}
+        ),
+        stored_url: httpx.Response(200, headers={"content-type": "text/plain"}, content=b""),
+    }
+
+    def handler(request):
+        url = str(request.url)
+        requests.append(url)
+        route = routes[url]
+        return httpx.Response(route.status_code, headers=route.headers, content=route.content, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+    document = _make_bill_document(db_session, url=stored_url)
+
+    with pytest.raises(DocumentFetchError) as excinfo:
+        process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert excinfo.value.status == STATUS_FETCH_ERROR
+    assert requests.count(stored_url) == 1

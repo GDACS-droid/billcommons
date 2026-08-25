@@ -100,7 +100,7 @@ def ma_docket_from_url(source_url: str) -> MaDocumentUrl | None:
     fetch pipeline can resolve the AUTHORITATIVE bill number via the JSON
     document API instead of guessing one from the id's shape. `None` for
     any URL that doesn't match (nothing MA-specific to do for it)."""
-    if urlparse(source_url).netloc.lower() not in _MA_HOSTS:
+    if urlparse(source_url).hostname not in _MA_HOSTS:
         return None
     match = _MA_BILLS_PATH_RE.match(source_url)
     if not match:
