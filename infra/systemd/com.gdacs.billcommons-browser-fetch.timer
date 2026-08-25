@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Bill Commons attended-browser fetch every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/30:00
+Persistent=true
+Unit=com.gdacs.billcommons-browser-fetch.service
+
+[Install]
+WantedBy=timers.target

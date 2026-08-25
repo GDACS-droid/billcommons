@@ -143,6 +143,49 @@ def test_periodic_recompute_advances_metadata_searchable_to_full_text_searchable
     assert coverage.status == "FULL_TEXT_SEARCHABLE"
 
 
+def test_coverage_does_not_count_stamped_permanently_failed_as_available(db_session):
+    """R3-1: a `permanently_failed` row stamped by browser-fetch's
+    `_charge_fetch_error` carries a trailing `browser_attempted_at=...`
+    suffix. The old exact-match `_TERMINAL_LICENSE_NOTES.notin_()` check
+    didn't recognize the decorated form as terminal, so it counted as
+    "available" in `full_text_available_count`, inflating the denominator
+    and silently dropping the coverage score after any browser-fetch pass
+    touched dead-lettered rows."""
+    jurisdiction, session_row = _make_jurisdiction_with_session(db_session)
+    coverage = JurisdictionCoverage(
+        jurisdiction_id=jurisdiction.id, session_id=session_row.id, status="METADATA_SEARCHABLE"
+    )
+    db_session.add(coverage)
+
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 1",
+        identifier_norm="HB 1",
+        title="Bill 1",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    version = BillVersion(bill_id=bill.id)
+    db_session.add(version)
+    db_session.flush()
+
+    document = BillDocument(
+        bill_version_id=version.id,
+        url="https://capitol.tn.gov/bills/dead.pdf",
+        license_note="fulltext_status=permanently_failed browser_attempted_at=2026-08-20T00:00:00+00:00",
+    )
+    db_session.add(document)
+    db_session.flush()
+
+    recompute_all_coverage(db_session, jurisdiction_ids=[jurisdiction.id])
+    db_session.flush()
+    db_session.refresh(coverage)
+
+    assert coverage.full_text_available_count == 0
+
+
 def test_periodic_recompute_does_not_touch_green_or_degraded_rows(db_session):
     """Business intent: recompute is a cheap, count-based pass that runs
     every 20 minutes unattended -- it must never silently demote a row a

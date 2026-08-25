@@ -86,6 +86,11 @@ SCANNED_PDF_MIN_CHARS = 100
 # machine-readable tag (schema has no dedicated fetch-status column; see
 # `_set_status` below for the encoding convention).
 STATUS_OK = "ok"
+# A document whose text was fetched through Alberto's attended browser over
+# CDP.  It is a successful text outcome, distinct from STATUS_OK so browser
+# assistance remains auditable and the normal, robots-aware fetch worker can
+# never produce it.
+STATUS_OK_BROWSER = "ok_browser"
 # Text was extracted, but one or more PDF pages crashed pypdf (malformed page
 # internals) and contributed nothing. The salvaged text is real and searchable,
 # but consumers must not treat it as the complete document -- a diff against a
@@ -155,6 +160,9 @@ NO_FETCH_ATTEMPT_CHARGE_STATUSES = frozenset({STATUS_MA_DOCKET_NO_BILL_NUMBER})
 # (which IS terminal) instead of retrying forever.
 TERMINAL_STATUSES = frozenset(
     {
+        # Browser-fetched documents must never be handed back to the normal
+        # worker merely because a legacy row has no extracted_text yet.
+        STATUS_OK_BROWSER,
         STATUS_ROBOTS_DISALLOWED,
         STATUS_EMPTY_URL,
         STATUS_SCANNED_PDF_NO_TEXT,
@@ -165,6 +173,32 @@ TERMINAL_STATUSES = frozenset(
         STATUS_NO_DOCUMENT_TEXT,
     }
 )
+
+# Every status in this family represents a successful text acquisition and
+# therefore clears the bounded retry budget.  Keep this centralized so a new
+# successful fetch path cannot accidentally leave stale charged attempts.
+SUCCESS_STATUSES = frozenset({STATUS_OK, STATUS_OK_BROWSER, STATUS_OK_PARTIAL_PDF})
+
+
+def license_note_matches_status(column, statuses):
+    """SQLAlchemy predicate: true when `column` (a `bill_documents.license_note`)
+    encodes `fulltext_status=<s>` for any `s` in `statuses`.
+
+    `_mark_status` appends decoration for some outcomes (` url_resolver=...`,
+    ` via=...`, ` browser_attempted_at=...`), so an exact string/IN match
+    alone misses every decorated row -- e.g. a browser success is stored as
+    `fulltext_status=ok_browser via=browser`, never the bare
+    `fulltext_status=ok_browser`, and a bounded-retry `permanently_failed`
+    row carries a trailing `browser_attempted_at=...`. One shared helper
+    keeps every consumer (`enqueue_fulltext_jobs`, `coverage.py`,
+    `reset-fetch-attempts`) from drifting out of sync with `_mark_status`'s
+    note shape again (R3-1).
+    """
+    notes = [f"fulltext_status={status}" for status in statuses]
+    return or_(
+        column.in_(notes),
+        *(column.like(f"{note} %") for note in notes),
+    )
 
 
 class UnfetchableDocument(RuntimeError):
@@ -636,7 +670,10 @@ def enqueue_fulltext_jobs(
         )
     )
 
-    terminal_license_notes = [f"fulltext_status={status}" for status in TERMINAL_STATUSES]
+    # license_note_matches_status tolerates every decorated form _mark_status
+    # can produce (` via=...`, ` browser_attempted_at=...`, ...), not just
+    # the bare `fulltext_status=<status>` string (R3-1).
+    terminal_note_filters = [license_note_matches_status(BillDocument.license_note, TERMINAL_STATUSES)]
 
     # A bill counts as covered once ANY of its documents has text, so a bill
     # with no text at all is worth far more than the 2nd/3rd version of one
@@ -680,7 +717,7 @@ def enqueue_fulltext_jobs(
             # NULL-propagating NOT IN semantics.
             or_(
                 BillDocument.license_note.is_(None),
-                BillDocument.license_note.not_in(terminal_license_notes),
+                ~or_(*terminal_note_filters),
             ),
             BillDocument.fetch_attempts < MAX_FETCH_ATTEMPTS,
             ~exists(already_queued),
@@ -981,7 +1018,44 @@ def process_fetch_text_job(
             status=status,
         ) from exc
 
-    raw = response.content
+    # ``persist_extraction_outcome`` records the same events.record_event(...,
+    # events.TEXT, ...) transition this function historically owned. Its
+    # ``had_text_before`` guard remains the transition check, so keeping that
+    # event in the shared tail ensures browser-assisted and ordinary fetches
+    # announce new searchable text identically without subscriber noise.
+    return persist_extraction_outcome(
+        db,
+        document,
+        raw=response.content,
+        content_type=response.headers.get("content-type"),
+        url=fetched_url,
+        outcome=outcome,
+        rawstore=rawstore,
+        resolver=resolver_name,
+    )
+
+
+def persist_extraction_outcome(
+    db: OrmSession,
+    document: BillDocument,
+    *,
+    raw: bytes,
+    content_type: str | None,
+    url: str,
+    outcome: ExtractionOutcome,
+    rawstore: RawStore,
+    success_status: str | None = None,
+    resolver: str | None = None,
+    provenance: str | None = None,
+) -> FetchTextResult:
+    """Persist one extracted document using the shared full-text success tail.
+
+    Both the ordinary, robots-aware worker and the explicitly separate
+    browser-assisted path arrive here only after bytes have been acquired.
+    ``success_status`` permits the latter to record its auditable
+    ``ok_browser`` provenance while retaining the ordinary extractor,
+    archival, event, and retry-reset behavior.
+    """
     # Raw-byte archival is best-effort. The full-document corpus (~730k docs)
     # far exceeds a single Railway volume, so archival must never block text
     # extraction: on a full/failed volume we keep extracted_text + source_url +
@@ -996,7 +1070,7 @@ def process_fetch_text_job(
                 meta={
                     "source_name": SOURCE_NAME,
                     "document_id": str(document.id),
-                    "url": document.url,
+                    "url": url,
                     "retrieved_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
@@ -1005,15 +1079,16 @@ def process_fetch_text_job(
 
     had_text_before = bool(document.extracted_text)
     document.extracted_text = outcome.extracted_text
-    document.media_type = document.media_type or response.headers.get("content-type")
+    document.media_type = document.media_type or content_type
     document.source_name = SOURCE_NAME
     document.retrieved_at = datetime.now(timezone.utc)
     document.raw_ref = raw_ref
     document.checksum = outcome.checksum
     document.parser_version = PARSER_VERSION
-    if outcome.status in (STATUS_OK, STATUS_OK_PARTIAL_PDF):
+    status = success_status if success_status and outcome.status == STATUS_OK else outcome.status
+    if status in SUCCESS_STATUSES:
         document.fetch_attempts = 0
-    _mark_status(document, outcome.status, resolver=resolver_name)
+    _mark_status(document, status, resolver=resolver, provenance=provenance)
     db.flush()
 
     # A bill going from "we have no text" to "text available" is the moment it
@@ -1033,31 +1108,40 @@ def process_fetch_text_job(
 
     return FetchTextResult(
         document_id=str(document.id),
-        status=outcome.status,
+        status=status,
         extracted_chars=len(outcome.extracted_text) if outcome.extracted_text else 0,
         raw_ref=raw_ref,
     )
 
 
-def _mark_status(document: BillDocument, status: str, *, resolver: str | None = None) -> None:
+def _mark_status(
+    document: BillDocument,
+    status: str,
+    *,
+    resolver: str | None = None,
+    provenance: str | None = None,
+    browser_attempted_at: str | None = None,
+) -> None:
     """Record the fetch/extraction outcome. The schema has no dedicated
     fetch-status column, so we encode it in `license_note` with a stable
     prefix -- kept human-readable and greppable, never overloaded with
     anything license-related for this row type (bill_documents rows never
     otherwise use license_note).
 
-    `resolver`, if given, is appended as `url_resolver=<name>` -- but ONLY
-    for a successful (STATUS_OK / STATUS_OK_PARTIAL_PDF) outcome. Every
-    OTHER status value must stay byte-identical to `f"fulltext_status={status}"`:
-    `enqueue_fulltext_jobs` and `coverage.py` both skip-terminal-status
-    documents via an EXACT string match against
-    `f"fulltext_status={status}"` for each member of TERMINAL_STATUSES (see
-    both modules). Appending a suffix to a terminal note would silently
-    break that match and re-enqueue a permanently-dead document forever.
+    `resolver` and browser `provenance`, if given, are appended only for a
+    successful (STATUS_OK / STATUS_OK_BROWSER / STATUS_OK_PARTIAL_PDF)
+    outcome.  A browser retry timestamp is the sole terminal-status suffix:
+    `enqueue_fulltext_jobs` recognizes its permanently_failed form as
+    terminal, while browser-fetch uses it to defer re-selection for seven
+    days.
     """
     note = f"fulltext_status={status}"
-    if resolver and status in (STATUS_OK, STATUS_OK_PARTIAL_PDF):
+    if resolver and status in SUCCESS_STATUSES:
         note = f"{note} url_resolver={resolver}"
+    if provenance and status in SUCCESS_STATUSES:
+        note = f"{note} via={provenance}"
+    if browser_attempted_at and status == STATUS_PERMANENTLY_FAILED:
+        note = f"{note} browser_attempted_at={browser_attempted_at}"
     document.license_note = note
 
 
