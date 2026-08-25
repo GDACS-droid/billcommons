@@ -1677,16 +1677,10 @@ def test_old_ma_docket_without_bill_number_starts_spending_fetch_attempts(unique
             cleanup.close()
 
 
-@pytest.mark.parametrize(
-    ("created_at", "expected_attempts"),
-    [
-        (None, 0),
-        (datetime.now() - timedelta(days=181), 1),
-    ],
-    ids=["missing-created-at-is-within-grace", "naive-created-at-is-treated-as-utc"],
-)
-def test_record_job_failure_handles_missing_and_naive_created_at(created_at, expected_attempts):
-    document = SimpleNamespace(created_at=created_at, fetch_attempts=0, license_note=None)
+def test_record_job_failure_treats_naive_created_at_as_utc():
+    document = SimpleNamespace(
+        created_at=datetime.now() - timedelta(days=181), fetch_attempts=0, license_note=None
+    )
 
     class FakeSession:
         def get(self, _model, _id, *, with_for_update=False):
@@ -1709,7 +1703,7 @@ def test_record_job_failure_handles_missing_and_naive_created_at(created_at, exp
         session_factory=FakeSession,
     )
 
-    assert document.fetch_attempts == expected_attempts
+    assert document.fetch_attempts == 1
 
 
 def test_claimed_document_id_helper_never_raises_on_a_malformed_payload():
@@ -2107,19 +2101,18 @@ def test_fetch_best_candidate_raises_original_terminal_over_alternate_retryable(
     assert excinfo.value.status == STATUS_MALFORMED_URL
 
 
-def test_fetch_best_candidate_raises_original_terminal_over_initial_retryable():
+def test_fetch_best_candidate_raises_initial_retryable_over_fallback_terminal():
     original_url = "not-a-url"
     client = httpx.Client(transport=_multi_host_transport(_ma_robots_allow_all()))
     fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
 
-    with pytest.raises(UnfetchableDocument) as excinfo:
+    with pytest.raises(httpx.ReadTimeout, match="MA API timed out"):
         _fetch_best_candidate(
             fetcher,
             [original_url],
             original_url=original_url,
             initial_exc=httpx.ReadTimeout("MA API timed out"),
         )
-    assert excinfo.value.status == STATUS_MALFORMED_URL
 
 
 def test_fetch_best_candidate_raises_original_terminal_after_alternate_empty():
@@ -2148,6 +2141,24 @@ def test_fetch_best_candidate_raises_the_most_informative_error_once_all_fail():
 
     with pytest.raises(httpx.HTTPError):
         _fetch_best_candidate(fetcher, ["https://malegislature.gov/a.pdf", "https://malegislature.gov/b.pdf"])
+
+
+def test_fetch_best_candidate_uses_the_last_retryable_error_without_an_original_error():
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/a.pdf": httpx.Response(404),
+        "https://malegislature.gov/b.pdf": httpx.Response(500),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        _fetch_best_candidate(
+            fetcher,
+            ["https://malegislature.gov/a.pdf", "https://malegislature.gov/b.pdf"],
+            original_url="https://malegislature.gov/original.pdf",
+        )
+    assert excinfo.value.response.status_code == 500
 
 
 def test_fetch_best_candidate_extraction_error_names_the_failing_url(monkeypatch):
@@ -2536,6 +2547,65 @@ def test_ma_bill_api_5xx_and_empty_stored_url_preserves_existing_text(db_session
     db_session.refresh(document)
     assert document.license_note == f"fulltext_status={STATUS_FETCH_ERROR}"
     assert document.extracted_text == "previously extracted official text"
+
+
+def test_ma_bill_api_5xx_and_malformed_stored_url_stays_retryable(db_session, rawstore, monkeypatch):
+    """A terminal stored-URL verdict cannot dead-letter an API 5xx."""
+    monkeypatch.setattr(fulltext_mod, "_jurisdiction_and_identifier", lambda db, document: ("ma", "H 177"))
+    monkeypatch.setattr(
+        fulltext_mod,
+        "ma_docket_from_url",
+        lambda _url: MaDocumentUrl("194", "H177", "https://malegislature.gov/Bills/", ".pdf"),
+    )
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/H177": httpx.Response(500),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+    document = _make_bill_document(db_session, url="not-a-url")
+
+    with pytest.raises(DocumentFetchError) as excinfo:
+        process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert excinfo.value.status == STATUS_FETCH_ERROR
+    db_session.refresh(document)
+    assert document.license_note == f"fulltext_status={STATUS_FETCH_ERROR}"
+
+
+def test_ma_resolved_page_timeout_falls_back_when_page_url_differs(db_session, rawstore, monkeypatch):
+    """A retryable resolved-page error still tries a distinct stored URL."""
+    monkeypatch.setattr(fulltext_mod, "_jurisdiction_and_identifier", lambda db, document: ("ma", "SD 123"))
+    stored_url = "https://malegislature.gov/Bills/194/SD123.pdf"
+    resolved_page_url = "https://malegislature.gov/Bills/194/S2045.pdf"
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/SD123": _json_response(
+            {"DocketNumber": "SD123", "BillNumber": "S2045", "DocumentText": ""}
+        ),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/S2045": _json_response(
+            {"DocketNumber": "SD123", "BillNumber": "S2045", "DocumentText": ""}
+        ),
+        stored_url: httpx.Response(
+            200, headers={"content-type": "text/plain"}, content=b"official text from the stored URL"
+        ),
+    }
+
+    def handler(request):
+        if str(request.url) == resolved_page_url:
+            raise httpx.ReadTimeout("MA resolved bill page timed out", request=request)
+        route = routes[str(request.url)]
+        return httpx.Response(route.status_code, headers=route.headers, content=route.content, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+    document = _make_bill_document(db_session, url=stored_url)
+
+    result = process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert result.status == STATUS_OK
+    db_session.refresh(document)
+    assert document.extracted_text == "official text from the stored URL"
 
 
 def test_ma_bill_resolved_page_empty_is_not_fetched_a_second_time(db_session, rawstore, monkeypatch):

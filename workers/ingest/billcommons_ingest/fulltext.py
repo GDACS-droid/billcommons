@@ -921,6 +921,20 @@ def process_fetch_text_job(
                     fetcher, [document.url], initial_exc=exc
                 )
                 resolver_name = None
+            except MaPageLookupError as exc:
+                # A resolved bill page can differ from the URL we stored
+                # (notably after a docket was assigned a bill number).  A
+                # retryable failure on that resolved page must still give the
+                # stored URL one chance; it may be an older but working
+                # official publication path.  Do not re-fetch it when both
+                # URLs are the same -- that would just repeat the failed
+                # request in the same attempt.
+                if exc.page_url == document.url:
+                    raise
+                response, fetched_url, outcome = _fetch_best_candidate(
+                    fetcher, [document.url], initial_exc=exc
+                )
+                resolver_name = None
         else:
             candidate_urls = resolve_fetch_url(jurisdiction_code, document.url, bill_identifier)
             response, fetched_url, outcome = _fetch_best_candidate(
@@ -1134,6 +1148,13 @@ def _fetch_best_candidate(
         empty_outcome = (response, url, outcome)
         outcomes.setdefault(url, []).append(("empty", empty_outcome))
 
+    # `initial_exc` represents the primary MA API/page resolution attempt;
+    # this candidate list is only its secondary fallback.  A fixed terminal
+    # fact about that secondary URL must not dead-letter while the primary
+    # source is transiently unavailable.
+    if initial_exc is not None:
+        raise initial_exc
+
     original_outcomes = outcomes.get(original_url, [])
     for outcome_type, outcome_value in original_outcomes:
         if outcome_type == "terminal":
@@ -1146,7 +1167,7 @@ def _fetch_best_candidate(
     if original_retryable is not None:
         retryable_exc = (original_url, original_retryable)
     elif retryable_outcomes:
-        retryable_exc = retryable_outcomes[0]
+        retryable_exc = retryable_outcomes[-1]
     else:
         retryable_exc = None
     if retryable_exc is not None:
@@ -1325,8 +1346,16 @@ class MaApiLookupError(DocumentFetchError):
     """A retryable DocumentFetchError produced while querying MA's API.
 
     Bill-shaped stored URLs may safely fall back to direct fetching after
-    these failures; errors from the resolved bill page must not do so.
+    these failures.
     """
+
+
+class MaPageLookupError(DocumentFetchError):
+    """A retryable failure while fetching or extracting a resolved MA page."""
+
+    def __init__(self, message: str, *, page_url: str, status: str = STATUS_FETCH_ERROR) -> None:
+        super().__init__(message, status=status)
+        self.page_url = page_url
 
 
 def _resolve_ma_bill(
@@ -1360,13 +1389,19 @@ def _resolve_ma_bill(
     # PDF/HTML page (never the docket's page: the docket-style path is what
     # went stale in the first place).
     page_url = f"{path_prefix}{court}/{bill_number}{path_suffix}"
-    page_response = fetcher.fetch(page_url)
     try:
+        page_response = fetcher.fetch(page_url)
         content_type = sniff_content_type(page_response.headers.get("content-type"), page_url, page_response.content)
         page_outcome = extract_document_text(content_type, page_response.content)
+    except (httpx.HTTPError, DocumentFetchError) as exc:
+        raise MaPageLookupError(
+            f"fetch failed for MA bill page {page_url}: {exc}",
+            page_url=page_url,
+            status=getattr(exc, "status", None) or STATUS_FETCH_ERROR,
+        ) from exc
     except Exception as exc:  # noqa: BLE001 - malformed page bytes are document-specific
-        raise DocumentFetchError(
-            f"text extraction failed for MA bill page {page_url}: {exc}", status=STATUS_FETCH_ERROR
+        raise MaPageLookupError(
+            f"text extraction failed for MA bill page {page_url}: {exc}", page_url=page_url
         ) from exc
     if page_outcome.extracted_text and page_outcome.extracted_text.strip():
         return page_response, page_url, "ma_bill_pdf", page_outcome
