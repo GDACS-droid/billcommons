@@ -116,6 +116,7 @@ E6-E8; consolidated fixlist items 1-13):**
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -123,7 +124,8 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Literal, NamedTuple
+from dataclasses import dataclass
+from typing import Literal
 
 import stripe
 from fastapi import APIRouter, BackgroundTasks, Depends, Request
@@ -214,7 +216,7 @@ def _notify_operator(background_tasks: BackgroundTasks | None, subject: str, bod
 
 def _stripe_cancel_already_terminal(exc: stripe.InvalidRequestError) -> bool:
     return getattr(exc, "code", None) == "resource_missing" or bool(
-        re.search(r"already canceled|No such subscription", str(exc), re.IGNORECASE)
+        re.search(r"already (been )?cancel|No such subscription|canceled subscription can only", str(exc), re.IGNORECASE)
     )
 
 
@@ -644,6 +646,28 @@ class _PermanentWebhookError(Exception):
         self.reason = reason
 
 
+def _cancel_subscription_or_classify(
+    subscription_id: str, background_tasks: BackgroundTasks | None
+) -> None:
+    """Cancel at Stripe, stopping only terminal and permanent request errors.
+
+    Connection, rate-limit, and general Stripe API errors deliberately
+    propagate so Stripe retries the webhook and its transaction rolls back.
+    """
+    try:
+        stripe.Subscription.cancel(subscription_id)
+    except stripe.InvalidRequestError as exc:
+        if _stripe_cancel_already_terminal(exc):
+            logger.warning("stripe.Subscription.cancel(%s) was already terminal", subscription_id)
+            return
+        _notify_operator(
+            background_tasks,
+            "Bill Commons: Stripe subscription cancel request rejected",
+            f"subscription {subscription_id}: {exc}",
+        )
+        raise _PermanentWebhookError(f"Stripe subscription cancel rejected for {subscription_id}: {exc}") from exc
+
+
 def _has_app_metadata(obj: dict | None) -> bool:
     return bool(obj) and (obj.get("metadata") or {}).get("app") == "billcommons"
 
@@ -848,9 +872,13 @@ def _customer_has_usable_key(db: OrmSession, customer_id: uuid.UUID) -> bool:
     )
 
 
-class _ProvisioningResult(NamedTuple):
+@dataclass(frozen=True)
+class _ProvisioningResult:
     minted: bool
     link_queued: bool
+
+    def __bool__(self) -> bool:
+        raise TypeError("Read _ProvisioningResult.minted or .link_queued explicitly")
 
 
 def _send_magic_link(
@@ -980,6 +1008,21 @@ def _apply_subscription_event(
         select(ApiSubscription).where(ApiSubscription.stripe_subscription_id == sub_id)
     ).scalar_one_or_none()
     incoming_status = sub.get("status", "active")
+    # Decide freshness before any incumbent-swap side effect.  A stale
+    # active event for a canceled former subscription must not cancel the
+    # customer's current dunning subscription.
+    if row is not None and row.last_event_created_at is not None:
+        last_ts = int(_aware(row.last_event_created_at).timestamp())
+        if event_created < last_ts:
+            return "processed"  # D1: stale event, ignored
+        # Stripe's `created` has one-second resolution.  On a tie, a
+        # terminal transition wins over a non-terminal resurrection.
+        if (
+            event_created == last_ts
+            and row.status in _TERMINAL_SUB_STATUSES
+            and incoming_status not in _TERMINAL_SUB_STATUSES
+        ):
+            return "processed"
     if invalid_metadata_plan and (row is None or incoming_status not in _TERMINAL_SUB_STATUSES):
         logger.warning("ignoring subscription %s with invalid metadata plan %r", sub_id, metadata_plan)
         return "ignored_invalid_plan"
@@ -991,212 +1034,212 @@ def _apply_subscription_event(
     # unrefunded, with no local record. `incomplete` is not in
     # `_BLOCKING_SUB_STATUSES`, so only a genuinely billing-authoritative
     # OTHER subscription trips the duplicate probe now.
+    incumbent_to_cancel: str | None = None
     existing_other = db.execute(
         select(ApiSubscription)
         .where(ApiSubscription.customer_id == customer.id)
         .where(ApiSubscription.stripe_subscription_id != sub_id)
         .where(ApiSubscription.status.in_(_BLOCKING_SUB_STATUSES))
     ).scalars().first()
-    if (
+    swap_needed = (
         existing_other is not None
         and existing_other.status in ("past_due", "unpaid")
         and incoming_status in ("active", "trialing")
-    ):
-        _configure_stripe()
-        try:
-            stripe.Subscription.cancel(existing_other.stripe_subscription_id)
-        except stripe.InvalidRequestError as exc:
-            if not _stripe_cancel_already_terminal(exc):
-                raise
-            logger.warning("stripe.Subscription.cancel(%s) was already terminal", existing_other.stripe_subscription_id)
-        existing_other.status = "canceled"
-        existing_other.past_due_since = None
-        watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
-        if existing_other.last_event_created_at is None or _aware(existing_other.last_event_created_at) < watermark:
-            existing_other.last_event_created_at = watermark
-        _notify_operator(
-            background_tasks,
-            "Bill Commons: dunning subscription canceled for new paid subscription",
-            f"Customer {customer.email} had dunning subscription {existing_other.stripe_subscription_id}; "
-            f"canceled it so {sub_id} can become authoritative.",
-        )
-        existing_other = None
+    )
+    # R7 fix (finding #1): the incumbent-swap savepoint must stay open
+    # across the newcomer's own write AND the deferred incumbent Stripe
+    # cancel below -- a `_PermanentWebhookError` raised by that cancel call
+    # (or by the duplicate-handling cancel inside the `except IntegrityError`
+    # branch) must unwind the WHOLE swap, not just the piece that happened
+    # to be flushed in its own now-already-closed savepoint. When no swap is
+    # in play (`swap_needed` False), `incumbent_to_cancel` never gets set and
+    # this is a no-op context, behaving exactly as before.
+    with (db.begin_nested() if swap_needed else contextlib.nullcontext()):
+        if swap_needed:
+            existing_other.status = "canceled"
+            existing_other.past_due_since = None
+            watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+            if existing_other.last_event_created_at is None or _aware(existing_other.last_event_created_at) < watermark:
+                existing_other.last_event_created_at = watermark
+            # Flush the old authoritative row before the newcomer is added
+            # or activated: PostgreSQL checks the partial unique index per
+            # flush.  The incoming row is written and flushed below before
+            # the Stripe cancel is issued, so any failure rolls the
+            # complete local swap back and retry redoes both sides.
+            db.flush()
+            incumbent_to_cancel = existing_other.stripe_subscription_id
+            existing_other = None
 
-    if existing_other is not None and row is None:
-        # D2: only refuse when this Stripe subscription id has never been
-        # seen locally before -- a resync/update of an ALREADY-accepted
-        # subscription is not a duplicate.
-        _configure_stripe()
-        if sub.get("status") not in _TERMINAL_SUB_STATUSES:
-            # Item 8 fix: `stripe.Subscription.cancel` on a subscription
-            # Stripe already considers terminal (a re-delivery of this same
-            # duplicate's OWN follow-up events, before the local record
-            # below existed) raises `InvalidRequestError` -- mapped to a
-            # no-op here instead of propagating to an unclassified 500
-            # that Stripe would retry forever.
-            try:
-                stripe.Subscription.cancel(sub_id)
-            except stripe.InvalidRequestError as exc:
-                if not _stripe_cancel_already_terminal(exc):
-                    raise
-                logger.warning("stripe.Subscription.cancel(%s) was already terminal", sub_id)
-        # Item 8 fix: record the duplicate locally as `canceled` -- the
-        # partial unique index permits it (status IS in
-        # `_TERMINAL_SUB_STATUSES`) -- so Stripe's follow-up
-        # `customer.subscription.updated`/`.deleted` events for this same
-        # `sub_id` find `row is not None` and take the normal update path
-        # instead of re-entering this branch (and re-calling `.cancel` on
-        # an already-canceled subscription) forever.
-        db.add(
-            ApiSubscription(
-                customer_id=customer.id,
-                stripe_subscription_id=sub_id,
-                plan=_plan_from_subscription(sub) or "builder",
-                status="canceled",
-                last_event_created_at=datetime.fromtimestamp(event_created, tz=timezone.utc),
-            )
-        )
-        db.flush()
-        _notify_operator(
-            background_tasks,
-            "Bill Commons: duplicate subscription canceled",
-            f"Customer {customer.email} already had an active subscription; "
-            f"canceled the newer Stripe subscription {sub_id}. If they were "
-            f"charged, issue a refund from the Stripe Dashboard (C9).",
-        )
-        # C9: email the CUSTOMER too, not just the operator.
-        buyer_subject = "About your Bill Commons subscription"
-        buyer_body = (
-            "You already had an active Bill Commons subscription, so we canceled "
-            "the duplicate one before it was fully set up. If you were charged for "
-            "it, reply to this email and we'll refund it right away."
-        )
-        if background_tasks is None:
-            _send_email(customer.email, buyer_subject, buyer_body)
-        else:
-            background_tasks.add_task(_send_email, customer.email, buyer_subject, buyer_body)
-        return "duplicate_subscription_canceled"
-
-    now = datetime.now(timezone.utc)
-    if row is not None and row.last_event_created_at is not None:
-        last_ts = int(_aware(row.last_event_created_at).timestamp())
-        if event_created < last_ts:
-            return "processed"  # D1: stale event, ignored
-        # Item 19: Stripe's `created` has one-second resolution, so an
-        # `updated` and the `deleted` that immediately follows it can
-        # legitimately share a timestamp. `>=` (the apply condition) can't
-        # tell them apart by ordering alone -- break the tie by preferring
-        # a TERMINAL transition: once this row is terminal, a same-second
-        # non-terminal event never revives it.
-        #
-        # Item 5 fix: was `row.status == "canceled"`/`incoming_status !=
-        # "canceled"` -- the file's own `_TERMINAL_SUB_STATUSES` also
-        # covers `incomplete_expired`, which this narrower check missed.
-        if (
-            event_created == last_ts
-            and row.status in _TERMINAL_SUB_STATUSES
-            and incoming_status not in _TERMINAL_SUB_STATUSES
-        ):
-            return "processed"
-
-    status = sub.get("status", "active")
-    if row is not None and existing_other is not None and status in _BLOCKING_SUB_STATUSES:
-        _configure_stripe()
-        try:
-            stripe.Subscription.cancel(sub_id)
-        except stripe.InvalidRequestError as exc:
-            if not _stripe_cancel_already_terminal(exc):
-                raise
-            logger.warning("stripe.Subscription.cancel(%s) was already terminal", sub_id)
-        row.status = "canceled"
-        row.past_due_since = None
-        watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
-        if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
-            row.last_event_created_at = watermark
-        db.flush()
-        _notify_operator(
-            background_tasks,
-            "Bill Commons: duplicate subscription canceled",
-            f"Customer {customer.email} already had an active subscription; canceled {sub_id}.",
-        )
-        return "duplicate_subscription_canceled"
-    # Item 2 fix: prefer the subscription's CURRENT price id (reflects a
-    # Portal plan switch immediately -- Stripe never rewrites
-    # `subscription.metadata` when `items[0].price` changes there); fall
-    # back to `metadata.plan` (stamped once at Checkout creation) only when
-    # the price id doesn't match a known plan.
-    plan = _plan_from_subscription(sub) or (row.plan if row is not None else "builder")
-    # Item 7/E3 fix: read both the pre-basil top-level shape (this file's
-    # own test fixtures/replayed old events) and the basil+ shape
-    # (`items.data[0].current_period_end` -- `stripe==13.2.0` has no
-    # top-level `Subscription.current_period_end` at all).
-    period_end_ts = sub.get("current_period_end")
-    if period_end_ts is None:
-        items = ((sub.get("items") or {}).get("data")) or []
-        if items:
-            period_end_ts = items[0].get("current_period_end")
-    period_end = datetime.fromtimestamp(period_end_ts, tz=timezone.utc) if period_end_ts else None
-    cancel_at_period_end = bool(sub.get("cancel_at_period_end", False))
-
-    try:
-        with db.begin_nested():
-            if row is None:
-                row = ApiSubscription(
+        if existing_other is not None and row is None:
+            # D2: only refuse when this Stripe subscription id has never been
+            # seen locally before -- a resync/update of an ALREADY-accepted
+            # subscription is not a duplicate.
+            _configure_stripe()
+            if sub.get("status") not in _TERMINAL_SUB_STATUSES:
+                # Item 8 fix: `stripe.Subscription.cancel` on a subscription
+                # Stripe already considers terminal (a re-delivery of this same
+                # duplicate's OWN follow-up events, before the local record
+                # below existed) raises `InvalidRequestError` -- mapped to a
+                # no-op here instead of propagating to an unclassified 500
+                # that Stripe would retry forever.
+                _cancel_subscription_or_classify(sub_id, background_tasks)
+            # Item 8 fix: record the duplicate locally as `canceled` -- the
+            # partial unique index permits it (status IS in
+            # `_TERMINAL_SUB_STATUSES`) -- so Stripe's follow-up
+            # `customer.subscription.updated`/`.deleted` events for this same
+            # `sub_id` find `row is not None` and take the normal update path
+            # instead of re-entering this branch (and re-calling `.cancel` on
+            # an already-canceled subscription) forever.
+            db.add(
+                ApiSubscription(
                     customer_id=customer.id,
                     stripe_subscription_id=sub_id,
-                    plan=plan,
-                    status=status,
-                    current_period_end=period_end,
-                    cancel_at_period_end=cancel_at_period_end,
+                    plan=_plan_from_subscription(sub) or "builder",
+                    status="canceled",
+                    last_event_created_at=datetime.fromtimestamp(event_created, tz=timezone.utc),
                 )
-                db.add(row)
+            )
+            db.flush()
+            _notify_operator(
+                background_tasks,
+                "Bill Commons: duplicate subscription canceled",
+                f"Customer {customer.email} already had an active subscription; "
+                f"canceled the newer Stripe subscription {sub_id}. If they were "
+                f"charged, issue a refund from the Stripe Dashboard (C9).",
+            )
+            # C9: email the CUSTOMER too, not just the operator.
+            buyer_subject = "About your Bill Commons subscription"
+            buyer_body = (
+                "You already had an active Bill Commons subscription, so we canceled "
+                "the duplicate one before it was fully set up. If you were charged for "
+                "it, reply to this email and we'll refund it right away."
+            )
+            if background_tasks is None:
+                _send_email(customer.email, buyer_subject, buyer_body)
             else:
-                row.plan = plan
-                row.status = status
-                row.current_period_end = period_end
-                row.cancel_at_period_end = cancel_at_period_end
-            if status == "past_due" and row.past_due_since is None:
-                row.past_due_since = now
-            elif status != "past_due":
-                row.past_due_since = None
+                background_tasks.add_task(_send_email, customer.email, buyer_subject, buyer_body)
+            return "duplicate_subscription_canceled"
+
+        now = datetime.now(timezone.utc)
+        status = sub.get("status", "active")
+        if row is not None and existing_other is not None and status in _BLOCKING_SUB_STATUSES:
+            _configure_stripe()
+            _cancel_subscription_or_classify(sub_id, background_tasks)
+            row.status = "canceled"
+            row.past_due_since = None
             watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
             if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
                 row.last_event_created_at = watermark
             db.flush()
-    except IntegrityError:
-        # A concurrent or late transition may have made another
-        # subscription authoritative after the first probe.  Re-check and
-        # route it through the duplicate policy instead of returning a bare
-        # 500 that Stripe would redeliver forever.
-        existing_other = db.execute(
-            select(ApiSubscription)
-            .where(ApiSubscription.customer_id == customer.id)
-            .where(ApiSubscription.stripe_subscription_id != sub_id)
-            .where(ApiSubscription.status.in_(_BLOCKING_SUB_STATUSES))
-        ).scalars().first()
-        if existing_other is None:
-            raise
-        _configure_stripe()
+            _notify_operator(
+                background_tasks,
+                "Bill Commons: duplicate subscription canceled",
+                f"Customer {customer.email} already had an active subscription; canceled {sub_id}.",
+            )
+            return "duplicate_subscription_canceled"
+        # Item 2 fix: prefer the subscription's CURRENT price id (reflects a
+        # Portal plan switch immediately -- Stripe never rewrites
+        # `subscription.metadata` when `items[0].price` changes there); fall
+        # back to `metadata.plan` (stamped once at Checkout creation) only when
+        # the price id doesn't match a known plan.
+        plan = _plan_from_subscription(sub) or (row.plan if row is not None else "builder")
+        # Item 7/E3 fix: read both the pre-basil top-level shape (this file's
+        # own test fixtures/replayed old events) and the basil+ shape
+        # (`items.data[0].current_period_end` -- `stripe==13.2.0` has no
+        # top-level `Subscription.current_period_end` at all).
+        period_end_ts = sub.get("current_period_end")
+        if period_end_ts is None:
+            items = ((sub.get("items") or {}).get("data")) or []
+            if items:
+                period_end_ts = items[0].get("current_period_end")
+        period_end = datetime.fromtimestamp(period_end_ts, tz=timezone.utc) if period_end_ts else None
+        cancel_at_period_end = bool(sub.get("cancel_at_period_end", False))
+
         try:
-            stripe.Subscription.cancel(sub_id)
-        except stripe.InvalidRequestError as exc:
-            if not _stripe_cancel_already_terminal(exc):
+            with db.begin_nested():
+                if row is None:
+                    row = ApiSubscription(
+                        customer_id=customer.id,
+                        stripe_subscription_id=sub_id,
+                        plan=plan,
+                        status=status,
+                        current_period_end=period_end,
+                        cancel_at_period_end=cancel_at_period_end,
+                    )
+                    db.add(row)
+                else:
+                    row.plan = plan
+                    row.status = status
+                    row.current_period_end = period_end
+                    row.cancel_at_period_end = cancel_at_period_end
+                if status == "past_due" and row.past_due_since is None:
+                    row.past_due_since = now
+                elif status != "past_due":
+                    row.past_due_since = None
+                watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+                if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
+                    row.last_event_created_at = watermark
+                db.flush()
+        except IntegrityError:
+            # A concurrent or late transition may have made another
+            # subscription authoritative after the first probe.  Re-check and
+            # route it through the duplicate policy instead of returning a bare
+            # 500 that Stripe would redeliver forever.
+            existing_other = db.execute(
+                select(ApiSubscription)
+                .where(ApiSubscription.customer_id == customer.id)
+                .where(ApiSubscription.stripe_subscription_id != sub_id)
+                .where(ApiSubscription.status.in_(_BLOCKING_SUB_STATUSES))
+            ).scalars().first()
+            if existing_other is None:
                 raise
-            logger.warning("stripe.Subscription.cancel(%s) was already terminal", sub_id)
-        if row not in db:
-            db.add(row)
-        row.status = "canceled"
-        row.past_due_since = None
-        watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
-        if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
-            row.last_event_created_at = watermark
-        db.flush()
-        _notify_operator(
-            background_tasks,
-            "Bill Commons: duplicate subscription canceled",
-            f"Customer {customer.email} already had an active subscription; canceled {sub_id}.",
-        )
-        return "duplicate_subscription_canceled"
+            _configure_stripe()
+            _cancel_subscription_or_classify(sub_id, background_tasks)
+            if row not in db:
+                db.add(row)
+            row.status = "canceled"
+            row.past_due_since = None
+            watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+            if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
+                row.last_event_created_at = watermark
+            db.flush()
+            _notify_operator(
+                background_tasks,
+                "Bill Commons: duplicate subscription canceled",
+                f"Customer {customer.email} already had an active subscription; canceled {sub_id}.",
+            )
+            # R7 fix (finding #2): a duplicate found on the NEWCOMER's own
+            # upsert must not silently swallow an already-decided incumbent
+            # swap -- the incumbent still needs its deferred Stripe cancel,
+            # or it bills forever with no local record ever revisiting it.
+            if incumbent_to_cancel is not None:
+                _configure_stripe()
+                _cancel_subscription_or_classify(incumbent_to_cancel, background_tasks)
+                _notify_operator(
+                    background_tasks,
+                    "Bill Commons: dunning subscription canceled for new paid subscription",
+                    f"Customer {customer.email} had dunning subscription {incumbent_to_cancel}; "
+                    f"canceled it so {sub_id} can become authoritative.",
+                )
+            return "duplicate_subscription_canceled"
+
+        if incumbent_to_cancel is not None:
+            # Stripe is deliberately last in the incumbent/newcomer swap: both
+            # local rows have been flushed successfully before this
+            # irreversible call, inside the SAME savepoint opened above --
+            # a `_PermanentWebhookError` here unwinds the entire swap (both
+            # rows) rather than leaving the incumbent `canceled` locally
+            # while still live at Stripe. A transient failure rolls back the
+            # outer webhook transaction and Stripe retries the full swap
+            # (there are no mid-webhook commits either way).
+            _configure_stripe()
+            _cancel_subscription_or_classify(incumbent_to_cancel, background_tasks)
+            _notify_operator(
+                background_tasks,
+                "Bill Commons: dunning subscription canceled for new paid subscription",
+                f"Customer {customer.email} had dunning subscription {incumbent_to_cancel}; "
+                f"canceled it so {sub_id} can become authoritative.",
+            )
 
     # C3/item 9 fix: the pre-fix condition was `if status == "canceled":
     # ... elif plan == "scale":` -- a Scale -> Builder DOWNGRADE arrives as
@@ -1535,6 +1578,9 @@ def _handle_invoice_event(
     incoming_blocking = event_type == "invoice.paid" or (
         event_type == "invoice.payment_failed" and row.status != "incomplete"
     )
+    incumbent_to_cancel: str | None = None
+    existing_other = None
+    swap_needed = False
     if incoming_blocking:
         existing_other = db.execute(
             select(ApiSubscription)
@@ -1542,34 +1588,37 @@ def _handle_invoice_event(
             .where(ApiSubscription.stripe_subscription_id != sub_id)
             .where(ApiSubscription.status.in_(_BLOCKING_SUB_STATUSES))
         ).scalars().first()
-        if existing_other is not None and existing_other.status in ("past_due", "unpaid") and event_type == "invoice.paid":
-            _configure_stripe()
-            try:
-                stripe.Subscription.cancel(existing_other.stripe_subscription_id)
-            except stripe.InvalidRequestError as exc:
-                if not _stripe_cancel_already_terminal(exc):
-                    raise
-                logger.warning("stripe.Subscription.cancel(%s) was already terminal", existing_other.stripe_subscription_id)
+        swap_needed = (
+            existing_other is not None
+            and existing_other.status in ("past_due", "unpaid")
+            and event_type == "invoice.paid"
+            and row.status not in _TERMINAL_SUB_STATUSES
+        )
+
+    # R7 fix (finding #1): keep the incumbent-swap savepoint open across
+    # the newcomer's own write AND the deferred incumbent Stripe cancel
+    # below -- a `_PermanentWebhookError` from that cancel (or from the
+    # duplicate-handling cancel in the `except IntegrityError` branch) must
+    # unwind the WHOLE swap, not just whatever happened to already be
+    # flushed in its own now-closed savepoint. When `swap_needed` is False,
+    # `incumbent_to_cancel` never gets set and this is a no-op context.
+    with (db.begin_nested() if swap_needed else contextlib.nullcontext()):
+        if swap_needed:
             existing_other.status = "canceled"
             existing_other.past_due_since = None
             watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
             if existing_other.last_event_created_at is None or _aware(existing_other.last_event_created_at) < watermark:
                 existing_other.last_event_created_at = watermark
-            _notify_operator(
-                background_tasks,
-                "Bill Commons: dunning subscription canceled for new paid subscription",
-                f"Customer {customer.email} had dunning subscription {existing_other.stripe_subscription_id}; "
-                f"canceled it so {sub_id} can become authoritative.",
-            )
+            # Make the incumbent terminal before this invoice activates
+            # the newcomer.  The incoming row is also flushed below
+            # before Stripe is canceled, so any failure rolls back
+            # the complete local swap for a clean retry.
+            db.flush()
+            incumbent_to_cancel = existing_other.stripe_subscription_id
             existing_other = None
-        if existing_other is not None:
+        if incoming_blocking and existing_other is not None:
             _configure_stripe()
-            try:
-                stripe.Subscription.cancel(sub_id)
-            except stripe.InvalidRequestError as exc:
-                if not _stripe_cancel_already_terminal(exc):
-                    raise
-                logger.warning("stripe.Subscription.cancel(%s) was already terminal", sub_id)
+            _cancel_subscription_or_classify(sub_id, background_tasks)
             row.status = "canceled"
             row.past_due_since = None
             watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
@@ -1582,73 +1631,97 @@ def _handle_invoice_event(
                 f"Customer {customer.email} already had an active subscription; canceled {sub_id}.",
             )
             return "duplicate_subscription_canceled"
-    # Item 11 fix: `_handle_invoice_event` and `_apply_subscription_event`
-    # share one `last_event_created_at` watermark -- an `invoice.paid`
-    # whose `created` lands after the `customer.subscription.deleted` that
-    # preceded it (both legitimate, just delivered close together) used to
-    # flip a CANCELED subscription back to "active" unconditionally, which
-    # then re-blocked the customer's next Checkout with a 409 and
-    # re-granted paid quota through item 1's recompute.
-    #
-    # Item 5 fix: was `row.status != "canceled"` -- the file's own
-    # `_TERMINAL_SUB_STATUSES` also covers `incomplete_expired`; only a
-    # subscription event may revive either terminal state.
-    try:
-        with db.begin_nested():
-            if row.status not in _TERMINAL_SUB_STATUSES:
-                if event_type == "invoice.payment_failed":
-                    # Item 1(d)/E6 fix: `incomplete` is NEVER a paid state -- the
-            # first invoice on a brand-new subscription failing is the
-            # NORMAL case for a customer who never successfully paid, not
-            # dunning against someone who once did. Promoting it to
-            # `past_due` (which IS plan-authoritative) would make
-            # `customer_plan()` grant paid quota, and `payment_required()`
-            # would wait a further 7 days before 402ing a customer who
-            # never paid a cent -- self-healing only ~23h later when Stripe
-            # expires the subscription to `incomplete_expired`. Only a
-            # subscription that was ALREADY billing-authoritative (or
-            # already dunning) can be pushed into dunning by an invoice
-            # event.
-                    if row.status != "incomplete":
-                        if row.status != "past_due" or row.past_due_since is None:
-                            row.past_due_since = now
-                        row.status = "past_due"
-                elif event_type == "invoice.paid":
-                    row.status = "active"
-                    row.past_due_since = None
+        # Item 11 fix: `_handle_invoice_event` and `_apply_subscription_event`
+        # share one `last_event_created_at` watermark -- an `invoice.paid`
+        # whose `created` lands after the `customer.subscription.deleted` that
+        # preceded it (both legitimate, just delivered close together) used to
+        # flip a CANCELED subscription back to "active" unconditionally, which
+        # then re-blocked the customer's next Checkout with a 409 and
+        # re-granted paid quota through item 1's recompute.
+        #
+        # Item 5 fix: was `row.status != "canceled"` -- the file's own
+        # `_TERMINAL_SUB_STATUSES` also covers `incomplete_expired`; only a
+        # subscription event may revive either terminal state.
+        try:
+            with db.begin_nested():
+                if row.status not in _TERMINAL_SUB_STATUSES:
+                    if event_type == "invoice.payment_failed":
+                        # Item 1(d)/E6 fix: `incomplete` is NEVER a paid state -- the
+                        # first invoice on a brand-new subscription failing is the
+                        # NORMAL case for a customer who never successfully paid, not
+                        # dunning against someone who once did. Promoting it to
+                        # `past_due` (which IS plan-authoritative) would make
+                        # `customer_plan()` grant paid quota, and `payment_required()`
+                        # would wait a further 7 days before 402ing a customer who
+                        # never paid a cent -- self-healing only ~23h later when Stripe
+                        # expires the subscription to `incomplete_expired`. Only a
+                        # subscription that was ALREADY billing-authoritative (or
+                        # already dunning) can be pushed into dunning by an invoice
+                        # event.
+                        if row.status != "incomplete":
+                            if row.status != "past_due" or row.past_due_since is None:
+                                row.past_due_since = now
+                            row.status = "past_due"
+                    elif event_type == "invoice.paid":
+                        row.status = "active"
+                        row.past_due_since = None
+                watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+                if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
+                    row.last_event_created_at = watermark
+                db.flush()
+        except IntegrityError:
+            # Belt-and-braces for a concurrent activation that raced the probe.
+            existing_other = db.execute(
+                select(ApiSubscription)
+                .where(ApiSubscription.customer_id == customer.id)
+                .where(ApiSubscription.stripe_subscription_id != sub_id)
+                .where(ApiSubscription.status.in_(_BLOCKING_SUB_STATUSES))
+            ).scalars().first()
+            if existing_other is None:
+                raise
+            _configure_stripe()
+            _cancel_subscription_or_classify(sub_id, background_tasks)
+            row.status = "canceled"
+            row.past_due_since = None
             watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
             if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
                 row.last_event_created_at = watermark
             db.flush()
-    except IntegrityError:
-        # Belt-and-braces for a concurrent activation that raced the probe.
-        existing_other = db.execute(
-            select(ApiSubscription)
-            .where(ApiSubscription.customer_id == customer.id)
-            .where(ApiSubscription.stripe_subscription_id != sub_id)
-            .where(ApiSubscription.status.in_(_BLOCKING_SUB_STATUSES))
-        ).scalars().first()
-        if existing_other is None:
-            raise
-        _configure_stripe()
-        try:
-            stripe.Subscription.cancel(sub_id)
-        except stripe.InvalidRequestError as exc:
-            if not _stripe_cancel_already_terminal(exc):
-                raise
-            logger.warning("stripe.Subscription.cancel(%s) was already terminal", sub_id)
-        row.status = "canceled"
-        row.past_due_since = None
-        watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
-        if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
-            row.last_event_created_at = watermark
-        db.flush()
-        _notify_operator(
-            background_tasks,
-            "Bill Commons: duplicate subscription canceled",
-            f"Customer {customer.email} already had an active subscription; canceled {sub_id}.",
-        )
-        return "duplicate_subscription_canceled"
+            _notify_operator(
+                background_tasks,
+                "Bill Commons: duplicate subscription canceled",
+                f"Customer {customer.email} already had an active subscription; canceled {sub_id}.",
+            )
+            # R7 fix (finding #2): the newcomer's own upsert hitting a
+            # duplicate must not silently swallow an already-decided
+            # incumbent swap -- the incumbent still needs its deferred
+            # Stripe cancel, or it bills forever with no record revisiting
+            # it.
+            if incumbent_to_cancel is not None:
+                _configure_stripe()
+                _cancel_subscription_or_classify(incumbent_to_cancel, background_tasks)
+                _notify_operator(
+                    background_tasks,
+                    "Bill Commons: dunning subscription canceled for new paid subscription",
+                    f"Customer {customer.email} had dunning subscription {incumbent_to_cancel}; "
+                    f"canceled it so {sub_id} can become authoritative.",
+                )
+            return "duplicate_subscription_canceled"
+        if incumbent_to_cancel is not None:
+            # Both sides of this invoice-led swap have flushed inside the
+            # SAME savepoint opened above -- a `_PermanentWebhookError` here
+            # unwinds the entire swap rather than leaving the incumbent
+            # `canceled` locally while still live at Stripe. A transient
+            # failure rolls back the outer webhook transaction and Stripe
+            # retries the full swap either way.
+            _configure_stripe()
+            _cancel_subscription_or_classify(incumbent_to_cancel, background_tasks)
+            _notify_operator(
+                background_tasks,
+                "Bill Commons: dunning subscription canceled for new paid subscription",
+                f"Customer {customer.email} had dunning subscription {incumbent_to_cancel}; "
+                f"canceled it so {sub_id} can become authoritative.",
+            )
     # E6/Gate A: `invoice.paid` is an explicit activation-path trigger --
     # if it lands before any `customer.subscription.*` event observes this
     # subscription reaching `active` (a plausible Stripe delivery order),
@@ -1767,14 +1840,26 @@ def _handle_charge_refunded(
                 customer = db.execute(
                     select(ApiCustomer).where(ApiCustomer.email == email.strip().lower())
                 ).scalar_one_or_none()
-                is_ours = customer is not None
+                # A guest-email match alone is not ownership evidence on a
+                # shared Stripe account: both the app tag and email match
+                # are required before this refund may touch local access.
+                is_ours = is_tagged and customer is not None
     if not is_ours or customer is None:
         # Stripe may deliver a guest-checkout refund before the matching
         # checkout completion has created our local customer.  Its own
         # metadata is sufficient to establish ownership, but not enough to
         # safely process it yet: raise so Stripe retries after checkout.
         if is_tagged:
+            # The 72-hour cutoff intentionally uses the Stripe event's
+            # `created` timestamp, not the local receipt time.
             if event_created <= int((datetime.now(timezone.utc) - timedelta(hours=72)).timestamp()):
+                if cancel_access:
+                    _notify_operator(
+                        background_tasks,
+                        "Bill Commons: manual access revocation required",
+                        f"payment_intent {payment_intent_id!r} could not be mapped after 72 hours.",
+                    )
+                    raise _PermanentWebhookError("manual access revocation required for unresolved cancel_access refund")
                 _notify_operator(
                     background_tasks,
                     "Bill Commons: refund skipped after unresolved guest checkout",
@@ -1810,7 +1895,14 @@ def _handle_charge_refunded(
             if sub_id
             else None
         )
-        if row is None:
+        if sub_id and row is None:
+            _notify_operator(
+                background_tasks,
+                "Bill Commons: cancel_access refund subscription mismatch",
+                f"customer {customer.email}, subscription={sub_id!r}, payment_intent={payment_intent_id!r}",
+            )
+            raise _PermanentWebhookError("refund_subscription_mismatch")
+        if row is None and not sub_id:
             candidates = db.execute(
                 select(ApiSubscription).where(
                     ApiSubscription.customer_id == customer.id,
@@ -1820,6 +1912,46 @@ def _handle_charge_refunded(
             if len(candidates) == 1:
                 row = candidates[0]
         if row is None:
+            # No id was derivable and no non-terminal subscription remains.
+            # Revoke any subscription entitlement instead of ending a
+            # cancel_access refund with no access change.
+            candidates = db.execute(
+                select(ApiSubscription.id).where(
+                    ApiSubscription.customer_id == customer.id,
+                    ApiSubscription.status.not_in(_TERMINAL_SUB_STATUSES),
+                )
+            ).all()
+            if not candidates:
+                # R7 fix (finding #3): every other terminal branch in this
+                # function stales-checks `event_created` against a
+                # subscription row's `last_event_created_at` before
+                # mutating state; this branch has no such row to check
+                # (there are none left). Use the entitlement's own
+                # `created_at` as the equivalent watermark instead -- a
+                # delayed/retried refund event must not expire an
+                # entitlement that was granted or extended (e.g. a manual
+                # comp or re-provision) AFTER the refund it's replaying.
+                now = datetime.now(timezone.utc)
+                # Stripe's `created` has one-second resolution (see the D1
+                # watermark comment above `_apply_subscription_event`) --
+                # an entitlement granted in the SAME wall-clock second as
+                # the refund event (sub-second `created_at` vs the
+                # truncated-to-the-second `event_ts`) must not be treated
+                # as "created after" it, or an entitlement seeded moments
+                # before a same-second webhook replay never expires.
+                event_ts = datetime.fromtimestamp(event_created, tz=timezone.utc)
+                db.execute(
+                    sa_update(SnapshotEntitlement)
+                    .where(
+                        SnapshotEntitlement.customer_id == customer.id,
+                        SnapshotEntitlement.kind == "subscription",
+                        (SnapshotEntitlement.expires_at.is_(None)) | (SnapshotEntitlement.expires_at > now),
+                        SnapshotEntitlement.created_at < event_ts + timedelta(seconds=1),
+                    )
+                    .values(expires_at=now)
+                )
+                _recompute_plan_onto_keys(db, customer.id, customer_plan(db, customer.id))
+                return "processed"
             _notify_operator(
                 background_tasks,
                 "Bill Commons: cancel_access refund could not be mapped to a subscription",
@@ -1828,12 +1960,7 @@ def _handle_charge_refunded(
             raise _PermanentWebhookError("cancel_access refund could not be mapped to a subscription")
         if row.last_event_created_at is not None and event_created < int(_aware(row.last_event_created_at).timestamp()):
             return "processed"
-        try:
-            stripe.Subscription.cancel(row.stripe_subscription_id)
-        except stripe.InvalidRequestError as exc:
-            if not _stripe_cancel_already_terminal(exc):
-                raise
-            logger.warning("stripe.Subscription.cancel(%s) was already terminal", row.stripe_subscription_id)
+        _cancel_subscription_or_classify(row.stripe_subscription_id, background_tasks)
         row.status = "canceled"
         row.past_due_since = None
         watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)

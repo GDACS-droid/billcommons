@@ -665,6 +665,21 @@ def test_pre_check_quota_read_failure_fails_closed_503(client, app_and_db, monke
     assert body["error"]["code"] == "quota_unavailable"
 
 
+def test_resolve_key_unexpected_exception_fails_closed_503(client, app_and_db, monkeypatch):
+    """R6: a malformed/crafted presented key must not turn an unexpected
+    resolver exception into Starlette's bare 500 response."""
+    import billcommons_api.quota as quota_module
+
+    monkeypatch.setattr(
+        quota_module,
+        "resolve_key",
+        lambda presented: (_ for _ in ()).throw(RuntimeError("crafted key parser failure")),
+    )
+    res = client.get("/api/v1/_test_ok", headers={"Authorization": "Bearer bc_live_" + "x" * 32})
+    assert res.status_code == 503
+    assert res.json()["error"]["code"] == "quota_unavailable"
+
+
 def test_anon_daily_tier_429_reports_its_own_limit_not_per_minute():
     """Fixlist item 14 regression: a refusal from the `anon-daily-ip` tier
     used to always render `X-RateLimit-Limit` from `self._default.ip`

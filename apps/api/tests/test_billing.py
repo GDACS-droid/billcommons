@@ -1978,7 +1978,7 @@ def test_r5_refund_uses_invoice_subscription_and_rejects_foreign_metadata(client
     assert _subscription_row(SessionLocal, "sub_r5_foreign").status == "active"
 
 
-def test_r5_unresolvable_cancel_access_refund_is_permanent_and_notifies(client, app_and_db, monkeypatch):
+def test_r6_cancel_access_refund_with_no_subscription_is_processed(client, app_and_db, monkeypatch):
     _, SessionLocal = app_and_db
     _make_customer(SessionLocal, "r5-unresolved@example.com", "cus_r5_unresolved")
     notices = []
@@ -1995,8 +1995,8 @@ def test_r5_unresolvable_cancel_access_refund_is_permanent_and_notifies(client, 
         ),
     )
     assert res.status_code == 200
-    assert res.json()["outcome"] == "permanent_error"
-    assert any("could not be mapped" in subject for subject in notices)
+    assert res.json()["outcome"] == "processed"
+    assert any("subscription charge refunded" in subject for subject in notices)
 
 
 def test_r5_delayed_old_refund_keeps_current_scale_entitlement(client, app_and_db, monkeypatch):
@@ -2079,7 +2079,9 @@ def test_r5_invalid_metadata_still_applies_terminal_transition(client, app_and_d
         ),
     )
     assert res.status_code == 200
-    assert _subscription_row(SessionLocal, "sub_r5_invalid_plan").status == "canceled"
+    row = _subscription_row(SessionLocal, "sub_r5_invalid_plan")
+    assert row.status == "canceled"
+    assert row.plan == "builder"
 
 
 def test_r5_new_paid_subscription_replaces_dunning_incumbent(client, app_and_db, monkeypatch):
@@ -2104,7 +2106,7 @@ def test_r5_new_paid_subscription_replaces_dunning_incumbent(client, app_and_db,
     assert _subscription_row(SessionLocal, "sub_r5_paid").status == "active"
 
 
-def test_r5_nonterminal_stripe_cancel_error_retries_webhook(client, app_and_db, monkeypatch):
+def test_r6_invalid_stripe_cancel_error_is_permanent(client, app_and_db, monkeypatch):
     _, SessionLocal = app_and_db
     customer_id = _make_customer(SessionLocal, "r5-cancel-error@example.com", "cus_r5_cancel_error")
     db = SessionLocal()
@@ -2120,5 +2122,309 @@ def test_r5_nonterminal_stripe_cancel_error_retries_webhook(client, app_and_db, 
         "customer.subscription.created",
         {"id": "sub_r5_new", "customer": "cus_r5_cancel_error", "status": "active", "metadata": {"app": "billcommons", "plan": "builder"}},
     )
+    res = _post_webhook(client, event)
+    assert res.status_code == 200
+    assert res.json()["outcome"] == "permanent_error"
+    assert _stripe_event_row(SessionLocal, event["id"]).outcome == "permanent_error"
+
+
+def test_r6_transient_stripe_cancel_error_retries_webhook(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r6-cancel-transient@example.com", "cus_r6_cancel_transient")
+    db = SessionLocal()
+    db.add(ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r6_incumbent", plan="builder", status="active"))
+    db.commit()
+    db.close()
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "cancel",
+        staticmethod(lambda sub_id: (_ for _ in ()).throw(stripe.APIConnectionError("network blip"))),
+    )
+    event = _stripe_event(
+        "customer.subscription.created",
+        {"id": "sub_r6_new", "customer": "cus_r6_cancel_transient", "status": "active", "metadata": {"app": "billcommons", "plan": "builder"}},
+    )
     assert _post_webhook(client, event).status_code == 500
     assert _stripe_event_row(SessionLocal, event["id"]) is None
+
+
+def test_r6_stale_active_event_does_not_swap_dunning_incumbent(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r6-stale@example.com", "cus_r6_stale")
+    db = SessionLocal()
+    db.add_all(
+        [
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r6_old", plan="builder", status="canceled", last_event_created_at=datetime.fromtimestamp(200, tz=timezone.utc)),
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r6_dunning", plan="builder", status="past_due"),
+        ]
+    )
+    db.commit()
+    db.close()
+    canceled = []
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "customer.subscription.updated",
+            {"id": "sub_r6_old", "customer": "cus_r6_stale", "status": "active", "metadata": {"app": "billcommons", "plan": "builder"}},
+            created=100,
+        ),
+    )
+    assert res.status_code == 200
+    assert canceled == []
+    assert _subscription_row(SessionLocal, "sub_r6_dunning").status == "past_due"
+
+
+def test_r6_invoice_paid_swaps_dunning_incumbent_before_newcomer_activation(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r6-invoice-swap@example.com", "cus_r6_invoice_swap")
+    db = SessionLocal()
+    db.add_all(
+        [
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r6_invoice_old", plan="builder", status="past_due"),
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r6_invoice_new", plan="builder", status="incomplete"),
+        ]
+    )
+    db.commit()
+    db.close()
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: None))
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "invoice.paid",
+            {"id": "in_r6_swap", "customer": "cus_r6_invoice_swap", "subscription": "sub_r6_invoice_new"},
+        ),
+    )
+    assert res.status_code == 200
+    assert _subscription_row(SessionLocal, "sub_r6_invoice_old").status == "canceled"
+    assert _subscription_row(SessionLocal, "sub_r6_invoice_new").status == "active"
+
+
+def test_r6_untagged_guest_refund_email_match_is_foreign(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    _make_customer(SessionLocal, "r6-guest-match@example.com")
+    monkeypatch.setattr(stripe.PaymentIntent, "retrieve", staticmethod(lambda _: {"metadata": {}}))
+    monkeypatch.setattr(
+        stripe.checkout.Session,
+        "list",
+        staticmethod(lambda **kwargs: {"data": [{"metadata": {}, "customer_details": {"email": "r6-guest-match@example.com"}}]}),
+    )
+    res = _post_webhook(
+        client,
+        _stripe_event("charge.refunded", {"id": "ch_r6_foreign", "payment_intent": "pi_r6_foreign", "refunds": {"data": [{"metadata": {}}]}}),
+    )
+    assert res.status_code == 200
+    assert res.json()["outcome"] == "skipped_foreign_app"
+
+
+def test_r6_explicit_foreign_refund_subscription_does_not_use_sole_sub_fallback(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r6-refund-mismatch@example.com", "cus_r6_refund_mismatch")
+    db = SessionLocal()
+    db.add(ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r6_only", plan="builder", status="active"))
+    db.commit()
+    db.close()
+    canceled = []
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+    event = _stripe_event(
+        "charge.refunded",
+        {"id": "ch_r6_mismatch", "customer": "cus_r6_refund_mismatch", "invoice": {"subscription": "sub_foreign"}, "refunds": {"data": [{"metadata": {"cancel_access": "true"}}]}},
+    )
+    res = _post_webhook(client, event)
+    assert res.status_code == 200
+    assert res.json()["outcome"] == "permanent_error"
+    event_row = _stripe_event_row(SessionLocal, event["id"])
+    assert event_row.outcome == "permanent_error"
+    assert event_row.last_error == "refund_subscription_mismatch"
+    assert canceled == []
+    assert _subscription_row(SessionLocal, "sub_r6_only").status == "active"
+
+
+def test_r6_cancel_access_without_subscription_expires_entitlements(client, app_and_db):
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r6-no-sub@example.com", "cus_r6_no_sub")
+    db = SessionLocal()
+    db.add(SnapshotEntitlement(customer_id=customer_id, kind="subscription", scope="full"))
+    db.commit()
+    db.close()
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "charge.refunded",
+            {"id": "ch_r6_no_sub", "customer": "cus_r6_no_sub", "refunds": {"data": [{"metadata": {"cancel_access": "true"}}]}},
+        ),
+    )
+    assert res.status_code == 200
+    assert res.json()["outcome"] == "processed"
+    db = SessionLocal()
+    entitlement = db.execute(select(SnapshotEntitlement).where(SnapshotEntitlement.customer_id == customer_id)).scalar_one()
+    db.close()
+    assert entitlement.expires_at is not None
+
+
+def test_r6_old_unresolved_cancel_access_refund_is_permanent(client, app_and_db, monkeypatch):
+    notices = []
+    monkeypatch.setattr(billing, "_notify_operator", lambda *args: notices.append(args[1]))
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "charge.refunded",
+            {"id": "ch_r6_old_unresolved", "metadata": {"app": "billcommons"}, "refunds": {"data": [{"metadata": {"cancel_access": "true"}}]}},
+            created=1,
+        ),
+    )
+    assert res.status_code == 200
+    assert res.json()["outcome"] == "permanent_error"
+    assert any("manual access revocation required" in subject for subject in notices)
+
+
+def test_r6_provisioning_result_rejects_boolean_use():
+    with pytest.raises(TypeError, match="minted"):
+        bool(billing._ProvisioningResult(False, False))
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 R7 regressions
+# ---------------------------------------------------------------------------
+
+
+def test_r7_permanent_incumbent_cancel_error_rolls_back_swap(client, app_and_db, monkeypatch):
+    """R7 finding #1: a `_PermanentWebhookError` raised by the DEFERRED
+    incumbent cancel must unwind the whole swap (incumbent AND newcomer),
+    not just leave whichever piece had already flushed in its own
+    now-closed savepoint. Pre-fix this committed the incumbent `canceled`
+    locally, with the newcomer `active`, while the incumbent stayed live
+    (and billing) at Stripe."""
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r7-permanent-swap@example.com", "cus_r7_permanent_swap")
+    db = SessionLocal()
+    db.add(ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r7_incumbent", plan="builder", status="past_due"))
+    db.commit()
+    db.close()
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "cancel",
+        staticmethod(lambda sub_id: (_ for _ in ()).throw(stripe.InvalidRequestError("subscription cancel rejected", None))),
+    )
+    event = _stripe_event(
+        "customer.subscription.created",
+        {"id": "sub_r7_new", "customer": "cus_r7_permanent_swap", "status": "active", "metadata": {"app": "billcommons", "plan": "builder"}},
+    )
+    res = _post_webhook(client, event)
+    assert res.status_code == 200
+    assert res.json()["outcome"] == "permanent_error"
+    # The swap must be undone in full: the incumbent is exactly as it was
+    # pre-webhook, and the newcomer never becomes a live local row.
+    assert _subscription_row(SessionLocal, "sub_r7_incumbent").status == "past_due"
+    assert _subscription_row(SessionLocal, "sub_r7_new") is None
+
+
+def test_r7_integrity_error_branch_still_cancels_deferred_incumbent(client, app_and_db, monkeypatch):
+    """R7 finding #2: hitting the `except IntegrityError:` duplicate path
+    on the NEWCOMER's own upsert must not skip the already-decided
+    incumbent swap's deferred Stripe cancel. Pre-fix, the early
+    `return "duplicate_subscription_canceled"` sat textually before the
+    `if incumbent_to_cancel is not None:` block, so the incumbent was
+    recorded `canceled` locally with zero Stripe cancel attempt, ever."""
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r7-integrity@example.com", "cus_r7_integrity")
+    db = SessionLocal()
+    db.add_all(
+        [
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r7_incumbent", plan="builder", status="past_due"),
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r7_second", plan="builder", status="incomplete"),
+        ]
+    )
+    db.commit()
+    db.close()
+
+    canceled: list[str] = []
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+
+    from sqlalchemy import update as sa_update
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Session as OrmSession
+
+    original_flush = OrmSession.flush
+    state = {"fired": False, "promoted": False}
+
+    def racy_flush(self, *args, **kwargs):
+        # The incumbent-swap savepoint's own flush (cancels sub_r7_incumbent
+        # locally) fires first. Promote a THIRD row to "active" right after
+        # that flush lands -- once it has, so the promotion isn't undone by
+        # a later savepoint rollback -- simulating a second subscription
+        # becoming authoritative for this customer between the initial
+        # duplicate probe and the newcomer's own flush below.
+        swap_in_progress = any(
+            isinstance(obj, ApiSubscription) and obj.stripe_subscription_id == "sub_r7_incumbent" and obj.status == "canceled"
+            for obj in self.dirty
+        )
+        if swap_in_progress and not state["promoted"]:
+            state["promoted"] = True
+            result = original_flush(self, *args, **kwargs)
+            self.execute(
+                sa_update(ApiSubscription)
+                .where(ApiSubscription.stripe_subscription_id == "sub_r7_second")
+                .values(status="active")
+            )
+            return result
+        # Fire exactly once, precisely when the newcomer's own row is the
+        # thing about to be flushed -- simulating that race landing right
+        # before this flush (the race `except IntegrityError:` exists to
+        # handle).
+        pending_newcomer = any(
+            isinstance(obj, ApiSubscription) and obj.stripe_subscription_id == "sub_r7_new"
+            for obj in self.new
+        )
+        if pending_newcomer and not state["fired"]:
+            state["fired"] = True
+            raise IntegrityError("forced race", {}, Exception("forced race"))
+        return original_flush(self, *args, **kwargs)
+
+    monkeypatch.setattr(OrmSession, "flush", racy_flush)
+
+    event = _stripe_event(
+        "customer.subscription.created",
+        {"id": "sub_r7_new", "customer": "cus_r7_integrity", "status": "active", "metadata": {"app": "billcommons", "plan": "builder"}},
+    )
+    res = _post_webhook(client, event)
+    assert res.status_code == 200
+    assert res.json()["outcome"] == "duplicate_subscription_canceled"
+    assert "sub_r7_incumbent" in canceled
+    assert "sub_r7_new" in canceled
+    assert _subscription_row(SessionLocal, "sub_r7_incumbent").status == "canceled"
+
+
+def test_r7_cancel_access_no_subscriptions_left_respects_entitlement_watermark(client, app_and_db):
+    """R7 finding #3: the `cancel_access` "no subscriptions left" branch
+    had no staleness/watermark guard, unlike every sibling terminal branch
+    in `_handle_charge_refunded`. A delayed/retried refund event older
+    than the entitlement's own grant/extension must not expire it."""
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r7-cancel-access-watermark@example.com", "cus_r7_cancel_access_watermark")
+    db = SessionLocal()
+    db.add(SnapshotEntitlement(customer_id=customer_id, kind="subscription", scope="full"))
+    db.commit()
+    db.close()
+
+    old_created = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp())
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "charge.refunded",
+            {
+                "id": "ch_r7_watermark",
+                "customer": "cus_r7_cancel_access_watermark",
+                "refunds": {"data": [{"metadata": {"cancel_access": "true"}}]},
+            },
+            created=old_created,
+        ),
+    )
+    assert res.status_code == 200
+    assert res.json()["outcome"] == "processed"
+    db = SessionLocal()
+    entitlement = db.execute(
+        select(SnapshotEntitlement).where(SnapshotEntitlement.customer_id == customer_id)
+    ).scalar_one()
+    db.close()
+    assert entitlement.expires_at is None
