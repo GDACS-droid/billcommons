@@ -19,7 +19,6 @@ RUN apt-get update \
 COPY requirements.txt ./requirements.txt
 COPY packages/schema ./packages/schema
 COPY packages/shared ./packages/shared
-COPY packages/source-registry ./packages/source-registry
 COPY workers/ingest ./workers/ingest
 COPY data/registry ./data/registry
 
