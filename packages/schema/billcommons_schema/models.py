@@ -1052,6 +1052,13 @@ class ApiSubscription(Base):
     __table_args__ = (
         CheckConstraint("plan in ('builder','scale','enterprise')", name="ck_api_subscriptions_plan"),
         Index("ix_api_subscriptions_customer_status", "customer_id", "status"),
+        Index(
+            "uq_api_subscriptions_one_active_per_customer",
+            "customer_id",
+            unique=True,
+            postgresql_where=text("status IN ('active', 'trialing', 'past_due', 'unpaid')"),
+            sqlite_where=text("status IN ('active', 'trialing', 'past_due', 'unpaid')"),
+        ),
     )
 
 

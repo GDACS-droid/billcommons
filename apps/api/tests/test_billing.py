@@ -1471,44 +1471,55 @@ def test_e8_issue_login_token_failure_rolls_back_whole_webhook_transaction(clien
 # ---------------------------------------------------------------------------
 
 
-def test_r3_1_lost_provision_race_keeps_exactly_one_live_key(app_and_db, monkeypatch):
+def test_r3_1_lost_provision_race_keeps_exactly_one_live_key(app_and_db):
     """A second writer can win after the guard SELECT; the unique index
     backstop must turn our losing mint into an idempotent no-op."""
     import billcommons_api.api_keys as api_keys_module
+    from sqlalchemy.exc import IntegrityError
 
     _, SessionLocal = app_and_db
     customer_id = _make_customer(SessionLocal, email="r3-race@example.com", stripe_customer_id="cus_r3_race")
     setup = SessionLocal()
-    setup.add(
-        ApiSubscription(
-            customer_id=customer_id,
-            stripe_subscription_id="sub_r3_race",
-            plan="builder",
-            status="active",
-        )
+    seeded_subscription = ApiSubscription(
+        customer_id=customer_id,
+        stripe_subscription_id="sub_r3_race",
+        plan="builder",
+        status="active",
     )
+    setup.add(seeded_subscription)
     setup.commit()
+    subscription_id = seeded_subscription.id
     setup.close()
 
-    original_mint = billing._mint_paid_key_with_reveal
+    other = SessionLocal()
+    try:
+        _, key_prefix, key_hash = api_keys_module.mint_key_material("live")
+        other.add(
+            ApiKey(
+                customer_id=customer_id,
+                key_prefix=key_prefix,
+                key_hash=key_hash,
+                environment="live",
+                plan="builder",
+                status="active",
+                subscription_id=subscription_id,
+            )
+        )
+        other.commit()
+    finally:
+        other.close()
 
-    def _second_session_wins(db, customer, plan, background_tasks, *, subscription_id=None):
-        other = SessionLocal()
-        try:
-            winner, _ = api_keys_module.mint_key(other, customer.id, plan=plan)
-            winner.subscription_id = subscription_id
-            other.commit()
-        finally:
-            other.close()
-        return original_mint(db, customer, plan, background_tasks, subscription_id=subscription_id)
-
-    monkeypatch.setattr(billing, "_mint_paid_key_with_reveal", _second_session_wins)
     db = SessionLocal()
     customer = db.execute(select(ApiCustomer).where(ApiCustomer.id == customer_id)).scalar_one()
     subscription = db.execute(
         select(ApiSubscription).where(ApiSubscription.stripe_subscription_id == "sub_r3_race")
     ).scalar_one()
-    billing._ensure_provisioned_for_subscription(db, customer, subscription, None)
+    with pytest.raises(IntegrityError):
+        with db.begin_nested():
+            billing._mint_paid_key_with_reveal(
+                db, customer, subscription.plan, None, subscription_id=subscription.id
+            )
+    assert billing._ensure_provisioned_for_subscription(db, customer, subscription, None).minted is False
     db.commit()
     keys = db.execute(select(ApiKey).where(ApiKey.subscription_id == subscription.id)).scalars().all()
     db.close()
@@ -1994,8 +2005,20 @@ def test_r5_delayed_old_refund_keeps_current_scale_entitlement(client, app_and_d
     db = SessionLocal()
     db.add_all(
         [
-            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r5_old", plan="builder", status="active"),
-            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r5_scale", plan="scale", status="active"),
+            ApiSubscription(
+                customer_id=customer_id,
+                stripe_subscription_id="sub_r5_old",
+                plan="builder",
+                status="canceled",
+                last_event_created_at=datetime.fromtimestamp(1_000, tz=timezone.utc),
+            ),
+            ApiSubscription(
+                customer_id=customer_id,
+                stripe_subscription_id="sub_r5_scale",
+                plan="scale",
+                status="active",
+                last_event_created_at=datetime.fromtimestamp(2_000, tz=timezone.utc),
+            ),
             SnapshotEntitlement(customer_id=customer_id, kind="subscription", scope="full"),
         ]
     )
@@ -2009,9 +2032,10 @@ def test_r5_delayed_old_refund_keeps_current_scale_entitlement(client, app_and_d
             {
                 "id": "ch_r5_old",
                 "customer": "cus_r5_entitlement",
-                "invoice": {"subscription": "sub_r5_old"},
+                "invoice": {"parent": {"subscription_details": {"subscription": "sub_r5_old"}}},
                 "refunds": {"data": [{"metadata": {"cancel_access": "true"}}]},
             },
+            created=3_000,
         ),
     )
     assert res.status_code == 200
