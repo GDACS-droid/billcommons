@@ -35,6 +35,9 @@ pypdf==6.14.2
 # ICANN/Mozilla public suffix list DATA in the package itself -- no network
 # fetch at runtime, no new startup dependency shape.
 publicsuffix2==2.20191221
+# Stripe Python SDK (2026-08-21 monetization Phase 2, billcommons_api.routers.billing).
+# Pinned per SPEC-LOCKED.md's "stripe==13.*" -- 13.2.0 is the newest 13.x release.
+stripe==13.2.0
 
 # workspace packages (editable installs, single source of truth for models/utils)
 -e packages/schema

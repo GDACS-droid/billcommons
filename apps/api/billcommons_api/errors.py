@@ -145,3 +145,36 @@ def bad_request(code: str, message: str) -> HTTPException:
 
 def conflict(code: str, message: str) -> HTTPException:
     return HTTPException(status_code=409, detail={"code": code, "message": message})
+
+
+def unauthorized(code: str, message: str, headers: dict | None = None) -> HTTPException:
+    return HTTPException(status_code=401, detail={"code": code, "message": message}, headers=headers)
+
+
+def service_unavailable(code: str, message: str, headers: dict | None = None) -> HTTPException:
+    """503 -- used by the key-reveal endpoint (item 4 fix) when Fernet
+    decryption fails: the ciphertext is left intact (never destroyed) and
+    the caller is told to retry, since a rotated/misconfigured
+    `BILLCOMMONS_REVEAL_KEY` is an operational condition, not a permanent
+    one."""
+    return HTTPException(status_code=503, detail={"code": code, "message": message}, headers=headers)
+
+
+def forbidden(code: str, message: str) -> HTTPException:
+    """403 -- used by `billcommons_api.routers.account`'s Origin/CSRF gate
+    (amendment B7) and by anything else that must refuse an authenticated
+    but not-permitted caller, as distinct from `not_found`'s "doesn't
+    exist" and `bad_request`'s "malformed input"."""
+    return HTTPException(status_code=403, detail={"code": code, "message": message})
+
+
+def too_many_requests(code: str, message: str, retry_after: int) -> HTTPException:
+    """429 -- fixlist item 4/E2: the billing router's own strict per-IP/
+    per-/24 checkout limiter (checkout endpoints are unauthenticated writes
+    against the shared Stripe account, so `QuotaMiddleware`'s per-customer
+    counters never apply to them)."""
+    return HTTPException(
+        status_code=429,
+        detail={"code": code, "message": message, "retry_after": retry_after},
+        headers={"Retry-After": str(retry_after)},
+    )

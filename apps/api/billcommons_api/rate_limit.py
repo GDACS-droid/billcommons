@@ -619,6 +619,31 @@ class _FixedWindowCounter:
         }
 
 
+class _BoundedFixedWindowCounter(_FixedWindowCounter):
+    """`_FixedWindowCounter` with an oldest-by-insertion size cap.
+
+    Moved here (2026-08-21 fix pass, item 10) from `quota.py`, where it was
+    originally defined only for the anonymous daily-cap buckets (R10), so
+    every OTHER long-window (>1 request/sec sweep cadence) counter in this
+    codebase -- notably `routers.account`'s magic-link IP/email limiters,
+    whose 1-hour window meant an unbounded dict could accumulate for a full
+    hour between sweeps -- can use the same bounded idiom instead of each
+    reinventing it.
+    """
+
+    def __init__(self, limit: int, window: float, clock, max_keys: int):
+        super().__init__(limit, window, clock)
+        self._max_keys = max_keys
+
+    def allow(self, key: str):
+        with self._lock:
+            if key not in self._buckets and len(self._buckets) >= self._max_keys:
+                oldest = next(iter(self._buckets), None)
+                if oldest is not None:
+                    del self._buckets[oldest]
+        return super().allow(key)
+
+
 class _RouteTier:
     """One route-class's pair of buckets: per-IP and per-subnet. A request
     on this tier must pass BOTH -- see `RateLimitMiddleware.dispatch`."""

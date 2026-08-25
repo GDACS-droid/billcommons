@@ -4,6 +4,7 @@ API-level configuration such as CORS origins and the version string.
 """
 from __future__ import annotations
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -54,6 +55,21 @@ class Settings(BaseSettings):
     # a number picked before that incident math was worked through.
     rate_limit_heavy_subnet: str = "180/minute"
     environment: str = "development"
+
+    # 2026-08-21 monetization (round-2 amendment C10). No BILLCOMMONS_API_
+    # prefix on either -- both are shared with non-API contexts (the reveal
+    # key is a plain Fernet key read directly by `billcommons_api.api_keys`;
+    # the allowed-origins list is also the CORS-with-credentials allowlist
+    # `AccountCorsMiddleware` in app.py reads for /account and /billing).
+    #
+    # `reveal_key` has NO DEFAULT on purpose: `billcommons_api.api_keys`
+    # raises loudly the first time a key is minted or revealed without one
+    # set, rather than silently falling back to something insecure.
+    reveal_key: str | None = Field(default=None, validation_alias="BILLCOMMONS_REVEAL_KEY")
+    allowed_origins: str = Field(
+        default="https://billcommons.org,https://www.billcommons.org",
+        validation_alias="BILLCOMMONS_ALLOWED_ORIGINS",
+    )
 
 
 def get_settings() -> Settings:
