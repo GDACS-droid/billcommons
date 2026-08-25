@@ -58,6 +58,7 @@ from billcommons_ingest import api_sync as api_sync_mod
 from billcommons_ingest import coverage as coverage_mod
 from billcommons_ingest import events as events_mod
 from billcommons_ingest import fulltext as fulltext_mod
+from billcommons_ingest import host_auth as host_auth_mod
 from billcommons_ingest import queue as queue_mod
 from billcommons_ingest import registry as registry_mod
 from billcommons_ingest import scheduler as scheduler_mod
@@ -631,6 +632,54 @@ def cmd_enqueue_fulltext(args: argparse.Namespace) -> int:
 RESETTABLE_DEFAULT_STATUSES = ("permanently_failed", "worker_error")
 
 
+_LIKE_ESCAPE = "\\"
+
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE metacharacters (`\\`, `%`, `_`) so a host containing one of
+    these (legal in a hostname label for `_`) cannot over-match a
+    differently-spelled host in a stored URL."""
+    return (
+        value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+
+
+def _robots_exempt_url_filter(hosts: frozenset[str]):
+    """SQL predicate for configured exact hosts' normal HTTP(S) URLs.
+
+    Compares against `func.lower(BillDocument.url)` so a stored URL with a
+    different host case (`HTTPS://LIMS.DCCOUNCIL.GOV/...`) still matches --
+    the runtime exemption check (`host_auth.robots_exempt`) lowercases the
+    parsed hostname via `urlsplit`, and this filter must agree with it or a
+    differently-cased document becomes unresettable forever.
+
+    Covers every URL shape `urlsplit().hostname` would resolve to this same
+    host: with a path, with a port, with a bare query string (no path, no
+    port), and the host with nothing after it at all (no path/query/port) --
+    the four `.../%`+`...: %` LIKE patterns alone miss the last two shapes.
+    Host strings are escaped before being embedded in the LIKE pattern so a
+    literal `_`/`%`/`\\` in a configured host cannot act as a wildcard.
+    """
+    if not hosts:
+        return BillDocument.id.is_(None)
+    lowered_url = func.lower(BillDocument.url)
+    return or_(
+        *(
+            or_(
+                lowered_url.like(f"http://{_escape_like(host.lower())}/%", escape=_LIKE_ESCAPE),
+                lowered_url.like(f"http://{_escape_like(host.lower())}:%", escape=_LIKE_ESCAPE),
+                lowered_url.like(f"http://{_escape_like(host.lower())}?%", escape=_LIKE_ESCAPE),
+                lowered_url.like(f"http://{_escape_like(host.lower())}", escape=_LIKE_ESCAPE),
+                lowered_url.like(f"https://{_escape_like(host.lower())}/%", escape=_LIKE_ESCAPE),
+                lowered_url.like(f"https://{_escape_like(host.lower())}:%", escape=_LIKE_ESCAPE),
+                lowered_url.like(f"https://{_escape_like(host.lower())}?%", escape=_LIKE_ESCAPE),
+                lowered_url.like(f"https://{_escape_like(host.lower())}", escape=_LIKE_ESCAPE),
+            )
+            for host in hosts
+        )
+    )
+
+
 def cmd_reset_fetch_attempts(args: argparse.Namespace) -> int:
     """Give documents their fetch-retry budget back.
 
@@ -656,19 +705,40 @@ def cmd_reset_fetch_attempts(args: argparse.Namespace) -> int:
 
     Only license_note values named by --status (default: permanently_failed
     and worker_error -- the self-inflicted ones) are cleared. A
-    robots_disallowed document keeps its note unless an operator names it by
-    hand: a politeness verdict is not collateral damage of an outage cleanup.
+    robots_disallowed document is reset only when its exact URL host currently
+    carries configured, token-authorized robots exemption; all other robots
+    verdicts remain terminal.
     --only-permanently-failed narrows that further to JUST permanently_failed
     (excluding worker_error) -- the requeue path after a URL-resolver fix
     (see url_resolvers.py), where the fix is document-specific and a
     worker_error is unrelated infrastructure noise that shouldn't be
     conflated with it.
     """
+    robots_exempt_hosts = host_auth_mod.robots_exempt_hosts()
+    default_statuses = list(RESETTABLE_DEFAULT_STATUSES)
+    if robots_exempt_hosts:
+        default_statuses.append(fulltext_mod.STATUS_ROBOTS_DISALLOWED)
     if args.only_permanently_failed:
         statuses = [fulltext_mod.STATUS_PERMANENTLY_FAILED]
     else:
-        statuses = args.status or list(RESETTABLE_DEFAULT_STATUSES)
-    notes = [f"fulltext_status={s}" for s in statuses]
+        requested_statuses = [args.status] if isinstance(args.status, str) else args.status
+        statuses = requested_statuses or default_statuses
+    status_predicates = []
+    for status in statuses:
+        # Non-terminal statuses (worker_error included) may carry the
+        # ` robots=api_token_exempt` audit suffix (fulltext._mark_status)
+        # when the fetch touched a configured exempt host -- match both
+        # forms so a suffixed note isn't left permanently unresettable.
+        predicate = BillDocument.license_note.in_(
+            [
+                f"fulltext_status={status}",
+                f"fulltext_status={status} robots=api_token_exempt",
+            ]
+        )
+        if status == fulltext_mod.STATUS_ROBOTS_DISALLOWED:
+            predicate = predicate & _robots_exempt_url_filter(robots_exempt_hosts)
+        status_predicates.append(predicate)
+    resettable_note_filter = or_(*status_predicates)
 
     filters = []
     if args.document_id:
@@ -703,7 +773,7 @@ def cmd_reset_fetch_attempts(args: argparse.Namespace) -> int:
     # spent budget or one of the resettable notes. Keeps --all from rewriting
     # (and bumping updated_at on) hundreds of thousands of untouched rows.
     filters.append(
-        or_(BillDocument.fetch_attempts > 0, BillDocument.license_note.in_(notes))
+        or_(BillDocument.fetch_attempts > 0, resettable_note_filter)
     )
 
     db = get_session()
@@ -733,15 +803,25 @@ def cmd_reset_fetch_attempts(args: argparse.Namespace) -> int:
             ids = db.execute(select(BillDocument.id).where(*filters).limit(args.limit)).scalars().all()
             scope = [BillDocument.id.in_(ids)]
 
+        # A single UPDATE, not two: the counter reset and the note-clearing
+        # decision must be evaluated against the SAME row snapshot under the
+        # SAME row lock. Two back-to-back UPDATEs leave a gap between them --
+        # a row outside `scope` when the first statement ran (e.g.
+        # fetch_attempts == 0 with a non-resettable note) can be pushed into
+        # `scope` by a concurrent worker committing fetch_attempts=1 plus a
+        # resettable note in that gap; the second statement, re-evaluating
+        # `scope AND resettable_note_filter` at its own write time, would
+        # then match and null the note the first statement never touched --
+        # silently erasing a note the first statement's WHERE never even
+        # considered. Folding both writes into one statement closes the gap:
+        # there is no second write that can see a different snapshot.
         result = db.execute(
             update(BillDocument)
             .where(*scope)
             .values(
                 fetch_attempts=0,
-                # Only the named notes are cleared; every other status keeps
-                # its meaning (robots_disallowed stays disallowed).
                 license_note=case(
-                    (BillDocument.license_note.in_(notes), None),
+                    (resettable_note_filter, None),
                     else_=BillDocument.license_note,
                 ),
             )

@@ -1,0 +1,21 @@
+{
+  "lims.dccouncil.gov": {
+    "headers": {
+      "Authorization": "{token}"
+    },
+    "token_file": "~/.config/billcommons/dc-lims.json",
+    "token_key": "api_token",
+    "robots_exempt": true,
+    "note": "DC Council LIMS developer API token authorizes API and returned document downloads."
+  },
+  "api.iga.in.gov": {
+    "headers": {
+      "x-api-key": "{token}",
+      "User-Agent": "iga-api-client-{token}"
+    },
+    "token_file": "~/.config/billcommons/in-iga.json",
+    "token_key": "api_token",
+    "robots_exempt": true,
+    "note": "Indiana IGA API credentials authorize API access when provisioned."
+  }
+}
