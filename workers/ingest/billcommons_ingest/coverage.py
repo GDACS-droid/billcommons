@@ -29,7 +29,7 @@ from pathlib import Path
 from sqlalchemy import func, or_ as sa_or, select
 from sqlalchemy.orm import Session as OrmSession
 
-from billcommons_ingest.fulltext import TERMINAL_STATUSES
+from billcommons_ingest.fulltext import TERMINAL_STATUSES, license_note_matches_status
 from billcommons_schema.models import (
     Bill,
     BillDocument,
@@ -40,9 +40,10 @@ from billcommons_schema.models import (
 )
 
 # fulltext.py stamps a document's terminal outcome into license_note as
-# `fulltext_status=<status>`; these are the ones that mean "text will never
-# be obtainable from this URL", as opposed to ok/never-attempted.
-_TERMINAL_LICENSE_NOTES = tuple(f"fulltext_status={status}" for status in sorted(TERMINAL_STATUSES))
+# `fulltext_status=<status>` (sometimes decorated, e.g. ` via=browser`);
+# these are the ones that mean "text will never be obtainable from this
+# URL", as opposed to ok/never-attempted. license_note_matches_status
+# (fulltext.py) tolerates the decorated forms -- see R3-1.
 
 _ADVANCEMENT_ORDER = [
     "NOT_STARTED",
@@ -107,7 +108,7 @@ def recompute_coverage_row(db: OrmSession, coverage: JurisdictionCoverage) -> Ju
                 sa_or(
                     BillDocument.extracted_text.is_not(None),
                     BillDocument.license_note.is_(None),
-                    BillDocument.license_note.notin_(_TERMINAL_LICENSE_NOTES),
+                    ~license_note_matches_status(BillDocument.license_note, TERMINAL_STATUSES),
                 ),
             )
         ).scalar_one()

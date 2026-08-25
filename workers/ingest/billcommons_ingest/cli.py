@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import os
 import argparse
+import math
 import random
 import socket
 import sys
@@ -55,6 +56,7 @@ from pathlib import Path
 from sqlalchemy import case, func, or_, select, text, update
 
 from billcommons_ingest import api_sync as api_sync_mod
+from billcommons_ingest import browser_fetch as browser_fetch_mod
 from billcommons_ingest import coverage as coverage_mod
 from billcommons_ingest import events as events_mod
 from billcommons_ingest import fulltext as fulltext_mod
@@ -628,6 +630,88 @@ def cmd_enqueue_fulltext(args: argparse.Namespace) -> int:
         db.close()
 
 
+def cmd_browser_fetch(
+    args: argparse.Namespace,
+    *,
+    tunnel_check=browser_fetch_mod.tunnel_is_up,
+    session_factory=get_session,
+    rawstore_factory=FilesystemRawStore,
+) -> int:
+    """Run the human-attended CDP fetch path, never the normal crawl path."""
+    hosts = browser_fetch_mod.ALLOWLIST if args.all_hosts else (args.host,)
+    # A dry-run reads only the queue.  It deliberately remains useful while
+    # the attended browser and reverse tunnel are offline.
+    if not args.dry_run and not tunnel_check():
+        print("browser-fetch: tunnel down")
+        return 0
+
+    db = session_factory()
+    try:
+        rawstore = rawstore_factory()
+        if args.dry_run:
+            summary = browser_fetch_mod.run_browser_fetch(
+                db,
+                hosts=hosts,
+                limit=args.limit,
+                pace=args.pace,
+                dry_run=True,
+                rawstore=rawstore,
+                max_seconds=getattr(args, "max_seconds", 1500.0),
+                # Dry runs never call the injected fetcher.
+                fetch_via_browser=lambda _url: (_ for _ in ()).throw(AssertionError("dry run fetched")),
+            )
+        else:
+            with browser_fetch_mod.connected_browser_fetcher(hosts) as fetch_via_browser:
+                summary = browser_fetch_mod.run_browser_fetch(
+                    db,
+                    hosts=hosts,
+                    limit=args.limit,
+                    pace=args.pace,
+                    dry_run=False,
+                    rawstore=rawstore,
+                    fetch_via_browser=fetch_via_browser,
+                    max_seconds=getattr(args, "max_seconds", 1500.0),
+                )
+        db.commit()
+        browser_fetch_mod.print_summary(summary)
+        return 0
+    except browser_fetch_mod.BrowserTunnelLost:
+        db.rollback()
+        print("browser-fetch: tunnel lost after 0 docs")
+        return 0
+    except Exception:
+        db.rollback()
+        traceback.print_exc()
+        return 1
+    finally:
+        db.close()
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _non_negative_finite_float(value: str) -> float:
+    """Reject negative/non-finite (`nan`/`inf`) values at the argparse
+    layer -- `run_browser_fetch`'s own `ValueError`/`sleep()` would
+    otherwise surface as a full traceback via `cmd_browser_fetch`'s generic
+    `except Exception` instead of a clean CLI-level rejection (R3-9)."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative, finite number")
+    return parsed
+
+
 RESETTABLE_DEFAULT_STATUSES = ("permanently_failed", "worker_error")
 
 
@@ -668,7 +752,12 @@ def cmd_reset_fetch_attempts(args: argparse.Namespace) -> int:
         statuses = [fulltext_mod.STATUS_PERMANENTLY_FAILED]
     else:
         statuses = args.status or list(RESETTABLE_DEFAULT_STATUSES)
-    notes = [f"fulltext_status={s}" for s in statuses]
+    # license_note_matches_status tolerates the decorated forms _mark_status
+    # can stamp (e.g. `permanently_failed browser_attempted_at=...`) -- an
+    # exact-string match alone leaves the decorated note un-cleared even
+    # after fetch_attempts is reset, silently excluding it from
+    # enqueue_fulltext_jobs forever (R3-1).
+    note_matches = fulltext_mod.license_note_matches_status(BillDocument.license_note, statuses)
 
     filters = []
     if args.document_id:
@@ -702,9 +791,7 @@ def cmd_reset_fetch_attempts(args: argparse.Namespace) -> int:
     # Nothing to reset unless the document actually carries state: either a
     # spent budget or one of the resettable notes. Keeps --all from rewriting
     # (and bumping updated_at on) hundreds of thousands of untouched rows.
-    filters.append(
-        or_(BillDocument.fetch_attempts > 0, BillDocument.license_note.in_(notes))
-    )
+    filters.append(or_(BillDocument.fetch_attempts > 0, note_matches))
 
     db = get_session()
     try:
@@ -741,7 +828,7 @@ def cmd_reset_fetch_attempts(args: argparse.Namespace) -> int:
                 # Only the named notes are cleared; every other status keeps
                 # its meaning (robots_disallowed stays disallowed).
                 license_note=case(
-                    (BillDocument.license_note.in_(notes), None),
+                    (note_matches, None),
                     else_=BillDocument.license_note,
                 ),
             )
@@ -2187,6 +2274,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=None, help="max number of documents to enqueue (default: no limit)"
     )
     p_enqueue_fulltext.set_defaults(func=cmd_enqueue_fulltext)
+
+    p_browser_fetch = sub.add_parser(
+        "browser-fetch",
+        help="fetch selected robots-dark public documents through attended Chrome/CDP",
+    )
+    browser_hosts = p_browser_fetch.add_mutually_exclusive_group(required=True)
+    browser_hosts.add_argument("--host", choices=browser_fetch_mod.ALLOWLIST)
+    browser_hosts.add_argument("--all-hosts", action="store_true", help="round-robin all approved hosts")
+    p_browser_fetch.add_argument(
+        "--limit", type=_positive_int, default=300, help="max documents to fetch (default: 300)"
+    )
+    p_browser_fetch.add_argument(
+        "--pace",
+        type=_non_negative_finite_float,
+        default=3.5,
+        help="base seconds between documents (default: 3.5)",
+    )
+    p_browser_fetch.add_argument(
+        "--max-seconds",
+        type=_positive_float,
+        default=1500.0,
+        help="wall-clock cap for this run (default: 1500)",
+    )
+    p_browser_fetch.add_argument("--dry-run", action="store_true", help="show matching documents without fetching")
+    p_browser_fetch.set_defaults(func=cmd_browser_fetch)
 
     p_reset_fetch = sub.add_parser(
         "reset-fetch-attempts",

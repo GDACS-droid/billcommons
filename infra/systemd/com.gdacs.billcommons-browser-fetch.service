@@ -1,0 +1,9 @@
+[Unit]
+Description=Bill Commons attended-browser full-text fetch
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/codingProjects/billcommons
+EnvironmentFile=-%h/.config/billcommons/.env
+Environment=PYTHONPATH=%h/codingProjects/billcommons/workers/ingest:%h/codingProjects/billcommons/packages/schema:%h/codingProjects/billcommons/packages/shared
+ExecStart=%h/codingProjects/billcommons/.venv/bin/python -m billcommons_ingest browser-fetch --all-hosts --limit 400

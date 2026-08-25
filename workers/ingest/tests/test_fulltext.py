@@ -1783,6 +1783,47 @@ def test_reset_fetch_attempts_makes_a_permanently_failed_document_eligible_again
         after.close()
 
 
+def test_reset_fetch_attempts_clears_stamped_permanently_failed_note():
+    """R3-1: browser-fetch stamps a bounded-retry `permanently_failed` row
+    with a trailing `browser_attempted_at=...` suffix. The old exact-match
+    `license_note.in_(notes)` cleared `fetch_attempts` back to 0 for such a
+    row (via the outer `fetch_attempts > 0` OR-clause) but never cleared its
+    license_note -- so it stayed excluded from enqueue_fulltext_jobs by the
+    `LIKE 'fulltext_status=permanently_failed %'` clause even after the
+    documented recovery lever ran, a silent no-op for exactly the rows
+    browser-fetch touched."""
+    marker = f"https://reset-stamped-{uuid.uuid4().hex}.gov/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=MAX_FETCH_ATTEMPTS)
+        document.license_note = (
+            f"fulltext_status={STATUS_PERMANENTLY_FAILED} browser_attempted_at=2026-08-01T00:00:00+00:00"
+        )
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    check = get_session()
+    try:
+        assert enqueue_fulltext_jobs(check, document_ids=[document_id]) == 0, "precondition: excluded"
+        check.rollback()
+    finally:
+        check.close()
+
+    assert cmd_reset_fetch_attempts(_reset_args(url_like=marker)) == 0
+
+    after = get_session()
+    try:
+        doc = after.get(BillDocument, document_id)
+        assert doc.fetch_attempts == 0
+        assert doc.license_note is None
+        assert enqueue_fulltext_jobs(after, document_ids=[document_id]) == 1
+        after.rollback()
+    finally:
+        after.close()
+
+
 def test_reset_fetch_attempts_refuses_to_run_unfiltered():
     """An unfiltered reset hands ~690k documents a fresh budget and re-opens
     the poison loop the counter exists to close."""
