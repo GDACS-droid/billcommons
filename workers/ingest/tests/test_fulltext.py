@@ -1889,6 +1889,54 @@ def test_reset_fetch_attempts_requeues_robots_for_a_bare_host_url_no_path_no_que
         check.close()
 
 
+def test_reset_fetch_attempts_leaves_an_http_url_note_robots_disallowed(monkeypatch):
+    """R3 fixlist #4: the reset filter is https-only -- `host_auth.robots_exempt`
+    always returns False for a non-https URL, so an http:// stored row for an
+    otherwise-configured, exempt host must never satisfy the host-exemption
+    filter: its `robots_disallowed` license_note must survive the reset (it
+    would otherwise be cleared here and immediately re-marked
+    robots_disallowed on the next fetch, wasting a cycle)."""
+    configured_host = f"http-only-{uuid.uuid4().hex}.gov"
+    marker = f"http://{configured_host}/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=2)
+        document.license_note = f"fulltext_status={STATUS_ROBOTS_DISALLOWED}"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    monkeypatch.setattr(
+        "billcommons_ingest.cli.host_auth_mod.robots_exempt_hosts", lambda: frozenset({configured_host})
+    )
+    assert cmd_reset_fetch_attempts(
+        _reset_args(url_like=marker, status=STATUS_ROBOTS_DISALLOWED)
+    ) == 0
+
+    check = get_session()
+    try:
+        doc = check.get(BillDocument, document_id)
+        assert doc.license_note == f"fulltext_status={STATUS_ROBOTS_DISALLOWED}", (
+            "an http:// row must never be treated as exempt-host-authorized"
+        )
+    finally:
+        check.close()
+
+
+def test_robots_exempt_url_filter_emits_no_http_pattern():
+    """R3 fixlist #4: the reset filter's compiled SQL must contain no
+    `http://` LIKE pattern at all -- only https:// belongs in an https-only
+    exemption filter."""
+    compiled = str(
+        cli_mod._robots_exempt_url_filter(frozenset({"example.gov"})).compile(
+            compile_kwargs={"literal_binds": True}
+        )
+    )
+    assert "http://" not in compiled
+    assert "https://" in compiled
+
+
 def test_reset_fetch_attempts_url_like_filter_does_not_over_match_underscore_host(monkeypatch):
     """R2 fixlist #2: `_` is a SQL LIKE wildcard; a configured host string
     must be escaped before being embedded in the LIKE pattern, or a

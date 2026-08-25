@@ -37,7 +37,7 @@ class HostAuth:
     def from_environment(cls) -> "HostAuth":
         """Load environment JSON first, then the optional configuration file."""
         raw = os.environ.get("BILLCOMMONS_HOST_AUTH_JSON")
-        if raw is None:
+        if raw is None or not raw.strip():
             config_path = Path(
                 os.environ.get("BILLCOMMONS_HOST_AUTH_FILE", str(_DEFAULT_CONFIG_PATH))
             ).expanduser()
@@ -57,7 +57,7 @@ class HostAuth:
         for host, settings in config.items():
             if not isinstance(host, str) or not isinstance(settings, dict):
                 continue
-            headers = cls._resolve_headers(settings)
+            headers = cls._resolve_headers(host, settings)
             if not headers:
                 continue
             entries[host.lower()] = _HostCredentials(
@@ -72,7 +72,7 @@ class HostAuth:
         return cls(entries)
 
     @staticmethod
-    def _resolve_headers(settings: dict) -> dict[str, str]:
+    def _resolve_headers(host: str, settings: dict) -> dict[str, str]:
         configured_headers = settings.get("headers")
         if not isinstance(configured_headers, dict) or not configured_headers:
             return {}
@@ -82,9 +82,11 @@ class HostAuth:
         token_key = settings.get("token_key")
         if token_file is not None or token_key is not None:
             if not isinstance(token_file, str) or not isinstance(token_key, str):
+                HostAuth._log_unresolved(host)
                 return {}
             token = HostAuth._token_from_file(token_file, token_key)
             if token is None:
+                HostAuth._log_unresolved(host)
                 return {}
 
         resolved: dict[str, str] = {}
@@ -93,15 +95,22 @@ class HostAuth:
                 return {}
             value = HostAuth._expand_environment(template)
             if value is None:
+                HostAuth._log_unresolved(host)
                 return {}
             if "{token}" in value:
                 if token is None:
+                    HostAuth._log_unresolved(host)
                     return {}
                 value = value.replace("{token}", token)
             if not value:
+                HostAuth._log_unresolved(host)
                 return {}
             resolved[name] = value
         return resolved
+
+    @staticmethod
+    def _log_unresolved(host: str) -> None:
+        logger.info("host auth for %s skipped: unresolved token", host)
 
     @staticmethod
     def _expand_environment(template: str) -> str | None:
@@ -110,7 +119,7 @@ class HostAuth:
         def replace(match: re.Match[str]) -> str:
             nonlocal missing
             value = os.environ.get(match.group(1))
-            if value is None:
+            if not value:
                 missing = True
                 return ""
             return value

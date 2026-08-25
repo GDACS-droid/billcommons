@@ -659,6 +659,10 @@ def _robots_exempt_url_filter(hosts: frozenset[str]):
     the four `.../%`+`...: %` LIKE patterns alone miss the last two shapes.
     Host strings are escaped before being embedded in the LIKE pattern so a
     literal `_`/`%`/`\\` in a configured host cannot act as a wildcard.
+
+    https-only: `host_auth.HostAuth.robots_exempt` requires `scheme ==
+    "https"`, so an `http://` stored URL can never carry a live exemption --
+    only https:// patterns belong here.
     """
     if not hosts:
         return BillDocument.id.is_(None)
@@ -666,10 +670,6 @@ def _robots_exempt_url_filter(hosts: frozenset[str]):
     return or_(
         *(
             or_(
-                lowered_url.like(f"http://{_escape_like(host.lower())}/%", escape=_LIKE_ESCAPE),
-                lowered_url.like(f"http://{_escape_like(host.lower())}:%", escape=_LIKE_ESCAPE),
-                lowered_url.like(f"http://{_escape_like(host.lower())}?%", escape=_LIKE_ESCAPE),
-                lowered_url.like(f"http://{_escape_like(host.lower())}", escape=_LIKE_ESCAPE),
                 lowered_url.like(f"https://{_escape_like(host.lower())}/%", escape=_LIKE_ESCAPE),
                 lowered_url.like(f"https://{_escape_like(host.lower())}:%", escape=_LIKE_ESCAPE),
                 lowered_url.like(f"https://{_escape_like(host.lower())}?%", escape=_LIKE_ESCAPE),

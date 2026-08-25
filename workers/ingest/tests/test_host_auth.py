@@ -262,6 +262,74 @@ def test_https_to_http_downgrade_hop_loses_robots_exemption_mid_chain(db_session
     assert "http://lims.dccouncil.gov/downloads/bill.pdf" in robots.calls
 
 
+def test_empty_env_var_disables_a_prefixed_header_template_and_the_exemption(monkeypatch, caplog):
+    """R3 fixlist #1: an empty (not just missing) env var must not survive
+    inside a prefixed template like "Bearer ${VAR}" -- the whole host entry
+    must be treated as unconfigured: no headers, and no robots exemption."""
+    monkeypatch.setenv("TEST_EMPTY_DC_LIMS_TOKEN", "")
+    caplog.set_level("INFO")
+
+    auth = _auth_from_env(
+        monkeypatch,
+        {
+            "lims.dccouncil.gov": {
+                "headers": {"Authorization": "Bearer ${TEST_EMPTY_DC_LIMS_TOKEN}"},
+                "robots_exempt": True,
+            }
+        },
+    )
+
+    assert auth.headers_for("https://lims.dccouncil.gov/downloads/bill.txt") == {}
+    assert auth.robots_exempt("https://lims.dccouncil.gov/downloads/bill.txt") is False
+    assert "host auth for lims.dccouncil.gov skipped: unresolved token" in caplog.text
+
+
+def test_empty_env_var_disables_a_prefixed_token_template(tmp_path, monkeypatch):
+    """Same gap via the {token} substitution path with a literal prefix
+    ("iga-api-client-{token}") when the token file resolves to an empty
+    value for the configured key."""
+    config_dir = tmp_path / ".config" / "billcommons"
+    config_dir.mkdir(parents=True)
+    token_path = config_dir / "empty-token.json"
+    token_path.write_text('{"api_token": ""}', encoding="utf-8")
+    monkeypatch.setattr(host_auth_mod.Path, "home", staticmethod(lambda: tmp_path))
+
+    auth = _auth_from_env(
+        monkeypatch,
+        {
+            "api.iga.in.gov": {
+                "headers": {"User-Agent": "iga-api-client-{token}"},
+                "token_file": str(token_path),
+                "token_key": "api_token",
+                "robots_exempt": True,
+            }
+        },
+    )
+
+    assert auth.headers_for("https://api.iga.in.gov/v1/bills") == {}
+    assert auth.robots_exempt("https://api.iga.in.gov/v1/bills") is False
+
+
+def test_empty_host_auth_json_env_var_falls_through_to_the_file(tmp_path, monkeypatch):
+    """R3 fixlist #2: BILLCOMMONS_HOST_AUTH_JSON present-but-empty (the
+    standard artifact of a cleared Railway var) must fall through to
+    BILLCOMMONS_HOST_AUTH_FILE, not silently resolve to {}."""
+    config_path = tmp_path / "host-auth.json"
+    config_path.write_text(
+        json.dumps({"lims.dccouncil.gov": {"headers": {"Authorization": "configured"}, "robots_exempt": True}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BILLCOMMONS_HOST_AUTH_JSON", "   ")
+    monkeypatch.setenv("BILLCOMMONS_HOST_AUTH_FILE", str(config_path))
+
+    auth = host_auth_mod.HostAuth.from_environment()
+
+    assert auth.headers_for("https://lims.dccouncil.gov/downloads/bill.txt") == {
+        "Authorization": "configured"
+    }
+    assert auth.robots_exempt("https://lims.dccouncil.gov/downloads/bill.txt") is True
+
+
 def test_token_file_template_and_logs_expose_only_hostname(tmp_path, monkeypatch, caplog):
     config_dir = tmp_path / ".config" / "billcommons"
     config_dir.mkdir(parents=True)
