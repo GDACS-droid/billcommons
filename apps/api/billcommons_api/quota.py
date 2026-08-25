@@ -64,6 +64,7 @@ from sqlalchemy import text
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -529,7 +530,7 @@ class QuotaMiddleware(BaseHTTPMiddleware):
         request_id = request.headers.get("x-request-id", "")
         try:
             resolved = await run_in_threadpool(resolve_key, presented)
-        except Exception:
+        except (SQLAlchemyError, OSError, TimeoutError):
             logger.exception("API-key resolution failed -- failing closed")
             return JSONResponse(
                 status_code=503,

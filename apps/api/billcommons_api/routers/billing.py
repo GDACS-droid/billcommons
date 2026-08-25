@@ -119,10 +119,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import stripe
 from fastapi import APIRouter, BackgroundTasks, Depends, Request
@@ -186,7 +187,7 @@ stripe.api_version = "2025-03-31.basil"
 
 
 def _site_url() -> str:
-    return os.environ.get("BILLCOMMONS_PUBLIC_SITE_URL", "https://billcommons.org")
+    return os.environ.get("BILLCOMMONS_PUBLIC_SITE_URL", "https://billcommons.org").rstrip("/")
 
 
 def _operator_email() -> str | None:
@@ -209,6 +210,12 @@ def _notify_operator(background_tasks: BackgroundTasks | None, subject: str, bod
         _send_email(to, subject, body)
         return
     background_tasks.add_task(_send_email, to, subject, body)
+
+
+def _stripe_cancel_already_terminal(exc: stripe.InvalidRequestError) -> bool:
+    return getattr(exc, "code", None) == "resource_missing" or bool(
+        re.search(r"already canceled|No such subscription", str(exc), re.IGNORECASE)
+    )
 
 
 _PRICE_ENV = {
@@ -841,6 +848,11 @@ def _customer_has_usable_key(db: OrmSession, customer_id: uuid.UUID) -> bool:
     )
 
 
+class _ProvisioningResult(NamedTuple):
+    minted: bool
+    link_queued: bool
+
+
 def _send_magic_link(
     db: OrmSession,
     customer: ApiCustomer,
@@ -873,7 +885,7 @@ def _ensure_provisioned_for_subscription(
     background_tasks: BackgroundTasks | None,
     *,
     send_magic_link: bool = True,
-) -> bool:
+) -> _ProvisioningResult:
     """E6/Gate A (SPEC-LOCKED "Post-verify decisions round 2"): mint the
     paid key + send the magic link the FIRST time `subscription` is
     observed reaching `active`/`trialing`, from WHICHEVER event notices
@@ -881,7 +893,9 @@ def _ensure_provisioned_for_subscription(
     subscription.*` webhook), `_handle_checkout_session_completed`
     (`checkout.session.completed`), or `_handle_invoice_event`
     (`invoice.paid`) may all call this for the same subscription; only the
-    first call does anything.
+    first call does anything. Returns `(minted, link_queued)`: `minted` is
+    true only when this call created the paid key, while `link_queued` is
+    true only when this call also queued a magic-link email.
 
     `incomplete`/`incomplete_expired` (and anything else outside
     `_PLAN_AUTHORITY_STATUSES`, e.g. `canceled`) are NEVER paid states --
@@ -903,14 +917,14 @@ def _ensure_provisioned_for_subscription(
     db.execute(select(ApiCustomer.id).where(ApiCustomer.id == customer.id).with_for_update())
 
     if subscription.status not in ("active", "trialing"):
-        return False
+        return _ProvisioningResult(False, False)
     already_for_sub = db.execute(
         select(ApiKey.id).where(ApiKey.subscription_id == subscription.id)
     ).first()
     if already_for_sub is not None:
-        return False
+        return _ProvisioningResult(False, False)
     if _customer_has_usable_key(db, customer.id):
-        return False
+        return _ProvisioningResult(False, False)
     try:
         # A savepoint confines a losing unique-index race to this mint. The
         # webhook's outer transaction (including its idempotency row) stays
@@ -922,11 +936,11 @@ def _ensure_provisioned_for_subscription(
     except IntegrityError:
         if db.execute(select(ApiKey.id).where(ApiKey.subscription_id == subscription.id)).first() is None:
             raise
-        return False
+        return _ProvisioningResult(False, False)
     if send_magic_link:
         _send_magic_link(db, customer, background_tasks)
-        return True
-    return False
+        return _ProvisioningResult(True, True)
+    return _ProvisioningResult(True, False)
 
 
 def _apply_subscription_event(
@@ -956,13 +970,19 @@ def _apply_subscription_event(
     metadata_plan = (sub.get("metadata") or {}).get("plan")
     items = ((sub.get("items") or {}).get("data")) or []
     price_id = (items[0].get("price") or {}).get("id") if items else None
-    if metadata_plan is not None and metadata_plan not in ("builder", "scale", "enterprise") and not (
+    invalid_metadata_plan = metadata_plan is not None and metadata_plan not in ("builder", "scale", "enterprise") and not (
         price_id and price_id in _price_id_to_plan_map()
-    ):
-        logger.warning("ignoring subscription %s with invalid metadata plan %r", sub_id, metadata_plan)
-        return "ignored_invalid_plan"
+    )
 
     db.execute(select(ApiCustomer.id).where(ApiCustomer.id == customer.id).with_for_update())
+
+    row = db.execute(
+        select(ApiSubscription).where(ApiSubscription.stripe_subscription_id == sub_id)
+    ).scalar_one_or_none()
+    incoming_status = sub.get("status", "active")
+    if invalid_metadata_plan and (row is None or incoming_status not in _TERMINAL_SUB_STATUSES):
+        logger.warning("ignoring subscription %s with invalid metadata plan %r", sub_id, metadata_plan)
+        return "ignored_invalid_plan"
 
     # Item 1 fix: was `.status.not_in(_TERMINAL_SUB_STATUSES)`, which
     # treated an `incomplete` OTHER subscription as blocking -- a guest
@@ -977,9 +997,30 @@ def _apply_subscription_event(
         .where(ApiSubscription.stripe_subscription_id != sub_id)
         .where(ApiSubscription.status.in_(_BLOCKING_SUB_STATUSES))
     ).scalars().first()
-    row = db.execute(
-        select(ApiSubscription).where(ApiSubscription.stripe_subscription_id == sub_id)
-    ).scalar_one_or_none()
+    if (
+        existing_other is not None
+        and existing_other.status in ("past_due", "unpaid")
+        and incoming_status in ("active", "trialing")
+    ):
+        _configure_stripe()
+        try:
+            stripe.Subscription.cancel(existing_other.stripe_subscription_id)
+        except stripe.InvalidRequestError as exc:
+            if not _stripe_cancel_already_terminal(exc):
+                raise
+            logger.warning("stripe.Subscription.cancel(%s) was already terminal", existing_other.stripe_subscription_id)
+        existing_other.status = "canceled"
+        existing_other.past_due_since = None
+        watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+        if existing_other.last_event_created_at is None or _aware(existing_other.last_event_created_at) < watermark:
+            existing_other.last_event_created_at = watermark
+        _notify_operator(
+            background_tasks,
+            "Bill Commons: dunning subscription canceled for new paid subscription",
+            f"Customer {customer.email} had dunning subscription {existing_other.stripe_subscription_id}; "
+            f"canceled it so {sub_id} can become authoritative.",
+        )
+        existing_other = None
 
     if existing_other is not None and row is None:
         # D2: only refuse when this Stripe subscription id has never been
@@ -995,12 +1036,10 @@ def _apply_subscription_event(
             # that Stripe would retry forever.
             try:
                 stripe.Subscription.cancel(sub_id)
-            except stripe.InvalidRequestError:
-                logger.warning(
-                    "stripe.Subscription.cancel(%s) failed (already terminal?) -- "
-                    "continuing to record the duplicate locally",
-                    sub_id,
-                )
+            except stripe.InvalidRequestError as exc:
+                if not _stripe_cancel_already_terminal(exc):
+                    raise
+                logger.warning("stripe.Subscription.cancel(%s) was already terminal", sub_id)
         # Item 8 fix: record the duplicate locally as `canceled` -- the
         # partial unique index permits it (status IS in
         # `_TERMINAL_SUB_STATUSES`) -- so Stripe's follow-up
@@ -1053,7 +1092,6 @@ def _apply_subscription_event(
         # Item 5 fix: was `row.status == "canceled"`/`incoming_status !=
         # "canceled"` -- the file's own `_TERMINAL_SUB_STATUSES` also
         # covers `incomplete_expired`, which this narrower check missed.
-        incoming_status = sub.get("status", "active")
         if (
             event_created == last_ts
             and row.status in _TERMINAL_SUB_STATUSES
@@ -1066,11 +1104,15 @@ def _apply_subscription_event(
         _configure_stripe()
         try:
             stripe.Subscription.cancel(sub_id)
-        except stripe.InvalidRequestError:
-            logger.warning("stripe.Subscription.cancel(%s) failed while resolving duplicate", sub_id)
+        except stripe.InvalidRequestError as exc:
+            if not _stripe_cancel_already_terminal(exc):
+                raise
+            logger.warning("stripe.Subscription.cancel(%s) was already terminal", sub_id)
         row.status = "canceled"
         row.past_due_since = None
-        row.last_event_created_at = datetime.fromtimestamp(event_created, tz=timezone.utc)
+        watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+        if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
+            row.last_event_created_at = watermark
         db.flush()
         _notify_operator(
             background_tasks,
@@ -1096,30 +1138,30 @@ def _apply_subscription_event(
     period_end = datetime.fromtimestamp(period_end_ts, tz=timezone.utc) if period_end_ts else None
     cancel_at_period_end = bool(sub.get("cancel_at_period_end", False))
 
-    if row is None:
-        row = ApiSubscription(
-            customer_id=customer.id,
-            stripe_subscription_id=sub_id,
-            plan=plan,
-            status=status,
-            current_period_end=period_end,
-            cancel_at_period_end=cancel_at_period_end,
-        )
-        db.add(row)
-    else:
-        row.plan = plan
-        row.status = status
-        row.current_period_end = period_end
-        row.cancel_at_period_end = cancel_at_period_end
-
-    if status == "past_due" and row.past_due_since is None:
-        row.past_due_since = now
-    elif status not in ("past_due",):
-        row.past_due_since = None
-
-    row.last_event_created_at = datetime.fromtimestamp(event_created, tz=timezone.utc)
     try:
         with db.begin_nested():
+            if row is None:
+                row = ApiSubscription(
+                    customer_id=customer.id,
+                    stripe_subscription_id=sub_id,
+                    plan=plan,
+                    status=status,
+                    current_period_end=period_end,
+                    cancel_at_period_end=cancel_at_period_end,
+                )
+                db.add(row)
+            else:
+                row.plan = plan
+                row.status = status
+                row.current_period_end = period_end
+                row.cancel_at_period_end = cancel_at_period_end
+            if status == "past_due" and row.past_due_since is None:
+                row.past_due_since = now
+            elif status != "past_due":
+                row.past_due_since = None
+            watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+            if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
+                row.last_event_created_at = watermark
             db.flush()
     except IntegrityError:
         # A concurrent or late transition may have made another
@@ -1137,10 +1179,17 @@ def _apply_subscription_event(
         _configure_stripe()
         try:
             stripe.Subscription.cancel(sub_id)
-        except stripe.InvalidRequestError:
-            logger.warning("stripe.Subscription.cancel(%s) failed while resolving duplicate", sub_id)
+        except stripe.InvalidRequestError as exc:
+            if not _stripe_cancel_already_terminal(exc):
+                raise
+            logger.warning("stripe.Subscription.cancel(%s) was already terminal", sub_id)
+        if row not in db:
+            db.add(row)
         row.status = "canceled"
         row.past_due_since = None
+        watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+        if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
+            row.last_event_created_at = watermark
         db.flush()
         _notify_operator(
             background_tasks,
@@ -1359,11 +1408,11 @@ def _handle_checkout_session_completed(
         raise _PermanentWebhookError(
             f"checkout completed but subscription not provisionable: subscription={sub_id!r}"
         )
-    queued_magic_link = _ensure_provisioned_for_subscription(db, customer, row, background_tasks)
+    provisioning = _ensure_provisioned_for_subscription(db, customer, row, background_tasks)
     # A completed Checkout is an explicit purchase. Even if it upgraded an
     # existing Developer key in place, send one login link; subscription and
     # invoice events deliberately retain mint-only email behavior.
-    if not queued_magic_link:
+    if not provisioning.link_queued:
         _send_magic_link(db, customer, background_tasks)
     return outcome
 
@@ -1493,15 +1542,39 @@ def _handle_invoice_event(
             .where(ApiSubscription.stripe_subscription_id != sub_id)
             .where(ApiSubscription.status.in_(_BLOCKING_SUB_STATUSES))
         ).scalars().first()
+        if existing_other is not None and existing_other.status in ("past_due", "unpaid") and event_type == "invoice.paid":
+            _configure_stripe()
+            try:
+                stripe.Subscription.cancel(existing_other.stripe_subscription_id)
+            except stripe.InvalidRequestError as exc:
+                if not _stripe_cancel_already_terminal(exc):
+                    raise
+                logger.warning("stripe.Subscription.cancel(%s) was already terminal", existing_other.stripe_subscription_id)
+            existing_other.status = "canceled"
+            existing_other.past_due_since = None
+            watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+            if existing_other.last_event_created_at is None or _aware(existing_other.last_event_created_at) < watermark:
+                existing_other.last_event_created_at = watermark
+            _notify_operator(
+                background_tasks,
+                "Bill Commons: dunning subscription canceled for new paid subscription",
+                f"Customer {customer.email} had dunning subscription {existing_other.stripe_subscription_id}; "
+                f"canceled it so {sub_id} can become authoritative.",
+            )
+            existing_other = None
         if existing_other is not None:
             _configure_stripe()
             try:
                 stripe.Subscription.cancel(sub_id)
-            except stripe.InvalidRequestError:
-                logger.warning("stripe.Subscription.cancel(%s) failed while resolving duplicate", sub_id)
+            except stripe.InvalidRequestError as exc:
+                if not _stripe_cancel_already_terminal(exc):
+                    raise
+                logger.warning("stripe.Subscription.cancel(%s) was already terminal", sub_id)
             row.status = "canceled"
             row.past_due_since = None
-            row.last_event_created_at = datetime.fromtimestamp(event_created, tz=timezone.utc)
+            watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+            if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
+                row.last_event_created_at = watermark
             db.flush()
             _notify_operator(
                 background_tasks,
@@ -1520,9 +1593,11 @@ def _handle_invoice_event(
     # Item 5 fix: was `row.status != "canceled"` -- the file's own
     # `_TERMINAL_SUB_STATUSES` also covers `incomplete_expired`; only a
     # subscription event may revive either terminal state.
-    if row.status not in _TERMINAL_SUB_STATUSES:
-        if event_type == "invoice.payment_failed":
-            # Item 1(d)/E6 fix: `incomplete` is NEVER a paid state -- the
+    try:
+        with db.begin_nested():
+            if row.status not in _TERMINAL_SUB_STATUSES:
+                if event_type == "invoice.payment_failed":
+                    # Item 1(d)/E6 fix: `incomplete` is NEVER a paid state -- the
             # first invoice on a brand-new subscription failing is the
             # NORMAL case for a customer who never successfully paid, not
             # dunning against someone who once did. Promoting it to
@@ -1534,16 +1609,16 @@ def _handle_invoice_event(
             # subscription that was ALREADY billing-authoritative (or
             # already dunning) can be pushed into dunning by an invoice
             # event.
-            if row.status != "incomplete":
-                if row.status != "past_due" or row.past_due_since is None:
-                    row.past_due_since = now
-                row.status = "past_due"
-        elif event_type == "invoice.paid":
-            row.status = "active"
-            row.past_due_since = None
-    row.last_event_created_at = datetime.fromtimestamp(event_created, tz=timezone.utc)
-    try:
-        with db.begin_nested():
+                    if row.status != "incomplete":
+                        if row.status != "past_due" or row.past_due_since is None:
+                            row.past_due_since = now
+                        row.status = "past_due"
+                elif event_type == "invoice.paid":
+                    row.status = "active"
+                    row.past_due_since = None
+            watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+            if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
+                row.last_event_created_at = watermark
             db.flush()
     except IntegrityError:
         # Belt-and-braces for a concurrent activation that raced the probe.
@@ -1558,10 +1633,15 @@ def _handle_invoice_event(
         _configure_stripe()
         try:
             stripe.Subscription.cancel(sub_id)
-        except stripe.InvalidRequestError:
-            logger.warning("stripe.Subscription.cancel(%s) failed while resolving duplicate", sub_id)
+        except stripe.InvalidRequestError as exc:
+            if not _stripe_cancel_already_terminal(exc):
+                raise
+            logger.warning("stripe.Subscription.cancel(%s) was already terminal", sub_id)
         row.status = "canceled"
         row.past_due_since = None
+        watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+        if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
+            row.last_event_created_at = watermark
         db.flush()
         _notify_operator(
             background_tasks,
@@ -1634,6 +1714,7 @@ def _refund_cancel_access_flag(charge: dict) -> bool:
 def _handle_charge_refunded(
     db: OrmSession, charge: dict, event_created: int, background_tasks: BackgroundTasks | None
 ) -> str:
+    _configure_stripe()
     payment_intent_id = charge.get("payment_intent")
     cancel_access = _refund_cancel_access_flag(charge)
 
@@ -1672,16 +1753,34 @@ def _handle_charge_refunded(
     # explicitly set metadata.cancel_access="true" on the Refund in the
     # Dashboard.
     is_ours, customer = _resolve_invoice_ownership(db, {"customer": charge.get("customer")})
+    is_tagged = _has_app_metadata(charge)
+    remote_intent = None
+    if not is_ours and payment_intent_id:
+        remote_intent = stripe.PaymentIntent.retrieve(payment_intent_id)
+        is_tagged = is_tagged or _has_app_metadata(remote_intent)
+        sessions = stripe.checkout.Session.list(payment_intent=payment_intent_id, limit=1).get("data") or []
+        if sessions:
+            checkout_session = sessions[0]
+            is_tagged = is_tagged or _has_app_metadata(checkout_session)
+            email = (checkout_session.get("customer_details") or {}).get("email")
+            if email:
+                customer = db.execute(
+                    select(ApiCustomer).where(ApiCustomer.email == email.strip().lower())
+                ).scalar_one_or_none()
+                is_ours = customer is not None
     if not is_ours or customer is None:
         # Stripe may deliver a guest-checkout refund before the matching
         # checkout completion has created our local customer.  Its own
         # metadata is sufficient to establish ownership, but not enough to
         # safely process it yet: raise so Stripe retries after checkout.
-        is_tagged = _has_app_metadata(charge)
-        if not is_tagged and payment_intent_id:
-            remote_intent = stripe.PaymentIntent.retrieve(payment_intent_id)
-            is_tagged = _has_app_metadata(remote_intent)
         if is_tagged:
+            if event_created <= int((datetime.now(timezone.utc) - timedelta(hours=72)).timestamp()):
+                _notify_operator(
+                    background_tasks,
+                    "Bill Commons: refund skipped after unresolved guest checkout",
+                    f"payment_intent {payment_intent_id!r} could not be mapped to a local customer after 72 hours.",
+                )
+                return "skipped_unresolvable_refund"
             raise RuntimeError("Bill Commons refund arrived before checkout provisioning")
         return "skipped_foreign_app"
 
@@ -1692,33 +1791,65 @@ def _handle_charge_refunded(
     )
     if cancel_access:
         metadata = charge.get("metadata") or {}
-        sub_id = charge.get("subscription") or metadata.get("subscription_id") or metadata.get("stripe_subscription_id")
         invoice = charge.get("invoice")
         if isinstance(invoice, dict):
-            sub_id = sub_id or _invoice_subscription_id(invoice)
-        elif invoice and not sub_id:
+            sub_id = _invoice_subscription_id(invoice)
+        elif invoice:
             remote_invoice = stripe.Invoice.retrieve(invoice)
             sub_id = _invoice_subscription_id(remote_invoice)
+        else:
+            sub_id = None
+        sub_id = sub_id or metadata.get("subscription_id") or metadata.get("stripe_subscription_id")
         row = (
-            db.execute(select(ApiSubscription).where(ApiSubscription.stripe_subscription_id == sub_id)).scalar_one_or_none()
+            db.execute(
+                select(ApiSubscription).where(
+                    ApiSubscription.stripe_subscription_id == sub_id,
+                    ApiSubscription.customer_id == customer.id,
+                )
+            ).scalar_one_or_none()
             if sub_id
             else None
         )
-        if row is not None:
-            _configure_stripe()
-            try:
-                stripe.Subscription.cancel(row.stripe_subscription_id)
-            except stripe.InvalidRequestError:
-                logger.warning("stripe.Subscription.cancel(%s) failed (already terminal?)", row.stripe_subscription_id)
-            row.status = "canceled"
-            row.past_due_since = None
-            watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
-            if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
-                row.last_event_created_at = watermark
-            # `SessionLocal` intentionally uses autoflush=False.  Flush the
-            # canceled state before `customer_plan()` queries it, otherwise
-            # the old paid row remains visible and key plans are not dropped.
-            db.flush()
+        if row is None:
+            candidates = db.execute(
+                select(ApiSubscription).where(
+                    ApiSubscription.customer_id == customer.id,
+                    ApiSubscription.status.not_in(_TERMINAL_SUB_STATUSES),
+                )
+            ).scalars().all()
+            if len(candidates) == 1:
+                row = candidates[0]
+        if row is None:
+            _notify_operator(
+                background_tasks,
+                "Bill Commons: cancel_access refund could not be mapped to a subscription",
+                f"customer {customer.email}, payment_intent={payment_intent_id!r}",
+            )
+            raise _PermanentWebhookError("cancel_access refund could not be mapped to a subscription")
+        if row.last_event_created_at is not None and event_created < int(_aware(row.last_event_created_at).timestamp()):
+            return "processed"
+        try:
+            stripe.Subscription.cancel(row.stripe_subscription_id)
+        except stripe.InvalidRequestError as exc:
+            if not _stripe_cancel_already_terminal(exc):
+                raise
+            logger.warning("stripe.Subscription.cancel(%s) was already terminal", row.stripe_subscription_id)
+        row.status = "canceled"
+        row.past_due_since = None
+        watermark = datetime.fromtimestamp(event_created, tz=timezone.utc)
+        if row.last_event_created_at is None or _aware(row.last_event_created_at) < watermark:
+            row.last_event_created_at = watermark
+        # `SessionLocal` intentionally uses autoflush=False.  Flush the
+        # canceled state before `customer_plan()` queries it, otherwise
+        # the old paid row remains visible and key plans are not dropped.
+        db.flush()
+        remaining_authority = db.execute(
+            select(ApiSubscription.id).where(
+                ApiSubscription.customer_id == customer.id,
+                ApiSubscription.status.in_(_PLAN_AUTHORITY_STATUSES),
+            )
+        ).first()
+        if remaining_authority is None:
             now = datetime.now(timezone.utc)
             db.execute(
                 sa_update(SnapshotEntitlement)
@@ -1729,7 +1860,7 @@ def _handle_charge_refunded(
                 )
                 .values(expires_at=now)
             )
-            _recompute_plan_onto_keys(db, customer.id, customer_plan(db, customer.id))
+        _recompute_plan_onto_keys(db, customer.id, customer_plan(db, customer.id))
     return "processed"
 
 

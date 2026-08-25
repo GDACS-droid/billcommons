@@ -1818,7 +1818,7 @@ def test_r4_6_delayed_refund_only_targets_its_own_subscription(client, app_and_d
             {
                 "id": "ch_r4_old_refund",
                 "customer": "cus_r4_old_refund",
-                "subscription": "sub_r4_old",
+                "invoice": {"subscription": "sub_r4_old"},
                 "refunds": {"data": [{"metadata": {"cancel_access": "true"}}]},
             },
         ),
@@ -1880,7 +1880,7 @@ def test_r4_10_expired_rotating_key_does_not_block_paid_mint(app_and_db):
     expired.revoke_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     db.flush()
     customer = db.execute(select(ApiCustomer).where(ApiCustomer.id == customer_id)).scalar_one()
-    assert billing._ensure_provisioned_for_subscription(db, customer, subscription, None) is True
+    assert billing._ensure_provisioned_for_subscription(db, customer, subscription, None).minted is True
     db.commit()
     keys = db.execute(select(ApiKey).where(ApiKey.customer_id == customer_id)).scalars().all()
     db.close()
@@ -1919,3 +1919,182 @@ def test_r4_14_fresh_checkout_queues_one_magic_link(client, app_and_db, monkeypa
     )
     assert res.status_code == 200
     assert sent == ["r4-mail@example.com"]
+
+
+def test_r5_refund_configures_stripe_before_payment_intent_retrieve(app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    configured = []
+    monkeypatch.setattr(billing, "_configure_stripe", lambda: configured.append(True))
+
+    def _retrieve(payment_intent_id):
+        assert configured
+        return {"id": payment_intent_id, "metadata": {}}
+
+    monkeypatch.setattr(stripe.PaymentIntent, "retrieve", staticmethod(_retrieve))
+    monkeypatch.setattr(stripe.checkout.Session, "list", staticmethod(lambda **kwargs: {"data": []}))
+    monkeypatch.setattr(stripe.Refund, "list", staticmethod(lambda **kwargs: {"data": []}))
+    db = SessionLocal()
+    assert billing._handle_charge_refunded(db, {"payment_intent": "pi_r5_config"}, 1, None) == "skipped_foreign_app"
+    db.close()
+
+
+def test_r5_refund_uses_invoice_subscription_and_rejects_foreign_metadata(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    own_customer = _make_customer(SessionLocal, "r5-own@example.com", "cus_r5_own")
+    foreign_customer = _make_customer(SessionLocal, "r5-foreign@example.com", "cus_r5_foreign")
+    db = SessionLocal()
+    db.add(ApiSubscription(customer_id=own_customer, stripe_subscription_id="sub_r5_own", plan="builder", status="active"))
+    db.add(ApiSubscription(customer_id=foreign_customer, stripe_subscription_id="sub_r5_foreign", plan="builder", status="active"))
+    db.commit()
+    db.close()
+    canceled = []
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "charge.refunded",
+            {
+                "id": "ch_r5_invoice",
+                "customer": "cus_r5_own",
+                "invoice": {"subscription": "sub_r5_own"},
+                "metadata": {"stripe_subscription_id": "sub_r5_foreign"},
+                "refunds": {"data": [{"metadata": {"cancel_access": "true"}}]},
+            },
+        ),
+    )
+    assert res.status_code == 200
+    assert canceled == ["sub_r5_own"]
+    assert _subscription_row(SessionLocal, "sub_r5_foreign").status == "active"
+
+
+def test_r5_unresolvable_cancel_access_refund_is_permanent_and_notifies(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    _make_customer(SessionLocal, "r5-unresolved@example.com", "cus_r5_unresolved")
+    notices = []
+    monkeypatch.setattr(billing, "_notify_operator", lambda *args: notices.append(args[1]))
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "charge.refunded",
+            {
+                "id": "ch_r5_unresolved",
+                "customer": "cus_r5_unresolved",
+                "refunds": {"data": [{"metadata": {"cancel_access": "true"}}]},
+            },
+        ),
+    )
+    assert res.status_code == 200
+    assert res.json()["outcome"] == "permanent_error"
+    assert any("could not be mapped" in subject for subject in notices)
+
+
+def test_r5_delayed_old_refund_keeps_current_scale_entitlement(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r5-entitlement@example.com", "cus_r5_entitlement")
+    db = SessionLocal()
+    db.add_all(
+        [
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r5_old", plan="builder", status="active"),
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r5_scale", plan="scale", status="active"),
+            SnapshotEntitlement(customer_id=customer_id, kind="subscription", scope="full"),
+        ]
+    )
+    db.commit()
+    db.close()
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: None))
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "charge.refunded",
+            {
+                "id": "ch_r5_old",
+                "customer": "cus_r5_entitlement",
+                "invoice": {"subscription": "sub_r5_old"},
+                "refunds": {"data": [{"metadata": {"cancel_access": "true"}}]},
+            },
+        ),
+    )
+    assert res.status_code == 200
+    db = SessionLocal()
+    entitlement = db.execute(select(SnapshotEntitlement).where(SnapshotEntitlement.customer_id == customer_id)).scalar_one()
+    db.close()
+    assert entitlement.expires_at is None
+
+
+def test_r5_guest_refund_converges_after_checkout_provisioning(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    monkeypatch.setattr(stripe.PaymentIntent, "retrieve", staticmethod(lambda _: {"metadata": {"app": "billcommons"}}))
+    monkeypatch.setattr(
+        stripe.checkout.Session,
+        "list",
+        staticmethod(lambda **kwargs: {"data": [{"metadata": {"app": "billcommons"}, "customer_details": {"email": "r5-guest@example.com"}}]}),
+    )
+    refund = _stripe_event(
+        "charge.refunded",
+        {"id": "ch_r5_guest", "payment_intent": "pi_r5_guest", "refunds": {"data": [{"metadata": {}}]}},
+        event_id="evt_r5_guest_refund",
+    )
+    assert _post_webhook(client, refund).status_code == 500
+    assert _stripe_event_row(SessionLocal, refund["id"]) is None
+    _make_customer(SessionLocal, "r5-guest@example.com")
+    assert _post_webhook(client, refund).status_code == 200
+
+
+def test_r5_invalid_metadata_still_applies_terminal_transition(client, app_and_db):
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r5-invalid-plan@example.com", "cus_r5_invalid_plan")
+    db = SessionLocal()
+    db.add(ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r5_invalid_plan", plan="builder", status="active"))
+    db.commit()
+    db.close()
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "customer.subscription.deleted",
+            {"id": "sub_r5_invalid_plan", "customer": "cus_r5_invalid_plan", "metadata": {"app": "billcommons", "plan": "bogus"}},
+        ),
+    )
+    assert res.status_code == 200
+    assert _subscription_row(SessionLocal, "sub_r5_invalid_plan").status == "canceled"
+
+
+def test_r5_new_paid_subscription_replaces_dunning_incumbent(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r5-dunning@example.com", "cus_r5_dunning")
+    db = SessionLocal()
+    db.add(ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r5_dunning", plan="builder", status="past_due"))
+    db.commit()
+    db.close()
+    canceled = []
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "customer.subscription.created",
+            {"id": "sub_r5_paid", "customer": "cus_r5_dunning", "status": "active", "metadata": {"app": "billcommons", "plan": "scale"}},
+        ),
+    )
+    assert res.status_code == 200
+    assert canceled == ["sub_r5_dunning"]
+    assert _subscription_row(SessionLocal, "sub_r5_dunning").status == "canceled"
+    assert _subscription_row(SessionLocal, "sub_r5_paid").status == "active"
+
+
+def test_r5_nonterminal_stripe_cancel_error_retries_webhook(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r5-cancel-error@example.com", "cus_r5_cancel_error")
+    db = SessionLocal()
+    db.add(ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r5_incumbent", plan="builder", status="active"))
+    db.commit()
+    db.close()
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "cancel",
+        staticmethod(lambda sub_id: (_ for _ in ()).throw(stripe.InvalidRequestError("temporary Stripe failure", None))),
+    )
+    event = _stripe_event(
+        "customer.subscription.created",
+        {"id": "sub_r5_new", "customer": "cus_r5_cancel_error", "status": "active", "metadata": {"app": "billcommons", "plan": "builder"}},
+    )
+    assert _post_webhook(client, event).status_code == 500
+    assert _stripe_event_row(SessionLocal, event["id"]) is None

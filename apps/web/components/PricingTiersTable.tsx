@@ -18,7 +18,7 @@ const TIERS: {
   heavyDay: string;
   note?: string;
 }[] = [
-  { name: "Anonymous", monthlyPrice: "$0", annualPrice: null, reqDay: "2,000/IP, 5,000/24", heavyDay: "—" },
+  { name: "Anonymous", monthlyPrice: "$0", annualPrice: null, reqDay: "2,000/IP, 5,000/24", heavyDay: "per-minute cap only" },
   { name: "Developer", monthlyPrice: "$0 (free key)", annualPrice: null, reqDay: "5,000", heavyDay: "500" },
   { name: "Builder", monthlyPrice: "$49/mo", annualPrice: "$490/yr", reqDay: "50,000", heavyDay: "5,000" },
   {
