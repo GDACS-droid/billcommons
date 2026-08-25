@@ -1157,14 +1157,21 @@ def record_job_failure(
             document = db.get(BillDocument, document_id, with_for_update=True)
             if document is not None:
                 status = document_status
+                created_at = document.created_at
+                if created_at is not None and created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
                 if (
                     count_attempt
                     and status not in fulltext_mod.TERMINAL_STATUSES
                     and (
                         status not in fulltext_mod.NO_FETCH_ATTEMPT_CHARGE_STATUSES
-                        or document.created_at
-                        <= datetime.now(timezone.utc)
-                        - timedelta(days=fulltext_mod.MA_DOCKET_NO_BILL_NUMBER_GRACE_DAYS)
+                        # The 180-day created_at anchor is an accepted approximation for this grace period.
+                        or (
+                            created_at is not None
+                            and created_at
+                            <= datetime.now(timezone.utc)
+                            - timedelta(days=fulltext_mod.MA_DOCKET_NO_BILL_NUMBER_GRACE_DAYS)
+                        )
                     )
                 ):
                     document.fetch_attempts = (document.fetch_attempts or 0) + 1

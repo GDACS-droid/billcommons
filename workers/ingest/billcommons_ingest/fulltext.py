@@ -910,7 +910,7 @@ def process_fetch_text_job(
         if ma_url is not None:
             try:
                 response, fetched_url, resolver_name, outcome = _resolve_ma_document(fetcher, ma_url)
-            except (httpx.HTTPError, MaApiLookupError) as exc:
+            except MaApiLookupError as exc:
                 if is_ma_docket_id(ma_url.doc_id):
                     raise
                 # A bill-shaped URL already identifies a real bill, so an
@@ -923,7 +923,9 @@ def process_fetch_text_job(
                 resolver_name = None
         else:
             candidate_urls = resolve_fetch_url(jurisdiction_code, document.url, bill_identifier)
-            response, fetched_url, outcome = _fetch_best_candidate(fetcher, candidate_urls)
+            response, fetched_url, outcome = _fetch_best_candidate(
+                fetcher, candidate_urls, original_url=document.url
+            )
             resolver_name = resolver_name_for_candidate(
                 jurisdiction_code, document.url, fetched_url, bill_identifier
             )
@@ -1103,32 +1105,50 @@ def _fetch_best_candidate(
     result that looks like success.
     """
     original_url = original_url or candidates[0]
-    last_exc: tuple[str | None, BaseException] | None = (
-        (None, initial_exc) if initial_exc is not None else None
-    )
-    retryable_exc: tuple[str | None, BaseException] | None = last_exc
-    terminal_exceptions: list[tuple[str, UnfetchableDocument]] = []
-    last_empty: tuple[httpx.Response, str, "ExtractionOutcome"] | None = None
+    outcomes: dict[str, list[tuple[str, BaseException | tuple[httpx.Response, str, "ExtractionOutcome"]]]] = {}
+    retryable_outcomes: list[tuple[str, BaseException]] = []
+
+    if initial_exc is not None:
+        outcomes.setdefault(original_url, []).append(("retryable", initial_exc))
+        retryable_outcomes.append((original_url, initial_exc))
+
     for url in candidates:
         try:
             response = fetcher.fetch(url)
         except (httpx.HTTPError, UnfetchableDocument) as exc:
-            last_exc = (url, exc)
             if isinstance(exc, httpx.HTTPError):
-                retryable_exc = last_exc
+                outcomes.setdefault(url, []).append(("retryable", exc))
+                retryable_outcomes.append((url, exc))
             else:
-                terminal_exceptions.append((url, exc))
+                outcomes.setdefault(url, []).append(("terminal", exc))
             continue
         try:
             content_type = sniff_content_type(response.headers.get("content-type"), url, response.content)
             outcome = extract_document_text(content_type, response.content)
         except Exception as exc:  # noqa: BLE001 - try the next candidate; classified below if none work
-            last_exc = (url, exc)
-            retryable_exc = last_exc
+            outcomes.setdefault(url, []).append(("retryable", exc))
+            retryable_outcomes.append((url, exc))
             continue
         if outcome.extracted_text and outcome.extracted_text.strip():
             return response, url, outcome
-        last_empty = (response, url, outcome)
+        empty_outcome = (response, url, outcome)
+        outcomes.setdefault(url, []).append(("empty", empty_outcome))
+
+    original_outcomes = outcomes.get(original_url, [])
+    for outcome_type, outcome_value in original_outcomes:
+        if outcome_type == "terminal":
+            raise outcome_value
+
+    original_retryable = next(
+        (outcome_value for outcome_type, outcome_value in original_outcomes if outcome_type == "retryable"),
+        None,
+    )
+    if original_retryable is not None:
+        retryable_exc = (original_url, original_retryable)
+    elif retryable_outcomes:
+        retryable_exc = retryable_outcomes[0]
+    else:
+        retryable_exc = None
     if retryable_exc is not None:
         _error_url, exc = retryable_exc
         if isinstance(exc, (httpx.HTTPError, DocumentFetchError)):
@@ -1138,20 +1158,29 @@ def _fetch_best_candidate(
         raise DocumentFetchError(
             f"text extraction failed for {_error_url}: {exc}", status=STATUS_FETCH_ERROR
         ) from exc
-    if terminal_exceptions:
-        # A terminal verdict from a speculative rewrite must not turn an
-        # original URL's real 200 response into a charged failure. The
-        # original URL defaults to candidate #1; T2-2's original-error case
-        # still reaches the retryable branch above.
-        if (
-            last_empty is not None
-            and last_empty[1] == original_url
-            and all(url != original_url for url, _exc in terminal_exceptions)
-        ):
-            return last_empty
-        raise terminal_exceptions[-1][1]
-    assert last_empty is not None  # candidates is never empty (original url always present)
-    return last_empty
+    original_empty = next(
+        (outcome_value for outcome_type, outcome_value in original_outcomes if outcome_type == "empty"),
+        None,
+    )
+    if original_empty is not None:
+        return original_empty
+
+    terminal_outcomes = [
+        outcome_value
+        for candidate_outcomes in outcomes.values()
+        for outcome_type, outcome_value in candidate_outcomes
+        if outcome_type == "terminal"
+    ]
+    if terminal_outcomes:
+        raise terminal_outcomes[-1]
+    empty_outcomes = [
+        outcome_value
+        for candidate_outcomes in outcomes.values()
+        for outcome_type, outcome_value in candidate_outcomes
+        if outcome_type == "empty"
+    ]
+    assert empty_outcomes  # candidates is never empty (original url always present)
+    return empty_outcomes[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -1316,8 +1345,10 @@ def _resolve_ma_bill(
         _assert_ma_field(bill_data, "BillNumber", bill_number, bill_url)
         if expected_docket is not None:
             _assert_ma_field(bill_data, "DocketNumber", expected_docket, bill_url)
-    except DocumentFetchError as exc:
-        raise MaApiLookupError(str(exc), status=exc.status) from exc
+    except (httpx.HTTPError, DocumentFetchError) as exc:
+        raise MaApiLookupError(
+            str(exc), status=getattr(exc, "status", None) or STATUS_FETCH_ERROR
+        ) from exc
 
     bill_text = _clean_ma_document_text(bill_data)
     if bill_text is not None:
