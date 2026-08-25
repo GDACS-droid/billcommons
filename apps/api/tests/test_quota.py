@@ -165,6 +165,23 @@ def test_valid_key_raises_ceiling_past_anonymous_limit(client, app_and_db):
     assert all(s == 200 for s in statuses)
 
 
+def test_r4_1_valid_key_bypasses_saturated_anonymous_buckets(client, app_and_db, monkeypatch):
+    """A valid paid key must resolve before the anonymous probe guard.
+    Saturating both anonymous windows from its IP cannot turn it into a 429."""
+    monkeypatch.setenv("BILLCOMMONS_ANON_DAILY_LIMIT", "3")
+    monkeypatch.setenv("BILLCOMMONS_ANON_DAILY_LIMIT_SUBNET", "3")
+    _, SessionLocal = app_and_db
+    _, _, full_key = _mint_key(SessionLocal, email="r4-keyed@example.com", plan="builder")
+    ip_headers = {"X-Forwarded-For": "203.0.113.201"}
+    assert [client.get("/api/v1/_test_ok", headers=ip_headers).status_code for _ in range(3)] == [200, 200, 200]
+    res = client.get(
+        "/api/v1/_test_ok",
+        headers={**ip_headers, "Authorization": f"Bearer {full_key}"},
+    )
+    assert res.status_code == 200
+    assert res.headers["X-Plan"] == "builder"
+
+
 def test_test_mode_key_gets_test_environment(client, app_and_db):
     _, SessionLocal = app_and_db
     _, _, full_key = _mint_key(SessionLocal, environment="test", plan="builder")
@@ -581,14 +598,10 @@ def test_unknown_key_401_still_charges_the_anonymous_ip_bucket(client, app_and_d
     assert statuses[3] == 429
 
 
-def test_probe_stops_hitting_resolve_key_once_anon_ip_is_over_limit(client, app_and_db, monkeypatch):
-    """Fixlist item 4 regression: round-1 item 1 already stopped a probe
-    from being CACHED, and the test above confirms it's eventually 429'd --
-    but pre-fix, EVERY probe still called `resolve_key` (one indexed
-    SELECT) even after the same IP was already over its anonymous limit
-    and therefore guaranteed a 429 regardless of what `resolve_key` found.
-    `_anon_tier_peek`'s non-mutating short-circuit must stop calling
-    `resolve_key` at all once that happens."""
+def test_probe_still_resolves_before_anonymous_saturation_is_applied(client, app_and_db, monkeypatch):
+    """R4-1 deliberately accepts one indexed lookup for every probe: only
+    a failed resolution may consult the anonymous saturation guard, because
+    resolving first prevents a valid key behind that IP from being 429'd."""
     monkeypatch.setenv("BILLCOMMONS_ANON_DAILY_LIMIT", "1000")
     calls = []
     original_resolve_key = quota_module.resolve_key
@@ -603,14 +616,12 @@ def test_probe_stops_hitting_resolve_key_once_anon_ip_is_over_limit(client, app_
         "Authorization": "Bearer bc_live_" + "z" * 32,
         "X-Forwarded-For": "203.0.113.61",
     }
-    # BILLCOMMONS_API_RATE_LIMIT_DEFAULT is "3/minute" -- the first 3
-    # probes still resolve (and get charged, per item 1), but the 4th+
-    # must be refused by the peek short-circuit BEFORE `resolve_key` is
-    # ever called again.
+    # BILLCOMMONS_API_RATE_LIMIT_DEFAULT is "3/minute".  All failed keys
+    # resolve first; the fourth and later are then refused by the anon peek.
     statuses = [client.get("/api/v1/_test_ok", headers=headers).status_code for _ in range(6)]
     assert statuses[:3] == [401, 401, 401]
     assert all(s == 429 for s in statuses[3:])
-    assert len(calls) == 3, "resolve_key must not be called once the anon IP tier is saturated"
+    assert len(calls) == 6
 
 
 def test_post_response_metering_failure_does_not_500_the_response(client, app_and_db, monkeypatch):
@@ -948,6 +959,42 @@ def test_create_key_inherits_customer_subscription_plan(app_and_db):
     key = db2.execute(select(ApiKey).where(ApiKey.customer_id == customer_id)).scalars().first()
     assert key.plan == "builder"
     db2.close()
+
+
+def test_r4_2_incomplete_expired_subscription_is_not_plan_authoritative(app_and_db):
+    """`/me` and a newly minted account key must both fall back to Developer
+    when the only Scale row is an abandoned checkout."""
+    app, SessionLocal = app_and_db
+    db = SessionLocal()
+    customer = ApiCustomer(email="r4-incomplete-expired@example.com")
+    db.add(customer)
+    db.flush()
+    db.add(
+        ApiSubscription(
+            customer_id=customer.id,
+            stripe_subscription_id="sub_r4_incomplete_expired",
+            plan="scale",
+            status="incomplete_expired",
+        )
+    )
+    db.commit()
+    customer_id = customer.id
+    db.close()
+
+    client = _login_client(app, customer_id)
+    me = client.get("/api/v1/account/me")
+    assert me.status_code == 200
+    assert me.json()["plan"] == "developer"
+    minted = client.post(
+        "/api/v1/account/keys",
+        json={"name": "r4 developer key"},
+        headers={"Origin": "https://billcommons.org"},
+    )
+    assert minted.status_code == 201
+    db = SessionLocal()
+    key = db.execute(select(ApiKey).where(ApiKey.customer_id == customer_id)).scalar_one()
+    db.close()
+    assert key.plan == "developer"
 
 
 def test_magic_link_short_circuits_email_limiter_when_ip_already_blocked(app_and_db):

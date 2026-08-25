@@ -66,6 +66,7 @@ from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_api.api_keys import (
     KeyLimitExceeded,
+    _PLAN_AUTHORITY_STATUSES,
     _aware,
     decrypt_reveal,
     expire_stale_reveal,
@@ -348,7 +349,9 @@ def request_magic_link(
     # scanner/proxy that pre-fetches links would burn it before the human
     # ever clicks). That page's "Continue" button is what calls
     # POST /api/v1/account/session.
-    link = f"https://billcommons.org/account/login?token={token}"
+    from billcommons_api.routers.billing import _site_url
+
+    link = f"{_site_url()}/account/login?token={token}"
     # Fixlist item 16: was a bare `threading.Thread(daemon=True).start()`
     # per accepted request -- this route is exempt from `QuotaMiddleware`
     # (A5) and bounded only by the 20/hour/IP + 5/hour/email limiters
@@ -473,7 +476,7 @@ def _current_plan(db: OrmSession, customer_id: uuid.UUID) -> str:
     subscription = db.execute(
         select(ApiSubscription)
         .where(ApiSubscription.customer_id == customer_id)
-        .where(ApiSubscription.status != "canceled")
+        .where(ApiSubscription.status.in_(_PLAN_AUTHORITY_STATUSES))
         .order_by(ApiSubscription.created_at.desc())
     ).scalars().first()
     return subscription.plan if subscription else "developer"

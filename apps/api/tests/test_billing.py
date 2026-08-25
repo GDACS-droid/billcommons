@@ -1045,6 +1045,7 @@ def test_item12_refund_cancel_access_reads_newest_not_oldest(client, app_and_db,
         {
             "id": "ch_multi",
             "customer": "cus_multi",
+            "subscription": "sub_multi",
             # Newest-first: index 0 is the refund just issued, WITH the flag;
             # index 1 is an older goodwill refund with no metadata at all
             # (Stripe sends `"metadata": null` sometimes -- must not crash).
@@ -1667,3 +1668,254 @@ def test_r3_10_revoked_subscription_key_is_not_reminted(client, app_and_db):
     keys = _keys_for_customer(SessionLocal, customer_id)
     assert len(keys) == 1
     assert keys[0].status == "revoked"
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 R4 regressions
+# ---------------------------------------------------------------------------
+
+
+def test_r4_3_incomplete_scale_creates_no_entitlement_until_activation(client, app_and_db):
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r4-scale@example.com", "cus_r4_scale")
+    incomplete = _stripe_event(
+        "customer.subscription.created",
+        {
+            "id": "sub_r4_scale",
+            "customer": "cus_r4_scale",
+            "status": "incomplete",
+            "metadata": {"app": "billcommons", "plan": "scale"},
+        },
+        created=4_000_000,
+    )
+    assert _post_webhook(client, incomplete).status_code == 200
+    db = SessionLocal()
+    assert db.execute(
+        select(SnapshotEntitlement).where(
+            SnapshotEntitlement.customer_id == customer_id,
+            SnapshotEntitlement.kind == "subscription",
+        )
+    ).scalar_one_or_none() is None
+    db.close()
+
+    active = _stripe_event(
+        "customer.subscription.updated",
+        {
+            "id": "sub_r4_scale",
+            "customer": "cus_r4_scale",
+            "status": "active",
+            "metadata": {"app": "billcommons", "plan": "scale"},
+        },
+        created=4_000_001,
+    )
+    assert _post_webhook(client, active).status_code == 200
+    db = SessionLocal()
+    entitlement = db.execute(
+        select(SnapshotEntitlement).where(
+            SnapshotEntitlement.customer_id == customer_id,
+            SnapshotEntitlement.kind == "subscription",
+        )
+    ).scalar_one()
+    db.close()
+    assert entitlement.expires_at is None
+
+
+def test_r4_5_invoice_paid_duplicate_active_is_canceled_not_500(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r4-duplicate@example.com", "cus_r4_duplicate")
+    db = SessionLocal()
+    db.add_all(
+        [
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r4_b", plan="builder", status="active"),
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r4_a", plan="scale", status="incomplete"),
+        ]
+    )
+    db.commit()
+    db.close()
+    canceled = []
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "invoice.paid",
+            {"id": "in_r4_duplicate", "customer": "cus_r4_duplicate", "subscription": "sub_r4_a"},
+            created=4_000_010,
+        ),
+    )
+    assert res.status_code == 200
+    assert res.json()["outcome"] == "duplicate_subscription_canceled"
+    assert canceled == ["sub_r4_a"]
+    assert _subscription_row(SessionLocal, "sub_r4_a").status == "canceled"
+    assert _subscription_row(SessionLocal, "sub_r4_b").status == "active"
+
+
+def test_r4_6_cancel_access_recomputes_expires_and_handles_terminal_stripe(client, app_and_db, monkeypatch):
+    import billcommons_api.api_keys as api_keys_module
+
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r4-refund@example.com", "cus_r4_refund")
+    db = SessionLocal()
+    subscription = ApiSubscription(
+        customer_id=customer_id, stripe_subscription_id="sub_r4_refund", plan="scale", status="active"
+    )
+    db.add(subscription)
+    db.flush()
+    api_keys_module.mint_key(db, customer_id, plan="scale")
+    db.add(SnapshotEntitlement(customer_id=customer_id, kind="subscription", scope="full"))
+    db.commit()
+    db.close()
+
+    def _already_terminal(sub_id):
+        raise stripe.InvalidRequestError("already canceled", None)
+
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(_already_terminal))
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "charge.refunded",
+            {
+                "id": "ch_r4_refund",
+                "customer": "cus_r4_refund",
+                "subscription": "sub_r4_refund",
+                "refunds": {"data": [{"metadata": {"cancel_access": "true"}}]},
+            },
+            created=4_000_020,
+        ),
+    )
+    assert res.status_code == 200
+    db = SessionLocal()
+    key = db.execute(select(ApiKey).where(ApiKey.customer_id == customer_id)).scalar_one()
+    entitlement = db.execute(
+        select(SnapshotEntitlement).where(SnapshotEntitlement.customer_id == customer_id)
+    ).scalar_one()
+    row = db.execute(select(ApiSubscription).where(ApiSubscription.id == subscription.id)).scalar_one()
+    db.close()
+    assert key.plan == "developer"
+    assert entitlement.expires_at is not None
+    assert row.status == "canceled"
+    assert int(billing._aware(row.last_event_created_at).timestamp()) == 4_000_020
+
+
+def test_r4_6_delayed_refund_only_targets_its_own_subscription(client, app_and_db, monkeypatch):
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r4-old-refund@example.com", "cus_r4_old_refund")
+    db = SessionLocal()
+    db.add_all(
+        [
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r4_old", plan="builder", status="canceled"),
+            ApiSubscription(customer_id=customer_id, stripe_subscription_id="sub_r4_current", plan="scale", status="active"),
+        ]
+    )
+    db.commit()
+    db.close()
+    canceled = []
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "charge.refunded",
+            {
+                "id": "ch_r4_old_refund",
+                "customer": "cus_r4_old_refund",
+                "subscription": "sub_r4_old",
+                "refunds": {"data": [{"metadata": {"cancel_access": "true"}}]},
+            },
+        ),
+    )
+    assert res.status_code == 200
+    assert canceled == ["sub_r4_old"]
+    assert _subscription_row(SessionLocal, "sub_r4_current").status == "active"
+
+
+def test_r4_8_refund_before_snapshot_checkout_retries_then_revokes(client, app_and_db):
+    _, SessionLocal = app_and_db
+    refund = _stripe_event(
+        "charge.refunded",
+        {
+            "id": "ch_r4_ordering",
+            "payment_intent": "pi_r4_ordering",
+            "metadata": {"app": "billcommons"},
+            "refunds": {"data": [{"metadata": {}}]},
+        },
+        event_id="evt_r4_ordering_refund",
+    )
+    assert _post_webhook(client, refund).status_code == 500
+    assert _stripe_event_row(SessionLocal, refund["id"]) is None
+
+    checkout = _stripe_event(
+        "checkout.session.completed",
+        {
+            "id": "cs_r4_ordering",
+            "mode": "payment",
+            "payment_status": "paid",
+            "customer_details": {"email": "r4-ordering@example.com"},
+            "metadata": {"app": "billcommons", "scope": "full"},
+            "payment_intent": "pi_r4_ordering",
+        },
+    )
+    assert _post_webhook(client, checkout).status_code == 200
+    assert _post_webhook(client, refund).status_code == 200
+    db = SessionLocal()
+    entitlement = db.execute(
+        select(SnapshotEntitlement).where(SnapshotEntitlement.stripe_payment_intent_id == "pi_r4_ordering")
+    ).scalar_one()
+    db.close()
+    assert entitlement.expires_at is not None
+
+
+def test_r4_10_expired_rotating_key_does_not_block_paid_mint(app_and_db):
+    import billcommons_api.api_keys as api_keys_module
+
+    _, SessionLocal = app_and_db
+    customer_id = _make_customer(SessionLocal, "r4-expired-rotating@example.com")
+    db = SessionLocal()
+    subscription = ApiSubscription(
+        customer_id=customer_id, stripe_subscription_id="sub_r4_rotating", plan="builder", status="active"
+    )
+    db.add(subscription)
+    db.flush()
+    expired, _ = api_keys_module.mint_key(db, customer_id, plan="developer")
+    expired.status = "rotating"
+    expired.revoke_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    db.flush()
+    customer = db.execute(select(ApiCustomer).where(ApiCustomer.id == customer_id)).scalar_one()
+    assert billing._ensure_provisioned_for_subscription(db, customer, subscription, None) is True
+    db.commit()
+    keys = db.execute(select(ApiKey).where(ApiKey.customer_id == customer_id)).scalars().all()
+    db.close()
+    assert len(keys) == 2
+    assert any(key.subscription_id == subscription.id for key in keys)
+
+
+def test_r4_14_fresh_checkout_queues_one_magic_link(client, app_and_db, monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "retrieve",
+        staticmethod(
+            lambda sub_id: {
+                "id": sub_id,
+                "customer": "cus_r4_mail",
+                "status": "active",
+                "metadata": {"app": "billcommons", "plan": "builder"},
+            }
+        ),
+    )
+    monkeypatch.setattr(billing, "_send_magic_link", lambda db, customer, background_tasks: sent.append(customer.email))
+    res = _post_webhook(
+        client,
+        _stripe_event(
+            "checkout.session.completed",
+            {
+                "id": "cs_r4_mail",
+                "mode": "subscription",
+                "customer": "cus_r4_mail",
+                "subscription": "sub_r4_mail",
+                "customer_details": {"email": "r4-mail@example.com"},
+                "metadata": {"app": "billcommons", "plan": "builder"},
+            },
+        ),
+    )
+    assert res.status_code == 200
+    assert sent == ["r4-mail@example.com"]

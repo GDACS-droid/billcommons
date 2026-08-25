@@ -191,6 +191,10 @@ class ResolvedKey:
 # `_BoundedFixedWindowCounter` already uses, as defense in depth.
 _MAX_CACHE_ENTRIES = 50_000
 
+# The one billing-authoritative status set.  `billing.customer_plan`,
+# account key minting, and resolved-key dunning selection must agree on it.
+_PLAN_AUTHORITY_STATUSES = ("active", "trialing", "past_due", "unpaid")
+
 _cache_lock = threading.Lock()
 # key_hash -> (ResolvedKey, expires_at_monotonic) -- only ever holds HITS.
 _cache: dict[str, tuple[ResolvedKey, float]] = {}
@@ -315,9 +319,9 @@ def _load_resolved_key(db: OrmSession, key_prefix: str, presented_hash: str) -> 
         select(ApiSubscription).where(ApiSubscription.customer_id == row.customer_id)
     ).scalars().all()
     subscription: ApiSubscription | None = None
-    non_canceled = [s for s in subscriptions if s.status != "canceled"]
-    if non_canceled:
-        subscription = max(non_canceled, key=lambda s: s.created_at)
+    authoritative = [s for s in subscriptions if s.status in _PLAN_AUTHORITY_STATUSES]
+    if authoritative:
+        subscription = max(authoritative, key=lambda s: s.created_at)
     elif subscriptions:
         subscription = max(subscriptions, key=lambda s: s.created_at)
     return ResolvedKey(

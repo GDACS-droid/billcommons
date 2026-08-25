@@ -42,5 +42,13 @@ def test_allows_localhost_with_explicit_opt_in(monkeypatch):
 def test_allows_staging_named_url_with_explicit_opt_in(monkeypatch):
     monkeypatch.setenv("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE", "1")
     _assert_destructive_test_db_allowed(
-        "postgresql://bc:pw@some-internal-host.example.net:5432/bc_staging"
+        "postgresql://bc:pw@billing.internal:5432/bc_staging"
     )
+
+
+def test_refuses_test_marker_in_username_on_production_database(monkeypatch):
+    """R4-7: the disposable marker must be in the database name, never a
+    coincidental substring in credentials or the host."""
+    monkeypatch.setenv("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE", "1")
+    with pytest.raises(RuntimeError, match="not provably disposable"):
+        _assert_destructive_test_db_allowed("postgresql://bc_test@prod-host/railway")

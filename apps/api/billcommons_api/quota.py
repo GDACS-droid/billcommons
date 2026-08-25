@@ -527,20 +527,25 @@ class QuotaMiddleware(BaseHTTPMiddleware):
 
     async def _dispatch_keyed(self, request: Request, call_next, presented: str):
         request_id = request.headers.get("x-request-id", "")
-        # Item 4 fix: short-circuit BEFORE `resolve_key`'s DB round trip if
-        # this IP/subnet is already over its anonymous budget -- such a
-        # probe is guaranteed a 429 either way (see `_anon_tier_peek`'s
-        # docstring), so there is no reason to pay for the SELECT first.
-        # Non-mutating: a request that is NOT yet over the limit falls
-        # through to `resolve_key` exactly as before, and the existing
-        # charge-then-401 behavior below still applies to it -- a valid
-        # key is still never charged against the anonymous buckets, only
-        # a key that turns out to be unknown/revoked.
-        already_over = self._anon_tier_peek(request)
-        if already_over is not None:
-            return already_over
-        resolved = await run_in_threadpool(resolve_key, presented)
+        try:
+            resolved = await run_in_threadpool(resolve_key, presented)
+        except Exception:
+            logger.exception("API-key resolution failed -- failing closed")
+            return JSONResponse(
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+                content=_error_body(
+                    "quota_unavailable",
+                    "Quota check is temporarily unavailable. Please retry shortly.",
+                    request_id,
+                ),
+            )
         if resolved is None or not resolved.is_usable():
+            # A valid key must never be gated by anonymous saturation. The
+            # peek is solely a probe-DoS optimization after resolution fails.
+            already_over = self._anon_tier_peek(request)
+            if already_over is not None:
+                return already_over
             # Item 1 fix (other half -- api_keys.py holds the cache-bounding
             # half): an unauthenticated bearer that looks like one of our
             # keys is charged against the SAME anonymous IP/subnet buckets

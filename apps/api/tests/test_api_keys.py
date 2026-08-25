@@ -379,6 +379,30 @@ def test_load_resolved_key_prefers_non_canceled_over_newer_canceled(db_session):
     assert resolved.payment_required() is False
 
 
+def test_r4_4_authoritative_past_due_beats_newer_incomplete_for_402(db_session):
+    """A fresh abandoned Checkout must not hide an older dunning row from
+    key resolution and thereby bypass the 402 gate."""
+    customer = _make_customer(db_session, "r4-dunning@example.com")
+    db_session.add(
+        ApiSubscription(
+            customer_id=customer.id,
+            plan="builder",
+            status="past_due",
+            past_due_since=datetime.now(timezone.utc) - timedelta(days=8),
+        )
+    )
+    db_session.commit()
+    db_session.add(ApiSubscription(customer_id=customer.id, plan="scale", status="incomplete"))
+    db_session.commit()
+    _, full_key = api_keys.mint_key(db_session, customer.id, plan="builder")
+    db_session.commit()
+
+    resolved = api_keys.resolve_key(full_key)
+    assert resolved is not None
+    assert resolved.subscription_status == "past_due"
+    assert resolved.payment_required() is True
+
+
 def test_rotate_key_refreshes_stale_identity_map_entry(db_session):
     """Item 6 regression: `rotate_key` must see the CURRENT row state even
     if this session already has a stale copy of it in its identity map from

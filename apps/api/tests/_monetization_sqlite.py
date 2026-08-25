@@ -29,8 +29,9 @@ clean slate, it never creates schema against Postgres.
 against anything that isn't provably disposable. Two gates, both
 required, checked as soon as `BILLCOMMONS_TEST_DATABASE_URL` is read (at
 import time, and again defensively inside `_make_postgres_engine`):
-(a) the URL's host must be `127.0.0.1`/`localhost`, OR the URL text must
-contain `_staging`/`_test`; (b) `BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE=1`
+(a) the URL's host must be `127.0.0.1`/`localhost` or explicitly end in
+`.staging`/`.internal`, AND the database name must end in `_staging`/`_test`;
+(b) `BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE=1`
 must be set explicitly. Either gate failing raises `RuntimeError` loudly
 rather than silently deleting rows. This exists because the original
 `TRUNCATE ... CASCADE` form, run against a miswired `DATABASE_URL`
@@ -134,9 +135,9 @@ def _assert_destructive_test_db_allowed(pg_url: str) -> None:
     CASCADE) against `pg_url` unless it is provably disposable. Both
     gates are required (fixlist item 1):
 
-    (a) the URL's host is `127.0.0.1`/`localhost`, OR the URL text
-        contains `_staging`/`_test` (covers e.g. a Railway/RDS throwaway
-        instance named accordingly); AND
+    (a) the URL's host is `127.0.0.1`/`localhost`, or explicitly ends in
+        `.staging`/`.internal`; AND its database name ends in
+        `_staging`/`_test`; AND
     (b) `BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE=1` is set explicitly --
         this can't be inferred from the URL alone, it's the operator
         affirmatively saying "yes, wipe this one".
@@ -146,14 +147,16 @@ def _assert_destructive_test_db_allowed(pg_url: str) -> None:
     operational writeup.
     """
     host = (urlsplit(pg_url).hostname or "").lower()
+    database_name = urlsplit(pg_url).path.rstrip("/").rsplit("/", 1)[-1].lower()
     disposable_host = host in ("127.0.0.1", "localhost")
-    disposable_name = "_staging" in pg_url or "_test" in pg_url
-    if not (disposable_host or disposable_name):
+    private_or_staging_host = host.endswith((".staging", ".internal"))
+    disposable_name = database_name.endswith(("_staging", "_test"))
+    if not ((disposable_host or private_or_staging_host) and disposable_name):
         raise RuntimeError(
             "REFUSING to run the monetization test harness: "
             f"BILLCOMMONS_TEST_DATABASE_URL host={host!r} is not provably "
-            "disposable (must be 127.0.0.1/localhost, or the URL must "
-            "contain '_staging'/'_test'). This harness DELETEs rows from "
+            "disposable (must use localhost, a .staging/.internal host, "
+            "and a database name ending '_staging'/'_test'). This harness DELETEs rows from "
             "monetization tables before every test -- see "
             "docs/operations/monetization-runbook.md."
         )
