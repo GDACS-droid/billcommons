@@ -1157,7 +1157,11 @@ def record_job_failure(
             document = db.get(BillDocument, document_id, with_for_update=True)
             if document is not None:
                 status = document_status
-                if count_attempt and status not in fulltext_mod.TERMINAL_STATUSES:
+                if (
+                    count_attempt
+                    and status not in fulltext_mod.TERMINAL_STATUSES
+                    and status not in fulltext_mod.NO_FETCH_ATTEMPT_CHARGE_STATUSES
+                ):
                     document.fetch_attempts = (document.fetch_attempts or 0) + 1
                     if document.fetch_attempts >= fulltext_mod.MAX_FETCH_ATTEMPTS:
                         status = fulltext_mod.STATUS_PERMANENTLY_FAILED
@@ -2188,7 +2192,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="SQL LIKE pattern against bill_documents.url, e.g. 'https://leg.state.xx.us/%%'",
     )
-    p_reset_fetch.add_argument(
+    reset_status_group = p_reset_fetch.add_mutually_exclusive_group()
+    reset_status_group.add_argument(
         "--status",
         action="append",
         default=None,
@@ -2203,7 +2208,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="repeatable; two-letter jurisdiction abbreviation, e.g. --jurisdiction MA",
     )
-    p_reset_fetch.add_argument(
+    reset_status_group.add_argument(
         "--only-permanently-failed",
         action="store_true",
         help=(

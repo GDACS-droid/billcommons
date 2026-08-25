@@ -144,6 +144,13 @@ def test_ma_docket_from_url_returns_none_for_a_non_ma_bills_url():
     assert ma_docket_from_url("https://malegislature.gov/Committees/J26") is None
 
 
+def test_ma_docket_from_url_is_anchored_to_the_official_ma_hosts():
+    # T2-4: a mirror/archive URL may use MA's path convention but must stay
+    # on its own direct-fetch path rather than being resolved through MA's API.
+    assert ma_docket_from_url("https://archive.example/Bills/194/H100.pdf") is None
+    assert ma_docket_from_url("https://www.malegislature.gov/Bills/194/H100.pdf") is not None
+
+
 def test_is_ma_docket_id_distinguishes_docket_from_bill_shape():
     assert is_ma_docket_id("HD177") is True
     assert is_ma_docket_id("SD3668") is True
@@ -173,6 +180,13 @@ def test_sniff_content_type_returns_json_only_for_the_ma_api_url_shape():
     assert sniff_content_type("application/json; charset=utf-8", MA_API_URL, raw) == "json"
     # Same body, different host: NOT sniffed as json (scoped, not generic).
     assert sniff_content_type("application/json", "https://example.com/x", raw) == "text"
+
+
+def test_sniff_content_type_does_not_treat_suffix_matched_hosts_as_ma_api():
+    # T2-4: endswith("malegislature.gov") incorrectly accepted this host.
+    raw = json.dumps({"DocumentText": "hello"}).encode("utf-8")
+    url = "https://notmalegislature.gov/api/GeneralCourts/194/Documents/H177"
+    assert sniff_content_type("application/json", url, raw) == "text"
 
 
 def test_sniff_content_type_falls_back_to_magic_bytes_for_ma_api_without_header():

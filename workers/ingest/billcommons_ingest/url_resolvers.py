@@ -47,6 +47,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Callable
+from urllib.parse import urlparse
 
 CandidateFn = Callable[[str, "str | None", "str | None"], list[str]]
 
@@ -62,6 +63,7 @@ CandidateFn = Callable[[str, "str | None", "str | None"], list[str]]
 _MA_BILLS_PATH_RE = re.compile(
     r"^(?P<prefix>.*/Bills/)(?P<court>\d+)/(?P<docid>[A-Za-z]+\d+)(?P<suffix>\.[A-Za-z0-9]+)?$"
 )
+_MA_HOSTS = frozenset({"malegislature.gov", "www.malegislature.gov"})
 # A House/Senate DOCKET id (assigned at filing) has the shape HD854/SD123 --
 # as opposed to a House/Senate BILL id (assigned once a docket is taken up),
 # e.g. H854/S123. Used only to decide WHICH resolution path to take (docket
@@ -98,6 +100,8 @@ def ma_docket_from_url(source_url: str) -> MaDocumentUrl | None:
     fetch pipeline can resolve the AUTHORITATIVE bill number via the JSON
     document API instead of guessing one from the id's shape. `None` for
     any URL that doesn't match (nothing MA-specific to do for it)."""
+    if urlparse(source_url).netloc.lower() not in _MA_HOSTS:
+        return None
     match = _MA_BILLS_PATH_RE.match(source_url)
     if not match:
         return None

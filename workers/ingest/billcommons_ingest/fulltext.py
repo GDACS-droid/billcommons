@@ -134,6 +134,11 @@ STATUS_MA_DOCKET_NO_BILL_NUMBER = "ma_docket_no_bill_number"
 #    where license_note like 'fulltext_status=%' group by 1;
 STATUS_WORKER_ERROR = "worker_error"
 
+# A docket that has not yet received a bill number is intentionally retried
+# on later sweeps, but is not a failed fetch and therefore must never consume
+# its retry budget while that upstream assignment is pending.
+NO_FETCH_ATTEMPT_CHARGE_STATUSES = frozenset({STATUS_MA_DOCKET_NO_BILL_NUMBER})
+
 # Statuses that will NEVER change on a retry -- the document's URL/robots.txt/
 # content shape is a fixed fact about that source, not a transient condition.
 # enqueue_fulltext_jobs skips documents already marked with one of these so a
@@ -489,7 +494,11 @@ def _is_ma_document_api_url(url: str) -> bool:
     full bill text.
     """
     parsed = urlparse(url)
-    return parsed.netloc.lower().endswith("malegislature.gov") and "/api/" in parsed.path and "/Documents/" in parsed.path
+    return (
+        parsed.netloc.lower() in {"malegislature.gov", "www.malegislature.gov"}
+        and "/api/" in parsed.path
+        and "/Documents/" in parsed.path
+    )
 
 
 def sniff_content_type(content_type_header: str | None, url: str, raw: bytes) -> str:
@@ -897,7 +906,17 @@ def process_fetch_text_job(
 
     try:
         if ma_url is not None:
-            response, fetched_url, resolver_name, outcome = _resolve_ma_document(fetcher, ma_url)
+            try:
+                response, fetched_url, resolver_name, outcome = _resolve_ma_document(fetcher, ma_url)
+            except (httpx.HTTPError, DocumentFetchError):
+                if is_ma_docket_id(ma_url.doc_id):
+                    raise
+                # A bill-shaped URL already identifies a real bill, so an
+                # unavailable MA API must not prevent a working stored PDF
+                # from being fetched directly. Docket-shaped URLs remain
+                # API-only because their stored page is not authoritative bill text.
+                response, fetched_url, outcome = _fetch_best_candidate(fetcher, [document.url])
+                resolver_name = None
         else:
             candidate_urls = resolve_fetch_url(jurisdiction_code, document.url, bill_identifier)
             response, fetched_url, outcome = _fetch_best_candidate(fetcher, candidate_urls)
@@ -1092,17 +1111,14 @@ def _fetch_best_candidate(
         if outcome.extracted_text and outcome.extracted_text.strip():
             return response, url, outcome
         last_empty = (response, url, outcome)
-    if last_empty is not None:
-        return last_empty
-    assert last_exc is not None  # candidates is never empty (original url always present)
-    if isinstance(last_exc, (httpx.HTTPError, UnfetchableDocument)):
-        raise last_exc
-    # A bare extraction crash (e.g. the unhandled pypdf crashes behind most
-    # of the 84k dead fetch_text rows) is a fact about the document, so it
-    # burns an attempt and eventually goes terminal -- never left as a bare
-    # exception, which process_fetch_text_job's outer handling could not
-    # otherwise attribute to a status.
-    raise DocumentFetchError(f"text extraction failed for {url}: {last_exc}", status=STATUS_FETCH_ERROR) from last_exc
+    if last_exc is not None:
+        if isinstance(last_exc, (httpx.HTTPError, UnfetchableDocument)):
+            raise last_exc
+        # Failing candidates' bytes are deliberately not archived; only the
+        # winning candidate's raw document is retained below.
+        raise DocumentFetchError(f"text extraction failed for {url}: {last_exc}", status=STATUS_FETCH_ERROR) from last_exc
+    assert last_empty is not None  # candidates is never empty (original url always present)
+    return last_empty
 
 
 # ---------------------------------------------------------------------------
@@ -1270,8 +1286,13 @@ def _resolve_ma_bill(
     # went stale in the first place).
     page_url = f"{path_prefix}{court}/{bill_number}{path_suffix}"
     page_response = fetcher.fetch(page_url)
-    content_type = sniff_content_type(page_response.headers.get("content-type"), page_url, page_response.content)
-    page_outcome = extract_document_text(content_type, page_response.content)
+    try:
+        content_type = sniff_content_type(page_response.headers.get("content-type"), page_url, page_response.content)
+        page_outcome = extract_document_text(content_type, page_response.content)
+    except Exception as exc:  # noqa: BLE001 - malformed page bytes are document-specific
+        raise DocumentFetchError(
+            f"text extraction failed for MA bill page {page_url}: {exc}", status=STATUS_FETCH_ERROR
+        ) from exc
     if page_outcome.extracted_text and page_outcome.extracted_text.strip():
         return page_response, page_url, "ma_bill_pdf", page_outcome
     raise DocumentFetchError(
