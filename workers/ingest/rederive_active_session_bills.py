@@ -102,13 +102,21 @@ def main() -> int:
                 print("\n(dry run -- re-run with --apply to write)")
                 return 0
             changed = 0
+            related_upserted = 0
+            recompute_counts: dict[str, int] = {}
             for i in range(0, len(ids_preview), 2000):
                 chunk = ids_preview[i : i + 2000]
-                updated, _c = recompute_status_for_bills(db, chunk, stamp=True)
+                updated, _c, chunk_related = recompute_status_for_bills(
+                    db, chunk, recompute_counts, stamp=True
+                )
                 db.commit()
                 changed += updated
+                related_upserted += chunk_related
                 print(f"  ...{i + len(chunk)}/{len(ids_preview)}, {changed} changed", flush=True)
-            print(f"done: {changed} bill(s) re-derived")
+            print(
+                f"done: {changed} bill(s) re-derived, related_upserted={related_upserted}, "
+                f"related_removed={recompute_counts.get('_related_removed', 0)}"
+            )
             return 0
 
         rows = list(db.execute(SUMMARY, {"codes": codes}))
@@ -126,6 +134,8 @@ def main() -> int:
 
         ids = list(db.execute(AFFECTED, {"codes": codes}).scalars())
         changed = 0
+        related_upserted = 0
+        recompute_counts: dict[str, int] = {}
         # Batched: recompute_status_for_bills builds IN lists, and one
         # jurisdiction here is 18,000 bills.
         for i in range(0, len(ids), 2000):
@@ -134,11 +144,17 @@ def main() -> int:
             # backfill's stamp=False exists so a wholesale re-derivation cannot
             # flood every feed; this is a bounded correction of ~29k rows that
             # consumers were actively misinformed about.
-            updated, _cleared = recompute_status_for_bills(db, chunk, stamp=True)
+            updated, _cleared, chunk_related = recompute_status_for_bills(
+                db, chunk, recompute_counts, stamp=True
+            )
             db.commit()
             changed += updated
+            related_upserted += chunk_related
             print(f"  ...{i + len(chunk)}/{len(ids)} processed, {changed} changed", flush=True)
-        print(f"done: {changed} bill(s) re-derived")
+        print(
+            f"done: {changed} bill(s) re-derived, related_upserted={related_upserted}, "
+            f"related_removed={recompute_counts.get('_related_removed', 0)}"
+        )
         return 0
     finally:
         db.close()

@@ -1426,10 +1426,10 @@ def defer_job_for_budget(
 
 def recompute_status_for_bills(
     db, bill_ids: list, counts: dict[str, int] | None = None, *, stamp: bool = True
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Re-derive `bills.status` for a specific set of bills. Caller commits.
 
-    Returns (changed, cleared). Shared by the full `recompute-status` backfill
+    Returns (changed, cleared, related_upserted). Shared by the full `recompute-status` backfill
     and the sync worker's per-cycle refresh so the two can never drift: a
     status written by one and a status written by the other have to mean the
     same thing.
@@ -1450,7 +1450,7 @@ def recompute_status_for_bills(
     event kind. This flag is the honest stand-in until there is one.
     """
     if not bill_ids:
-        return (0, 0)
+        return (0, 0, 0)
     # The session's end date is part of the derivation, not decoration: a bill
     # short of the governor's desk in an adjourned session is dead however
     # alive its own actions look. Joined here so it costs one query for the
@@ -1525,7 +1525,20 @@ def recompute_status_for_bills(
             BillAction.classification,
             BillAction.description,
             BillAction.organization_id,
-        ).where(BillAction.bill_id.in_(bill_ids))
+        )
+        .where(BillAction.bill_id.in_(bill_ids))
+        # Deterministic order (round-4 panel): the substitution-target scan
+        # below is last-one-wins, and since this branch persists that
+        # target (and DELETES stored rows that disagree with it), an
+        # unordered query would let the planner decide which of two
+        # divergent targets survives -- churn that flips between passes.
+        # Latest-dated action wins; undated sort oldest, matching
+        # derive_status; `order` then id break the remaining ties.
+        .order_by(
+            BillAction.action_date.asc().nulls_first(),
+            BillAction.order.asc().nulls_first(),
+            BillAction.id,
+        )
     ).all():
         actions_by_bill[a.bill_id].append(
             status_mod.ActionRow(
@@ -1555,33 +1568,97 @@ def recompute_status_for_bills(
     # the bill that moves; the identified survivor is. If the survivor
     # reached an OUTCOME, the substituted print should read as that outcome
     # too, not sit at IN_COMMITTEE/SUBSTITUTED forever while its survivor is
-    # chaptered. related_bills is consulted the same way: a relation whose
-    # type names a substitution, pointing away from this bill, is the same
-    # signal as the text form.
+    # chaptered. related_bills is consulted the same way: an existing
+    # 'substituted-by' row pointing away from this bill is the same signal
+    # as the text form.
     survivor_bill_id: dict = {}
+    # Parallel to survivor_bill_id: the identifier each entry was actually
+    # resolved FROM. Persistence below only trusts a survivor_bill_id[bid]
+    # entry when it matches survivor_identifier[bid] for THIS pass -- an
+    # entry recorded against a different (or unknown) identifier is a stale
+    # pairing, not this pass's target, and must never be persisted as if it
+    # were.
+    survivor_bill_id_identifier: dict = {}
     survivor_identifier: dict = {}
     for bid in bill_ids:
         for action in actions_by_bill[bid]:
             target = status_mod.substitution_target(action.description)
             if target:
-                survivor_identifier[bid] = target  # last one wins; actions
-                # are not guaranteed date-ordered from the query, but a bill
+                survivor_identifier[bid] = target  # last one wins == the
+                # latest-dated action (query is date-ordered above); a bill
                 # is only ever substituted once in practice.
+    # Frozen BEFORE the stored-row loop below: the targets this pass derived
+    # from the bills' OWN action text. The loop reads it (never the live
+    # `survivor_identifier`, which it also writes to) when deciding whether
+    # a stored row conflicts with this pass, and persistence writes back
+    # only these. Reading the live dict let a stored, unresolved sibling row
+    # processed first masquerade as "this pass's text target", so a later
+    # resolved row for the same bid was rejected as stale -- and then
+    # deleted (round-3 panel, confirmed by repro).
+    text_derived_identifier = dict(survivor_identifier)
     related_rows = db.execute(
         select(
             RelatedBill.bill_id,
             RelatedBill.related_bill_id,
             RelatedBill.related_identifier,
-        ).where(
-            RelatedBill.bill_id.in_(bill_ids),
-            RelatedBill.relation_type.ilike("%substitut%"),
         )
+        .where(
+            RelatedBill.bill_id.in_(bill_ids),
+            # Exact relation_type, the same value persistence writes and
+            # reconciles below (round-5 panel): a looser match would let a
+            # differently-typed row be consulted as survivor evidence that
+            # reconciliation can never correct or remove.
+            RelatedBill.relation_type == "substituted-by",
+        )
+        # Deterministic across runs when a bid carries more than one
+        # unresolved 'substituted-by' row (a prior pass's stray plus a
+        # newer one): without an ORDER BY, row order -- and so which one
+        # wins the last-write-wins assignment below -- depended on
+        # whatever the planner felt like handing back that day.
+        .order_by(RelatedBill.bill_id, RelatedBill.created_at, RelatedBill.id)
     ).all()
     for row in related_rows:
         if row.related_bill_id is not None:
+            # A bill can only ever be substituted by ONE survivor. If THIS
+            # bid's own action text already named a different identifier
+            # this pass, an existing related_bills row pointing elsewhere is
+            # a STALE relation (an earlier print, corrected text, etc.) --
+            # trusting its related_bill_id here would resolve the fresh
+            # text's target to the wrong bill. Leave it out of resolution;
+            # the fresh identifier gets looked up on its own below, and the
+            # persistence pass further down reconciles (deletes) the stale
+            # row itself. Compared whenever a fresh target exists this pass:
+            # a row whose OWN identifier is unusable (NULL/unparseable) is
+            # NOT assumed to agree with the fresh target either -- that
+            # would fabricate a pairing between this pass's target and
+            # whatever stale bill id the row happens to carry, so it is
+            # skipped along with an outright mismatch. Only bypassed when
+            # there is no fresh text target to conflict with at all
+            # (pre-dating this feature / no in-text signal this pass),
+            # matching prior behavior.
+            row_identifier = None
+            if row.related_identifier:
+                try:
+                    row_identifier = normalize_bill_number(row.related_identifier)
+                except ValueError:
+                    row_identifier = None
+            fresh_text_target = text_derived_identifier.get(row.bill_id)
+            if fresh_text_target is not None and row_identifier != fresh_text_target:
+                continue
             survivor_bill_id[row.bill_id] = row.related_bill_id
+            survivor_bill_id_identifier[row.bill_id] = row_identifier
         elif row.related_identifier:
+            # Same reasoning: never let a stored (possibly stale) identifier
+            # overwrite one this pass already derived straight from the
+            # bill's own action text. Among several stored-only rows the
+            # NEWEST wins (query is ordered oldest -> newest and each row
+            # overwrites), matching the resolved-row branch above (round 7).
+            if row.bill_id in text_derived_identifier:
+                continue
             try:
+                # Lookup signal only (status derivation): a stored
+                # identifier is never persisted back, see
+                # text_derived_identifier above.
                 survivor_identifier[row.bill_id] = normalize_bill_number(
                     row.related_identifier
                 )
@@ -1645,6 +1722,7 @@ def recompute_status_for_bills(
                     match = in_chunk_by_key.get(key)
                     if match is not None and match != bid:
                         survivor_bill_id[bid] = match
+                        survivor_bill_id_identifier[bid] = needs_lookup[bid]
                         remaining.pop(bid, None)
                     else:
                         still_needed.append(bid)
@@ -1682,6 +1760,7 @@ def recompute_status_for_bills(
                     )
                     if match is not None:
                         survivor_bill_id[bid] = match.id
+                        survivor_bill_id_identifier[bid] = needs_lookup[bid]
                         remaining.pop(bid, None)
 
         for bid, sid in survivor_bill_id.items():
@@ -1698,6 +1777,135 @@ def recompute_status_for_bills(
                 derived_status[bid] = survivor_status
             else:
                 derived_status[bid] = status_mod.SUBSTITUTED
+
+    # Persist the substitution relation itself. Everything above only ever
+    # derives a STATUS from the survivor; nothing wrote the relation, so
+    # `related_bills` had no `substituted-by` rows for text-parsed
+    # substitutions, and consumers of that table (the API's substitution
+    # links) stayed empty for this whole class of bill. One row per bid that
+    # named a survivor here, whether or not that survivor resolved to an
+    # actual bill.
+    #
+    # Upsert key is (bill_id, related_identifier, relation_type == exactly
+    # 'substituted-by') -- deliberately NOT keyed on related_bill_id, which
+    # mirrors openstates_bulk.py's own dedup key for this table (bill_id,
+    # related_identifier, relation_type). That makes a later pass that
+    # resolves a previously-unresolved survivor an UPDATE of the same row
+    # (NULL -> real id) rather than a second insert, and a repeat run over an
+    # already-correct chunk a no-op. Scoped to the exact relation_type we
+    # write -- the same scope the resolution query above reads -- so a
+    # differently-typed relation (e.g. upstream 'replaced-by' data) is
+    # neither consulted nor touched.
+    #
+    # Reconciliation: a bill can only ever be substituted by ONE survivor, so
+    # if THIS pass derives target X for bid but an existing 'substituted-by'
+    # row for the same bid points at a different identifier Y (an earlier
+    # print, corrected text, etc.), Y is stale and is deleted rather than
+    # left to sit alongside X forever. Scoped strictly to bids that have a
+    # currently-derived target: a bid that no longer appears in
+    # `survivor_identifier` this pass (its action text was removed, or it
+    # simply wasn't in this chunk) is NOT touched here -- retraction (a bill
+    # that stops being substituted) is out of scope, see
+    # docs/operations/status-carryover-recompute.md. Likewise scoped to
+    # targets derived from the bill's own text THIS pass
+    # (`text_derived_identifier`), never to a target that only came from a
+    # stored related_bills row: the stored rows are the thing being
+    # reconciled, so they cannot also be the evidence for reconciling.
+    related_upserted = 0
+    related_removed = 0
+    if text_derived_identifier:
+        # ORM instances, not bare columns -- an UPDATE upgrading a NULL
+        # related_bill_id must go through the identity map so a caller that
+        # already loaded this row in the same session sees the new value,
+        # rather than a raw UPDATE the ORM has no way to know invalidates it.
+        # Fetched per bid (not per (bid, identifier)) so a stale row -- one
+        # whose identifier no longer matches this pass's derived target --
+        # is visible here too, and can be reconciled below.
+        existing_by_bid: dict = {}
+        for row in db.execute(
+            select(RelatedBill)
+            .where(
+                RelatedBill.bill_id.in_(text_derived_identifier),
+                RelatedBill.relation_type == "substituted-by",
+            )
+            # Deterministic pick among same-identifier duplicates below
+            # (there is no unique constraint on this table yet).
+            .order_by(RelatedBill.created_at, RelatedBill.id)
+        ).scalars().all():
+            existing_by_bid.setdefault(row.bill_id, []).append(row)
+
+        # Normalized the same way the resolution loop above normalizes
+        # `identifier` itself, so an unnormalized legacy row (e.g. "A5678"
+        # on disk vs. "A 5678" derived this pass) is recognized as the SAME
+        # relation and updated in place, rather than delete-and-reinsert
+        # churn on every single run.
+        def _normalized_related_identifier(value):
+            # NULL and '' are the same legacy shape: no recorded identifier,
+            # so the row can never match this pass's target and is replaced
+            # (its related_bill_id is not donated -- see the mismatch rule
+            # in the resolution loop above).
+            if not value:
+                return None
+            try:
+                return normalize_bill_number(value)
+            except ValueError:
+                return None
+
+        for bid, identifier in text_derived_identifier.items():
+            resolved_id = survivor_bill_id.get(bid)
+            # A survivor_bill_id entry is only trustworthy here when it was
+            # resolved FROM this exact identifier -- see
+            # survivor_bill_id_identifier's comment above. Anything else
+            # (recorded against a different or unknown identifier, e.g. a
+            # stray related_bills row for the same bid that lost the
+            # mismatch check above) is not this pass's pairing and must not
+            # be persisted as if it were; it is dropped back to unresolved
+            # rather than silently reused.
+            if resolved_id is not None and survivor_bill_id_identifier.get(bid) != identifier:
+                resolved_id = None
+            rows_for_bid = existing_by_bid.get(bid, [])
+            matching_rows = [
+                r
+                for r in rows_for_bid
+                if _normalized_related_identifier(r.related_identifier) == identifier
+            ]
+            # Among duplicates of the same identifier keep the one that is
+            # already resolved -- the NEWEST such twin, because that is the
+            # one whose related_bill_id the resolution loop above trusted
+            # (round 7) -- so the delete below never discards a real
+            # related_bill_id in favour of a NULL twin or an older stale FK.
+            current_row = next(
+                (r for r in reversed(matching_rows) if r.related_bill_id is not None),
+                matching_rows[0] if matching_rows else None,
+            )
+            for stale in rows_for_bid:
+                if stale is not current_row:
+                    db.delete(stale)
+                    related_removed += 1
+            if current_row is None:
+                db.add(
+                    RelatedBill(
+                        bill_id=bid,
+                        related_bill_id=resolved_id,
+                        related_identifier=identifier,
+                        relation_type="substituted-by",
+                    )
+                )
+                related_upserted += 1
+            elif current_row.related_bill_id is None and resolved_id is not None:
+                current_row.related_bill_id = resolved_id
+                related_upserted += 1
+
+    if counts is not None and related_removed:
+        # Piggybacked on the existing `counts` dict rather than widening this
+        # function's return tuple -- every caller (the sync worker, the
+        # full-corpus backfill, and every test in test_recompute_status.py)
+        # already unpacks exactly (changed, cleared, related_upserted), and
+        # changing that arity for one more number is not worth the call-site
+        # churn. `_related_removed` is not a status name, so it is invisible
+        # to the `status_mod.ALL_STATUSES` print loop that walks this same
+        # dict in cmd_recompute_status.
+        counts["_related_removed"] = counts.get("_related_removed", 0) + related_removed
 
     updates = []
     cleared = 0
@@ -1736,7 +1944,7 @@ def recompute_status_for_bills(
             ),
             updates,
         )
-    return (len(updates), cleared)
+    return (len(updates), cleared, related_upserted)
 
 
 def cmd_backfill_session_dates(args: argparse.Namespace) -> int:
@@ -1920,6 +2128,7 @@ def cmd_recompute_status(args: argparse.Namespace) -> int:
     processed = 0
     changed = 0
     cleared = 0
+    related_upserted = 0
     counts: dict[str, int] = {}
     jurisdiction_id = None
     if getattr(args, "jurisdiction", None):
@@ -1953,11 +2162,12 @@ def cmd_recompute_status(args: argparse.Namespace) -> int:
 
             # stamp=False: see recompute_status_for_bills. A wholesale
             # re-derivation is a maintenance pass, not 209k bills moving.
-            chunk_changed, chunk_cleared = recompute_status_for_bills(
+            chunk_changed, chunk_cleared, chunk_related = recompute_status_for_bills(
                 db, bill_ids, counts, stamp=False
             )
             changed += chunk_changed
             cleared += chunk_cleared
+            related_upserted += chunk_related
             db.commit()
             processed += len(rows)
             print(
@@ -1965,7 +2175,11 @@ def cmd_recompute_status(args: argparse.Namespace) -> int:
                 flush=True,
             )
 
-        print(f"recompute-status: DONE scanned={processed:,} updated={changed:,} cleared={cleared:,}")
+        print(
+            f"recompute-status: DONE scanned={processed:,} updated={changed:,} "
+            f"cleared={cleared:,} related_upserted={related_upserted:,} "
+            f"related_removed={counts.get('_related_removed', 0):,}"
+        )
         for name in status_mod.ALL_STATUSES:
             if counts.get(name):
                 print(f"  {name:20} {counts[name]:>8,}")
@@ -2163,13 +2377,18 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                 db = get_session()
                 try:
                     batch = sorted(pending_status_bills)
-                    changed, cleared = recompute_status_for_bills(db, batch)
+                    recompute_counts: dict[str, int] = {}
+                    changed, cleared, _related = recompute_status_for_bills(
+                        db, batch, recompute_counts
+                    )
                     db.commit()
                     pending_status_bills = set()
                     print(
                         f"sync-worker {worker_id}: status recomputed for "
                         f"{len(batch)} touched bill(s) -- {changed} changed, "
-                        f"{cleared} cleared",
+                        f"{cleared} cleared, "
+                        f"{recompute_counts.get('_related_removed', 0)} "
+                        f"related row(s) removed",
                         flush=True,
                     )
                 except Exception:
