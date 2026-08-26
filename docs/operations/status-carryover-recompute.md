@@ -27,6 +27,18 @@ the in-progress chunk and the database, before the stripped fallback is
 tried at all -- so which chunk a survivor happens to land in never changes
 which bill wins.
 
+Detection is case-insensitive and tolerates NJ's mixed-case `Substituted by
+A1516 (1R)` wording and its trailing `(1R)`/`(2R)` reprint marker, not just
+NY's `SUBSTITUTED BY A10008C` shape -- run `--jurisdiction NJ` too when
+backfilling for the first time.
+
+NJ's enactment wording (`Approved P.L.2025, c.34.`, distinct from
+"signed/approved BY the Governor") and passage wording (`Passed by the
+Senate (40-0)`, `Passed Assembly (Passed Both Houses) (75-0-0)`) are also
+recognized -- re-run `recompute-status --jurisdiction NJ` after deploying
+that change to pick up the `enacted`/`passed_both`/`passed_one_chamber`
+backfill.
+
 `--jurisdiction` filters by abbreviation and is case-insensitive. Omit it (or
 run a second time with no flag) to sweep every bill. The command is
 idempotent and safe to re-run: only rows whose derived status actually

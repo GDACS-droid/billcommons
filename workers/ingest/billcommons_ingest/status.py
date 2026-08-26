@@ -127,12 +127,49 @@ _CLASSIFICATION_STATUS = {
 # thing ("motion to withdraw failed"), and a wrong terminal status is far
 # costlier than a missing one.
 _TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Checked before ENACTED: NJ's companion-bill bookkeeping reads "Withdrawn
+    # Because Approved P.L.2025, c.34." -- this bill was pulled because the
+    # OTHER (identical) bill was the one signed into law. It must stay
+    # WITHDRAWN, never read as this bill's own enactment just because the
+    # word "approved" appears in it. First-match-wins is this module's only
+    # precedence mechanism (see status_for_action/derive_status docstrings),
+    # so this entry has to sit ahead of the ENACTED "approved P.L." pattern
+    # below rather than relying on a lookbehind. Any wording between the two
+    # words is tolerated ("Withdrawn from Consideration because Approved
+    # P.L. ...", "Withdrawn from Consideration; Approved P.L. ...") -- the
+    # narrow 3-word form let every other withdrawal phrasing fall through to
+    # ENACTED (round 4, Finding 1), and a joiner class that excluded ";"
+    # reopened it for semicolon-joined records (round 5). The span between
+    # the two words is unbounded and newline-tolerant (round 6): an 80-char
+    # cap without DOTALL let a longer or line-broken withdrawal fall through
+    # to ENACTED; every prod row is 43 chars, so nothing in the corpus needs
+    # the cap. Anchored to the record start: a withdrawal of THIS bill is
+    # what the record is about; "Amendment withdrawn and bill Approved
+    # P.L. ..." is the bill's own enactment and correctly falls through to
+    # ENACTED below.
+    (re.compile(r"^withdrawn\b[\s\S]*?\bapproved\s+p\.?\s*l\b", re.I), WITHDRAWN),
     # Enactment first: "veto overridden" must read as law, not as a veto.
     (re.compile(r"\bveto\s+overr(idden|ide)\b", re.I), ENACTED),
     (re.compile(r"\boverr(idden|ode)\s+.{0,20}\bveto\b", re.I), ENACTED),
     (re.compile(r"\bchaptered\b", re.I), ENACTED),
     (re.compile(r"\bbecame\s+law\b", re.I), ENACTED),
     (re.compile(r"\b(signed|approved)\s+by\s+(the\s+)?governor\b", re.I), ENACTED),
+    # NJ's enactment record: "Approved P.L.2025, c.34." names the chapter law
+    # number, never "by the Governor" (joint resolutions: "Approved P.L.2025,
+    # JR-5."). The WITHDRAWN entry above already intercepts the "Withdrawn
+    # Because Approved ..." companion-bill case. Anchored to the record
+    # start or to "and bill " (rounds 6-7): an embedded citation --
+    # "Corrective amendment to language approved P.L.2025, c.34.",
+    # "...conforming this measure to bill approved P.L.2024, c.12." -- is
+    # about another law, not this bill's enactment. Every prod enactment
+    # row starts with "Approved".
+    (
+        re.compile(
+            r"(?:^|\band\s+bill\s+)approved\s+p\.?\s*l\.?\s*\d{4},?\s*(?:c\.?|jr-?)\s*\d+",
+            re.I,
+        ),
+        ENACTED,
+    ),
     (re.compile(r"^act\s+\d+", re.I), ENACTED),
     (re.compile(r"\bact\s+\d+,\s*\d{2}/\d{2}/\d{4}", re.I), ENACTED),
     (re.compile(r"\bvetoed\s+by\s+(the\s+)?governor\b", re.I), VETOED),
@@ -147,9 +184,148 @@ _TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # print moves to a new identifier and stays LIVE under it); "substituted
     # FOR X" means THIS bill is the survivor, so it implies nothing about this
     # bill's own status and is deliberately absent from this table.
-    (re.compile(r"\bsubstituted\s+by\s+[A-Za-z]{1,3}\s?\d+[\s-]?[A-Za-z]?\b", re.I), SUBSTITUTED),
+    #
+    # Case-insensitive (re.I) so NJ's mixed-case "Substituted by A1516 (1R)"
+    # matches the same as NY's all-caps "SUBSTITUTED BY A10008C". The trailing
+    # `(?:\s*\(\d+R\))?` explicitly tolerates NJ's reprint marker -- e.g. the
+    # "(1R)"/"(2R)" appended after the survivor's identifier -- so it never
+    # has to rely on the identifier group's own trailing-letter slot to eat
+    # part of it.
+    (
+        re.compile(
+            r"\bsubstituted\s+by\s+[A-Za-z]{1,3}\s?\d+[\s-]?[A-Za-z]?\b(?:\s*\(\d+R\))?",
+            re.I,
+        ),
+        SUBSTITUTED,
+    ),
     (re.compile(r"\bsent\s+to\s+(the\s+)?governor\b", re.I), ENROLLED),
     (re.compile(r"\benrolled\b", re.I), ENROLLED),
+    # NJ's unclassified passage actions read "Passed by the Senate (40-0)"
+    # (one chamber) or "Passed Assembly (Passed Both Houses) (75-0-0)" (the
+    # second chamber's vote, naming that both have now passed it). The
+    # PASSED_BOTH entry must come first: it is more specific, and the
+    # compound Assembly string above contains both phrases -- first-match-
+    # wins would otherwise stop at the one-chamber reading. Also accepts
+    # "passed by both houses" (not just "passed both houses").
+    # Same clause-start + tail guards as PASSED_ONE_CHAMBER below (round 3,
+    # Finding C): unguarded, "Bill was not passed by both houses" and
+    # "Committee report recommending the bill be passed by both houses"
+    # would read as bicameral passage. NJ's compound "Passed Assembly
+    # (Passed Both Houses) (75-0-0)" is matched by the dedicated first
+    # entry -- the parenthetical counts only when it directly follows a
+    # clause-initial one-chamber passage. A bare "(" is NOT a clause start
+    # for the generic entry (round 6): "Motion to table (Passed by both
+    # houses)" describes the motion. ":" is not either (round 5): "Motion
+    # to table: Passed by both houses". Tail guards mirror
+    # PASSED_ONE_CHAMBER (round 6): "by" only ahead of a vote description,
+    # a bare number only as a dash tally.
+    (
+        re.compile(
+            r"^passed\s+(?:by\s+)?(?:the\s+)?(?:senate|assembly|house)\s*"
+            r"\(\s*passed\s+(?:by\s+)?both\s+houses\s*\)"
+            # Same tail guard as the generic entries (round 9): a
+            # committee or reading suffix after the parenthetical is not
+            # bicameral passage.
+            r"(?=\s*(?:[.;)]|$)"
+            # Round 10: a tally (optionally with an abstain count and its
+            # closing paren) must itself end the clause -- "(8-4) Judiciary
+            # Committee", "(40-0) - 2nd Reading" or "(36-0) (2nd Reading)" is
+            # not passage text (round 11: no second parenthetical either).
+            r"|\s*[(:,\-\u2013]\s*\d{1,3}\s*[-\u2013]\s*\d{1,3}"
+            r"(?:\s*[-\u2013]\s*\d{1,3})?\s*\)?\s*(?:[.;]|$)"
+            r"|\s+\d{1,3}\s*[-\u2013]\s*\d{1,3}(?:\s*[-\u2013]\s*\d{1,3})?\s*(?:[.;)]|$))",
+            re.I,
+        ),
+        PASSED_BOTH,
+    ),
+    (
+        re.compile(
+            r"(?:^|(?<=[;.])\s*)"
+            r"(?:(?:read\s+\w+\s+time\s+and|ordered\s+and|engrossed\s+and)\s+)?"
+            r"passed\s+(?:by\s+)?both\s+houses\b"
+            # Vote tallies are 1-3 digits; a 4-digit range such as the session
+            # years "(2026-2027)" is not a tally (round 8).
+            r"(?=\s*(?:[.;)]|$)"
+            # Round 10: a tally (optionally with an abstain count and its
+            # closing paren) must itself end the clause -- "(8-4) Judiciary
+            # Committee", "(40-0) - 2nd Reading" or "(36-0) (2nd Reading)" is
+            # not passage text (round 11: no second parenthetical either).
+            r"|\s*[(:,\-\u2013]\s*\d{1,3}\s*[-\u2013]\s*\d{1,3}"
+            r"(?:\s*[-\u2013]\s*\d{1,3})?\s*\)?\s*(?:[.;]|$)"
+            r"|(?:\s*,)?\s+(?:with|as|by\s+(?:a\s+)?(?:\d|voice|roll|vote))\b"
+            r"|\s+\d{1,3}\s*[-\u2013]\s*\d{1,3}(?:\s*[-\u2013]\s*\d{1,3})?\s*(?:[.;)]|$))",
+            re.I,
+        ),
+        PASSED_BOTH,
+    ),
+    # PASSED_ONE_CHAMBER is deliberately narrower than "passed" + a chamber
+    # name: a corpus-wide sweep found this pattern, unguarded, hit ~17k
+    # non-NJ actions that never meant one-chamber passage -- "Passed Senate
+    # Committee", "Passed Senate First/Second/Third Reading", "Committee
+    # report recommending bill be passed by House committee", "Motion to
+    # table passed by the Senate", "Amendment passed by the Assembly". Two
+    # guards close that off:
+    #   - the match must START the clause (string start or right after a
+    #     ";"/"." separator), optionally via a named floor-procedure verb
+    #     phrase that is itself clause-initial: "Read third time and",
+    #     "Ordered and", "Engrossed and". The verb phrase is not accepted
+    #     mid-clause (round 5): "Amendment ordered and passed by the
+    #     Senate" describes the amendment.
+    #     ":" and "(" are NOT clause starts here (round 4, Finding 2):
+    #     "Motion to table: Passed by the Senate" / "Motion to table
+    #     (passed Senate 20-19)" describe the motion. NJ's compound
+    #     "Passed Assembly (Passed Both Houses)" is caught by PASSED_BOTH
+    #     above, which does accept "(".
+    #     A bare "and " is NOT enough (round 3, Finding B): "Amended and
+    #     passed by the Assembly" / "Motion was considered and passed by
+    #     the Senate" describe the amendment/motion, not the bill.
+    #   - the chamber word must be followed by what a genuine passage
+    #     record ends with: end of string, a "."/";"/")" terminator, a vote
+    #     tally ("(40-0)", ": 36-0", ", 36-0", "36-0" -- a whole number, so
+    #     "2nd Reading" fails; "(", ":", "," and "-" only count when a tally
+    #     follows, so "Passed Senate (2nd Reading)" / "Passed House: Third
+    #     Reading" / "Passed Assembly, Education Committee" fail), or
+    #     one of with/as/amended, "by" ahead of a vote description
+    #     ("passed Senate by 2/3 vote", "by voice vote" -- not "Passed
+    #     Senate, by the Judiciary Committee", round 6), or "block vote"
+    #     ("passed senate block vote" -- not "Passed House Block Grant
+    #     Committee", round 6). A bare number counts only as a dash tally
+    #     ("Passed Senate 36-0", NJ "75-0-0" -- not "Passed Senate 2026
+    #     Session", round 6). on/in/at are NOT allowed (round 4,
+    #     Findings 3/4): "Passed Senate on second reading" is a reading,
+    #     not passage, and the prod corpus has no on/in/at passage tail.
+    #     "/" is not an accepted terminator either: "Passed Senate/House"
+    #     names both chambers (round 4, Finding 8).
+    #     An allowlist tail, not a committee-name blocklist (round 3,
+    #     Finding A): "Passed Senate Education Committee", "Passed House
+    #     Ways and Means Committee" and every other committee name fail it
+    #     in one shot. Prod corpus check (2026-08-26): 14,327 -> 14,178
+    #     matches, the only drop being VA "block vote" before "block" was
+    #     allowlisted; zero new matches.
+    # "General Assembly" (VA/IL's name for the WHOLE legislature, not one
+    # chamber) is deliberately excluded from the chamber alternation (F2);
+    # no PASSED_BOTH alternative is added for it since bicameral meaning
+    # there is not confirmed everywhere it appears.
+    (
+        re.compile(
+            r"(?:^|(?<=[;.])\s*)"
+            r"(?:(?:read\s+\w+\s+time\s+and|ordered\s+and|engrossed\s+and)\s+)?"
+            r"passed\s+(?:by\s+)?(?:the\s+)?"
+            r"(senate|assembly|house)\b"
+            r"(?=\s*(?:[.;)]|$)"
+            # Round 10: a tally (optionally with an abstain count and its
+            # closing paren) must itself end the clause -- "(8-4) Judiciary
+            # Committee", "(40-0) - 2nd Reading" or "(36-0) (2nd Reading)" is
+            # not passage text (round 11: no second parenthetical either).
+            r"|\s*[(:,\-\u2013]\s*\d{1,3}\s*[-\u2013]\s*\d{1,3}"
+            r"(?:\s*[-\u2013]\s*\d{1,3})?\s*\)?\s*(?:[.;]|$)"
+            r"|(?:\s*,)?\s+(?:with|as|amended|block\s+vote"
+            r"|by\s+(?:a\s+)?(?:\d|voice|roll|vote))\b"
+            r"|\s+\d{1,3}\s*[-\u2013]\s*\d{1,3}(?:\s*[-\u2013]\s*\d{1,3})?\s*(?:[.;)]|$))",
+            re.I,
+        ),
+        PASSED_ONE_CHAMBER,
+    ),
     (re.compile(r"\breferred\s+to\b", re.I), IN_COMMITTEE),
     (re.compile(r"\bintroduced\b", re.I), INTRODUCED),
 )
@@ -322,8 +498,13 @@ def derive_status(actions: list[ActionRow]) -> str | None:
 # this action imply", never "which OTHER bill does it name") because
 # resolving the survivor is a cross-bill lookup that belongs to the caller
 # (see cli.py `recompute_status_for_bills`), not to single-action derivation.
+#
+# Case-insensitive (re.I), same as `_TEXT_PATTERNS`'s SUBSTITUTED entry, and
+# the same explicit `(?:\s*\(\d+R\))?` tail tolerates NJ's reprint marker
+# after the captured identifier so "Substituted by A1516 (1R)" still
+# captures the survivor as "A1516", not "A1516 (1R)".
 _SUBSTITUTED_BY_RE = re.compile(
-    r"\bsubstituted\s+by\s+([A-Za-z]{1,3}\s?\d+[\s-]?[A-Za-z]?)\b", re.I
+    r"\bsubstituted\s+by\s+([A-Za-z]{1,3}\s?\d+[\s-]?[A-Za-z]?)\b(?:\s*\(\d+R\))?", re.I
 )
 # "substituted FOR X" means this bill is the survivor -- it must never be
 # read as naming a survivor of ITS OWN.
