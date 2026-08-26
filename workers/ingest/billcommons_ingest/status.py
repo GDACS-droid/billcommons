@@ -33,6 +33,7 @@ from datetime import date
 # for, so nobody has to translate ours into theirs.
 INTRODUCED = "introduced"
 IN_COMMITTEE = "in_committee"
+SUBSTITUTED = "substituted"
 PASSED_ONE_CHAMBER = "passed_one_chamber"
 PASSED_BOTH = "passed_both"
 ENROLLED = "enrolled"
@@ -45,6 +46,7 @@ DIED_ON_ADJOURNMENT = "died_on_adjournment"
 ALL_STATUSES = (
     INTRODUCED,
     IN_COMMITTEE,
+    SUBSTITUTED,
     PASSED_ONE_CHAMBER,
     PASSED_BOTH,
     ENROLLED,
@@ -66,12 +68,19 @@ TERMINAL_STATUSES = frozenset({ENACTED, VETOED, DEAD, WITHDRAWN, DIED_ON_ADJOURN
 # survives sine die, and executives routinely sign for weeks afterwards (HI
 # SB 2135 adjourned 2026-05-08 and was signed 2026-07-07). Marking those dead
 # would be the same error in the opposite direction.
-LIVE_STATUSES = frozenset({INTRODUCED, IN_COMMITTEE, PASSED_ONE_CHAMBER, PASSED_BOTH})
+LIVE_STATUSES = frozenset(
+    {INTRODUCED, IN_COMMITTEE, SUBSTITUTED, PASSED_ONE_CHAMBER, PASSED_BOTH}
+)
 
 # Used only to break ties between statuses derived from the SAME date.
 _RANK = {
     INTRODUCED: 1,
     IN_COMMITTEE: 2,
+    # A substituted print sits below a chamber passage: the survivor print is
+    # what actually carries the bill forward, and this rank only matters for
+    # same-date tie-breaks before recompute_status_for_bills resolves it via
+    # related_bills (see cli.py).
+    SUBSTITUTED: 2.5,
     PASSED_ONE_CHAMBER: 3,
     PASSED_BOTH: 4,
     ENROLLED: 5,
@@ -134,6 +143,11 @@ _TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bsession\s+sine\s+die\b", re.I), DEAD),
     (re.compile(r"\bwithdrawn\s+by\s+(the\s+)?(author|sponsor|patron)\b", re.I), WITHDRAWN),
     (re.compile(r"^withdrawn\b", re.I), WITHDRAWN),
+    # Direction matters: "substituted BY X" means X replaced this bill (this
+    # print moves to a new identifier and stays LIVE under it); "substituted
+    # FOR X" means THIS bill is the survivor, so it implies nothing about this
+    # bill's own status and is deliberately absent from this table.
+    (re.compile(r"\bsubstituted\s+by\s+[A-Za-z]{1,3}\s?\d+[\s-]?[A-Za-z]?\b", re.I), SUBSTITUTED),
     (re.compile(r"\bsent\s+to\s+(the\s+)?governor\b", re.I), ENROLLED),
     (re.compile(r"\benrolled\b", re.I), ENROLLED),
     (re.compile(r"\breferred\s+to\b", re.I), IN_COMMITTEE),
@@ -143,11 +157,46 @@ _TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 @dataclass(frozen=True)
 class ActionRow:
-    """The only three fields status derivation reads."""
+    """The fields status derivation reads.
+
+    `organization_id` is optional and defaults to None so every existing
+    caller/fixture that only ever passed the first three fields keeps
+    working unchanged. It is populated by callers that can join
+    `bill_actions.organization_id` (see cli.py) and is used ONLY to detect
+    two distinct chambers both recording a `passage` action (R2 -- PASSED_BOTH).
+    """
 
     action_date: date | None
     classification: str | None
     description: str | None
+    organization_id: object | None = None
+
+
+# Classification tokens that represent forward motion on a bill, used only to
+# decide whether a stale DEAD (see below) should be demoted. Deliberately a
+# broader set than "things that map to a LIVE status today" -- reading-2/
+# reading-3 currently map to INTRODUCED, but a second or third reading dated
+# after a recorded death is still unambiguous proof the bill kept moving.
+_PROGRESS_CLASSIFICATIONS = frozenset(
+    {
+        "passage",
+        "committee-passage",
+        "committee-passage-favorable",
+        "committee-passage-unfavorable",
+        "referral-committee",
+        "reading-2",
+        "reading-3",
+        "executive-receipt",
+    }
+)
+
+
+def _is_progress_classification(classification: str | None) -> bool:
+    if not classification:
+        return False
+    return any(
+        token.strip() in _PROGRESS_CLASSIFICATIONS for token in classification.split(",")
+    )
 
 
 def _status_from_classification(classification: str | None) -> str | None:
@@ -195,6 +244,19 @@ def derive_status(actions: list[ActionRow]) -> str | None:
 
     Undated actions sort oldest: an action with no date cannot be shown to
     supersede one that has a date, so it must not win by accident.
+
+    ONE exception to "an outcome, once reached, is what the bill is": DEAD.
+    Carryover jurisdictions (NY chief among them) file "DIED IN [CHAMBER]" at
+    the close of year one of a two-year session purely as an end-of-year
+    bookkeeping artifact -- the bill is very much still alive and often goes
+    on to pass both chambers in year two. Treating that the same as a real
+    death would report bills that later got enacted as dead forever. So: if
+    the winning terminal entry is DEAD (never VETOED/ENACTED/WITHDRAWN -- those
+    are real, deliberate acts, not clerical carryover noise) and the record
+    also contains unambiguous forward motion dated strictly AFTER it, the
+    stale DEAD is dropped and the bill is re-derived as if that entry had
+    never been recorded. Same-date "progress" does not count -- an action
+    filed the same day as the death is noise, not proof of survival.
     """
     derived: list[tuple[date | None, str]] = []
     for action in actions:
@@ -205,13 +267,92 @@ def derive_status(actions: list[ActionRow]) -> str | None:
     if not derived:
         return None
 
+    progress_dates = [
+        action.action_date
+        for action in actions
+        if action.action_date is not None
+        and (
+            _is_progress_classification(action.classification)
+            or status_for_action(action) in (PASSED_ONE_CHAMBER, PASSED_BOTH)
+        )
+    ]
+
     def sort_key(entry: tuple[date | None, str]) -> tuple[date, int]:
         action_date, status = entry
         return (action_date or date.min, _RANK[status])
 
-    terminal = [entry for entry in derived if entry[1] in TERMINAL_STATUSES]
-    pool = terminal or derived
-    return max(pool, key=sort_key)[1]
+    remaining = list(derived)
+    result: str | None = None
+    while remaining:
+        terminal = [entry for entry in remaining if entry[1] in TERMINAL_STATUSES]
+        pool = terminal or remaining
+        winner = max(pool, key=sort_key)
+        if winner[1] == DEAD:
+            winner_date = winner[0] or date.min
+            if any(pd > winner_date for pd in progress_dates):
+                # Stale carryover DEAD: drop this one entry and re-resolve
+                # from what remains, so an earlier real terminal outcome (or
+                # the non-terminal pool, if nothing else concluded the bill)
+                # decides instead.
+                remaining.remove(winner)
+                continue
+        result = winner[1]
+        break
+
+    # R2 -- two distinct chambers each recording a `passage` action outrank a
+    # single chamber's passage. Only ever upgrades PASSED_ONE_CHAMBER: a bill
+    # that concluded some other way (terminal, or a later committee referral)
+    # is reported as that, not silently overwritten.
+    if result == PASSED_ONE_CHAMBER:
+        chambers = {
+            action.organization_id
+            for action in actions
+            if action.organization_id is not None
+            and action.classification
+            and "passage" in {tok.strip() for tok in action.classification.split(",")}
+        }
+        if len(chambers) >= 2:
+            result = PASSED_BOTH
+
+    return result
+
+
+# `substituted by <ID>` regex, capturing the survivor's identifier. Kept
+# separate from `_TEXT_PATTERNS` (which only ever answers "what status does
+# this action imply", never "which OTHER bill does it name") because
+# resolving the survivor is a cross-bill lookup that belongs to the caller
+# (see cli.py `recompute_status_for_bills`), not to single-action derivation.
+_SUBSTITUTED_BY_RE = re.compile(
+    r"\bsubstituted\s+by\s+([A-Za-z]{1,3}\s?\d+[\s-]?[A-Za-z]?)\b", re.I
+)
+# "substituted FOR X" means this bill is the survivor -- it must never be
+# read as naming a survivor of ITS OWN.
+_SUBSTITUTED_FOR_RE = re.compile(r"\bsubstituted\s+for\b", re.I)
+
+
+def substitution_target(description: str | None) -> str | None:
+    """The OTHER bill's identifier if `description` says this bill was
+    substituted BY it, else None.
+
+    Direction matters: "substituted by A10008C" names a survivor this bill
+    should defer to; "substituted for A10008C" names a bill THIS one
+    replaced, which says nothing about this bill's own fate. The identifier
+    is returned normalized (`normalize_bill_number`) so callers can compare
+    it directly against `bills.identifier_norm`.
+    """
+    if not description:
+        return None
+    if _SUBSTITUTED_FOR_RE.search(description):
+        return None
+    match = _SUBSTITUTED_BY_RE.search(description)
+    if not match:
+        return None
+    from billcommons_shared.normalize import normalize_bill_number
+
+    try:
+        return normalize_bill_number(match.group(1))
+    except ValueError:
+        return None
 
 
 # Re-exported here so ingest callers keep importing it from status.
