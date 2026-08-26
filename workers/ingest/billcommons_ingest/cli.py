@@ -1654,13 +1654,20 @@ def recompute_status_for_bills(
                 # rank, then match rows back per bill by (jurisdiction,
                 # session, identifier).
                 rank_candidates = {candidates_by_bid[bid][rank] for bid in still_needed}
+                # Scope in SQL as well as in Python: without the jurisdiction
+                # + session predicates a nationwide sweep would pull every
+                # "HB 1"-shaped row in the corpus for each rank.
                 rows = db.execute(
                     select(
                         Bill.id,
                         Bill.jurisdiction_id,
                         Bill.session_id,
                         Bill.identifier_norm,
-                    ).where(Bill.identifier_norm.in_(rank_candidates))
+                    ).where(
+                        Bill.jurisdiction_id.in_({bill_jurisdiction.get(bid) for bid in still_needed}),
+                        Bill.session_id.in_({bill_session.get(bid) for bid in still_needed}),
+                        Bill.identifier_norm.in_(rank_candidates),
+                    )
                 ).all()
                 rows_by_key: dict = {}
                 for row in rows:
