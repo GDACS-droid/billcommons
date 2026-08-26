@@ -85,6 +85,46 @@ def test_substituted_bill_inherits_terminal_survivor_status(db_session):
     assert cleared == 0
 
 
+def test_substituted_bill_inherits_survivor_status_nj_mixed_case_reprint_marker(
+    db_session,
+):
+    """NJ's shape: "Substituted by A1516 (1R)" -- mixed-case verb, no NY-style
+    ALL CAPS, and a trailing "(1R)" reprint marker that is never part of the
+    survivor's identity. The substituted print must still resolve A1516 as
+    its survivor and inherit its terminal status."""
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    survivor = _bill(db_session, jurisdiction, session_row, "A 1516")
+    substituted = _bill(db_session, jurisdiction, session_row, "S 1092")
+
+    db_session.add_all(
+        [
+            BillAction(
+                bill_id=substituted.id,
+                description="Substituted by A1516 (1R)",
+                classification=None,
+            ),
+            BillAction(
+                bill_id=survivor.id,
+                description="Signed by Governor",
+                classification="executive-signature",
+            ),
+        ]
+    )
+    db_session.flush()
+
+    changed, cleared = recompute_status_for_bills(
+        db_session, [survivor.id, substituted.id], stamp=False
+    )
+    db_session.flush()
+    db_session.refresh(survivor)
+    db_session.refresh(substituted)
+
+    assert survivor.status == "enacted"
+    assert substituted.status == "enacted"
+    assert changed == 2
+    assert cleared == 0
+
+
 def test_substituted_bill_with_unresolvable_survivor_keeps_substituted(db_session):
     jurisdiction, session_row = _jurisdiction_with_session(db_session)
     substituted = _bill(db_session, jurisdiction, session_row, "S 1234")
@@ -358,3 +398,72 @@ def test_recompute_status_jurisdiction_filter_scopes_to_one_state(db_session, ca
         select(Bill.id).where(Bill.jurisdiction_id == row.id)
     ).all()
     assert len(matched) == 1
+
+
+def test_recompute_status_derives_enacted_from_nj_p_l_citation(db_session):
+    """NJ's enactment record reads "Approved P.L.2025, c.34." -- no
+    "signed/approved BY the Governor" wording, no structured classification.
+    recompute_status_for_bills must still land on ENACTED from that text
+    alone."""
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    bill = _bill(db_session, jurisdiction, session_row, "A 1516")
+    db_session.add(
+        BillAction(
+            bill_id=bill.id,
+            description="Approved P.L.2025, c.34.",
+            classification=None,
+        )
+    )
+    db_session.flush()
+
+    recompute_status_for_bills(db_session, [bill.id], stamp=False)
+    db_session.flush()
+    db_session.refresh(bill)
+
+    assert bill.status == "enacted"
+
+
+def test_recompute_status_withdrawn_because_approved_stays_withdrawn(db_session):
+    """A companion bill pulled because the OTHER (identical) bill was signed
+    -- "Withdrawn Because Approved P.L.2025, c.34." -- must resolve to
+    WITHDRAWN, not ENACTED, even though the text contains "Approved P.L.
+    ...c.N" verbatim."""
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    bill = _bill(db_session, jurisdiction, session_row, "S 1092")
+    db_session.add(
+        BillAction(
+            bill_id=bill.id,
+            description="Withdrawn Because Approved P.L.2025, c.34.",
+            classification=None,
+        )
+    )
+    db_session.flush()
+
+    recompute_status_for_bills(db_session, [bill.id], stamp=False)
+    db_session.flush()
+    db_session.refresh(bill)
+
+    assert bill.status == "withdrawn"
+
+
+def test_recompute_status_derives_passed_both_from_nj_compound_wording(db_session):
+    """"Passed Assembly (Passed Both Houses) (75-0-0)" is a single
+    unclassified action that names both chambers as done -- it must resolve
+    to passed_both directly, not passed_one_chamber (the R2 two-organization
+    upgrade never even has to run)."""
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    bill = _bill(db_session, jurisdiction, session_row, "A 1516")
+    db_session.add(
+        BillAction(
+            bill_id=bill.id,
+            description="Passed Assembly (Passed Both Houses) (75-0-0)",
+            classification=None,
+        )
+    )
+    db_session.flush()
+
+    recompute_status_for_bills(db_session, [bill.id], stamp=False)
+    db_session.flush()
+    db_session.refresh(bill)
+
+    assert bill.status == "passed_both"
