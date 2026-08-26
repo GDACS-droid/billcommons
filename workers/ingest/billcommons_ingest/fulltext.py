@@ -1498,13 +1498,15 @@ def _resolve_ma_document(
         # 4xx, a body that doesn't match) is a normal retryable failure and
         # falls through to `process_fetch_text_job`'s generic handling
         # unchanged.
-        body = exc.response.text
-        if exc.response.status_code in (400, 404) and "could not be found" in body.lower():
-            raise DocumentFetchError(
-                f"MA document API says docket {ma_url.doc_id} (court {ma_url.court}) does not "
-                f"exist ({exc.response.status_code}): {docket_url}",
-                status=STATUS_MA_DOCKET_NOT_FOUND,
-            ) from exc
+        failing_url = str(exc.request.url) if exc.request is not None else str(exc.response.url)
+        if exc.response.status_code in (400, 404) and failing_url == docket_url:
+            body = exc.response.text
+            if "requested document could not be found in general court" in body.lower():
+                raise DocumentFetchError(
+                    f"MA document API says docket {ma_url.doc_id} (court {ma_url.court}) does not "
+                    f"exist ({exc.response.status_code}): {docket_url}",
+                    status=STATUS_MA_DOCKET_NOT_FOUND,
+                ) from exc
         raise
     docket_data = _parse_ma_document(docket_response, docket_url)
     _assert_ma_field(docket_data, "DocketNumber", ma_url.doc_id, docket_url)

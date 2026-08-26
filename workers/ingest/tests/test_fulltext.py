@@ -65,7 +65,7 @@ from billcommons_ingest.fulltext import (
     sniff_content_type,
 )
 from billcommons_ingest.queue import claim_job, enqueue
-from billcommons_ingest.url_resolvers import MaDocumentUrl, ma_docket_from_url
+from billcommons_ingest.url_resolvers import MaDocumentUrl, ma_api_url, ma_docket_from_url
 from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob, Jurisdiction, Session as SessionModel
 from billcommons_shared.db import get_session
 
@@ -2838,6 +2838,58 @@ def test_ma_docket_lookup_500_is_generic_fetch_error_with_a_detail_token(db_sess
     assert document.license_note == f"fulltext_status={STATUS_FETCH_ERROR} fetch_detail=HTTPStatusError:500"
 
 
+def test_ma_docket_lookup_404_without_the_exact_phrase_is_generic_fetch_error(db_session, rawstore, monkeypatch):
+    """A generic web-server 404 (no exact "could not be found in General
+    Court" phrase) on the docket-lookup URL must NOT be classified as
+    STATUS_MA_DOCKET_NOT_FOUND -- only the API's own deterministic phrase is
+    terminal; every other 404/400 falls through to the ordinary retryable
+    fetch_error path."""
+    monkeypatch.setattr(fulltext_mod, "_jurisdiction_and_identifier", lambda db, document: ("ma", "HD 9003"))
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/HD9003": httpx.Response(
+            404, text="The requested URL could not be found on this server."
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+    document = _make_bill_document(db_session, url="https://malegislature.gov/Bills/194/HD9003.pdf")
+
+    with pytest.raises(DocumentFetchError) as excinfo:
+        process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert excinfo.value.status == STATUS_FETCH_ERROR
+    assert STATUS_FETCH_ERROR not in TERMINAL_STATUSES
+    db_session.refresh(document)
+    assert document.license_note == f"fulltext_status={STATUS_FETCH_ERROR} fetch_detail=HTTPStatusError:404"
+
+
+def test_ma_docket_not_found_requires_the_failing_request_to_be_the_docket_lookup():
+    """Guard (b): even the exact deterministic MA phrase, on a 404, must NOT
+    be classified as STATUS_MA_DOCKET_NOT_FOUND unless the failing request
+    was the docket lookup itself -- a phrase match against some OTHER
+    request must bare-raise the original httpx.HTTPStatusError untouched."""
+    ma_url = _ma_document_url("HD9004")
+    docket_url = ma_api_url(ma_url.court, ma_url.doc_id)
+    other_url = "https://malegislature.gov/some/unrelated/path"
+    request = httpx.Request("GET", other_url)
+    response = httpx.Response(
+        404,
+        request=request,
+        text='The requested Document could not be found in General Court "194"',
+    )
+    exc = httpx.HTTPStatusError("404", request=request, response=response)
+
+    class _FakeFetcher:
+        def fetch(self, url):
+            assert url == docket_url
+            raise exc
+
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        _resolve_ma_document(_FakeFetcher(), ma_url)
+    assert excinfo.value is exc
+
+
 def test_reset_fetch_attempts_accepts_ma_docket_not_found():
     """R3-1-style operator requeue lever: an operator who is convinced a
     docket the API said didn't exist actually does now (e.g. malegislature.gov
@@ -2868,6 +2920,34 @@ def test_reset_fetch_attempts_accepts_ma_docket_not_found():
         assert doc.fetch_attempts == 0
         assert doc.license_note is None
         assert enqueue_fulltext_jobs(after, document_ids=[document_id]) == 1
+        after.rollback()
+    finally:
+        after.close()
+
+
+def test_reset_fetch_attempts_status_filter_matches_a_decorated_fetch_error_note():
+    """--status fetch_error must match a fetch_error row whose license_note
+    carries a trailing `fetch_detail=...` token (e.g. the HTTPStatusError:500
+    detail stamped alongside a generic MA docket-lookup failure) -- an exact
+    equality match against the bare `fulltext_status=fetch_error` string
+    would silently exclude every such row from the requeue lever."""
+    marker = f"https://reset-fetch-error-detail-{uuid.uuid4().hex}.gov/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=MAX_FETCH_ATTEMPTS)
+        document.license_note = f"fulltext_status={STATUS_FETCH_ERROR} fetch_detail=HTTPStatusError:500"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    assert cmd_reset_fetch_attempts(_reset_args(url_like=marker, status=[STATUS_FETCH_ERROR])) == 0
+
+    after = get_session()
+    try:
+        doc = after.get(BillDocument, document_id)
+        assert doc.fetch_attempts == 0
+        assert doc.license_note is None
         after.rollback()
     finally:
         after.close()
