@@ -70,6 +70,7 @@ on the website lives at a readable URL:
 - \`GET /api/v1/search?q=\` — full-text search across bill text and metadata
 - \`GET /api/v1/bills\` — filter by jurisdiction, session, chamber, identifier
 - \`GET /api/v1/bills/{id}\` — detail, plus /versions /actions /sponsors /votes /documents
+- \`GET /api/v1/bills/{id}/documents/{document_id}/text\` — one document's extracted full text as JSON
 - \`GET /api/v1/jurisdictions\`, \`/api/v1/sessions\` — reference data
 - \`GET /api/v1/coverage\` — per-jurisdiction coverage state and validation results
 - \`POST /api/v1/bills/lookup\` — resolve up to 250 (jurisdiction, bill number) keys at once
