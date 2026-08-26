@@ -1600,33 +1600,89 @@ def recompute_status_for_bills(
             if bid not in survivor_bill_id
         }
         if needs_lookup:
-            # First check within this chunk (no extra query needed) ...
+            # NY-only: the print-suffix stripped candidate only ever applies
+            # there (FL "HB 1A" / CA "AB 1X" use the same trailing-letter
+            # shape as part of identity). One cheap query for the whole
+            # chunk's jurisdictions, not per bill.
+            jurisdiction_ids = {
+                bill_jurisdiction.get(bid) for bid in needs_lookup if bill_jurisdiction.get(bid)
+            }
+            ny_jurisdiction_ids = {
+                row.id
+                for row in db.execute(
+                    select(Jurisdiction.id).where(
+                        Jurisdiction.id.in_(jurisdiction_ids),
+                        func.upper(Jurisdiction.abbreviation) == "NY",
+                    )
+                ).all()
+            }
+            candidates_by_bid = {
+                bid: status_mod.substitution_lookup_candidates(
+                    ident, print_suffix=bill_jurisdiction.get(bid) in ny_jurisdiction_ids
+                )
+                for bid, ident in needs_lookup.items()
+            }
+
             in_chunk_by_key = {
                 (bill_jurisdiction.get(other), bill_session.get(other), bill_identifier_norm.get(other)): other
                 for other in bill_ids
             }
-            still_needed = []
-            for bid, ident in needs_lookup.items():
-                key = (bill_jurisdiction.get(bid), bill_session.get(bid), ident)
-                found = in_chunk_by_key.get(key)
-                if found is not None and found != bid:
-                    survivor_bill_id[bid] = found
-                else:
-                    still_needed.append(bid)
-            # ... then fall back to one query for whatever wasn't in the chunk.
-            if still_needed:
+
+            # Resolve rank-by-rank (exact identifier before the NY stripped
+            # fallback), each rank checked against the chunk THEN the DB, so
+            # an exact-but-out-of-chunk survivor always outranks a stripped
+            # in-chunk one -- the winner must not depend on chunk boundaries.
+            remaining = dict(needs_lookup)
+            max_rank = max((len(c) for c in candidates_by_bid.values()), default=0)
+            for rank in range(max_rank):
+                rank_bids = [bid for bid in remaining if rank < len(candidates_by_bid[bid])]
+                if not rank_bids:
+                    continue
+                still_needed = []
+                for bid in rank_bids:
+                    candidate = candidates_by_bid[bid][rank]
+                    key = (bill_jurisdiction.get(bid), bill_session.get(bid), candidate)
+                    match = in_chunk_by_key.get(key)
+                    if match is not None and match != bid:
+                        survivor_bill_id[bid] = match
+                        remaining.pop(bid, None)
+                    else:
+                        still_needed.append(bid)
+                if not still_needed:
+                    continue
+                # One batched query for every bill still unresolved at this
+                # rank, then match rows back per bill by (jurisdiction,
+                # session, identifier).
+                rank_candidates = {candidates_by_bid[bid][rank] for bid in still_needed}
+                # Scope in SQL as well as in Python: without the jurisdiction
+                # + session predicates a nationwide sweep would pull every
+                # "HB 1"-shaped row in the corpus for each rank.
+                rows = db.execute(
+                    select(
+                        Bill.id,
+                        Bill.jurisdiction_id,
+                        Bill.session_id,
+                        Bill.identifier_norm,
+                    ).where(
+                        Bill.jurisdiction_id.in_({bill_jurisdiction.get(bid) for bid in still_needed}),
+                        Bill.session_id.in_({bill_session.get(bid) for bid in still_needed}),
+                        Bill.identifier_norm.in_(rank_candidates),
+                    )
+                ).all()
+                rows_by_key: dict = {}
+                for row in rows:
+                    rows_by_key.setdefault(
+                        (row.jurisdiction_id, row.session_id, row.identifier_norm), []
+                    ).append(row)
                 for bid in still_needed:
-                    ident = needs_lookup[bid]
-                    row = db.execute(
-                        select(Bill.id, Bill.status).where(
-                            Bill.jurisdiction_id == bill_jurisdiction.get(bid),
-                            Bill.session_id == bill_session.get(bid),
-                            Bill.identifier_norm == ident,
-                            Bill.id != bid,
-                        )
-                    ).first()
-                    if row is not None:
-                        survivor_bill_id[bid] = row.id
+                    candidate = candidates_by_bid[bid][rank]
+                    key = (bill_jurisdiction.get(bid), bill_session.get(bid), candidate)
+                    match = next(
+                        (row for row in rows_by_key.get(key, ()) if row.id != bid), None
+                    )
+                    if match is not None:
+                        survivor_bill_id[bid] = match.id
+                        remaining.pop(bid, None)
 
         for bid, sid in survivor_bill_id.items():
             if bid not in bill_ids:

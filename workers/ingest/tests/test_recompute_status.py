@@ -182,6 +182,153 @@ def test_related_bills_substitution_relation_propagates_terminal_status(db_sessi
     assert substituted.status == "vetoed"
 
 
+def test_substituted_bill_inherits_survivor_stored_with_print_version_stripped_in_chunk(
+    db_session,
+):
+    """NY: "SUBSTITUTED BY A10008C" normalizes to "A 10008C", but the
+    survivor is stored as "A 10008" -- the trailing print/amendment letter
+    is never part of bill identity. Resolved via the in-chunk map."""
+    jurisdiction, session_row = _jurisdiction_with_session(db_session, abbr="NY")
+    survivor = _bill(db_session, jurisdiction, session_row, "A 10008")
+    substituted = _bill(db_session, jurisdiction, session_row, "S 9008")
+    db_session.add_all(
+        [
+            BillAction(
+                bill_id=substituted.id,
+                description="SUBSTITUTED BY A10008C",
+                classification=None,
+            ),
+            BillAction(
+                bill_id=survivor.id,
+                description="SIGNED CHAP.58",
+                classification="executive-signature",
+            ),
+        ]
+    )
+    db_session.flush()
+
+    recompute_status_for_bills(db_session, [survivor.id, substituted.id], stamp=False)
+    db_session.flush()
+    db_session.refresh(substituted)
+
+    assert substituted.status == "enacted"
+
+
+def test_substituted_bill_inherits_survivor_stored_with_print_version_stripped_via_db_fallback(
+    db_session,
+):
+    """Same as above, but the survivor is not in the recompute chunk, so
+    resolution must go through the DB fallback query's `in_(candidates)`
+    lookup rather than the in-chunk map."""
+    jurisdiction, session_row = _jurisdiction_with_session(db_session, abbr="NY")
+    survivor = _bill(db_session, jurisdiction, session_row, "A 10008")
+    substituted = _bill(db_session, jurisdiction, session_row, "S 9008")
+    db_session.add_all(
+        [
+            BillAction(
+                bill_id=substituted.id,
+                description="SUBSTITUTED BY A10008C",
+                classification=None,
+            ),
+            BillAction(
+                bill_id=survivor.id,
+                description="SIGNED CHAP.58",
+                classification="executive-signature",
+            ),
+        ]
+    )
+    db_session.flush()
+    # Recompute the survivor separately first so its status is already
+    # persisted, then recompute only the substituted print.
+    recompute_status_for_bills(db_session, [survivor.id], stamp=False)
+    db_session.flush()
+
+    recompute_status_for_bills(db_session, [substituted.id], stamp=False)
+    db_session.flush()
+    db_session.refresh(substituted)
+
+    assert substituted.status == "enacted"
+
+
+def test_exact_survivor_across_db_wins_over_stripped_survivor_in_chunk(db_session):
+    """NY, R2 defect #1: the exact lettered survivor "A 10008C" (enacted)
+    sits OUTSIDE this recompute chunk, while an unrelated bill that happens
+    to share the stripped identifier "A 10008" (still in_committee) sits
+    INSIDE it. The exact form must be resolved -- across chunk AND db --
+    before the stripped fallback is even tried, so the winner cannot depend
+    on which bill happened to land in this chunk."""
+    jurisdiction, session_row = _jurisdiction_with_session(db_session, abbr="NY")
+    survivor_exact = _bill(db_session, jurisdiction, session_row, "A 10008C")
+    unrelated_stripped = _bill(db_session, jurisdiction, session_row, "A 10008")
+    substituted = _bill(db_session, jurisdiction, session_row, "S 9008")
+    db_session.add_all(
+        [
+            BillAction(
+                bill_id=substituted.id,
+                description="SUBSTITUTED BY A10008C",
+                classification=None,
+            ),
+            BillAction(
+                bill_id=survivor_exact.id,
+                description="SIGNED CHAP.58",
+                classification="executive-signature",
+            ),
+            BillAction(
+                bill_id=unrelated_stripped.id,
+                description="REFERRED TO COMMITTEE",
+                classification="referral-committee",
+            ),
+        ]
+    )
+    db_session.flush()
+    # Persist the exact survivor's status first (outside this chunk), same
+    # pattern as the db-fallback test above.
+    recompute_status_for_bills(db_session, [survivor_exact.id], stamp=False)
+    db_session.flush()
+
+    recompute_status_for_bills(
+        db_session, [unrelated_stripped.id, substituted.id], stamp=False
+    )
+    db_session.flush()
+    db_session.refresh(substituted)
+    db_session.refresh(unrelated_stripped)
+
+    assert unrelated_stripped.status == "in_committee"
+    assert substituted.status == "enacted"
+
+
+def test_non_ny_jurisdiction_does_not_strip_print_suffix(db_session):
+    """FL: "SUBSTITUTED BY HB1A" normalizes to "HB 1A". Only "HB 1" exists
+    (a different bill in a different special session print), and the
+    trailing letter is part of FL's identity, not a print version -- it must
+    NOT be stripped, so the substituted print stays SUBSTITUTED rather than
+    wrongly inheriting HB 1's status."""
+    jurisdiction, session_row = _jurisdiction_with_session(db_session, abbr="FL")
+    decoy = _bill(db_session, jurisdiction, session_row, "HB 1")
+    substituted = _bill(db_session, jurisdiction, session_row, "HB 2")
+    db_session.add_all(
+        [
+            BillAction(
+                bill_id=substituted.id,
+                description="SUBSTITUTED BY HB1A",
+                classification=None,
+            ),
+            BillAction(
+                bill_id=decoy.id,
+                description="SIGNED BY GOVERNOR",
+                classification="executive-signature",
+            ),
+        ]
+    )
+    db_session.flush()
+
+    recompute_status_for_bills(db_session, [decoy.id, substituted.id], stamp=False)
+    db_session.flush()
+    db_session.refresh(substituted)
+
+    assert substituted.status == "substituted"
+
+
 def test_recompute_status_jurisdiction_filter_scopes_to_one_state(db_session, capsys):
     """R4: `--jurisdiction` must only touch bills in that jurisdiction. Exercised
     directly against the argparse-wired command via a stand-in args object,
