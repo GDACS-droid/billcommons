@@ -15,6 +15,10 @@ billcommons-ingest recompute-status --jurisdiction NY
 billcommons-ingest recompute-status
 ```
 
+Run each command until it reports 0 changed rows (normally twice). A
+substituted bill whose survivor sits in a later chunk reads the survivor's
+pre-recompute status on the first pass; the second pass converges.
+
 `--jurisdiction` filters by abbreviation and is case-insensitive. Omit it (or
 run a second time with no flag) to sweep every bill. The command is
 idempotent and safe to re-run: only rows whose derived status actually
