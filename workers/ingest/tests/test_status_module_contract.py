@@ -73,13 +73,21 @@ def test_substitution_lookup_candidates_tolerates_ny_print_version_suffix():
     """"SUBSTITUTED BY A10008C" normalizes to "A 10008C", but the corpus
     identifies the bill as "A 10008" -- the trailing letter is NY's print/
     amendment version, never part of bill identity. Exact match must still
-    be tried first."""
-    assert status_mod.substitution_lookup_candidates("A 10008C") == [
-        "A 10008C",
-        "A 10008",
-    ]
+    be tried first, and only when the caller opts in with print_suffix=True
+    (NY only -- FL "HB 1A" / CA "AB 1X" use the same shape as identity)."""
+    assert status_mod.substitution_lookup_candidates("A 10008C") == ["A 10008C"]
+    assert status_mod.substitution_lookup_candidates(
+        "A 10008C", print_suffix=True
+    ) == ["A 10008C", "A 10008"]
     assert status_mod.substitution_lookup_candidates("A 10008") == ["A 10008"]
+    assert status_mod.substitution_lookup_candidates("A 10008", print_suffix=True) == [
+        "A 10008"
+    ]
     assert status_mod.substitution_lookup_candidates("HB 12") == ["HB 12"]
+    # print_suffix is a caller-supplied opt-in, not a jurisdiction lookup --
+    # the FL/CA gate (only NY passes print_suffix=True) lives in the CLI's
+    # pass-2 resolution, not in this function.
+    assert status_mod.substitution_lookup_candidates("HB 1A") == ["HB 1A"]
 
 
 def test_substituted_is_in_the_vocabulary_and_non_terminal():

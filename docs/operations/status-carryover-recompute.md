@@ -19,9 +19,13 @@ Run each command until it reports 0 changed rows (normally twice). A
 substituted bill whose survivor sits in a later chunk reads the survivor's
 pre-recompute status on the first pass; the second pass converges.
 
-Survivor lookup also tries the identifier with a trailing NY print/amendment
-letter stripped (e.g. `A 10008C` -> `A 10008`) when the exact form isn't
-found, since that letter is never part of the survivor's stored identity.
+Survivor lookup also tries the identifier with a trailing print/amendment
+letter stripped (e.g. `A 10008C` -> `A 10008`), NY only -- elsewhere (FL's
+`HB 1A`, CA's `AB 1X`) that trailing letter is part of the bill's identity,
+not a print version. The exact form is always resolved first, across both
+the in-progress chunk and the database, before the stripped fallback is
+tried at all -- so which chunk a survivor happens to land in never changes
+which bill wins.
 
 `--jurisdiction` filters by abbreviation and is case-insensitive. Omit it (or
 run a second time with no flag) to sweep every bill. The command is
