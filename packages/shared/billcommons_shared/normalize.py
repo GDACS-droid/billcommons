@@ -52,3 +52,29 @@ def normalize_bill_number(raw: str) -> str:
     number = str(int(digits))  # strips leading zeros
     result = f"{prefix} {number}{suffix}" if prefix else f"{number}{suffix}"
     return result
+
+
+# A single uppercase letter trailing a digit is NY's print/amendment version
+# (e.g. "A 10008C"), never part of the bill's identity -- the corpus stores
+# the bill as "A 10008". Lookups that resolve a survivor/substitution
+# identifier against `bills.identifier_norm` need both forms, exact first.
+# NY-only: FL ("HB 1A", a special-session print) and CA ("AB 1X") use the
+# same trailing-letter shape to mean something else -- there the letter IS
+# part of identity, so stripping it would resolve to the wrong bill. Mirrors
+# workers/ingest/billcommons_ingest/status.py's `substitution_lookup_candidates`
+# (kept independent/duplicated on purpose -- the API doesn't have ingest on
+# its import path, and ingest is left untouched by this helper's existence).
+_TRAILING_PRINT_VERSION_RE = re.compile(r"\d[A-Z]$")
+
+
+def identifier_lookup_candidates(identifier: str, *, print_suffix: bool = False) -> list[str]:
+    """Identifiers to try, in order, when resolving `identifier` (already
+    normalized, e.g. via `normalize_bill_number`) against `bills.identifier_norm`.
+    Always includes `identifier` itself; when `print_suffix` is True (NY
+    only -- see module note above) and it ends in a digit followed by one
+    uppercase letter (an NY print version), also includes that identifier
+    with the trailing letter stripped."""
+    candidates = [identifier]
+    if print_suffix and _TRAILING_PRINT_VERSION_RE.search(identifier):
+        candidates.append(identifier[:-1])
+    return candidates

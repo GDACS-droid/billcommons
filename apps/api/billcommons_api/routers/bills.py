@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import difflib
+import re
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session as OrmSession
 from sqlalchemy.orm import selectinload
 
@@ -19,7 +20,7 @@ from billcommons_shared.evidence import (
     reproducibility_note,
     snapshot_id,
 )
-from billcommons_shared.normalize import normalize_bill_number
+from billcommons_shared.normalize import identifier_lookup_candidates, normalize_bill_number
 
 from billcommons_api.deps import get_db
 from billcommons_api.errors import bad_request, conflict, not_found
@@ -47,6 +48,7 @@ from billcommons_api.schemas import (
     BillSummary,
     BillVersionOut,
     Jurisdiction as JurisdictionSchema,
+    RelatedBillLink,
     RelatedBillOut,
     DiffLineOut,
     SponsorshipOut,
@@ -69,6 +71,18 @@ from billcommons_schema.models import (
 
 router = APIRouter(prefix="/bills", tags=["bills"])
 
+# A `q` value that LOOKS like a bill number ("S9008", "hb 123", "A-10008C",
+# "HJRES12", "SJRES 8", "HCONRES 10") rather than a keyword/title search.
+# Widened to whatever `normalize_bill_number` itself accepts -- up to 8
+# letters (Congress-style HJRES/SJRES/HCONRES prefixes are longer than a
+# state's 1-4 letter chamber code), optional hyphen/whitespace (including
+# double spaces) between prefix and digits, up to 6 digits, and an optional
+# trailing letter suffix -- so q= doesn't silently degrade to FTS-only for
+# identifier shapes that `identifier=` already handles. Still anchored
+# end-to-end, so free-text like "AI budget 2026" (letters, then a whole
+# other word, then digits) correctly falls through to full-text search.
+_IDENTIFIER_LIKE_Q = re.compile(r"^[A-Za-z]{1,8}\s*-?\s*\d{1,6}[A-Za-z]*$")
+
 
 def _get_bill_or_404(db: OrmSession, bill_id: uuid.UUID) -> Bill:
     row = db.get(Bill, bill_id)
@@ -88,6 +102,15 @@ def list_bills(
             "Bill number, matched on the normalized form -- 'HB123', 'hb 123' and "
             "'H.B. 123' all find HB 123. Combine with jurisdiction (and session) to "
             "resolve a single bill."
+        ),
+    ),
+    q: str | None = Query(
+        None,
+        description=(
+            "Free-text search over title/description; a bill-number-shaped "
+            "value (e.g. 'S9008', 'HB 123') ALSO matches on the normalized "
+            "identifier and those matches are returned first, so callers "
+            "don't need to know about `identifier=` to look a bill up by number."
         ),
     ),
     chamber: str | None = Query(None),
@@ -149,6 +172,52 @@ def list_bills(
             identifier_norm = identifier.upper().strip()
         stmt = stmt.where(Bill.identifier_norm == identifier_norm)
         count_stmt = count_stmt.where(Bill.identifier_norm == identifier_norm)
+    identifier_match_rank = None
+    q_stripped = q.strip() if q else ""
+    if q_stripped:
+        if _IDENTIFIER_LIKE_Q.match(q_stripped):
+            # Bill-number-shaped q: match identifier_norm (same fallback as
+            # `identifier=` above) OR the full-text index, and surface the
+            # identifier hit(s) first via ORDER BY below -- see module
+            # docstring on _IDENTIFIER_LIKE_Q. Non-identifier `q` values are
+            # untouched (full-text only), so that behavior stays exactly what
+            # it is today.
+            try:
+                q_identifier_norm = normalize_bill_number(q_stripped)
+            except ValueError:
+                q_identifier_norm = q_stripped.upper().strip()
+            exact_condition = Bill.identifier_norm == q_identifier_norm
+            identifier_condition = exact_condition
+            rank_whens = [(exact_condition, 0)]
+            # NY print versions: a user types "A10008C" but NY identifier_norm
+            # is "A 10008" (print letter stripped at ingest). Try the stripped
+            # form too, gated to NY rows only -- NE/FL use a trailing letter as
+            # real identity -- and rank exact hits ahead of stripped ones.
+            # Same helper + gate as `_attach_substitution_links`.
+            stripped_candidates = identifier_lookup_candidates(
+                q_identifier_norm, print_suffix=True
+            )[1:]
+            if stripped_candidates:
+                ny_jurisdictions = select(Jurisdiction.id).where(
+                    func.upper(Jurisdiction.abbreviation) == "NY"
+                )
+                stripped_condition = Bill.identifier_norm.in_(
+                    stripped_candidates
+                ) & Bill.jurisdiction_id.in_(ny_jurisdictions)
+                identifier_condition = exact_condition | stripped_condition
+                rank_whens.append((stripped_condition, 1))
+            text_condition = Bill.search_tsv.op("@@")(
+                func.websearch_to_tsquery("english", q_stripped)
+            )
+            stmt = stmt.where(identifier_condition | text_condition)
+            count_stmt = count_stmt.where(identifier_condition | text_condition)
+            identifier_match_rank = case(*rank_whens, else_=len(rank_whens))
+        else:
+            text_condition = Bill.search_tsv.op("@@")(
+                func.websearch_to_tsquery("english", q_stripped)
+            )
+            stmt = stmt.where(text_condition)
+            count_stmt = count_stmt.where(text_condition)
     if chamber:
         stmt = stmt.where(Bill.chamber == chamber)
         count_stmt = count_stmt.where(Bill.chamber == chamber)
@@ -179,9 +248,14 @@ def list_bills(
         count_stmt = count_stmt.where(sponsor_match.exists())
 
     total = db.execute(count_stmt).scalar_one()
+    order_columns = []
+    if identifier_match_rank is not None:
+        order_columns.append(identifier_match_rank)
+    order_columns.append(Bill.latest_action_date.desc().nullslast())
+    order_columns.append(Bill.id)
     rows = (
         db.execute(
-            stmt.order_by(Bill.latest_action_date.desc().nullslast(), Bill.id)
+            stmt.order_by(*order_columns)
             .offset((page - 1) * per_page)
             .limit(per_page)
         )
@@ -448,6 +522,174 @@ def _resolve_lookup(
     )
 
 
+# The only substitution relation_type this corpus has ever been observed to
+# carry (see workers/ingest/billcommons_ingest/cli.py's own
+# `.ilike("%substitut%")` check and its test fixture, relation_type=
+# "substituted-by") -- there is no relation_type literally named "replaces".
+# Matched case-insensitively for the same reason cli.py does: upstream is not
+# guaranteed to agree on exact casing.
+_SUBSTITUTION_RELATION_PATTERN = "%substitut%"
+
+
+def _resolve_related_bill_links(
+    db: OrmSession, bill_ids: set[uuid.UUID]
+) -> dict[uuid.UUID, RelatedBillLink]:
+    """Bill id -> RelatedBillLink, for the small id sets involved in a
+    substitution (almost always 0 or 1 per bill)."""
+    if not bill_ids:
+        return {}
+    rows = db.execute(
+        select(Bill.id, Bill.identifier, Jurisdiction.abbreviation, Session.identifier, Bill.status)
+        .join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id)
+        .join(Session, Session.id == Bill.session_id)
+        .where(Bill.id.in_(bill_ids))
+    ).all()
+    return {
+        r[0]: RelatedBillLink(
+            id=r[0],
+            identifier=r[1],
+            jurisdiction_abbreviation=r[2],
+            session_identifier=r[3],
+            status=r[4],
+        )
+        for r in rows
+    }
+
+
+def _attach_substitution_links(db: OrmSession, bill: Bill, detail: BillDetail) -> None:
+    """Populate BillDetail.replaces/replaced_by from `related_bills` rows
+    whose relation_type names a substitution.
+
+    Direction (see cli.py's recompute_status_for_bills, which reads the same
+    rows for status propagation, and its test fixture): a
+    "substituted-by"-typed row has `bill_id` = the SUBSTITUTED bill and
+    `related_bill_id` = the SURVIVOR. So on the survivor's own detail page,
+    `replaces` is populated from rows where THIS bill is `related_bill_id`;
+    on the substituted bill's detail page, `replaced_by` is populated from
+    rows where THIS bill is `bill_id`.
+
+    Known limitation, not fixed here (read-side only, per scope): the
+    free-text "SUBSTITUTED BY A10008C" signal parsed out of a bill's own
+    actions (status.substitution_target, used for status propagation) is
+    NEVER written back as a `related_bills` row -- only a relation that
+    ingest already received as a row (from an upstream source, or a future
+    ingest change) shows up here. A substitution this API's own text-parsing
+    inferred but that has no corresponding `related_bills` row will
+    correctly show `status` reflecting the survivor's outcome, but will NOT
+    show up in `replaces`/`replaced_by`.
+    """
+    replaced_by_rows = (
+        db.execute(
+            select(RelatedBill).where(
+                RelatedBill.bill_id == bill.id,
+                RelatedBill.relation_type.ilike(_SUBSTITUTION_RELATION_PATTERN),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    replaces_rows = (
+        db.execute(
+            select(RelatedBill).where(
+                RelatedBill.related_bill_id == bill.id,
+                RelatedBill.relation_type.ilike(_SUBSTITUTION_RELATION_PATTERN),
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # NY prints its substitution reference WITH the trailing print/amendment
+    # letter ("SUBSTITUTED BY A10008C"), but that letter is never part of
+    # identifier_norm ("A 10008") -- see identifier_lookup_candidates' module
+    # docstring in packages/shared/billcommons_shared/normalize.py for why
+    # this is NY-only (FL "HB 1A" / CA "AB 1X" use the same trailing-letter
+    # shape as real identity, so stripping it there would resolve to the
+    # wrong bill). Gate on THIS bill's own jurisdiction -- a substitution
+    # never crosses jurisdictions.
+    is_ny = (
+        db.execute(
+            select(func.upper(Jurisdiction.abbreviation)).where(
+                Jurisdiction.id == bill.jurisdiction_id
+            )
+        ).scalar_one_or_none()
+        == "NY"
+    )
+
+    # `replaces`: this bill IS the survivor named by related_bill_id on each
+    # of those rows -- the substituted bill is the row's own bill_id.
+    replaces_ids: set[uuid.UUID] = {r.bill_id for r in replaces_rows}
+    # A substitution row can ALSO reference its survivor only by
+    # related_identifier (related_bill_id NULL), the same way the reverse
+    # direction below does -- e.g. ingest saw the substituted print first and
+    # hadn't imported the survivor bill yet. Find those by joining back to
+    # `bills` scoped to this survivor's own jurisdiction+session (a
+    # substitution never crosses either), then normalizing in Python the same
+    # way `identifier=` and list_related_bills do -- trying the NY
+    # print-suffix-stripped candidate too, since related_identifier came from
+    # free text, not identifier_norm.
+    unresolved_replaces = db.execute(
+        select(RelatedBill.bill_id, RelatedBill.related_identifier)
+        .join(Bill, Bill.id == RelatedBill.bill_id)
+        .where(
+            RelatedBill.related_bill_id.is_(None),
+            RelatedBill.related_identifier.isnot(None),
+            RelatedBill.relation_type.ilike(_SUBSTITUTION_RELATION_PATTERN),
+            Bill.jurisdiction_id == bill.jurisdiction_id,
+            Bill.session_id == bill.session_id,
+        )
+    ).all()
+    for substituted_bill_id, related_identifier in unresolved_replaces:
+        try:
+            normalized = normalize_bill_number(related_identifier)
+        except ValueError:
+            continue
+        if bill.identifier_norm in identifier_lookup_candidates(normalized, print_suffix=is_ny):
+            replaces_ids.add(substituted_bill_id)
+
+    # `replaced_by`: this bill is the substituted print; the survivor is
+    # related_bill_id when resolved, else looked up by related_identifier
+    # scoped to the same jurisdiction+session (mirrors list_related_bills'
+    # same-session resolution below), again trying the NY print-suffix
+    # candidate.
+    replaced_by_ids: set[uuid.UUID] = {
+        r.related_bill_id for r in replaced_by_rows if r.related_bill_id
+    }
+    unresolved = [
+        r for r in replaced_by_rows if not r.related_bill_id and r.related_identifier
+    ]
+    if unresolved:
+        candidate_norms: set[str] = set()
+        for r in unresolved:
+            try:
+                normalized = normalize_bill_number(r.related_identifier)
+            except ValueError:
+                continue
+            candidate_norms.update(identifier_lookup_candidates(normalized, print_suffix=is_ny))
+        if candidate_norms:
+            matches = db.execute(
+                select(Bill.id, Bill.identifier_norm).where(
+                    Bill.jurisdiction_id == bill.jurisdiction_id,
+                    Bill.session_id == bill.session_id,
+                    Bill.identifier_norm.in_(list(candidate_norms)),
+                )
+            ).all()
+            replaced_by_ids.update(m.id for m in matches)
+
+    # A bill can never replace/be-replaced-by itself; guard against a
+    # malformed row before it reaches the response.
+    replaces_ids.discard(bill.id)
+    replaced_by_ids.discard(bill.id)
+
+    link_map = _resolve_related_bill_links(db, replaces_ids | replaced_by_ids)
+    detail.replaces = sorted(
+        (link_map[i] for i in replaces_ids if i in link_map), key=lambda link: link.identifier
+    )
+    detail.replaced_by = sorted(
+        (link_map[i] for i in replaced_by_ids if i in link_map), key=lambda link: link.identifier
+    )
+
+
 @router.get("/{bill_id}", response_model=BillDetail)
 def get_bill(
     bill_id: uuid.UUID, response: Response, db: OrmSession = Depends(get_db)
@@ -463,6 +705,7 @@ def get_bill(
     detail.enrolled_outcome_uncaptured = enrolled_outcome_is_uncaptured(
         row.status, session_end
     )
+    _attach_substitution_links(db, row, detail)
     return detail
 
 

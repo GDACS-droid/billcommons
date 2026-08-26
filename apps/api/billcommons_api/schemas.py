@@ -81,6 +81,18 @@ class BillSummary(OrmModel):
     updated_at: datetime | None = None
 
 
+class RelatedBillLink(BaseModel):
+    """A minimal cross-reference to another bill, used by
+    BillDetail.replaces/replaced_by (see RelatedBillOut for the fuller
+    /related shape this is a lighter sibling of)."""
+
+    id: uuid.UUID
+    identifier: str
+    jurisdiction_abbreviation: str | None = None
+    session_identifier: str | None = None
+    status: str | None = None
+
+
 class BillDetail(BillSummary):
     description: str | None = None
     source_name: str | None = None
@@ -95,6 +107,15 @@ class BillDetail(BillSummary):
     # 4,918 enrolled bills, 3,274 were in this state on 2026-08-02, including
     # 2,192 Texas bills from a session that ended fourteen months earlier.
     enrolled_outcome_uncaptured: bool = False
+    # Substitution links, both directions -- backed by `related_bills` rows
+    # whose relation_type names a substitution (observed value:
+    # "substituted-by"; matched case-insensitively since upstream sources are
+    # not guaranteed to agree on exact casing). `replaces`: bills THIS one
+    # substituted (this bill is the survivor). `replaced_by`: the survivor(s)
+    # that substituted THIS bill away. Both empty for the overwhelming
+    # majority of bills, which are never substituted.
+    replaces: list[RelatedBillLink] = Field(default_factory=list)
+    replaced_by: list[RelatedBillLink] = Field(default_factory=list)
 
 
 class BillBatchEnvelope(BaseModel):
