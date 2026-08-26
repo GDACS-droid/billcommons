@@ -547,6 +547,21 @@ class DiffLineOut(BaseModel):
     text: str
 
 
+class BillDocumentTextOut(BaseModel):
+    document_id: uuid.UUID
+    bill_id: uuid.UUID
+    version_id: uuid.UUID
+    extracted_text: str
+    char_count: int
+    fulltext_status: str | None = Field(
+        default=None,
+        description=(
+            "Parsed from bill_documents.license_note's `fulltext_status=<token>` "
+            "encoding; null if the note doesn't carry one."
+        ),
+    )
+
+
 class BillCompareOut(BaseModel):
     bill_id: uuid.UUID
     from_version_id: uuid.UUID

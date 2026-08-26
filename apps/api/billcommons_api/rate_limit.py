@@ -33,6 +33,8 @@ TRUSTED_CLIENT_HEADER = "x-billcommons-internal"
 # (bill detail's full/versions/compare sub-resources, the bill list, and
 # search) are each an order of magnitude more expensive than the average
 # request -- a joined-and-serialized full bill vs. an indexed row lookup.
+# The per-document full-text endpoint (added later) reads the same
+# extracted_text column /compare diffs, so it shares the tier.
 # These get their own, tighter tier (see `_is_heavy_route` / `RouteTier`
 # below) on top of the general per-IP/subnet ceiling, not instead of it.
 # `/?$` on every pattern: a trailing slash (e.g. "/api/v1/bills/123/full/")
@@ -45,6 +47,7 @@ _HEAVY_ROUTE_PATTERNS = tuple(
         r"^/api/v1/bills/[^/]+/full/?$",
         r"^/api/v1/bills/[^/]+/versions/?$",
         r"^/api/v1/bills/[^/]+/compare/?$",
+        r"^/api/v1/bills/[^/]+/documents/[^/]+/text/?$",
         r"^/api/v1/search/?$",
     )
 )

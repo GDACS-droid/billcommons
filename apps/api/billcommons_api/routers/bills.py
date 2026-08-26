@@ -43,6 +43,7 @@ from billcommons_api.schemas import (
     BillLookupKey,
     BillLookupRequest,
     BillDocumentOut,
+    BillDocumentTextOut,
     BillSummary,
     BillVersionOut,
     Jurisdiction as JurisdictionSchema,
@@ -286,6 +287,34 @@ def batch_lookup_bills(
             )
         )
     return _resolve_lookup(db, parsed, request)
+
+
+# GET /bills/lookup: same query-string form as GET /bills/batch, under the
+# name that matches POST /bills/lookup (which supersedes this for anything
+# non-trivial -- see that handler's docstring). Registered here, ahead of
+# GET /bills/{bill_id} below, deliberately -- FastAPI/Starlette match routes
+# in registration order, so a literal path segment like "lookup" registered
+# AFTER "{bill_id}" would never be reached: "lookup" would bind to the
+# {bill_id} path parameter first and fail UUID parsing (422) instead of
+# ever running this handler.
+@router.get("/lookup", response_model=BillBatchEnvelope)
+def lookup_bills_get(
+    request: Request,
+    ids: str | None = Query(
+        None, description="Comma-separated bill UUIDs, e.g. `ids=<uuid>,<uuid>`"
+    ),
+    keys: str | None = Query(
+        None,
+        description=(
+            "Comma-separated `JURISDICTION:BILL_NUMBER` pairs, e.g. "
+            "`keys=HI:SB2135,NY:S9417`. Append a session to disambiguate: "
+            "`NY:S9417:2025-2026 Regular Session`."
+        ),
+    ),
+    db: OrmSession = Depends(get_db),
+) -> BillBatchEnvelope:
+    """GET alias of `/bills/batch` under the `/bills/lookup` name."""
+    return batch_lookup_bills(request=request, ids=ids, keys=keys, db=db)
 
 
 @router.post("/lookup", response_model=BillBatchEnvelope)
@@ -610,6 +639,21 @@ def list_bill_subjects(bill_id: uuid.UUID, db: OrmSession = Depends(get_db)) -> 
 PARTIAL_TEXT_NOTE = "fulltext_status=ok_partial_pdf"
 
 
+def _fulltext_status(license_note: str | None) -> str | None:
+    """Pull the `fulltext_status=<token>` value out of `license_note`, null
+    if the note doesn't encode one. The ingest worker decorates some outcomes
+    with a trailing ` key=value` (e.g. `fulltext_status=ok_browser
+    via=browser`; see workers/ingest/billcommons_ingest/fulltext.py's
+    license_note_matches_status) -- the API must not import billcommons_ingest
+    (see test_container_import_boundary.py), so this mirrors that parsing
+    locally rather than sharing the worker's helper.
+    """
+    prefix = "fulltext_status="
+    if not license_note or not license_note.startswith(prefix):
+        return None
+    return license_note[len(prefix):].split(" ", 1)[0]
+
+
 @router.get("/{bill_id}/documents", response_model=list[BillDocumentOut])
 def list_bill_documents(bill_id: uuid.UUID, db: OrmSession = Depends(get_db)) -> list[BillDocumentOut]:
     _get_bill_or_404(db, bill_id)
@@ -745,6 +789,45 @@ def compare_bill_versions(
             "removed that are actually just missing from the partial text."
         )
     return BillCompareEnvelope(data=result, meta=meta)
+
+
+@router.get("/{bill_id}/documents/{document_id}/text", response_model=BillDocumentTextOut)
+def get_bill_document_text(
+    bill_id: uuid.UUID, document_id: uuid.UUID, db: OrmSession = Depends(get_db)
+) -> BillDocumentTextOut:
+    """Extracted full text of one document, as JSON.
+
+    Reads the same `bill_documents.extracted_text` column /compare diffs and
+    MCP's `get_bill_record(include_full_text=True)` read (see
+    `compare_bill_versions` above and apps/mcp/billcommons_mcp/tools.py) --
+    exposed directly here rather than only reachable via a diff or the MCP
+    tool. Heavy route: see `_HEAVY_ROUTE_PATTERNS` in rate_limit.py, same
+    quota/rate-limit tier as /compare and /full.
+    """
+    row = db.execute(
+        select(BillDocument, BillVersion.id)
+        .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
+        .where(BillDocument.id == document_id, BillVersion.bill_id == bill_id)
+    ).first()
+    if row is None:
+        raise not_found(
+            "document_not_found",
+            f"No document {document_id} found for bill {bill_id}",
+        )
+    doc, version_id = row
+    if not doc.extracted_text:
+        raise not_found(
+            "no_extracted_text",
+            f"Document {document_id} has no extracted text.",
+        )
+    return BillDocumentTextOut(
+        document_id=doc.id,
+        bill_id=bill_id,
+        version_id=version_id,
+        extracted_text=doc.extracted_text,
+        char_count=len(doc.extracted_text),
+        fulltext_status=_fulltext_status(doc.license_note),
+    )
 
 
 @router.get("/{bill_id}/evidence")
