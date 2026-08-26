@@ -2890,6 +2890,27 @@ def test_ma_docket_not_found_requires_the_failing_request_to_be_the_docket_looku
     assert excinfo.value is exc
 
 
+def test_ma_docket_not_found_guard_survives_request_less_http_status_error():
+    """A request-less httpx.HTTPStatusError (httpx raises RuntimeError on
+    ``.request`` when none was attached) must fall through to the bare
+    ``raise`` -- never crash the classifier with an unrelated exception and
+    never be classified terminal."""
+    ma_url = _ma_document_url("HD9005")
+    response = httpx.Response(
+        404,
+        text='The requested Document could not be found in General Court "194"',
+    )
+    exc = httpx.HTTPStatusError("404", request=None, response=response)
+
+    class _FakeFetcher:
+        def fetch(self, url):
+            raise exc
+
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        _resolve_ma_document(_FakeFetcher(), ma_url)
+    assert excinfo.value is exc
+
+
 def test_reset_fetch_attempts_accepts_ma_docket_not_found():
     """R3-1-style operator requeue lever: an operator who is convinced a
     docket the API said didn't exist actually does now (e.g. malegislature.gov

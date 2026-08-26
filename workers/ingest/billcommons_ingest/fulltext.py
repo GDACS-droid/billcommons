@@ -1498,7 +1498,10 @@ def _resolve_ma_document(
         # 4xx, a body that doesn't match) is a normal retryable failure and
         # falls through to `process_fetch_text_job`'s generic handling
         # unchanged.
-        failing_url = str(exc.request.url) if exc.request is not None else str(exc.response.url)
+        try:  # httpx raises RuntimeError when .request was never attached
+            failing_url = str(exc.request.url)
+        except (RuntimeError, AttributeError):
+            failing_url = ""  # unknown origin -> never terminal, fall through to bare raise
         if exc.response.status_code in (400, 404) and failing_url == docket_url:
             body = exc.response.text
             if "requested document could not be found in general court" in body.lower():
