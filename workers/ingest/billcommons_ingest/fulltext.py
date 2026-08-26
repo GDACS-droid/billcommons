@@ -129,6 +129,21 @@ STATUS_NO_DOCUMENT_TEXT = "no_document_text"
 # Deliberately excluded from TERMINAL_STATUSES; retried like any other
 # fetch error, up to MAX_FETCH_ATTEMPTS.
 STATUS_MA_DOCKET_NO_BILL_NUMBER = "ma_docket_no_bill_number"
+# The MA document API itself says the docket does not exist: a 400/404
+# response whose body is the deterministic "The requested Document could
+# not be found in General Court ..." text (verified live 2026-08-26 against
+# 166 bill_documents rows, all docket-shaped malegislature.gov PDF URLs).
+# This is DIFFERENT from STATUS_MA_DOCKET_NO_BILL_NUMBER (a real docket
+# that exists but has no bill number YET, which may change on a later
+# day) -- a docket the API says it has never heard of is not going to
+# start existing on a retry, so unlike that status THIS one IS terminal
+# (see TERMINAL_STATUSES below). Before this status existed, the raised
+# `httpx.HTTPStatusError` had no `.status` attribute, so
+# `process_fetch_text_job`'s generic handler collapsed it to the
+# undiagnosable `STATUS_FETCH_ERROR` with no detail -- see also
+# `_fetch_detail_token`, added so ANY generic fetch_error at least records
+# what kind of failure it was.
+STATUS_MA_DOCKET_NOT_FOUND = "ma_docket_not_found"
 # Recorded when a fetch_text job died of something that is OUR fault, not the
 # document's: the database blinked, the object store 500ed, a bug in this
 # worker. Non-terminal (the document is still worth fetching) and -- unlike
@@ -172,6 +187,7 @@ TERMINAL_STATUSES = frozenset(
         STATUS_MALFORMED_URL,
         STATUS_PERMANENTLY_FAILED,
         STATUS_NO_DOCUMENT_TEXT,
+        STATUS_MA_DOCKET_NOT_FOUND,
     }
 )
 
@@ -1039,7 +1055,13 @@ def process_fetch_text_job(
         # already follows that rule (see the UnfetchableDocument branch
         # above).
         status = getattr(exc, "status", None) or STATUS_FETCH_ERROR
-        _mark_status(document, status, robots_exempt=fetcher.last_fetch_robots_exempt)
+        fetch_detail = _fetch_detail_token(exc) if status == STATUS_FETCH_ERROR else None
+        _mark_status(
+            document,
+            status,
+            robots_exempt=fetcher.last_fetch_robots_exempt,
+            fetch_detail=fetch_detail,
+        )
         db.flush()
         raise DocumentFetchError(
             f"fetch failed for {document.url}: {exc}",
@@ -1151,6 +1173,27 @@ def persist_extraction_outcome(
     )
 
 
+def _fetch_detail_token(exc: BaseException) -> str:
+    """A short, greppable detail token for a generic `STATUS_FETCH_ERROR`
+    `license_note` (see `_mark_status`'s `fetch_detail`) -- the fact this
+    status collapsed 166 distinct malegislature.gov 400s into an
+    undiagnosable `fulltext_status=fetch_error` with nothing to tell them
+    apart from any other fetch failure is what this exists to fix.
+
+    `<exception class name>[:<http status code>]`, e.g. `HTTPStatusError:500`
+    or, for an error with no HTTP response at all (a connect/read timeout),
+    just `ConnectTimeout`. Deliberately never the exception's message or the
+    URL: `document.url` already carries the URL, and an exception's own
+    message/args can carry arbitrary upstream response bytes this token must
+    never leak into a searchable, ops-visible column. Capped to 60 chars
+    per the spec, though no real class name gets remotely close.
+    """
+    name = type(exc).__name__
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    token = f"{name}:{status_code}" if status_code is not None else name
+    return token[:60]
+
+
 def _mark_status(
     document: BillDocument,
     status: str,
@@ -1159,6 +1202,7 @@ def _mark_status(
     provenance: str | None = None,
     robots_exempt: bool = False,
     browser_attempted_at: str | None = None,
+    fetch_detail: str | None = None,
 ) -> None:
     """Record the fetch/extraction outcome. The schema has no dedicated
     fetch-status column, so we encode it in `license_note` with a stable
@@ -1174,7 +1218,9 @@ def _mark_status(
     them as terminal. A browser retry timestamp is the sole terminal-status
     suffix: `enqueue_fulltext_jobs` recognizes its permanently_failed form as
     terminal, while browser-fetch uses it to defer re-selection for seven
-    days.
+    days. `fetch_detail` (see `_fetch_detail_token`), if given, is appended
+    only for the generic STATUS_FETCH_ERROR outcome -- every other status
+    already has a specific, greppable value of its own.
     """
     note = f"fulltext_status={status}"
     if robots_exempt and status not in TERMINAL_STATUSES:
@@ -1185,6 +1231,8 @@ def _mark_status(
         note = f"{note} via={provenance}"
     if browser_attempted_at and status == STATUS_PERMANENTLY_FAILED:
         note = f"{note} browser_attempted_at={browser_attempted_at}"
+    if fetch_detail and status == STATUS_FETCH_ERROR:
+        note = f"{note} fetch_detail={fetch_detail}"
     document.license_note = note
 
 
@@ -1402,8 +1450,13 @@ def _resolve_ma_document(
     only if the bill's JSON record itself has no text.
 
     Returns `(response, fetched_url, resolver_name, outcome)` for the
-    request that ended up carrying real text. Raises `DocumentFetchError`,
-    always non-terminal, for:
+    request that ended up carrying real text. Raises `DocumentFetchError`
+    for:
+      * the MA document API itself saying the docket does not exist
+        (STATUS_MA_DOCKET_NOT_FOUND -- a 400/404 "could not be found" body
+        on the initial docket lookup; this ONE case IS terminal, unlike
+        every other raise here, because the docket will never start
+        existing on a retry);
       * a docket that has not been assigned a bill number yet AND has no
         text of its own (STATUS_MA_DOCKET_NO_BILL_NUMBER -- a real,
         time-bound fact about the source, not a fetch failure, but NOT a
@@ -1432,7 +1485,32 @@ def _resolve_ma_document(
         )
 
     docket_url = ma_api_url(ma_url.court, ma_url.doc_id)
-    docket_response = fetcher.fetch(docket_url)
+    try:
+        docket_response = fetcher.fetch(docket_url)
+    except httpx.HTTPStatusError as exc:
+        # The MA document API's deterministic "not a real docket" answer:
+        # a 400 or 404 whose body says the docket could not be found at
+        # all (verified live 2026-08-26, 166 rows). This is NOT the same
+        # fact as STATUS_MA_DOCKET_NO_BILL_NUMBER (a docket that exists but
+        # hasn't been assigned a bill number yet) -- the API here is
+        # saying the docket itself doesn't exist, which a retry cannot fix,
+        # so this status is terminal. Any other HTTP error (5xx, other
+        # 4xx, a body that doesn't match) is a normal retryable failure and
+        # falls through to `process_fetch_text_job`'s generic handling
+        # unchanged.
+        try:  # httpx raises RuntimeError when .request was never attached
+            failing_url = str(exc.request.url)
+        except (RuntimeError, AttributeError):
+            failing_url = ""  # unknown origin -> never terminal, fall through to bare raise
+        if exc.response.status_code in (400, 404) and failing_url == docket_url:
+            body = exc.response.text
+            if "requested document could not be found in general court" in body.lower():
+                raise DocumentFetchError(
+                    f"MA document API says docket {ma_url.doc_id} (court {ma_url.court}) does not "
+                    f"exist ({exc.response.status_code}): {docket_url}",
+                    status=STATUS_MA_DOCKET_NOT_FOUND,
+                ) from exc
+        raise
     docket_data = _parse_ma_document(docket_response, docket_url)
     _assert_ma_field(docket_data, "DocketNumber", ma_url.doc_id, docket_url)
 

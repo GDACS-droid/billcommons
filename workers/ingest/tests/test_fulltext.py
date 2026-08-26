@@ -35,6 +35,7 @@ from billcommons_ingest.cli import (
 from billcommons_ingest.fulltext import (
     STATUS_FETCH_ERROR,
     STATUS_MA_DOCKET_NO_BILL_NUMBER,
+    STATUS_MA_DOCKET_NOT_FOUND,
     STATUS_MALFORMED_URL,
     STATUS_OK,
     STATUS_OK_PARTIAL_PDF,
@@ -64,7 +65,7 @@ from billcommons_ingest.fulltext import (
     sniff_content_type,
 )
 from billcommons_ingest.queue import claim_job, enqueue
-from billcommons_ingest.url_resolvers import MaDocumentUrl, ma_docket_from_url
+from billcommons_ingest.url_resolvers import MaDocumentUrl, ma_api_url, ma_docket_from_url
 from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob, Jurisdiction, Session as SessionModel
 from billcommons_shared.db import get_session
 
@@ -2782,6 +2783,197 @@ def test_ma_docket_never_derives_a_bill_id_from_the_dockets_shape():
     )
 
 
+def test_ma_docket_not_found_is_a_terminal_not_retried_status(db_session, rawstore, monkeypatch):
+    """malegislature.gov's deterministic "docket does not exist" answer
+    (400, body "The requested Document could not be found in General
+    Court ...", verified live 2026-08-26 against 166 bill_documents rows)
+    must become STATUS_MA_DOCKET_NOT_FOUND, terminal, and therefore never
+    re-enqueued -- unlike STATUS_MA_DOCKET_NO_BILL_NUMBER, this docket will
+    never start existing on a later retry."""
+    monkeypatch.setattr(fulltext_mod, "_jurisdiction_and_identifier", lambda db, document: ("ma", "HD 9001"))
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/HD9001": httpx.Response(
+            400, text='The requested Document could not be found in General Court "194"'
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+    document = _make_bill_document(db_session, url="https://malegislature.gov/Bills/194/HD9001.pdf")
+
+    with pytest.raises(DocumentFetchError) as excinfo:
+        process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert excinfo.value.status == STATUS_MA_DOCKET_NOT_FOUND
+    assert STATUS_MA_DOCKET_NOT_FOUND in TERMINAL_STATUSES
+    db_session.refresh(document)
+    assert document.license_note == f"fulltext_status={STATUS_MA_DOCKET_NOT_FOUND}"
+    assert document.extracted_text is None
+    assert enqueue_fulltext_jobs(db_session, document_ids=[document.id]) == 0, (
+        "terminal status must not be re-enqueued"
+    )
+
+
+def test_ma_docket_lookup_500_is_generic_fetch_error_with_a_detail_token(db_session, rawstore, monkeypatch):
+    """A genuine 500 on the same docket-lookup call is a normal, retryable
+    fetch failure -- NOT ma_docket_not_found -- but the collapse into an
+    undiagnosable bare `fulltext_status=fetch_error` (the 166-row bug this
+    whole status was built to fix) is itself fixed by recording a
+    `fetch_detail=<ExceptionClassName>[:<http status>]` token."""
+    monkeypatch.setattr(fulltext_mod, "_jurisdiction_and_identifier", lambda db, document: ("ma", "HD 9002"))
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/HD9002": httpx.Response(500),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+    document = _make_bill_document(db_session, url="https://malegislature.gov/Bills/194/HD9002.pdf")
+
+    with pytest.raises(DocumentFetchError) as excinfo:
+        process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert excinfo.value.status == STATUS_FETCH_ERROR
+    assert STATUS_FETCH_ERROR not in TERMINAL_STATUSES
+    db_session.refresh(document)
+    assert document.license_note == f"fulltext_status={STATUS_FETCH_ERROR} fetch_detail=HTTPStatusError:500"
+
+
+def test_ma_docket_lookup_404_without_the_exact_phrase_is_generic_fetch_error(db_session, rawstore, monkeypatch):
+    """A generic web-server 404 (no exact "could not be found in General
+    Court" phrase) on the docket-lookup URL must NOT be classified as
+    STATUS_MA_DOCKET_NOT_FOUND -- only the API's own deterministic phrase is
+    terminal; every other 404/400 falls through to the ordinary retryable
+    fetch_error path."""
+    monkeypatch.setattr(fulltext_mod, "_jurisdiction_and_identifier", lambda db, document: ("ma", "HD 9003"))
+    routes = {
+        **_ma_robots_allow_all(),
+        "https://malegislature.gov/api/GeneralCourts/194/Documents/HD9003": httpx.Response(
+            404, text="The requested URL could not be found on this server."
+        ),
+    }
+    client = httpx.Client(transport=_multi_host_transport(routes))
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+    document = _make_bill_document(db_session, url="https://malegislature.gov/Bills/194/HD9003.pdf")
+
+    with pytest.raises(DocumentFetchError) as excinfo:
+        process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert excinfo.value.status == STATUS_FETCH_ERROR
+    assert STATUS_FETCH_ERROR not in TERMINAL_STATUSES
+    db_session.refresh(document)
+    assert document.license_note == f"fulltext_status={STATUS_FETCH_ERROR} fetch_detail=HTTPStatusError:404"
+
+
+def test_ma_docket_not_found_requires_the_failing_request_to_be_the_docket_lookup():
+    """Guard (b): even the exact deterministic MA phrase, on a 404, must NOT
+    be classified as STATUS_MA_DOCKET_NOT_FOUND unless the failing request
+    was the docket lookup itself -- a phrase match against some OTHER
+    request must bare-raise the original httpx.HTTPStatusError untouched."""
+    ma_url = _ma_document_url("HD9004")
+    docket_url = ma_api_url(ma_url.court, ma_url.doc_id)
+    other_url = "https://malegislature.gov/some/unrelated/path"
+    request = httpx.Request("GET", other_url)
+    response = httpx.Response(
+        404,
+        request=request,
+        text='The requested Document could not be found in General Court "194"',
+    )
+    exc = httpx.HTTPStatusError("404", request=request, response=response)
+
+    class _FakeFetcher:
+        def fetch(self, url):
+            assert url == docket_url
+            raise exc
+
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        _resolve_ma_document(_FakeFetcher(), ma_url)
+    assert excinfo.value is exc
+
+
+def test_ma_docket_not_found_guard_survives_request_less_http_status_error():
+    """A request-less httpx.HTTPStatusError (httpx raises RuntimeError on
+    ``.request`` when none was attached) must fall through to the bare
+    ``raise`` -- never crash the classifier with an unrelated exception and
+    never be classified terminal."""
+    ma_url = _ma_document_url("HD9005")
+    response = httpx.Response(
+        404,
+        text='The requested Document could not be found in General Court "194"',
+    )
+    exc = httpx.HTTPStatusError("404", request=None, response=response)
+
+    class _FakeFetcher:
+        def fetch(self, url):
+            raise exc
+
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        _resolve_ma_document(_FakeFetcher(), ma_url)
+    assert excinfo.value is exc
+
+
+def test_reset_fetch_attempts_accepts_ma_docket_not_found():
+    """R3-1-style operator requeue lever: an operator who is convinced a
+    docket the API said didn't exist actually does now (e.g. malegislature.gov
+    fixed something upstream) can explicitly requeue it -- the same recovery
+    pattern already available for permanently_failed/worker_error."""
+    marker = f"https://reset-ma-not-found-{uuid.uuid4().hex}.gov/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=MAX_FETCH_ATTEMPTS)
+        document.license_note = f"fulltext_status={STATUS_MA_DOCKET_NOT_FOUND}"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    check = get_session()
+    try:
+        assert enqueue_fulltext_jobs(check, document_ids=[document_id]) == 0, "precondition: excluded"
+        check.rollback()
+    finally:
+        check.close()
+
+    assert cmd_reset_fetch_attempts(_reset_args(url_like=marker, status=[STATUS_MA_DOCKET_NOT_FOUND])) == 0
+
+    after = get_session()
+    try:
+        doc = after.get(BillDocument, document_id)
+        assert doc.fetch_attempts == 0
+        assert doc.license_note is None
+        assert enqueue_fulltext_jobs(after, document_ids=[document_id]) == 1
+        after.rollback()
+    finally:
+        after.close()
+
+
+def test_reset_fetch_attempts_status_filter_matches_a_decorated_fetch_error_note():
+    """--status fetch_error must match a fetch_error row whose license_note
+    carries a trailing `fetch_detail=...` token (e.g. the HTTPStatusError:500
+    detail stamped alongside a generic MA docket-lookup failure) -- an exact
+    equality match against the bare `fulltext_status=fetch_error` string
+    would silently exclude every such row from the requeue lever."""
+    marker = f"https://reset-fetch-error-detail-{uuid.uuid4().hex}.gov/bill.pdf"
+    setup = get_session()
+    try:
+        document = _make_bill_document(setup, url=marker, fetch_attempts=MAX_FETCH_ATTEMPTS)
+        document.license_note = f"fulltext_status={STATUS_FETCH_ERROR} fetch_detail=HTTPStatusError:500"
+        document_id = document.id
+        setup.commit()
+    finally:
+        setup.close()
+
+    assert cmd_reset_fetch_attempts(_reset_args(url_like=marker, status=[STATUS_FETCH_ERROR])) == 0
+
+    after = get_session()
+    try:
+        doc = after.get(BillDocument, document_id)
+        assert doc.fetch_attempts == 0
+        assert doc.license_note is None
+        after.rollback()
+    finally:
+        after.close()
+
+
 def test_ma_docket_with_no_bill_number_but_its_own_text_uses_the_docket_json():
     # A procedural filing/report (no bill number) can still carry its own
     # DocumentText -- SD3668, a real commission report, verified live.
@@ -3033,7 +3225,10 @@ def test_ma_bill_api_5xx_and_empty_stored_url_preserves_existing_text(db_session
 
     assert excinfo.value.status == STATUS_FETCH_ERROR
     db_session.refresh(document)
-    assert document.license_note == f"fulltext_status={STATUS_FETCH_ERROR}"
+    # fetch_detail names the WRAPPING exception (MaApiLookupError, no HTTP
+    # status of its own -- the underlying 500 is inside its message, not
+    # exposed as a `.response`), not the underlying httpx.HTTPStatusError.
+    assert document.license_note == f"fulltext_status={STATUS_FETCH_ERROR} fetch_detail=MaApiLookupError"
     assert document.extracted_text == "previously extracted official text"
 
 
@@ -3058,7 +3253,7 @@ def test_ma_bill_api_5xx_and_malformed_stored_url_stays_retryable(db_session, ra
 
     assert excinfo.value.status == STATUS_FETCH_ERROR
     db_session.refresh(document)
-    assert document.license_note == f"fulltext_status={STATUS_FETCH_ERROR}"
+    assert document.license_note == f"fulltext_status={STATUS_FETCH_ERROR} fetch_detail=MaApiLookupError"
 
 
 def test_ma_resolved_page_robots_disallowed_does_not_run_direct_url_fallback(
