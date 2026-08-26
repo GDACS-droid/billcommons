@@ -1607,9 +1607,17 @@ def recompute_status_for_bills(
             }
             still_needed = []
             for bid, ident in needs_lookup.items():
-                key = (bill_jurisdiction.get(bid), bill_session.get(bid), ident)
-                found = in_chunk_by_key.get(key)
-                if found is not None and found != bid:
+                found = None
+                # Exact identifier first, then (NY) the same identifier with
+                # its trailing print-version letter stripped -- see
+                # status.substitution_lookup_candidates.
+                for candidate in status_mod.substitution_lookup_candidates(ident):
+                    key = (bill_jurisdiction.get(bid), bill_session.get(bid), candidate)
+                    match = in_chunk_by_key.get(key)
+                    if match is not None and match != bid:
+                        found = match
+                        break
+                if found is not None:
                     survivor_bill_id[bid] = found
                 else:
                     still_needed.append(bid)
@@ -1617,15 +1625,24 @@ def recompute_status_for_bills(
             if still_needed:
                 for bid in still_needed:
                     ident = needs_lookup[bid]
-                    row = db.execute(
-                        select(Bill.id, Bill.status).where(
+                    candidates = status_mod.substitution_lookup_candidates(ident)
+                    rows = db.execute(
+                        select(Bill.id, Bill.status, Bill.identifier_norm).where(
                             Bill.jurisdiction_id == bill_jurisdiction.get(bid),
                             Bill.session_id == bill_session.get(bid),
-                            Bill.identifier_norm == ident,
+                            Bill.identifier_norm.in_(candidates),
                             Bill.id != bid,
                         )
-                    ).first()
-                    if row is not None:
+                    ).all()
+                    if rows:
+                        by_identifier = {row.identifier_norm: row for row in rows}
+                        row = None
+                        for candidate in candidates:
+                            row = by_identifier.get(candidate)
+                            if row is not None:
+                                break
+                        if row is None:
+                            row = rows[0]
                         survivor_bill_id[bid] = row.id
 
         for bid, sid in survivor_bill_id.items():

@@ -61,11 +61,25 @@ def test_the_derivation_entry_points_still_exist():
         "status_for_action",
         "apply_session_outcome",
         "substitution_target",
+        "substitution_lookup_candidates",
         "LIVE_STATUSES",
         "TERMINAL_STATUSES",
         "SUBSTITUTED",
     ):
         assert hasattr(status_mod, name), f"status.{name} is gone"
+
+
+def test_substitution_lookup_candidates_tolerates_ny_print_version_suffix():
+    """"SUBSTITUTED BY A10008C" normalizes to "A 10008C", but the corpus
+    identifies the bill as "A 10008" -- the trailing letter is NY's print/
+    amendment version, never part of bill identity. Exact match must still
+    be tried first."""
+    assert status_mod.substitution_lookup_candidates("A 10008C") == [
+        "A 10008C",
+        "A 10008",
+    ]
+    assert status_mod.substitution_lookup_candidates("A 10008") == ["A 10008"]
+    assert status_mod.substitution_lookup_candidates("HB 12") == ["HB 12"]
 
 
 def test_substituted_is_in_the_vocabulary_and_non_terminal():

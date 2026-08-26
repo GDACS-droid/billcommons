@@ -355,6 +355,23 @@ def substitution_target(description: str | None) -> str | None:
         return None
 
 
+# A single uppercase letter trailing a digit is NY's print/amendment version
+# (e.g. "A 10008C"), never part of the bill's identity -- the corpus stores
+# the bill as "A 10008". Survivor lookups need both forms, exact first.
+_TRAILING_PRINT_VERSION_RE = re.compile(r"\d[A-Z]$")
+
+
+def substitution_lookup_candidates(identifier: str) -> list[str]:
+    """Identifiers to try, in order, when resolving `identifier` against
+    `bills.identifier_norm`. Always includes `identifier` itself; if it ends
+    in a digit followed by one uppercase letter (an NY print version), also
+    includes that identifier with the trailing letter stripped."""
+    candidates = [identifier]
+    if _TRAILING_PRINT_VERSION_RE.search(identifier):
+        candidates.append(identifier[:-1])
+    return candidates
+
+
 # Re-exported here so ingest callers keep importing it from status.
 ENROLLED_PENDING_GRACE_DAYS = _ENROLLED_PENDING_GRACE_DAYS
 enrolled_outcome_is_uncaptured = _enrolled_outcome_is_uncaptured

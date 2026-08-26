@@ -182,6 +182,74 @@ def test_related_bills_substitution_relation_propagates_terminal_status(db_sessi
     assert substituted.status == "vetoed"
 
 
+def test_substituted_bill_inherits_survivor_stored_with_print_version_stripped_in_chunk(
+    db_session,
+):
+    """NY: "SUBSTITUTED BY A10008C" normalizes to "A 10008C", but the
+    survivor is stored as "A 10008" -- the trailing print/amendment letter
+    is never part of bill identity. Resolved via the in-chunk map."""
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    survivor = _bill(db_session, jurisdiction, session_row, "A 10008")
+    substituted = _bill(db_session, jurisdiction, session_row, "S 9008")
+    db_session.add_all(
+        [
+            BillAction(
+                bill_id=substituted.id,
+                description="SUBSTITUTED BY A10008C",
+                classification=None,
+            ),
+            BillAction(
+                bill_id=survivor.id,
+                description="SIGNED CHAP.58",
+                classification="executive-signature",
+            ),
+        ]
+    )
+    db_session.flush()
+
+    recompute_status_for_bills(db_session, [survivor.id, substituted.id], stamp=False)
+    db_session.flush()
+    db_session.refresh(substituted)
+
+    assert substituted.status == "enacted"
+
+
+def test_substituted_bill_inherits_survivor_stored_with_print_version_stripped_via_db_fallback(
+    db_session,
+):
+    """Same as above, but the survivor is not in the recompute chunk, so
+    resolution must go through the DB fallback query's `in_(candidates)`
+    lookup rather than the in-chunk map."""
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    survivor = _bill(db_session, jurisdiction, session_row, "A 10008")
+    substituted = _bill(db_session, jurisdiction, session_row, "S 9008")
+    db_session.add_all(
+        [
+            BillAction(
+                bill_id=substituted.id,
+                description="SUBSTITUTED BY A10008C",
+                classification=None,
+            ),
+            BillAction(
+                bill_id=survivor.id,
+                description="SIGNED CHAP.58",
+                classification="executive-signature",
+            ),
+        ]
+    )
+    db_session.flush()
+    # Recompute the survivor separately first so its status is already
+    # persisted, then recompute only the substituted print.
+    recompute_status_for_bills(db_session, [survivor.id], stamp=False)
+    db_session.flush()
+
+    recompute_status_for_bills(db_session, [substituted.id], stamp=False)
+    db_session.flush()
+    db_session.refresh(substituted)
+
+    assert substituted.status == "enacted"
+
+
 def test_recompute_status_jurisdiction_filter_scopes_to_one_state(db_session, capsys):
     """R4: `--jurisdiction` must only touch bills in that jurisdiction. Exercised
     directly against the argparse-wired command via a stand-in args object,
