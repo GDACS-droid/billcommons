@@ -60,7 +60,19 @@ def test_the_derivation_entry_points_still_exist():
         "derive_status",
         "status_for_action",
         "apply_session_outcome",
+        "substitution_target",
         "LIVE_STATUSES",
         "TERMINAL_STATUSES",
+        "SUBSTITUTED",
     ):
         assert hasattr(status_mod, name), f"status.{name} is gone"
+
+
+def test_substituted_is_in_the_vocabulary_and_non_terminal():
+    """Added for the substitution-propagation fix (R3): SUBSTITUTED is a LIVE
+    status, never a terminal one -- a substituted print only concludes once
+    its survivor does, and `recompute_status_for_bills` is what resolves
+    that, not this module."""
+    assert status_mod.SUBSTITUTED in status_mod.ALL_STATUSES
+    assert status_mod.SUBSTITUTED in status_mod.LIVE_STATUSES
+    assert status_mod.SUBSTITUTED not in status_mod.TERMINAL_STATUSES

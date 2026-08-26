@@ -83,9 +83,11 @@ from billcommons_schema.models import (
     IngestionRun,
     Jurisdiction,
     JurisdictionCoverage,
+    RelatedBill,
     Session as SessionModel,
 )
 from billcommons_shared.db import get_session
+from billcommons_shared.normalize import normalize_bill_number
 from billcommons_shared.rawstore import FilesystemRawStore
 
 # Ceiling on one adjournment-sweep pass. A sine die can retire several thousand
@@ -1457,11 +1459,15 @@ def recompute_status_for_bills(
     session_end = {}
     session_active = {}
     bill_session = {}
+    bill_jurisdiction: dict = {}
+    bill_identifier_norm: dict = {}
     for r in db.execute(
         select(
             Bill.id,
             Bill.status,
             Bill.session_id,
+            Bill.jurisdiction_id,
+            Bill.identifier_norm,
             SessionModel.end_date,
             SessionModel.active,
         )
@@ -1471,6 +1477,8 @@ def recompute_status_for_bills(
         current[r.id] = r.status
         session_end[r.id] = r.end_date
         session_active[r.id] = bool(r.active)
+        bill_jurisdiction[r.id] = r.jurisdiction_id
+        bill_identifier_norm[r.id] = r.identifier_norm
         bill_session[r.id] = r.session_id
     # Session-level recent activity, for the case where the source calls a
     # session active but its predicted adjournment has passed. Deliberately
@@ -1516,6 +1524,7 @@ def recompute_status_for_bills(
             BillAction.action_date,
             BillAction.classification,
             BillAction.description,
+            BillAction.organization_id,
         ).where(BillAction.bill_id.in_(bill_ids))
     ).all():
         actions_by_bill[a.bill_id].append(
@@ -1523,13 +1532,16 @@ def recompute_status_for_bills(
                 action_date=a.action_date,
                 classification=a.classification,
                 description=a.description,
+                organization_id=a.organization_id,
             )
         )
 
-    updates = []
-    cleared = 0
+    # Pass 1: derive every bill in the chunk before propagating anything, so
+    # a substituted bill resolved below sees its survivor's FRESH status
+    # rather than whatever was stored before this run.
+    derived_status: dict = {}
     for bid in bill_ids:
-        derived = status_mod.apply_session_outcome(
+        derived_status[bid] = status_mod.apply_session_outcome(
             status_mod.derive_status(actions_by_bill[bid]),
             session_end.get(bid),
             session_active=session_active.get(bid, False),
@@ -1537,6 +1549,104 @@ def recompute_status_for_bills(
                 bill_session.get(bid) in sessions_with_recent_activity
             ),
         )
+
+    # Pass 2 -- substitution propagation (Jaya gap #1, R3). A substituted
+    # print (e.g. an NY bill carrying "SUBSTITUTED BY A10008C") is not itself
+    # the bill that moves; the identified survivor is. If the survivor
+    # reached an OUTCOME, the substituted print should read as that outcome
+    # too, not sit at IN_COMMITTEE/SUBSTITUTED forever while its survivor is
+    # chaptered. related_bills is consulted the same way: a relation whose
+    # type names a substitution, pointing away from this bill, is the same
+    # signal as the text form.
+    survivor_bill_id: dict = {}
+    survivor_identifier: dict = {}
+    for bid in bill_ids:
+        for action in actions_by_bill[bid]:
+            target = status_mod.substitution_target(action.description)
+            if target:
+                survivor_identifier[bid] = target  # last one wins; actions
+                # are not guaranteed date-ordered from the query, but a bill
+                # is only ever substituted once in practice.
+    related_rows = db.execute(
+        select(
+            RelatedBill.bill_id,
+            RelatedBill.related_bill_id,
+            RelatedBill.related_identifier,
+        ).where(
+            RelatedBill.bill_id.in_(bill_ids),
+            RelatedBill.relation_type.ilike("%substitut%"),
+        )
+    ).all()
+    for row in related_rows:
+        if row.related_bill_id is not None:
+            survivor_bill_id[row.bill_id] = row.related_bill_id
+        elif row.related_identifier:
+            try:
+                survivor_identifier[row.bill_id] = normalize_bill_number(
+                    row.related_identifier
+                )
+            except ValueError:
+                pass
+
+    substitution_candidates = set(survivor_identifier) | set(survivor_bill_id)
+    if substitution_candidates:
+        # Resolve identifier-only survivors to a bill id within the same
+        # jurisdiction + session. Whitespace/hyphens/case are already folded
+        # by normalize_bill_number on both sides, since identifier_norm is
+        # produced by the same function at ingest time.
+        needs_lookup = {
+            bid: ident
+            for bid, ident in survivor_identifier.items()
+            if bid not in survivor_bill_id
+        }
+        if needs_lookup:
+            # First check within this chunk (no extra query needed) ...
+            in_chunk_by_key = {
+                (bill_jurisdiction.get(other), bill_session.get(other), bill_identifier_norm.get(other)): other
+                for other in bill_ids
+            }
+            still_needed = []
+            for bid, ident in needs_lookup.items():
+                key = (bill_jurisdiction.get(bid), bill_session.get(bid), ident)
+                found = in_chunk_by_key.get(key)
+                if found is not None and found != bid:
+                    survivor_bill_id[bid] = found
+                else:
+                    still_needed.append(bid)
+            # ... then fall back to one query for whatever wasn't in the chunk.
+            if still_needed:
+                for bid in still_needed:
+                    ident = needs_lookup[bid]
+                    row = db.execute(
+                        select(Bill.id, Bill.status).where(
+                            Bill.jurisdiction_id == bill_jurisdiction.get(bid),
+                            Bill.session_id == bill_session.get(bid),
+                            Bill.identifier_norm == ident,
+                            Bill.id != bid,
+                        )
+                    ).first()
+                    if row is not None:
+                        survivor_bill_id[bid] = row.id
+
+        for bid, sid in survivor_bill_id.items():
+            if bid not in bill_ids:
+                continue
+            if sid in derived_status:
+                survivor_status = derived_status[sid]
+            else:
+                row = db.execute(select(Bill.status).where(Bill.id == sid)).first()
+                survivor_status = row.status if row else None
+            if survivor_status is not None and survivor_status in status_mod.TERMINAL_STATUSES:
+                # No status_note/similar column exists on `bills` (checked
+                # models.py) -- inherit the status only, per spec R3.
+                derived_status[bid] = survivor_status
+            else:
+                derived_status[bid] = status_mod.SUBSTITUTED
+
+    updates = []
+    cleared = 0
+    for bid in bill_ids:
+        derived = derived_status[bid]
         if counts is not None and derived is not None:
             counts[derived] = counts.get(derived, 0) + 1
         if derived != current.get(bid):
@@ -1745,12 +1855,27 @@ def cmd_recompute_status(args: argparse.Namespace) -> int:
     Only rows whose status actually CHANGES are written, so a re-run over an
     already-correct corpus costs reads and no writes (and does not churn
     `updated_at`, which consumers use to detect real movement).
+
+    `--jurisdiction` scopes the scan to one state (by abbreviation, e.g. NY)
+    -- for running a fix like the R1-R3 status-carryover logic against the
+    jurisdiction it targets first, before the full 209k-bill backfill.
     """
     db = get_session()
     processed = 0
     changed = 0
     cleared = 0
     counts: dict[str, int] = {}
+    jurisdiction_id = None
+    if getattr(args, "jurisdiction", None):
+        jurisdiction_row = db.execute(
+            select(Jurisdiction.id).where(
+                Jurisdiction.abbreviation.ilike(args.jurisdiction)
+            )
+        ).first()
+        if jurisdiction_row is None:
+            print(f"recompute-status: unknown jurisdiction {args.jurisdiction!r}")
+            return 1
+        jurisdiction_id = jurisdiction_row.id
     try:
         last_id = None
         while True:
@@ -1760,6 +1885,8 @@ def cmd_recompute_status(args: argparse.Namespace) -> int:
             if args.limit:
                 chunk = min(chunk, args.limit - processed)
             q = select(Bill.id, Bill.status).order_by(Bill.id).limit(chunk)
+            if jurisdiction_id is not None:
+                q = q.where(Bill.jurisdiction_id == jurisdiction_id)
             if last_id is not None:
                 q = q.where(Bill.id > last_id)
             rows = db.execute(q).all()
@@ -2547,6 +2674,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_status.add_argument("--limit", type=int, default=0, help="stop after N bills (0 = all)")
     p_status.add_argument("--chunk", type=int, default=2000, help="bills per batch (default 2000)")
+    p_status.add_argument(
+        "--jurisdiction",
+        default=None,
+        help="scope to one jurisdiction by abbreviation (e.g. NY); default all",
+    )
     p_status.set_defaults(func=cmd_recompute_status)
 
     p_session_dates = sub.add_parser(
