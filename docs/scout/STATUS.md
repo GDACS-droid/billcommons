@@ -27,6 +27,7 @@ Updated 2026-09-01. This records checks actually run; it is not production-deplo
 - Billing/API-key/quota/rate-limit verification on disposable PostgreSQL: **227 passed**, 1 warning. Billing unit gate: **78 passed, 1 skipped**; real PostgreSQL reconciliation concurrency: **1 passed**.
 - Broad isolated shared/API regression is **not green**: **617 passed, 30 skipped, 45 failed**. Most failures require a populated legislative corpus or expose monolithic rate-limit state; a legacy `substituted` mortality-status mismatch also remains. Do not report this gate as passing.
 - Congress.gov authentication helper passed live. The final bounded Solari check passed as recorded above.
+- The explicitly named local disposable PostgreSQL databases and temporary `alberto` test role were dropped after the final guarded gates.
 
 ## Git / preservation
 

@@ -43,3 +43,5 @@ PYTHONPATH=apps/api:packages/schema:packages/shared:workers/scout \
 ```
 
 The PostgreSQL URL must identify an acknowledged local disposable database matching the test guard. Never point these tests at production.
+
+The documented `billcommons_scout_verify_20260901` and monetization test databases plus their temporary local role were removed after the recorded final run; recreate a newly dated disposable target before rerunning PostgreSQL coverage.
