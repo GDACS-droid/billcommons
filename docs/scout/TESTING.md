@@ -12,15 +12,17 @@ Most coverage uses deterministic fixtures and the mock browser. Live tests are e
 
 ## Evidence recorded 2026-09-01
 
-- Current focused command: **226 passed, 2 live skipped**, 9 warnings. This includes worker/shared/API coverage, outcome-unknown cleanup ownership, and guarded real-PostgreSQL source-history and daily-budget concurrency regressions.
+- Earlier full focused command: **226 passed, 2 live skipped**, 9 warnings. This included worker/shared/API coverage, outcome-unknown cleanup ownership, and guarded real-PostgreSQL source-history and daily-budget concurrency regressions before the final browser-budget repair.
+- Final browser-budget repair gate: **101 passed, 1 opt-in live skipped** across the directly affected API/shared/worker suites. The newly migrated guarded PostgreSQL suite then passed **6 tests, 2 opt-in live skipped**, including simultaneous distinct submissions and the two-job owner-lock test under an explicit test-only 800-second capacity.
 - Web contract: **8 passed**; targeted ESLint passed; Next production build/typecheck passed with `/scout` emitted. Optional localhost API fetches failed closed during static generation and did not fail the build.
-- PostgreSQL Scout default: **5 passed, 2 skipped**; live tests are skipped unless explicitly enabled.
+- PostgreSQL Scout final guarded run: **6 passed, 2 skipped**; live tests are skipped unless explicitly enabled.
 - Live direct official-source finding: passed against Florida Senate HB 625; one direct source and one finding whose excerpt supports both the identifier and action; mock browser unused.
 - Final live Solari smoke: passed; one page/action, 7,283 ms, recording/replay available, cleanup confirmed.
 - Public live Solari visual proof: passed; one page/action, 3,412 ms, recording disabled, cleanup confirmed; derivative image contains only official robots text, fixed safe labels, and a non-reversible run reference.
 - Chromium visual assertions/captures: passed at 1440x1100 and 390x844 with an explicitly labeled fixture.
 - Final strengthened demo: H.264, 1440x900, 25 fps, 849 frames, 33.96 seconds, 3,076,083 bytes. External Sonnet returned **SHIP**. An independent reviewer found contradictory cleanup tense in the first derivative; after correction it fully decoded the replacement, sampled frames 716–747 and 816–848, verified both visible cleanup labels, scanned metadata/printable strings, matched hashes, and returned **SHIP**.
 - Broad isolated shared/API gate: **617 passed, 30 skipped, 45 failed**. It is not green; failures are documented in `STATUS.md` and must not be presented as Scout-pass evidence.
+- A supplemental mixed Scout/security/change-feed run was interrupted at the existing change-feed `TestClient` teardown after **168 passed, 1 skipped** and no assertion failures. It is not a passing gate and did not replace the focused or guarded PostgreSQL evidence above.
 
 ## Reproducible commands
 

@@ -8,6 +8,7 @@ Updated 2026-09-01. This records checks actually run; it is not production-deplo
 - Implemented native authenticated `/scout`, owner-scoped API/job lifecycle, dedicated worker, structured-data-first routing, conservative Florida direct retrieval, an isolated Solari provider plus deterministic mock, immutable evidence/provenance, cache/dedupe/change primitives, analytics, partial results, and dark-launch controls.
 - Added bounded requests/retries/bytes/time/pages/actions/routed requests/concurrency/daily usage, DNS-pinned URL admission, private-network and redirect rejection, plain-text rendering, claim fencing, cancellation, browser cleanup/reaping, and replay authorization.
 - Repaired adversarial findings covering false terminal success after request exhaustion, late callback revival of abandoned browser slots, concurrent provenance forks, one-shot polling after transient errors, pre-provider usage inflation, provider-reported routed-request overruns, and false login-page classification.
+- Repaired the final browser-wallet review findings: jobs now reserve drive time plus both provider and runner cleanup windows, cleanup bounds are persisted and honored through normal/reaper/recovery paths, cross-midnight and missing-runtime sessions cannot escape the daily cap, legacy rows conservatively hold the full cap during rolling upgrades, infeasible enabled configurations fail at app construction, and old/new provider release signatures are dispatched once without a post-I/O retry.
 - Verified current first-party Solari and Congress.gov documentation. Congress.gov v3 live authentication passed without exposing the key; the account response reported a 20,000 request/hour limit.
 - Published the sanitized cookbook example at `GDACS-droid/solari-cookbook`, branch `billcommons-scout-challenge`, commit `1095a02`.
 - The production API-only Stripe billing hotfix was separately preflighted and deployed successfully. It did not deploy Scout, run a migration, change prices, or configure a webhook.
@@ -24,17 +25,18 @@ Updated 2026-09-01. This records checks actually run; it is not production-deplo
 
 ## Verification actually run
 
-- Focused current Scout Python gate, including guarded real-PostgreSQL provenance and daily-budget concurrency tests: **226 passed, 2 live skipped**, 9 warnings.
+- Earlier full focused Scout Python gate: **226 passed, 2 live skipped**, 9 warnings. After the final browser-budget repair, the directly affected API/shared/worker gate passed **101 tests with 1 opt-in live skip**; the freshly migrated guarded PostgreSQL suite passed **6 tests with 2 opt-in live skips**.
 - Web: **8 passed**; targeted ESLint passed; TypeScript/Next production build passed and emitted `/scout`. Optional build-time localhost API fetches logged nonfatal connection refusals.
-- Guarded PostgreSQL Scout suite: **5 passed, 2 live skipped** by default. The opt-in live direct HB 625 test separately passed.
+- Guarded PostgreSQL Scout suite: **6 passed, 2 live skipped** in the final migrated disposable-database run. The opt-in live direct HB 625 test separately passed.
 - Billing/API-key/quota/rate-limit verification on disposable PostgreSQL: **227 passed**, 1 warning. Billing unit gate: **78 passed, 1 skipped**; real PostgreSQL reconciliation concurrency: **1 passed**.
 - Broad isolated shared/API regression is **not green**: **617 passed, 30 skipped, 45 failed**. Most failures require a populated legislative corpus or expose monolithic rate-limit state; a legacy `substituted` mortality-status mismatch also remains. Do not report this gate as passing.
+- A supplemental mixed Scout/security/change-feed run was interrupted during the unrelated `test_changes_and_batch` shared `TestClient` teardown after **168 passed, 1 skipped** and no reported assertion failure. The change-feed file also hung during fixture teardown when run alone; it is not counted as a passing regression gate.
 - Congress.gov authentication helper passed live. The final bounded Solari check passed as recorded above.
-- The explicitly named local disposable PostgreSQL databases and temporary `alberto` test role were dropped after the final guarded gates.
+- The explicitly named local disposable PostgreSQL database and temporary least-privilege `alberto` test role created for the final guarded gate were dropped after the run.
 
 ## Git / preservation
 
-- Public feature branch: `billcommons-scout`; hardened code head `22a6376` (code repair `51e2588`), with the strengthened live-proof demo published in artifact commit `9423090`. Independent and external-model reviews returned **SHIP**, the remote head matched after push, and immutable raw demo/proof URLs returned HTTP 200 at their documented byte sizes.
+- Public feature branch: `billcommons-scout`; final browser-budget code repair `f09c295`, with the strengthened live-proof demo published in artifact commit `9423090`. Independent and external-model reviews returned **SHIP**, and immutable raw demo/proof URLs returned HTTP 200 at their documented byte sizes.
 - Preserve unrelated modified ingest health/full-text files and untracked `.claude`, operations, outreach, rendered, monitoring, and data-request files.
 - Scout production schema migration, worker service creation, RawStore topology, monitoring/canary, backup/restore proof, feature enablement, and web deployment have not run.
 
