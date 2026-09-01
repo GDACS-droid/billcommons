@@ -4,12 +4,12 @@ Congress.gov authentication, conservative Florida direct retrieval, and the opt-
 
 ## Solari
 
-Live authentication passed through the official Python SDK. The final smoke used a recorded Solari browser to visit the small official Florida Online Sunshine robots resource at `https://www.leg.state.fl.us/robots.txt` and asserted the deterministic `User-agent` marker.
+Live authentication passed through the official Python SDK. The final post-repair smoke used a recorded Solari browser to visit the small official Florida Online Sunshine robots resource at `https://www.leg.state.fl.us/robots.txt` and asserted the deterministic `User-agent` marker.
 
 - result: pass
-- session fingerprint: `cebada2bd753` (SHA-256 prefix; the signed provider capability is not retained in this document)
+- session fingerprint: `186a068f3858` (SHA-256 prefix; the signed provider capability is not retained in this document)
 - actions/pages: 1 / 1
-- elapsed runtime: 3,650 ms
+- elapsed runtime: 7,283 ms
 - recording: enabled
 - replay: available during the bounded post-release probe; URL not logged
 - cleanup: independently confirmed through idempotent release
@@ -24,11 +24,11 @@ The direct Online Sunshine and public cookbook checks are provider/SDK lifecycle
 
 ## Government source
 
-One bounded direct request used the corpus-retained official URL for Florida SB 1344:
+The final opt-in direct product check used a guarded disposable PostgreSQL database and the corpus-shaped official Florida Senate URL for HB 625:
 
-- host: `flsenate.gov`
-- outcome: HTTP 200, `text/html`
-- bytes: 51,922
-- SHA-256: `0b35ec1d4654da6ca3e468a6ce1ed63ce04a2e2d75be0d835bacabb0187b463c`
+- source: `https://flsenate.gov/Session/Bill/2026/625/ByCategory`
+- result: pass; direct retrieval only, mock browser unused
+- retained: one official source and one finding
+- evidence contract: the displayed excerpt supports both `HB 625` and `Chapter No. 2026-141`
 
-This proves conservative official retrieval only. It does not claim the page contained a new legislative development, and the visual QA finding remains explicitly labeled as a fixture.
+This proves the live evidence-retention contract for a known structured action. It does not claim Scout discovered a previously unknown development. The visual QA result remains explicitly labeled as a fixture.

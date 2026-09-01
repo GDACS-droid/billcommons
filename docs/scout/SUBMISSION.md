@@ -14,7 +14,7 @@ Bill Commons is already public at `GDACS-droid/billcommons` under Apache-2.0. Th
 
 Published cookbook branch: `https://github.com/GDACS-droid/solari-cookbook/tree/billcommons-scout-challenge/examples/bill-commons-scout-py` at hardened commit `1095a02`. The free fixture, native provider, and public example live paths are verified and pushed.
 
-Published Bill Commons feature branch: `https://github.com/GDACS-droid/billcommons/tree/billcommons-scout` at commits `3eb4832`, `aeee726`, and `3a814c7`. Production flags remain off; publishing source is not a production deployment.
+Published Bill Commons feature branch: `https://github.com/GDACS-droid/billcommons/tree/billcommons-scout`. The final hardened head includes post-review lifecycle, evidence, analytics, polling, concurrency, budget, and outcome-unknown cleanup repairs. Use the branch's immutable head SHA in the final post after push. Production flags remain off; publishing source is not a production deployment.
 
 ## Setup
 
@@ -47,7 +47,7 @@ SOLARI_API_KEY=... .venv/bin/python main.py --live
 4. If and only if that run required Solari, open Agent Replay: “Ordinary HTTP runs first; Solari handles the browser-only portal and is always released.”
 5. Show sources checked, browser pages/actions/time, and cache state: “The same research is reusable, so spend is bounded.”
 
-Do not use the visual fixture as a claimed government result. The infrastructure demo can truthfully show the verified official Online Sunshine SDK/provider browser/replay evidence. The production router/browser/session-lifecycle path is also live-verified against a real MyFloridaHouse `302` route: exactly one Solari session was admitted and durably released. That run asserted no government finding; a bill-level public recording still requires a source whose rendered page supports the exact finding.
+Do not use the visual fixture as a claimed government result. The infrastructure demo can truthfully show the verified official Online Sunshine SDK/provider browser/replay evidence. The production router/browser/session-lifecycle path is live-verified against a real MyFloridaHouse `302` route: exactly one Solari session was admitted and durably released. Separately, the direct live HB 625 check retained one finding only after the official page supported the exact bill/action. The browser-path run itself asserted no bill finding; a bill-level public recording that combines a supported finding with Solari still requires a suitable browser-only source.
 
 ## Product proof and analytics
 
@@ -57,7 +57,7 @@ The native client records Scout opened, example selected, job created/started/pa
 
 - Florida-only P0; no generic web crawl or arbitrary URL input.
 - Solari auth/session/recording/replay/cleanup passed on the official Online Sunshine smoke. `www.flsenate.gov` reset the Solari browser connection during separate diagnostics even though direct HTTP was healthy; partial-source handling is therefore material, not theoretical.
-- The Online Sunshine smoke calls the provider directly. A separate opt-in PostgreSQL/API product-path test against real MyFloridaHouse `BillId=84174` verified safe `302` escalation, database-backed browser-slot/session lifecycle, exactly one Solari session, and durable release. It did not produce a retained bill finding, so live bill-level finding/provenance remains unclaimed.
+- The Online Sunshine smoke calls the provider directly. A separate opt-in PostgreSQL/API product-path test against real MyFloridaHouse `BillId=84174` verified safe `302` escalation, database-backed browser-slot/session lifecycle, exactly one Solari session, and durable release. It did not produce a retained bill finding. A separate direct live Florida Senate HB 625 check did retain exact bill/action evidence, but did not require Solari.
 - Florida P0 revisits official `Bill.source_url` candidates already present in the corpus. New agenda/agency/source discovery is not yet implemented.
 - Broader popup/download planning, production cohorts, service telemetry, and graceful drain are rollout work. Daily job/runtime and per-job request/retry limits are implemented, with active-job ceilings bounding in-flight overshoot.
 - Full legacy API regression is not green and is unsafe without isolated-database wiring.
@@ -71,4 +71,4 @@ The native client records Scout opened, example selected, job created/started/pa
 
 > Legislative databases are good at normalized bills and weak at the surrounding government web: agendas, amendments, fiscal notes, hearings, and older interactive portals. I built Bill Commons Scout as a permanent evidence-first research feature. It checks Bill Commons and direct official retrieval first, then uses a recorded Solari browser only when interaction is genuinely required. The system retains provenance, hashes evidence, coalesces duplicate research, limits spend, handles partial failures, and exposes replay as audit material—not as primary evidence. Code and a reproducible cookbook example: [links]. @Harry Chow / Solari
 
-Required remaining public sequence: open/merge the public branches (or share their branch URLs), record a truthful demo, publish it, and tag `@harrychow_` and `@getsolari`. The live Solari SDK/provider gap and the product browser-fallback/session-lifecycle gap are closed. No live run has produced a retained bill-level government finding; do not imply that either smoke found a new bill development.
+Required remaining public sequence: push/share the immutable feature head, record a truthful demo, publish it, and tag `@harrychow_` and `@getsolari`. The live Solari SDK/provider gap, product browser-fallback/session-lifecycle gap, and direct official finding-retention contract are closed. Do not imply the Solari smoke discovered a bill development or that the known HB 625 action was previously unknown.
