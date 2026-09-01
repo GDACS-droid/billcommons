@@ -878,6 +878,20 @@ class ScoutRunner:
                 stage_id = stage.id
             try:
                 raw_ref = exact_raw_ref or self.rawstore.put(body, {"source_url": url, "mechanism": mechanism})
+            except ValueError as exc:
+                with self.sessions() as db:
+                    stage = db.get(ScoutSource, stage_id)
+                    if stage is not None:
+                        db.delete(stage)
+                        db.commit()
+                if str(exc) != "scout_rawstore_capacity_exceeded":
+                    raise
+                with self.sessions() as db:
+                    job = self._fenced(db, job_id, token)
+                    if job is not None:
+                        db.add(ScoutJobEvent(job_id=job_id, kind="rawstore_capacity_exceeded", detail={}))
+                        self._finish(db, job, token, "failed", "rawstore_capacity_exceeded", False)
+                return None
             except Exception:
                 with self.sessions() as db:
                     stage = db.get(ScoutSource, stage_id)

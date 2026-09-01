@@ -169,6 +169,11 @@ class ScoutSettings:
                 "BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS must cover one "
                 "job's browser capture and cleanup reservation"
             )
+        if self.platform_max_daily_browser_seconds < reservation_seconds:
+            raise ValueError(
+                "BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_BROWSER_SECONDS must cover one "
+                "job's browser capture and cleanup reservation"
+            )
 
     @classmethod
     def from_env(cls) -> "ScoutSettings":

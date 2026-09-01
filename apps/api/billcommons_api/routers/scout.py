@@ -26,6 +26,7 @@ from billcommons_schema.models import (
     ScoutBrowserSession,
     ScoutFinding,
     ScoutJobEvent,
+    ScoutRawBlob,
     ScoutResearchJob,
     ScoutSource,
 )
@@ -215,6 +216,29 @@ def _browser_budget_totals(
     return active_jobs, daily_browser_ms, reserved_browser_ms
 
 
+def _rawstore_reservation_bytes(job: ScoutResearchJob, settings: ScoutSettings) -> int:
+    """Bound future immutable evidence for a queued/running job.
+
+    Legacy jobs did not persist all limits, so retain the current process
+    ceilings rather than treating missing JSON fields as free capacity.
+    """
+    limits = job.limits or {}
+    requests = limits.get("max_external_requests", settings.max_external_requests)
+    direct_bytes = limits.get("max_direct_bytes", settings.max_direct_bytes)
+    if not isinstance(requests, int) or isinstance(requests, bool) or requests <= 0:
+        requests = settings.max_external_requests
+    if not isinstance(direct_bytes, int) or isinstance(direct_bytes, bool) or direct_bytes <= 0:
+        direct_bytes = settings.max_direct_bytes
+    return requests * direct_bytes
+
+
+def _retained_rawstore_bytes(db: Session) -> int:
+    size = func.octet_length(ScoutRawBlob.data)
+    if db.bind is not None and db.bind.dialect.name != "postgresql":
+        size = func.length(ScoutRawBlob.data)
+    return int(db.scalar(select(func.coalesce(func.sum(size), 0))) or 0)
+
+
 def _job_payload(db: Session, job: ScoutResearchJob) -> dict:
     findings = db.scalar(select(func.count()).select_from(ScoutFinding).where(ScoutFinding.job_id == job.id))
     browser_sessions = list(
@@ -402,8 +426,20 @@ def create_job(
         new_reservation_ms = settings.max_external_requests * (
             settings.browser_wall_seconds + 2 * settings.browser_cleanup_seconds
         ) * 1000
+        new_rawstore_reservation = settings.max_external_requests * settings.max_direct_bytes
         if len(platform_active) >= settings.platform_max_active_jobs:
             raise too_many_requests("scout_platform_active_job_limit", "Scout is at platform capacity.", 60)
+        retained_rawstore_bytes = _retained_rawstore_bytes(db)
+        active_rawstore_reservations = sum(
+            _rawstore_reservation_bytes(job, settings) for job in platform_active
+        )
+        if (
+            retained_rawstore_bytes + active_rawstore_reservations + new_rawstore_reservation
+            > settings.max_retained_rawstore_bytes
+        ):
+            raise too_many_requests(
+                "scout_rawstore_capacity_limit", "Scout evidence capacity reached.", 3600
+            )
         if platform_daily_jobs >= settings.platform_max_daily_jobs:
             raise too_many_requests("scout_platform_daily_job_limit", "Scout daily platform capacity reached.", 3600)
         if (
