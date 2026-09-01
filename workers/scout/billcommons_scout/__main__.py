@@ -135,6 +135,34 @@ def _run_worker_loop(runner: ScoutRunner, *, once: bool, worker_id: str) -> int:
         signal.signal(signal.SIGINT, old_int)
 
 
+def _idle_while_disabled() -> int:
+    """Keep a dark-deployed worker observable without opening a claim path.
+
+    The runner is deliberately never constructed here.  That makes the feature
+    flag a hard no-claim boundary while still keeping the service process alive
+    for Railway health/log observation.  TERM/INT use the same cooperative
+    drain contract as the active worker: there is no in-flight work, so exit is
+    immediate after the current sleep boundary.
+    """
+    draining = False
+
+    def request_drain(_signum, _frame) -> None:
+        nonlocal draining
+        draining = True
+
+    old_term = signal.signal(signal.SIGTERM, request_drain)
+    old_int = signal.signal(signal.SIGINT, request_drain)
+    try:
+        print("Scout is disabled; idling without job claims.", flush=True)
+        while not draining:
+            time.sleep(1)
+        print("Scout disabled worker drained.", flush=True)
+        return 0
+    finally:
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGINT, old_int)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="billcommons-scout")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -165,6 +193,8 @@ def main() -> int:
         return 0
     if not settings.enabled:
         # Dark launch blocks both API creation and worker claims.
+        if args.command == "worker" and not args.once:
+            return _idle_while_disabled()
         print("Scout is disabled; no jobs claimed.")
         return 2
     if args.command == "solari-check":

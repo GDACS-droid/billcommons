@@ -57,7 +57,7 @@ Railway service currently uses each one:
 | API | `infra/docker/Dockerfile.api` | `uvicorn main:app --app-dir apps/api ...` |
 | MCP | `infra/docker/Dockerfile.mcp` | `python apps/mcp/server.py` |
 | Ingest | `infra/docker/Dockerfile.worker` | `python -m billcommons_ingest.autoboot` |
-| Scout | `infra/docker/Dockerfile.scout-worker` | `python -m billcommons_scout worker` |
+| Scout | `infra/docker/Dockerfile.scout-worker` | image entrypoint runs `python -m billcommons_scout check`, then `python -m billcommons_scout worker` |
 | Web | `apps/web` | Vercel build from the pinned source revision |
 
 ## 1. Preflight: live state, capacity, and secrets
@@ -214,8 +214,10 @@ destructive downgrade is permitted in a production rollback.
    service, do not rely on app startup to migrate, and do not run a downgrade
    as a routine rollback action.
 4. Recheck API and MCP read paths with flags still dark. Confirm no Scout job
-   can be created while the API flag is false and that the Scout worker prints
-   its disabled/no-claim result rather than consuming jobs.
+   can be created while the API flag is false, that the Scout image readiness
+   check succeeds before the process enters the worker, and that the disabled
+   long-running worker remains healthy/idling without consuming jobs. A
+   one-shot `worker --once` intentionally returns its disabled/no-work result.
 5. Deploy the pinned Vercel artifact with `NEXT_PUBLIC_SCOUT_ENABLED=false`.
    Confirm `/scout` is unavailable or communicates the disabled state and the
    global navigation does not advertise Scout.
@@ -277,7 +279,10 @@ alone can therefore never accidentally create an all-account rollout.
 Current behavior is deliberately conservative:
 
 - Setting `BILLCOMMONS_SCOUT_ENABLED=false` blocks new API job creation and
-  new worker claims. It does not kill a fresh already-claimed browser action.
+  new worker claims. A long-running dark-deployed worker remains alive for
+  health/log observation without constructing a claim runner; `worker --once`
+  returns its disabled/no-work result. It does not kill a fresh already-claimed
+  browser action.
 - `SIGTERM`/`SIGINT` asks the worker loop to drain: it stops before its next
   claim and lets the in-progress `run_once` follow its normal cleanup path.
   Set a platform termination grace period that exceeds the configured browser

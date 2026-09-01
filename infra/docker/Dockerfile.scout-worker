@@ -10,8 +10,11 @@ COPY requirements.txt ./requirements.txt
 COPY packages/schema ./packages/schema
 COPY packages/shared ./packages/shared
 COPY workers/scout ./workers/scout
+COPY infra/docker/scout-entrypoint.sh /usr/local/bin/scout-entrypoint
 
 RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir -e workers/scout
+    && pip install --no-cache-dir -e workers/scout \
+    && chmod 755 /usr/local/bin/scout-entrypoint
 
+ENTRYPOINT ["/usr/local/bin/scout-entrypoint"]
 CMD ["python", "-m", "billcommons_scout", "worker"]

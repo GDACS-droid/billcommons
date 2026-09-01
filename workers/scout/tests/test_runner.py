@@ -10,6 +10,7 @@ import types
 import asyncio
 import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -2149,6 +2150,54 @@ def test_worker_term_drain_stops_before_a_second_claim_without_signaling_pytest(
     assert runner.claims == 1
 
 
+@pytest.mark.parametrize("drain_signal", [scout_cli.signal.SIGTERM, scout_cli.signal.SIGINT])
+def test_disabled_worker_idles_without_constructing_runner_and_drains_on_signal(monkeypatch, capsys, drain_signal):
+    handlers = {}
+
+    def fake_signal(kind, handler):
+        previous = handlers.get(kind)
+        handlers[kind] = handler
+        return previous
+
+    def request_drain(_seconds):
+        handlers[drain_signal](drain_signal, None)
+
+    monkeypatch.setattr(scout_cli.signal, "signal", fake_signal)
+    monkeypatch.setattr(scout_cli.time, "sleep", request_drain)
+    assert scout_cli._idle_while_disabled() == 0
+    assert capsys.readouterr().out == (
+        "Scout is disabled; idling without job claims.\n"
+        "Scout disabled worker drained.\n"
+    )
+
+
+def test_disabled_long_running_worker_uses_idle_loop_but_once_remains_non_success(monkeypatch, capsys):
+    calls = []
+
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "false")
+    monkeypatch.setattr(scout_cli, "_runner", lambda: pytest.fail("disabled worker must not construct a runner"))
+    monkeypatch.setattr(scout_cli, "_idle_while_disabled", lambda: calls.append("idle") or 0)
+    monkeypatch.setattr(sys, "argv", ["billcommons-scout", "worker"])
+    assert scout_cli.main() == 0
+    assert calls == ["idle"]
+
+    monkeypatch.setattr(sys, "argv", ["billcommons-scout", "worker", "--once"])
+    assert scout_cli.main() == 2
+    assert calls == ["idle"]
+    assert capsys.readouterr().out == "Scout is disabled; no jobs claimed.\n"
+
+
+def test_scout_image_runs_non_secret_readiness_before_worker():
+    root = Path(__file__).resolve().parents[3]
+    dockerfile = (root / "infra/docker/Dockerfile.scout-worker").read_text()
+    entrypoint = (root / "infra/docker/scout-entrypoint.sh").read_text()
+    assert 'ENTRYPOINT ["/usr/local/bin/scout-entrypoint"]' in dockerfile
+    assert 'CMD ["python", "-m", "billcommons_scout", "worker"]' in dockerfile
+    assert "set -eu" in entrypoint
+    assert "python -m billcommons_scout check" in entrypoint
+    assert 'exec "$@"' in entrypoint
+
+
 def test_readiness_check_exercises_required_dependencies_without_echoing_configuration(monkeypatch, tmp_path, capsys):
     class Db:
         def __enter__(self): return self
@@ -2169,6 +2218,27 @@ def test_readiness_check_exercises_required_dependencies_without_echoing_configu
     assert scout_cli._check_readiness() == 0
     output = capsys.readouterr().out
     assert output == "database=ok scout_tables=ok rawstore=ok solari_configured=False solari_sdk=missing\n"
+
+
+def test_readiness_rejects_configured_solari_without_sdk(monkeypatch, capsys):
+    class Db:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+        def execute(self, _statement): return None
+
+    class Store:
+        def __init__(self, _sessions): pass
+        def healthcheck(self): return True
+
+    monkeypatch.setattr(scout_cli, "get_sessionmaker", lambda: lambda: Db())
+    monkeypatch.delenv("BILLCOMMONS_SCOUT_RAWSTORE_BACKEND", raising=False)
+    monkeypatch.setattr(scout_cli, "PostgresScoutRawStore", Store)
+    monkeypatch.setattr(scout_cli, "resolve_solari_api_key", lambda: "configured")
+    monkeypatch.setattr(scout_cli.importlib.util, "find_spec", lambda _name: None)
+    assert scout_cli._check_readiness() == 2
+    assert capsys.readouterr().out == (
+        "database=ok scout_tables=ok rawstore=ok solari_configured=True solari_sdk=missing\n"
+    )
 
 
 def test_scout_rawstore_defaults_to_postgres_and_filesystem_needs_explicit_local_override(monkeypatch):
