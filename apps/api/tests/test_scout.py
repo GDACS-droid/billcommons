@@ -575,3 +575,20 @@ def test_enabled_scout_rejects_infeasible_browser_budget_at_app_start(monkeypatc
     monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_CLEANUP_SECONDS", "1")
     with pytest.raises(ValueError, match="DAILY_BROWSER"):
         create_app()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "0"),
+        ("BILLCOMMONS_SCOUT_ALLOW_PUBLIC", "not-a-boolean"),
+    ),
+)
+def test_enabled_scout_rejects_invalid_explicit_configuration_at_app_start(
+    monkeypatch, name, value
+):
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "1")
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        create_app()

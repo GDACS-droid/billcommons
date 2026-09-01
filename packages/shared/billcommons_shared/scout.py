@@ -152,12 +152,45 @@ class ScoutSettings:
 
     @classmethod
     def from_env(cls) -> "ScoutSettings":
-        def positive(name: str, default: int) -> int:
-            try:
-                value = int(os.environ.get(name, str(default)))
-            except ValueError:
+        true_values = frozenset({"1", "true", "yes"})
+        false_values = frozenset({"0", "false", "no"})
+
+        def boolean(name: str, default: bool, *, strict: bool) -> bool:
+            raw = os.environ.get(name)
+            if raw is None:
                 return default
-            return value if value > 0 else default
+            value = raw.strip().casefold()
+            if value in true_values:
+                return True
+            if value in false_values:
+                return False
+            if strict:
+                raise ValueError(
+                    f"{name} must be one of: 1, true, yes, 0, false, no"
+                )
+            return default
+
+        # Keep a disabled deployment compatible with its historical defaulting
+        # behavior. Once Scout is enabled, however, a malformed explicit ceiling
+        # must stop construction rather than silently expanding a cost or
+        # resource limit back to its default.
+        enabled = boolean("BILLCOMMONS_SCOUT_ENABLED", False, strict=False)
+
+        def positive(name: str, default: int) -> int:
+            raw = os.environ.get(name)
+            if raw is None:
+                return default
+            try:
+                value = int(raw)
+            except ValueError:
+                if enabled:
+                    raise ValueError(f"{name} must be a positive integer") from None
+                return default
+            if value > 0:
+                return value
+            if enabled:
+                raise ValueError(f"{name} must be a positive integer")
+            return default
 
         canary_emails = tuple(
             sorted(
@@ -172,10 +205,10 @@ class ScoutSettings:
         )
 
         return cls(
-            enabled=os.environ.get("BILLCOMMONS_SCOUT_ENABLED", "").lower() in {"1", "true", "yes"},
-            allow_public_rollout=os.environ.get(
-                "BILLCOMMONS_SCOUT_ALLOW_PUBLIC", ""
-            ).lower() in {"1", "true", "yes"},
+            enabled=enabled,
+            allow_public_rollout=boolean(
+                "BILLCOMMONS_SCOUT_ALLOW_PUBLIC", False, strict=enabled
+            ),
             canary_emails=canary_emails,
             max_query_chars=positive("BILLCOMMONS_SCOUT_MAX_QUERY_CHARS", 500),
             max_direct_bytes=positive("BILLCOMMONS_SCOUT_MAX_DIRECT_BYTES", 2 * 1024 * 1024),
