@@ -47,9 +47,10 @@
 - API container must not import worker code.
 - Fetched content is hostile data; every job access is owner-scoped; Solari use is bounded and cleanup is attempted in all terminal paths.
 
-## Git state at checkpoint
+## Git state at final handoff
 
-- Branch: `main`, tracking `origin/main`.
+- Branch: `billcommons-scout`, tracking the public `origin/billcommons-scout` branch.
+- Immutable feature commits: `3eb4832` (Scout), `aeee726` (served-session MCP fixes), and `3a814c7` (native Stripe checkout links).
 - Pre-existing changes before Scout: modified `workers/ingest/billcommons_ingest/fulltext.py`, `healthcheck.py`, `workers/ingest/tests/test_healthcheck.py`; untracked `.claude/`, operations/outreach/rendered/monitoring files.
 - Scout changes now include additive schema/migration, shared policy, owner-scoped API, dedicated worker/provider, web route/components/client/tests, `docs/scout/*`, `.env.example`, and safe setup/check helpers. `/docs/bulk` is the only Stripe-adjacent application edit. MCP session/coverage fixes are separately scoped.
 
@@ -57,15 +58,16 @@
 
 - `apps/web`: `npm run test:scout` (4 passed), `npm run lint`, and `NEXT_PUBLIC_SCOUT_ENABLED=true npm run build` passed; the production build emitted `/scout`.
 - Pre-live combined Scout Python gate: 101 passed. The final post-hardening focused regression expanded to 144 passed, with only the known TestClient and SQLite adapter deprecations. These cover shared URL/security tests, API/CORS/owner contracts, MCP session behavior, and worker adversarial/lifecycle tests; disposable-PostgreSQL E2E is recorded separately.
-- Disposable PostgreSQL Scout E2E/concurrency/migration gate: 4 passed, 1 live test skipped by default, one TestClient deprecation warning. The explicit live product-path test separately passed once with the Solari key configured.
+- Disposable PostgreSQL Scout E2E/concurrency/migration gate: 4 passed, 1 live test skipped by default, one TestClient deprecation warning. The explicit live product-path test passed after the final browser-egress hardening with the Solari key configured.
 - MCP session/coverage gate: 29 passed.
 - `git diff --check` and Python `compileall` passed.
 - Broader shared/API regression: 641 passed, 3 skipped, 3 failed, 4 setup errors. The failures are existing production-corpus/status/performance assertions and a pre-existing mortality bucket vocabulary mismatch; the errors are legacy fixtures attempting duplicate NY/NE jurisdictions. This default path falls back to the configured live database and must not be repeated without an isolated test database.
 - `scripts/congress_api_check.py` passed live authentication without exposing the key.
 - Production Stripe checkout creation and the separately requested outreach operation ran successfully. The final live Solari browser/recording/replay/cleanup gate passed; no production schema migration/deploy or completed Stripe payment has run.
+- Billing regression gate: 71 passed. The `/docs/bulk` page now uses the owned Builder/snapshot Checkout flows instead of legacy external Payment Links.
 - Post-repair focused provider/security gate: 27 passed. Live Solari result: `session_ref=cebada2bd753`, one action, 3,650 ms, deterministic marker present, replay available, cleanup confirmed.
 - Final web gate rerun after the hardened live pass: 4 tests, ESLint, typecheck, and production build passed with `/scout` emitted. Static generation logged nonfatal `ECONNREFUSED 127.0.0.1:8000` warnings for pages whose optional local API was absent.
 
 ## NEXT
 
-Reconcile and push the public cookbook example, run the final deterministic regression/build gate, record the truthful demo, then publish the prepared social post. Production rollout remains a separate explicitly authorized operation and is still NOT READY under the release preflight.
+Record the truthful demo, open/merge the prepared public branches, then publish the prepared social post. Production rollout remains a separate explicitly authorized operation and is still NOT READY under the release preflight.

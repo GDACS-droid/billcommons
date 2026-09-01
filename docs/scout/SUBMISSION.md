@@ -14,6 +14,8 @@ Bill Commons is already public at `GDACS-droid/billcommons` under Apache-2.0. Th
 
 Published cookbook branch: `https://github.com/GDACS-droid/solari-cookbook/tree/billcommons-scout-challenge/examples/bill-commons-scout-py` at hardened commit `1095a02`. The free fixture, native provider, and public example live paths are verified and pushed.
 
+Published Bill Commons feature branch: `https://github.com/GDACS-droid/billcommons/tree/billcommons-scout` at commits `3eb4832`, `aeee726`, and `3a814c7`. Production flags remain off; publishing source is not a production deployment.
+
 ## Setup
 
 Bill Commons local configuration follows `.env.example`. Store the browser secret without printing or committing it:
@@ -69,4 +71,4 @@ The native client records Scout opened, example selected, job created/started/pa
 
 > Legislative databases are good at normalized bills and weak at the surrounding government web: agendas, amendments, fiscal notes, hearings, and older interactive portals. I built Bill Commons Scout as a permanent evidence-first research feature. It checks Bill Commons and direct official retrieval first, then uses a recorded Solari browser only when interaction is genuinely required. The system retains provenance, hashes evidence, coalesces duplicate research, limits spend, handles partial failures, and exposes replay as audit material—not as primary evidence. Code and a reproducible cookbook example: [links]. @Harry Chow / Solari
 
-Required remaining public sequence: merge the cookbook branch (or share its branch URL), record a truthful demo, publish it, and tag `@harrychow_` and `@getsolari`. The live Solari SDK/provider gap and the product browser-fallback/session-lifecycle gap are closed. No live run has produced a retained bill-level government finding; do not imply that either smoke found a new bill development.
+Required remaining public sequence: open/merge the public branches (or share their branch URLs), record a truthful demo, publish it, and tag `@harrychow_` and `@getsolari`. The live Solari SDK/provider gap and the product browser-fallback/session-lifecycle gap are closed. No live run has produced a retained bill-level government finding; do not imply that either smoke found a new bill development.
