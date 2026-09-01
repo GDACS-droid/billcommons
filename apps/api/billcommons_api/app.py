@@ -37,12 +37,14 @@ from billcommons_api.routers import (
     search,
     sessions,
     sitemap,
+    scout,
     sources,
     stats,
     topics,
     webhooks,
 )
 from billcommons_api.settings import get_settings
+from billcommons_shared.scout import ScoutSettings
 
 API_PREFIX = "/api/v1"
 
@@ -101,6 +103,11 @@ def _validate_monetization_env() -> None:
 def create_app() -> FastAPI:
     settings = get_settings()
     _validate_monetization_env()
+    # Scout remains a dark-launch feature. When enabled, validate its coupled
+    # browser budget at process construction rather than first customer POST;
+    # disabled deployments retain their existing import/startup behavior.
+    if os.environ.get("BILLCOMMONS_SCOUT_ENABLED", "").lower() in {"1", "true", "yes"}:
+        ScoutSettings.from_env()
 
     # Keep a slowapi Limiter available for any future per-route decorators, but
     # global enforcement is handled by RateLimitMiddleware below (slowapi's
@@ -187,6 +194,7 @@ def create_app() -> FastAPI:
         stats.router,
         topics.router,
         webhooks.router,
+        scout.router,
     ):
         app.include_router(router, prefix=API_PREFIX)
 

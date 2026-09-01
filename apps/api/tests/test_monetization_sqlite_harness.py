@@ -39,6 +39,21 @@ def test_allows_localhost_with_explicit_opt_in(monkeypatch):
     _assert_destructive_test_db_allowed("postgresql://bc@127.0.0.1:54329/bc_staging")
 
 
+def test_allows_standard_local_socket_with_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE", "1")
+    _assert_destructive_test_db_allowed(
+        "postgresql:///billcommons_regression_test?host=/var/run/postgresql"
+    )
+
+
+def test_refuses_nonstandard_socket_even_with_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE", "1")
+    with pytest.raises(RuntimeError, match="not provably disposable"):
+        _assert_destructive_test_db_allowed(
+            "postgresql:///billcommons_regression_test?host=/tmp/other-postgres"
+        )
+
+
 def test_allows_staging_named_url_with_explicit_opt_in(monkeypatch):
     monkeypatch.setenv("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE", "1")
     _assert_destructive_test_db_allowed(
@@ -52,3 +67,18 @@ def test_refuses_test_marker_in_username_on_production_database(monkeypatch):
     monkeypatch.setenv("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE", "1")
     with pytest.raises(RuntimeError, match="not provably disposable"):
         _assert_destructive_test_db_allowed("postgresql://bc_test@prod-host/railway")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql:///billcommons_regression_test?host=/var/run/postgresql&host=example.invalid",
+        "postgresql:///billcommons_regression_test?host=/var/run/postgresql&hostaddr=203.0.113.10",
+        "postgresql:///billcommons_regression_test?host=/var/run/postgresql&service=remote",
+        "postgresql:///billcommons_regression_test?host=/var/run/postgresql&servicefile=/tmp/pg_service.conf",
+    ],
+)
+def test_refuses_ambiguous_libpq_targets_even_with_explicit_opt_in(monkeypatch, url):
+    monkeypatch.setenv("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE", "1")
+    with pytest.raises(RuntimeError, match="not provably disposable"):
+        _assert_destructive_test_db_allowed(url)

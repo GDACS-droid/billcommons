@@ -129,11 +129,13 @@ def find_jurisdiction(db: Session, state: str) -> Jurisdiction | None:
 
 
 def coverage_rows_for_jurisdiction(
-    db: Session, jurisdiction_id: uuid.UUID
+    db: Session, jurisdiction_id: uuid.UUID, session_id: uuid.UUID | None = None
 ) -> list[JurisdictionCoverage]:
     stmt = select(JurisdictionCoverage).where(
         JurisdictionCoverage.jurisdiction_id == jurisdiction_id
     )
+    if session_id is not None:
+        stmt = stmt.where(JurisdictionCoverage.session_id == session_id)
     return list(db.execute(stmt).scalars().all())
 
 
@@ -167,13 +169,17 @@ def serialize_coverage_row(row: JurisdictionCoverage) -> dict[str, Any]:
 
 
 def coverage_warning_for_jurisdiction(
-    db: Session, jurisdiction: Jurisdiction, min_state: str = "METADATA_SEARCHABLE"
+    db: Session,
+    jurisdiction: Jurisdiction,
+    min_state: str = "METADATA_SEARCHABLE",
+    session_id: uuid.UUID | None = None,
 ) -> dict[str, Any] | None:
     """Build a structured coverage_warning dict if the jurisdiction's coverage
     is below `min_state` (or has no coverage rows at all). Returns None if
-    coverage is sufficient.
+    coverage is sufficient. When `session_id` is supplied, assess only that
+    session's coverage row; the default remains jurisdiction-wide aggregation.
     """
-    rows = coverage_rows_for_jurisdiction(db, jurisdiction.id)
+    rows = coverage_rows_for_jurisdiction(db, jurisdiction.id, session_id)
     status = worst_status(rows)
     # Severity, not lifecycle position. The BLOCKED special-case that used to be
     # needed here is gone: BLOCKED is now simply the lowest severity, so it

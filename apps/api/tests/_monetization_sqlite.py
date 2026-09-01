@@ -29,7 +29,8 @@ clean slate, it never creates schema against Postgres.
 against anything that isn't provably disposable. Two gates, both
 required, checked as soon as `BILLCOMMONS_TEST_DATABASE_URL` is read (at
 import time, and again defensively inside `_make_postgres_engine`):
-(a) the URL's host must be `127.0.0.1`/`localhost` or explicitly end in
+(a) the URL's host must be `127.0.0.1`/`localhost`, use the standard local
+Postgres Unix socket, or explicitly end in
 `.staging`/`.internal`, AND the database name must end in `_staging`/`_test`;
 (b) `BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE=1`
 must be set explicitly. Either gate failing raises `RuntimeError` loudly
@@ -54,7 +55,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -146,16 +147,26 @@ def _assert_destructive_test_db_allowed(pg_url: str) -> None:
     fails. See `docs/operations/monetization-runbook.md` for the
     operational writeup.
     """
-    host = (urlsplit(pg_url).hostname or "").lower()
-    database_name = urlsplit(pg_url).path.rstrip("/").rsplit("/", 1)[-1].lower()
+    parsed = urlsplit(pg_url)
+    host = (parsed.hostname or "").lower()
+    database_name = parsed.path.rstrip("/").rsplit("/", 1)[-1].lower()
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query_hosts = query.get("host", [])
+    ambiguous_target = (
+        len(query_hosts) > 1
+        or bool(host and query_hosts)
+        or any(query.get(key) for key in ("hostaddr", "service", "servicefile"))
+    )
+    socket_host = query_hosts[0] if len(query_hosts) == 1 else ""
     disposable_host = host in ("127.0.0.1", "localhost")
+    disposable_socket = not host and socket_host == "/var/run/postgresql"
     private_or_staging_host = host.endswith((".staging", ".internal"))
     disposable_name = database_name.endswith(("_staging", "_test"))
-    if not ((disposable_host or private_or_staging_host) and disposable_name):
+    if ambiguous_target or not ((disposable_host or disposable_socket or private_or_staging_host) and disposable_name):
         raise RuntimeError(
             "REFUSING to run the monetization test harness: "
             f"BILLCOMMONS_TEST_DATABASE_URL host={host!r} is not provably "
-            "disposable (must use localhost, a .staging/.internal host, "
+            "disposable (must use localhost, /var/run/postgresql, or a .staging/.internal host, "
             "and a database name ending '_staging'/'_test'). This harness DELETEs rows from "
             "monetization tables before every test -- see "
             "docs/operations/monetization-runbook.md."

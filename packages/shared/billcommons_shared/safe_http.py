@@ -585,10 +585,14 @@ class SafeHttpClient:
         resolver: Resolver = default_resolver,
         port: int = DEFAULT_PORT,
         address_policy: AddressPolicy = _is_publicly_routable,
+        max_body_bytes: int = MAX_BODY_BYTES,
     ) -> None:
+        if max_body_bytes <= 0:
+            raise ValueError("max_body_bytes must be positive")
         self._resolver = resolver
         self._port = port
         self._address_policy = address_policy
+        self._max_body_bytes = max_body_bytes
 
     def fetch(
         self,
@@ -782,7 +786,7 @@ class SafeHttpClient:
                         # connection that dies mid-body after already sending
                         # well over the cap slips through uncounted.
                         total += len(exc.partial)
-                        if total > MAX_BODY_BYTES:
+                        if total > self._max_body_bytes:
                             if require_body:
                                 raise TooLarge("response_body_too_large") from exc
                             break
@@ -797,7 +801,7 @@ class SafeHttpClient:
                     if not chunk:
                         break
                     total += len(chunk)
-                    if total > MAX_BODY_BYTES:
+                    if total > self._max_body_bytes:
                         if require_body:
                             raise TooLarge("response_body_too_large")
                         # Delivery, not a challenge: the body was never needed
@@ -849,6 +853,7 @@ def new_safe_http_client(
     *,
     port: int = DEFAULT_PORT,
     address_policy: AddressPolicy = _is_publicly_routable,
+    max_body_bytes: int = MAX_BODY_BYTES,
 ) -> SafeHttpClient:
     """Production entrypoint. The dispatcher calls this with no arguments,
     which wires in `default_resolver`, the real `_is_publicly_routable`
@@ -862,4 +867,5 @@ def new_safe_http_client(
         resolver=resolver if resolver is not None else default_resolver,
         port=port,
         address_policy=address_policy,
+        max_body_bytes=max_body_bytes,
     )

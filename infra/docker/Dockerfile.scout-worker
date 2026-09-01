@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpq-dev gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./requirements.txt
+COPY packages/schema ./packages/schema
+COPY packages/shared ./packages/shared
+COPY workers/scout ./workers/scout
+
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -e workers/scout
+
+CMD ["python", "-m", "billcommons_scout", "worker"]

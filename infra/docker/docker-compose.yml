@@ -26,6 +26,8 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://billcommons:billcommons@postgres:5432/billcommons
+      BILLCOMMONS_SCOUT_ENABLED: ${BILLCOMMONS_SCOUT_ENABLED:-false}
+      BILLCOMMONS_SCOUT_ALLOW_PUBLIC: ${BILLCOMMONS_SCOUT_ALLOW_PUBLIC:-false}
     ports:
       - "8000:8000"
 
@@ -42,6 +44,21 @@ services:
       RAWSTORE_ROOT: /data/rawstore
     volumes:
       - billcommons_rawstore:/data/rawstore
+
+  scout-worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.scout-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://billcommons:billcommons@postgres:5432/billcommons
+      BILLCOMMONS_SCOUT_ENABLED: ${BILLCOMMONS_SCOUT_ENABLED:-false}
+      BILLCOMMONS_SCOUT_ALLOW_PUBLIC: ${BILLCOMMONS_SCOUT_ALLOW_PUBLIC:-false}
+      BILLCOMMONS_SCOUT_RAWSTORE_BACKEND: postgres
+      SOLARI_API_KEY: ${SOLARI_API_KEY:-}
 
   mcp:
     build:

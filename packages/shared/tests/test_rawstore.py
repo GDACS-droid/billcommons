@@ -4,6 +4,8 @@ The core guarantee ingestion adapters rely on: identical bytes always
 produce the same content-addressed key (so re-fetching an unchanged upstream
 document is a no-op / dedupes), and different bytes never collide.
 """
+import json
+
 from billcommons_shared.rawstore import FilesystemRawStore
 
 
@@ -42,3 +44,17 @@ def test_get_missing_key_raises(tmp_path):
         pass
     else:
         raise AssertionError("expected FileNotFoundError for missing key")
+
+
+def test_identical_bytes_do_not_rewrite_first_observation_metadata(tmp_path):
+    store = FilesystemRawStore(root=tmp_path)
+    key = store.put(b"shared government document", {"source_url": "https://first.example.gov/document"})
+    assert store.put(
+        b"shared government document",
+        {"source_url": "https://second.example.gov/same-bytes"},
+    ) == key
+
+    _, meta_path = store._paths(key)
+    assert json.loads(meta_path.read_text()) == {
+        "source_url": "https://first.example.gov/document"
+    }
