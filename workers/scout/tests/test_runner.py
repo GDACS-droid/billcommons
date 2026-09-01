@@ -292,6 +292,37 @@ def test_evidence_excerpt_allows_benign_navigation_login_when_exact_support_is_n
     assert "login" in evidence[0].casefold() and "chapter no. 2026-141" in evidence[0].casefold()
 
 
+def test_html_entities_are_decoded_before_evidence_support_is_checked(tmp_path):
+    body = (
+        b'<nav><a href="/tracker/login">Login</a></nav>'
+        b'<main>HB 625 Last Action: Chapter No.&nbsp;2026-141</main>'
+    )
+    runner, sessions, job_id = _runner(
+        tmp_path,
+        MockResearchBrowserProvider(),
+        lambda _url: (200, "text/html", body),
+    )
+    metadata = {"identifier": "HB 625", "latest_action": "Chapter No. 2026-141"}
+    source_id = runner._persist_capture(
+        job_id,
+        "initial-claim",
+        None,
+        "HB 625",
+        "enacted",
+        metadata,
+        "https://www.flsenate.gov/Session/Bill/2026/625",
+        "direct",
+        200,
+        "text/html; charset=utf-8",
+        body,
+    )
+    assert source_id is not None
+    with sessions() as db:
+        finding = db.scalar(select(ScoutFinding).where(ScoutFinding.source_id == source_id))
+        assert finding is not None
+        assert "Chapter No. 2026-141" in finding.excerpt
+
+
 def test_solari_key_uses_explicit_environment_then_safe_local_file(tmp_path, monkeypatch):
     local_env = tmp_path / ".env"
     local_env.write_text("IGNORED=value\nSOLARI_API_KEY='local-test-key'\n")

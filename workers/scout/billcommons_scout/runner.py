@@ -1,6 +1,7 @@
 """DB-backed Scout queue runner; no database transaction spans external I/O."""
 from __future__ import annotations
 
+import html
 import re
 import secrets
 import threading
@@ -441,7 +442,7 @@ class ScoutRunner:
                         break
                 text = " ".join(parts).strip()
             else:
-                text = _TAG_RE.sub(" ", body.decode("utf-8", "replace"))[:self.settings.max_pdf_text_chars].strip()
+                text = html.unescape(_TAG_RE.sub(" ", body.decode("utf-8", "replace")))[:self.settings.max_pdf_text_chars].strip()
             evidence = self._evidence_excerpt(text, metadata, bill_status)
             if evidence is None:
                 self._record_failed_source(job_id, token, url, mechanism, status, mime)

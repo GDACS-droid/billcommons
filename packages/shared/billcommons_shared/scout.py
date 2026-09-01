@@ -23,7 +23,20 @@ OFFICIAL_FLORIDA_HOSTS = frozenset({
 })
 BROWSER_REQUIRED_FLORIDA_HOSTS = frozenset({"www.myfloridahouse.gov", "myfloridahouse.gov"})
 _DIRECT_BROWSER_SHELL_MARKERS = (b"request rejected", b"enable javascript", b"javascript challenge")
-_UNUSABLE_DIRECT_MARKERS = (b"captcha", b"login", b"maintenance")
+# These must identify an interstitial, not merely a normal navigation link.
+# Government pages commonly include `/login` and maintenance-policy links in
+# their header while the actual legislative body remains fully retrievable.
+_UNUSABLE_DIRECT_MARKERS = (
+    b"captcha",
+    b"<title>login",
+    b"login required",
+    b"please log in",
+    b"authentication required",
+    b"enable javascript login",
+    b"maintenance mode",
+    b"temporarily unavailable for maintenance",
+    b"enable javascript maintenance",
+)
 _SPACE_RE = re.compile(r"\s+")
 _BILL_RE = re.compile(r"\b(?:H\.?\s*B\.?|S\.?\s*B\.?|HB|SB)\s*(\d{1,6})\b", re.I)
 _TOPICAL_STOPWORDS = frozenset({

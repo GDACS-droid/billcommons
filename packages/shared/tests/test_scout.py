@@ -70,6 +70,15 @@ def test_direct_html_shells_are_tentative_only_and_host_policy_remains_the_gate(
     assert classify_direct_response(200, "text/html", b"Enable JavaScript CAPTCHA") == "failed"
 
 
+def test_direct_classifier_does_not_mistake_navigation_login_link_for_interstitial():
+    body = (
+        b'<header><a href="/tracker/login">Login</a></header>'
+        b'<main>HB 625 Last Action Chapter No. 2026-141</main>'
+    )
+    assert classify_direct_response(200, "text/html; charset=utf-8", body) == "usable"
+    assert classify_direct_response(200, "text/html", b"<title>Login</title>Login required") == "failed"
+
+
 def test_browser_required_redirect_is_house_only_and_bodyless():
     house = "https://www.myfloridahouse.gov/Sections/Bills/billsdetail.aspx"
     senate = "https://www.flsenate.gov/Session/Bill/2026/12"
