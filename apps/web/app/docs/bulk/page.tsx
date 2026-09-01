@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import CheckoutButton from "@/components/CheckoutButton";
 import PageHeader from "@/components/PageHeader";
 import SnapshotCheckoutButton from "@/components/SnapshotCheckoutButton";
 
@@ -159,30 +160,23 @@ LIMIT 20;`}</code>
 
       <section className="mt-8">
         <h2 className="text-base font-semibold text-slate-900">
-          Prefer a direct checkout link?
+          Ready to start?
         </h2>
         <p className="mt-2 text-sm text-slate-600">
-          Both flagship products can also be bought directly, no account
-          needed — we deliver by email within one business day:
+          Checkout is handled by Bill Commons and Stripe. No account is
+          required to begin; purchases are linked to the email entered at
+          checkout, and snapshot delivery follows by email within one business
+          day.
         </p>
-        <ul className="mt-3 space-y-2 text-sm text-slate-700">
-          <li>
-            <a
-              href="https://checkout.frontlinehq.vote/b/3cIdRbbp620l4wT3qJco005"
-              className="underline font-medium"
-            >
-              Full-corpus snapshot — $499 one-time
-            </a>
-          </li>
-          <li>
-            <a
-              href="https://checkout.frontlinehq.vote/b/3cI6oJ50IcEZ5AXf9rco006"
-              className="underline font-medium"
-            >
-              Scale API access — $299/month
-            </a>
-          </li>
-        </ul>
+        <div className="mt-4 flex flex-wrap gap-3">
+          <SnapshotCheckoutButton scope="full" label="Full corpus — $499 once" />
+          <CheckoutButton
+            plan="scale"
+            interval="monthly"
+            label="Scale API — $299/month"
+            className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+          />
+        </div>
       </section>
 
       <section className="mt-8">
