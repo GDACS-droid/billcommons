@@ -68,10 +68,14 @@ The native client records Scout opened, example selected, job created/started/pa
 
 ## Recommended X post (human sends after reviewing the public links)
 
-> Built Bill Commons Scout: an evidence-first government research agent that checks structured legislative data first, uses ordinary HTTP when it can, and launches a bounded @getsolari browser only for the messy browser-only government web. Every finding links to retained primary evidence, and every browser run is bounded and released. The demo ends with an actual live Solari cloud-browser proof. Demo: https://github.com/GDACS-droid/billcommons/blob/billcommons-scout/docs/scout/demo/scout-demo.mp4 Code: https://github.com/GDACS-droid/billcommons/tree/billcommons-scout @harrychow_
+Attach `docs/scout/demo/scout-demo.mp4` natively, then post this 277-character weighted draft:
+
+> Built Bill Commons Scout: evidence-first legislative research. It checks structured data and official HTTP first, then uses @getsolari for browser-only government portals. Findings retain primary evidence. Demo: https://github.com/GDACS-droid/billcommons/blob/billcommons-scout/docs/scout/demo/scout-demo.mp4 Code: https://github.com/GDACS-droid/billcommons/tree/billcommons-scout @harrychow_
 
 ## Recommended LinkedIn post (human sends after reviewing the public links)
 
-> Legislative databases are good at normalized bills and weak at the surrounding government web: agendas, amendments, fiscal notes, hearings, and older interactive portals. I built Bill Commons Scout as a permanent evidence-first research feature. It checks Bill Commons and direct official retrieval first, then uses a recorded Solari browser only when interaction is genuinely required. The system retains provenance, hashes evidence, coalesces duplicate research, limits spend, handles partial failures, and exposes replay as audit material—not as primary evidence. Code and a reproducible cookbook example: [links]. @Harry Chow / Solari
+Attach `docs/scout/demo/scout-demo.mp4`, then post:
+
+> Legislative databases are good at normalized bills and weak at the surrounding government web: agendas, amendments, fiscal notes, hearings, and older interactive portals. I built Bill Commons Scout as a permanent evidence-first research feature. It checks Bill Commons and direct official retrieval first, then uses a bounded Solari browser only when interaction is genuinely required. The system retains provenance, hashes evidence, coalesces duplicate research, limits spend, handles partial failures, and treats replay as audit material—not primary evidence. Demo and code: https://github.com/GDACS-droid/billcommons/tree/billcommons-scout Reproducible Solari example: https://github.com/GDACS-droid/solari-cookbook/tree/billcommons-scout-challenge/examples/bill-commons-scout-py @Harry Chow / Solari
 
 Required remaining public sequence: have a human review and publish the X or LinkedIn post, tagging `@harrychow_` and `@getsolari`. The public source, reviewed demo, live Solari SDK/provider, product browser-fallback/session lifecycle, and direct official finding-retention gaps are closed. Do not imply the Solari smoke discovered a bill development or that the known HB 625 action was previously unknown.
