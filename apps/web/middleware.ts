@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { CappedBucketMap } from "./lib/capped-bucket-map.mjs";
 import { checkDualBuckets } from "./lib/dual-bucket-check.mjs";
 import { canonicalIp, subnetBucket } from "./lib/subnet-bucket.mjs";
+import { isDarkScoutRoute } from "./lib/scoutAccess";
 
 // NOTE ON WHAT THIS FILE IS: this edge layer is best-effort and
 // PER-INSTANCE (see the module-scope caveat below) -- it is NOT the
@@ -134,6 +135,18 @@ function rateLimitedResponse(req: NextRequest, retryAfter: number): NextResponse
 }
 
 export function middleware(req: NextRequest) {
+  // A disabled Scout route must be dark at the edge. Calling notFound() from
+  // the statically generated page can still produce an HTTP 200 shell with
+  // Scout metadata in the prerendered payload, which is not a dark launch.
+  if (isDarkScoutRoute(req.nextUrl.pathname, process.env.NEXT_PUBLIC_SCOUT_ENABLED)) {
+    return new NextResponse("Not Found", {
+      status: 404,
+      headers: {
+        "Cache-Control": "no-store",
+        "Content-Type": "text/plain; charset=utf-8",
+      },
+    });
+  }
   const ip = resolveClientIp(req);
   if (ip === null) {
     // No public IP found on either header -- never share one bucket across
