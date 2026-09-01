@@ -27,6 +27,9 @@ def _app(monkeypatch):
     tables = [Base.metadata.tables[name] for name in (
         "api_customers", "scout_research_jobs", "scout_job_events", "scout_sources",
         "scout_findings", "scout_browser_sessions",
+        # New-job admission totals durable raw evidence before it writes a
+        # queue row, so the router fixture needs the production dependency.
+        "scout_raw_blobs",
     )]
     Base.metadata.create_all(engine, tables=tables)
     sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)

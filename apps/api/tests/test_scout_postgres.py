@@ -52,6 +52,7 @@ from billcommons_schema.models import (
     Jurisdiction,
     ScoutBrowserSession,
     ScoutFinding,
+    ScoutJobEvent,
     ScoutRawBlob,
     ScoutResearchJob,
     ScoutSource,
@@ -808,6 +809,190 @@ def test_postgres_platform_browser_reservation_and_terminal_release(
             _direct_request_for(second), Response(), db,
         )
         assert released["coalesced"] is False
+
+
+def test_postgres_retained_raw_evidence_refuses_new_job_before_insert(
+    monkeypatch, pg_scout: PostgresScoutHarness, scout_api
+):
+    """Immutable evidence already at capacity must reject before creating a job."""
+    customer = pg_scout.customer("raw-capacity-preflight")
+    retained = b"0123456789"
+    retained_key = content_hash(retained)
+    with pg_scout.sessions() as db:
+        db.add(ScoutRawBlob(sha256=retained_key, data=retained, metadata_json={}))
+        db.commit()
+    pg_scout.raw_blob_keys.append(retained_key)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DIRECT_BYTES", "10")
+    # Ten retained bytes plus one ten-byte worst-case reservation cannot fit.
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_RETAINED_RAWSTORE_BYTES", "19")
+    monkeypatch.setattr(scout, "_require_session", lambda _request, db: db.get(ApiCustomer, customer.id))
+
+    with pg_scout.sessions() as db:
+        with pytest.raises(HTTPException) as rejected:
+            scout.create_job(
+                scout.CreateScoutJob(query="raw capacity preflight", jurisdiction="FL"),
+                _direct_request(), Response(), db,
+            )
+        assert rejected.value.status_code == 429
+        assert rejected.value.detail["code"] == "scout_rawstore_capacity_limit"
+        assert db.scalar(select(func.count()).select_from(ScoutResearchJob)) == 0
+
+
+def test_postgres_raw_evidence_reservation_is_atomic_and_releases_on_terminal_job(
+    monkeypatch, pg_scout: PostgresScoutHarness, scout_api
+):
+    """Two owners may reserve exactly the global byte ceiling; N+1 cannot race past it."""
+    customers = [pg_scout.customer(f"raw-capacity-{number}") for number in range(3)]
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DIRECT_BYTES", "10")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_RETAINED_RAWSTORE_BYTES", "20")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_PLATFORM_MAX_ACTIVE_JOBS", "10")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_JOBS", "10")
+    monkeypatch.setattr(
+        scout,
+        "_require_session",
+        lambda request, db: db.get(ApiCustomer, uuid.UUID(request.headers["x-test-customer"])),
+    )
+    barrier = threading.Barrier(2)
+
+    def submit(index: int) -> tuple[str, dict | str]:
+        with pg_scout.sessions() as db:
+            barrier.wait(timeout=10)
+            try:
+                result = scout.create_job(
+                    scout.CreateScoutJob(query=f"raw reservation topic {index}", jurisdiction="FL"),
+                    _direct_request_for(customers[index]), Response(), db,
+                )
+                return "created", result
+            except HTTPException as exc:
+                return "limited", exc.detail["code"]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(submit, range(2)))
+    assert [outcome for outcome, _value in outcomes].count("created") == 2
+    created = [value for outcome, value in outcomes if outcome == "created"]
+
+    # A third owner gets a stable capacity error, rather than a third queued
+    # job that would make the worker discover the byte limit too late.
+    with pg_scout.sessions() as db:
+        with pytest.raises(HTTPException) as rejected:
+            scout.create_job(
+                scout.CreateScoutJob(query="raw reservation topic 2", jurisdiction="FL"),
+                _direct_request_for(customers[2]), Response(), db,
+            )
+        assert rejected.value.status_code == 429
+        assert rejected.value.detail["code"] == "scout_rawstore_capacity_limit"
+        assert db.scalar(select(func.count()).select_from(ScoutResearchJob).where(
+            ScoutResearchJob.status.in_(("queued", "running"))
+        )) == 2
+
+        completed = db.get(ScoutResearchJob, uuid.UUID(created[0]["job"]["id"]))
+        assert completed is not None
+        completed.status = "completed"
+        completed.completed_at = datetime.now(timezone.utc)
+        completed.fresh_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        db.commit()
+
+    # A terminal job releases its future-evidence reservation. Reusing either
+    # an active request or a fresh terminal result remains a zero-cost read,
+    # even while the two remaining reservations exactly fill the ceiling.
+    with pg_scout.sessions() as db:
+        released = scout.create_job(
+            scout.CreateScoutJob(query="raw reservation topic 2", jurisdiction="FL"),
+            _direct_request_for(customers[2]), Response(), db,
+        )
+        assert released["coalesced"] is False
+        before_reuse = db.scalar(select(func.count()).select_from(ScoutResearchJob))
+        active_reuse = scout.create_job(
+            scout.CreateScoutJob(query="raw reservation topic 1", jurisdiction="FL"),
+            _direct_request_for(customers[1]), Response(), db,
+        )
+        fresh_reuse = scout.create_job(
+            scout.CreateScoutJob(query="raw reservation topic 0", jurisdiction="FL"),
+            _direct_request_for(customers[0]), Response(), db,
+        )
+        assert active_reuse["coalesced"] is True and "cached" not in active_reuse
+        assert fresh_reuse["coalesced"] is True and fresh_reuse["cached"] is True
+        assert db.scalar(select(func.count()).select_from(ScoutResearchJob)) == before_reuse
+
+
+def test_postgres_runner_rawstore_capacity_failure_is_terminal_and_leaves_no_stage(
+    pg_scout: PostgresScoutHarness, scout_api
+):
+    """A late RawStore refusal must not leave a clickable source or partial claim."""
+    customer = pg_scout.customer("rawstore-runner-capacity")
+    baseline = b"capacity-filled"
+    baseline_key = content_hash(baseline)
+    body = b"<main>HB 701 Filed</main>"
+    with pg_scout.sessions() as db:
+        db.add(ScoutRawBlob(sha256=baseline_key, data=baseline, metadata_json={}))
+        job = ScoutResearchJob(
+            id=uuid.uuid4(),
+            customer_id=customer.id,
+            original_query="HB 701",
+            normalized_query="hb 701",
+            jurisdiction="FL",
+            cache_key=uuid.uuid4().hex,
+            status="running",
+            claim_token="rawstore-capacity-claim",
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            strategy={},
+            limits={"max_direct_bytes": len(body)},
+            usage={},
+        )
+        db.add(job)
+        db.commit()
+    pg_scout.raw_blob_keys.append(baseline_key)
+    runner = ScoutRunner(
+        pg_scout.sessions,
+        PostgresScoutRawStore(pg_scout.sessions, max_retained_bytes=len(baseline)),
+        MockResearchBrowserProvider(),
+        settings=ScoutSettings(enabled=True, max_direct_bytes=len(body)),
+    )
+
+    assert runner._persist_capture(
+        job.id,
+        "rawstore-capacity-claim",
+        None,
+        "HB 701",
+        "Filed",
+        {"identifier": "HB 701", "latest_action": "Filed"},
+        "https://www.flsenate.gov/Session/Bill/2026/701",
+        "direct",
+        200,
+        "text/html",
+        body,
+    ) is None
+
+    with pg_scout.sessions() as db:
+        persisted = db.get(ScoutResearchJob, job.id)
+        assert persisted is not None
+        assert (persisted.status, persisted.error_class, persisted.partial_success) == (
+            "failed", "rawstore_capacity_exceeded", False,
+        )
+        assert db.scalar(select(func.count()).select_from(ScoutSource).where(
+            ScoutSource.job_id == job.id
+        )) == 0
+        assert db.scalar(select(func.count()).select_from(ScoutFinding).where(
+            ScoutFinding.job_id == job.id
+        )) == 0
+        events = db.execute(
+            select(ScoutJobEvent).where(ScoutJobEvent.job_id == job.id).order_by(ScoutJobEvent.created_at)
+        ).scalars().all()
+        capacity_events = [event for event in events if event.kind == "rawstore_capacity_exceeded"]
+        assert len(capacity_events) == 1 and capacity_events[0].detail == {}
+        assert any(
+            event.kind == "finished"
+            and event.detail == {"status": "failed", "error_class": "rawstore_capacity_exceeded"}
+            for event in events
+        )
+        assert db.scalar(select(func.count()).select_from(ScoutRawBlob).where(
+            ScoutRawBlob.sha256 == baseline_key
+        )) == 1
+        assert db.scalar(select(func.count()).select_from(ScoutRawBlob).where(
+            ScoutRawBlob.sha256 == content_hash(body)
+        )) == 0
 
 
 def test_postgres_global_browser_cap_and_reaper_claim_are_cross_runner_atomic(tmp_path, pg_scout: PostgresScoutHarness):
