@@ -181,6 +181,29 @@ def test_checkout_guest_capable(client, monkeypatch):
     assert "customer" not in created and "customer_email" not in created
 
 
+def test_snapshot_checkout_restricts_p0_to_synchronous_card_payment(client, monkeypatch):
+    created = {}
+    # This test owns only the Checkout contract. Avoid consuming the module's
+    # shared anonymous-rate-limit bucket and changing later limiter tests.
+    monkeypatch.setattr(billing, "_enforce_checkout_rate_limit", lambda _request: None)
+
+    def _fake_create(**kwargs):
+        created.update(kwargs)
+        return {"url": "https://checkout.stripe.com/pay/cs_snapshot", "id": "cs_snapshot"}
+
+    monkeypatch.setattr(stripe.checkout.Session, "create", staticmethod(_fake_create))
+    res = client.post(
+        "/api/v1/billing/checkout/snapshot",
+        json={"scope": "full"},
+        headers={"Origin": ORIGIN},
+    )
+
+    assert res.status_code == 200
+    assert created["mode"] == "payment"
+    assert created["payment_method_types"] == ["card"]
+    assert created["metadata"] == {"app": "billcommons", "scope": "full"}
+
+
 def test_checkout_409_when_active_subscription_exists(client, app_and_db, monkeypatch):
     _, SessionLocal = app_and_db
     email = "already-paying@example.com"
@@ -243,6 +266,7 @@ def test_checkout_completed_mints_exactly_one_key(client, app_and_db, monkeypatc
     row = customer.execute(select(ApiCustomer).where(ApiCustomer.email == "new-buyer@example.com")).scalar_one()
     keys = customer.execute(select(ApiKey).where(ApiKey.customer_id == row.id)).scalars().all()
     customer.close()
+    assert row.stripe_customer_id == "cus_new"
     assert len(keys) == 1
     assert keys[0].plan == "builder"
     assert keys[0].reveal_ciphertext is not None  # B1: never revealed inline for the checkout path
@@ -547,6 +571,397 @@ def test_duplicate_subscription_canceled_at_stripe(client, app_and_db, monkeypat
     assert res2.status_code == 200
     assert res2.json()["outcome"] == "processed"
     assert canceled_ids == []
+
+
+@pytest.mark.parametrize("first_delivery", ["subscription", "checkout"])
+def test_guest_duplicate_keeps_incumbent_stripe_customer_for_portal_in_both_delivery_orders(
+    client, app_and_db, monkeypatch, first_delivery
+):
+    """An active guest Customer must not steal the local Portal mapping.
+
+    Stripe can deliver either the subscription event or Checkout completion
+    first.  In both cases the incoming Customer really does hold an active
+    remote subscription, but the local incumbent already has the one
+    authoritative subscription and paid key.  The duplicate must be
+    canceled once while the Portal continues to target the incumbent.
+    """
+    import billcommons_api.api_keys as api_keys_module
+
+    _, SessionLocal = app_and_db
+    email = "guest-duplicate@example.com"
+    incumbent_customer_id = "cus_incumbent_live"
+    guest_customer_id = "cus_guest_active"
+    incumbent_subscription_id = "sub_incumbent_live"
+    guest_subscription_id = "sub_guest_active"
+    customer_id = _make_customer(SessionLocal, email, incumbent_customer_id)
+    db = SessionLocal()
+    incumbent_subscription = ApiSubscription(
+        customer_id=customer_id,
+        stripe_subscription_id=incumbent_subscription_id,
+        plan="builder",
+        status="active",
+    )
+    db.add(incumbent_subscription)
+    db.flush()
+    incumbent_key, _ = api_keys_module.mint_key(db, customer_id, plan="builder")
+    incumbent_key.subscription_id = incumbent_subscription.id
+    db.commit()
+    db.close()
+
+    canceled_ids = []
+    portal_customers = []
+    monkeypatch.setattr(
+        stripe.Customer,
+        "retrieve",
+        staticmethod(
+            lambda stripe_customer_id: {
+                "id": stripe_customer_id,
+                "email": "Guest-Duplicate@Example.COM",
+                "metadata": {"app": "billcommons"},
+                "deleted": False,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "retrieve",
+        staticmethod(
+            lambda sub_id: {
+                "id": sub_id,
+                "customer": guest_customer_id,
+                "status": "active",
+                "metadata": {"app": "billcommons", "plan": "builder"},
+            }
+        ),
+    )
+    # The repair must decide from the incumbent local subscription before
+    # asking Stripe whether the guest Customer is active.  Raising here
+    # makes a future regression deterministic rather than fixture-dependent.
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "list",
+        staticmethod(lambda **kwargs: (_ for _ in ()).throw(AssertionError("guest authority lookup is unnecessary"))),
+    )
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled_ids.append(sub_id)))
+    monkeypatch.setattr(
+        stripe.billing_portal.Session,
+        "create",
+        staticmethod(lambda **kwargs: portal_customers.append(kwargs["customer"]) or {"url": "https://portal.example.test"}),
+    )
+
+    checkout = _stripe_event(
+        "checkout.session.completed",
+        {
+            "id": "cs_guest_duplicate",
+            "mode": "subscription",
+            "customer": guest_customer_id,
+            "subscription": guest_subscription_id,
+            "customer_details": {"email": "Guest-Duplicate@Example.COM"},
+            "metadata": {"app": "billcommons", "plan": "builder"},
+        },
+        created=100,
+    )
+    subscription_active = _stripe_event(
+        "customer.subscription.created",
+        {
+            "id": guest_subscription_id,
+            "customer": guest_customer_id,
+            "status": "active",
+            "metadata": {"app": "billcommons", "plan": "builder"},
+        },
+        created=100,
+    )
+    subscription_canceled = _stripe_event(
+        "customer.subscription.deleted",
+        {
+            "id": guest_subscription_id,
+            "customer": guest_customer_id,
+            "status": "canceled",
+            "metadata": {"app": "billcommons", "plan": "builder"},
+        },
+        created=101,
+    )
+
+    if first_delivery == "subscription":
+        first, second = subscription_active, checkout
+    else:
+        # Once Checkout's active remote subscription has been canceled, the
+        # follow-up Stripe subscription delivery is terminal.
+        first, second = checkout, subscription_canceled
+
+    assert _post_webhook(client, first).json()["outcome"] == "duplicate_subscription_canceled"
+    assert _post_webhook(client, second).status_code == 200
+
+    db = SessionLocal()
+    customer = db.execute(select(ApiCustomer).where(ApiCustomer.id == customer_id)).scalar_one()
+    keys = db.execute(select(ApiKey).where(ApiKey.customer_id == customer_id)).scalars().all()
+    incumbent = db.execute(
+        select(ApiSubscription).where(ApiSubscription.stripe_subscription_id == incumbent_subscription_id)
+    ).scalar_one()
+    duplicate = db.execute(
+        select(ApiSubscription).where(ApiSubscription.stripe_subscription_id == guest_subscription_id)
+    ).scalar_one()
+    db.close()
+    assert customer.stripe_customer_id == incumbent_customer_id
+    assert incumbent.status == "active"
+    assert duplicate.status == "canceled"
+    assert len(keys) == 1
+    assert keys[0].plan == "builder"
+    assert canceled_ids == [guest_subscription_id]
+
+    portal_headers = _log_in(client, SessionLocal, email)
+    portal = client.post("/api/v1/billing/portal", headers={"Origin": ORIGIN, **portal_headers})
+    assert portal.status_code == 200
+    assert portal_customers == [incumbent_customer_id]
+
+
+def test_remote_authority_conflict_preserves_incumbent_and_records_operator_condition(
+    client, app_and_db, monkeypatch
+):
+    """A stale local row must not let an active guest Customer steal Portal.
+
+    The old mapping has no local ApiSubscription (the exact stale/missing
+    state a failed historical webhook can create), while Stripe says both
+    Customers have live plans. There is no safe automatic winner, so retain
+    the incumbent and make the delivery operator-reconcilable rather than
+    minting a key or canceling either remote subscription.
+    """
+    _, SessionLocal = app_and_db
+    email = "remote-authority-conflict@example.com"
+    customer_id = _make_customer(SessionLocal, email, "cus_remote_incumbent")
+    list_calls: list[str] = []
+    canceled: list[str] = []
+
+    monkeypatch.setattr(
+        stripe.Customer,
+        "retrieve",
+        staticmethod(lambda stripe_customer_id: {"id": stripe_customer_id, "deleted": False}),
+    )
+
+    def _list(**kwargs):
+        list_calls.append(kwargs["customer"])
+        return {"data": [{"id": f"sub_{kwargs['customer']}", "status": kwargs["status"]}]}
+
+    monkeypatch.setattr(stripe.Subscription, "list", staticmethod(_list))
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled.append(sub_id)))
+
+    event = _stripe_event(
+        "checkout.session.completed",
+        {
+            "id": "cs_remote_authority_conflict",
+            "mode": "subscription",
+            "customer": "cus_guest_remote_authority",
+            "subscription": "sub_guest_remote_authority",
+            "customer_details": {"email": email},
+            "metadata": {"app": "billcommons", "plan": "builder"},
+        },
+    )
+    response = _post_webhook(client, event)
+
+    assert response.status_code == 200
+    assert response.json()["outcome"] == "permanent_error"
+    assert list_calls == ["cus_remote_incumbent", "cus_guest_remote_authority"]
+    assert canceled == []
+    db = SessionLocal()
+    customer = db.execute(select(ApiCustomer).where(ApiCustomer.id == customer_id)).scalar_one()
+    subscriptions = db.execute(select(ApiSubscription).where(ApiSubscription.customer_id == customer_id)).scalars().all()
+    keys = db.execute(select(ApiKey).where(ApiKey.customer_id == customer_id)).scalars().all()
+    db.close()
+    assert customer.stripe_customer_id == "cus_remote_incumbent"
+    assert subscriptions == []
+    assert keys == []
+    event_row = _stripe_event_row(SessionLocal, event["id"])
+    assert event_row is not None
+    assert event_row.outcome == "permanent_error"
+    assert "operator reconciliation required" in (event_row.last_error or "")
+
+
+@pytest.mark.parametrize(
+    ("incumbent_has_authority", "incoming_has_authority", "expected_customer"),
+    [
+        (True, False, "cus_remote_incumbent_only"),
+        (False, True, "cus_remote_incoming_only"),
+    ],
+)
+def test_remote_authority_reconciliation_only_repoints_when_incoming_is_sole_authority(
+    app_and_db, monkeypatch, incumbent_has_authority, incoming_has_authority, expected_customer
+):
+    """When local authority is missing, Stripe's two customer histories decide."""
+    _, SessionLocal = app_and_db
+    email = (
+        f"remote-authority-{str(incumbent_has_authority).lower()}-"
+        f"{str(incoming_has_authority).lower()}@example.com"
+    )
+    customer_id = _make_customer(SessionLocal, email, "cus_remote_incumbent_only")
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        stripe.Customer,
+        "retrieve",
+        staticmethod(lambda stripe_customer_id: {"id": stripe_customer_id, "deleted": False}),
+    )
+
+    def _list(**kwargs):
+        customer = kwargs["customer"]
+        calls.append(customer)
+        has_authority = (
+            incumbent_has_authority if customer == "cus_remote_incumbent_only" else incoming_has_authority
+        )
+        return {"data": [{"id": f"sub_{customer}"}]} if has_authority else {"data": []}
+
+    monkeypatch.setattr(stripe.Subscription, "list", staticmethod(_list))
+    db = SessionLocal()
+    customer = billing._upsert_customer_by_email(db, email, "cus_remote_incoming_only")
+    db.commit()
+    db.close()
+
+    assert customer.id == customer_id
+    assert customer.stripe_customer_id == expected_customer
+    # The helper checks every plan-authority status until it finds one. The
+    # first Customer is always reconciled before the incoming guest.
+    assert calls[0] == "cus_remote_incumbent_only"
+    assert "cus_remote_incoming_only" in calls
+
+
+def test_customer_reconciliation_uses_locked_fresh_customer_read(app_and_db, monkeypatch):
+    """The existing-email reconciliation query must carry FOR UPDATE.
+
+    SQLite intentionally has no row-lock syntax, so inspect SQLAlchemy's
+    dialect-neutral statement before it reaches the test database. This
+    prevents a future lockless pre-read regression without pretending SQLite
+    provides PostgreSQL concurrency semantics.
+    """
+    from sqlalchemy.orm import Session as OrmSession
+
+    _, SessionLocal = app_and_db
+    email = "locked-reconciliation@example.com"
+    _make_customer(SessionLocal, email, "cus_locked_incumbent")
+    monkeypatch.setattr(
+        stripe.Customer,
+        "retrieve",
+        staticmethod(lambda stripe_customer_id: {"id": stripe_customer_id, "deleted": False}),
+    )
+    monkeypatch.setattr(stripe.Subscription, "list", staticmethod(lambda **kwargs: {"data": []}))
+
+    original_execute = OrmSession.execute
+    locked_statements = []
+
+    def _record_execute(self, statement, *args, **kwargs):
+        if "FROM api_customers" in str(statement) and getattr(statement, "_for_update_arg", None) is not None:
+            locked_statements.append(statement)
+        return original_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(OrmSession, "execute", _record_execute)
+    db = SessionLocal()
+    billing._upsert_customer_by_email(db, email, "cus_locked_incoming")
+    db.rollback()
+    db.close()
+
+    assert len(locked_statements) == 1
+
+
+def test_postgres_concurrent_guest_reconciliation_keeps_first_authoritative_mapping(
+    app_and_db, monkeypatch
+):
+    """Real PostgreSQL lock proof, opt-in through the guarded billing harness.
+
+    The default SQLite harness exercises the exact logic above but cannot
+    model `SELECT ... FOR UPDATE`; this test activates only when
+    BILLCOMMONS_TEST_DATABASE_URL points at the harness's explicitly
+    disposable PostgreSQL database.
+    """
+    import threading
+
+    _, SessionLocal = app_and_db
+    dialect_probe = SessionLocal()
+    try:
+        dialect_name = dialect_probe.get_bind().dialect.name
+    finally:
+        dialect_probe.close()
+    if dialect_name != "postgresql":
+        pytest.skip("requires guarded BILLCOMMONS_TEST_DATABASE_URL PostgreSQL harness")
+
+    email = "concurrent-guest-reconciliation@example.com"
+    _make_customer(SessionLocal, email, "cus_concurrent_incumbent")
+    first_ready = threading.Event()
+    permit_first_commit = threading.Event()
+    second_finished = threading.Event()
+    failures: list[BaseException] = []
+    list_calls: list[str] = []
+    calls_lock = threading.Lock()
+
+    monkeypatch.setattr(
+        stripe.Customer,
+        "retrieve",
+        staticmethod(lambda stripe_customer_id: {"id": stripe_customer_id, "deleted": False}),
+    )
+
+    def _list(**kwargs):
+        customer = kwargs["customer"]
+        with calls_lock:
+            list_calls.append(customer)
+        if customer == "cus_concurrent_incumbent":
+            return {"data": []}
+        return {"data": [{"id": f"sub_{customer}"}]}
+
+    monkeypatch.setattr(stripe.Subscription, "list", staticmethod(_list))
+
+    def _first_worker():
+        db = SessionLocal()
+        try:
+            customer = billing._upsert_customer_by_email(db, email, "cus_concurrent_winner")
+            db.add(
+                ApiSubscription(
+                    customer_id=customer.id,
+                    stripe_subscription_id="sub_concurrent_winner",
+                    plan="builder",
+                    status="active",
+                )
+            )
+            first_ready.set()
+            assert permit_first_commit.wait(timeout=5)
+            db.commit()
+        except BaseException as exc:  # propagate cross-thread assertion failures
+            failures.append(exc)
+            db.rollback()
+        finally:
+            db.close()
+
+    def _second_worker():
+        db = SessionLocal()
+        try:
+            customer = billing._upsert_customer_by_email(db, email, "cus_concurrent_loser")
+            db.commit()
+            assert customer.stripe_customer_id == "cus_concurrent_winner"
+        except BaseException as exc:  # propagate cross-thread assertion failures
+            failures.append(exc)
+            db.rollback()
+        finally:
+            second_finished.set()
+            db.close()
+
+    first = threading.Thread(target=_first_worker)
+    second = threading.Thread(target=_second_worker)
+    first.start()
+    assert first_ready.wait(timeout=5)
+    second.start()
+    # The contender must wait on the ApiCustomer lock, not inspect its stale
+    # state and replace the mapping while the winner is still committing.
+    assert not second_finished.wait(timeout=0.2)
+    permit_first_commit.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert failures == []
+    assert "cus_concurrent_loser" not in list_calls
+    db = SessionLocal()
+    customer = db.execute(select(ApiCustomer).where(ApiCustomer.email == email)).scalar_one()
+    subscriptions = db.execute(select(ApiSubscription).where(ApiSubscription.customer_id == customer.id)).scalars().all()
+    db.close()
+    assert customer.stripe_customer_id == "cus_concurrent_winner"
+    assert [row.stripe_subscription_id for row in subscriptions] == ["sub_concurrent_winner"]
 
 
 # ---------------------------------------------------------------------------
@@ -1622,6 +2037,17 @@ def test_r3_6_checkout_missing_subscription_is_permanent_error(client, app_and_d
 def test_r3_9_deleted_stripe_customer_is_stale(app_and_db, monkeypatch):
     _, SessionLocal = app_and_db
     customer_id = _make_customer(SessionLocal, email="r3-deleted@example.com", stripe_customer_id="cus_deleted")
+    db = SessionLocal()
+    db.add(
+        ApiSubscription(
+            customer_id=customer_id,
+            stripe_subscription_id="sub_deleted_customer_recovery",
+            plan="builder",
+            status="active",
+        )
+    )
+    db.commit()
+    db.close()
     monkeypatch.setattr(
         stripe.Customer, "retrieve", staticmethod(lambda stripe_customer_id: {"id": stripe_customer_id, "deleted": True})
     )
