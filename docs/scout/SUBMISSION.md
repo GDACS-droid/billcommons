@@ -41,15 +41,16 @@ SOLARI_API_KEY=... .venv/bin/python main.py --live
 
 ## Truthful 30-second demo
 
-[Watch the 28.96-second challenge artifact](demo/scout-demo.mp4) or inspect its [poster](demo/scout-demo-poster.png). Its [provenance note](demo/README.md) and [sanitized audit record](demo/VERIFICATION.md) describe exactly which portions are deterministic and which contracts were separately checked live.
+[Watch the 33.96-second challenge artifact](demo/scout-demo.mp4) or inspect its [product poster](demo/scout-demo-poster.png) and [live Solari proof](demo/scout-solari-live-proof.png). Its [provenance note](demo/README.md) and [sanitized audit record](demo/VERIFICATION.md) describe exactly which portions are deterministic and which checks ran live.
 
 1. Open `/scout`: “Bill Commons already normalizes state legislation; Scout follows the official record beyond the database.”
 2. Submit a real Florida bill/query selected by the live preflight. Show backend-driven stages, never timers.
 3. Open the retained finding and official source. Say: “Every material claim has source metadata, an excerpt, and a content hash.”
 4. If and only if that run required Solari, open Agent Replay: “Ordinary HTTP runs first; Solari handles the browser-only portal and is always released.”
 5. Show sources checked, browser pages/actions/time, and cache state: “The same research is reusable, so spend is bounded.”
+6. End on the separate live Solari cloud-browser proof: “This is an actual bounded Solari session on an official Florida source; one page, one action, and cleanup confirmed.”
 
-The recorded UI sequence uses deterministic backend job states and says so on screen. The displayed HB 625 evidence contract separately passed an opt-in live-source test: the official page supported the exact bill/action before Scout retained it. The infrastructure evidence separately proves the official Online Sunshine SDK/provider browser/recording/replay/cleanup path, while a real MyFloridaHouse `302` route proved production router/browser/session persistence and durable release. Neither browser run asserted a bill finding, and the recording does not imply that Solari discovered the HB 625 action.
+The product UI sequence uses deterministic backend job states and says so on screen. The displayed HB 625 evidence contract separately passed an opt-in live-source test: the official page supported the exact bill/action before Scout retained it. The final five seconds show a separate actual, non-recorded Solari cloud-browser session after confirmed cleanup. Earlier infrastructure evidence proves the recorded Online Sunshine SDK/provider replay lifecycle, while a real MyFloridaHouse `302` route proved product router/browser/session persistence and durable release. None of the browser runs asserted the HB 625 finding.
 
 ## Product proof and analytics
 
@@ -67,7 +68,7 @@ The native client records Scout opened, example selected, job created/started/pa
 
 ## Recommended X post (human sends after reviewing the public links)
 
-> Built Bill Commons Scout: an evidence-first government research agent that checks structured legislative data first, uses ordinary HTTP when it can, and launches a recorded @getsolari browser only for the messy browser-only government web. Every finding links to retained primary evidence, and every browser run is bounded and released. Demo: https://github.com/GDACS-droid/billcommons/blob/billcommons-scout/docs/scout/demo/scout-demo.mp4 Code: https://github.com/GDACS-droid/billcommons/tree/billcommons-scout @harrychow_
+> Built Bill Commons Scout: an evidence-first government research agent that checks structured legislative data first, uses ordinary HTTP when it can, and launches a bounded @getsolari browser only for the messy browser-only government web. Every finding links to retained primary evidence, and every browser run is bounded and released. The demo ends with an actual live Solari cloud-browser proof. Demo: https://github.com/GDACS-droid/billcommons/blob/billcommons-scout/docs/scout/demo/scout-demo.mp4 Code: https://github.com/GDACS-droid/billcommons/tree/billcommons-scout @harrychow_
 
 ## Recommended LinkedIn post (human sends after reviewing the public links)
 

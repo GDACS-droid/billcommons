@@ -15,10 +15,12 @@ Updated 2026-09-01. This records checks actually run; it is not production-deplo
 ## Live evidence
 
 - Final post-repair Solari smoke: pass; official `www.leg.state.fl.us/robots.txt`; one page/action; 7,283 ms; recording enabled; replay available; cleanup confirmed; non-reversible session fingerprint `186a068f3858`.
+- Public live Solari visual proof: pass; same harmless official target; one page/action; 3,412 ms; recording deliberately disabled; cleanup confirmed; non-reversible session fingerprint `b0dd77da148d`; reviewed derivative contains no signed provider capability.
 - Earlier product-path Solari check: real MyFloridaHouse `302` escalation; exactly one durable browser session; terminal state `released`; deliberately no unsupported bill finding.
 - Live direct product check: the official Florida Senate HB 625 page supported both `HB 625` and `Chapter No. 2026-141`; Scout retained one direct source and one exact evidence-backed finding without launching the mock browser.
 - Chromium visual assertions and full-page captures passed at 1440x1100 and 390x844 using an explicitly labeled result fixture. This is rendering proof, not a claimed live discovery.
-- A 28.96-second H.264 challenge demo was recorded at 1440x900 with backend-driven deterministic job states, the separately live-verified HB 625 evidence contract, and explicit on-screen boundaries between that direct result and the separately verified Solari run. It is a local product/demo artifact, not a production recording.
+- A 33.96-second H.264 challenge demo was produced at 1440x900 with backend-driven deterministic product states, the separately live-verified HB 625 evidence contract, explicit claim boundaries, and a final five-second actual Solari cloud-browser proof. It is a challenge artifact, not a production recording.
+- Final demo verification: external Sonnet returned **SHIP** for comprehension, disclosure, and visible-secret checks. An independent frame reviewer initially returned **NO-SHIP** for contradictory future/past cleanup wording; the derivative was corrected without another live session, then fully decoded, re-scanned, re-sampled across the cut/ending, and returned **SHIP**. Current MP4 SHA-256 is `46f77fbcdf9be802bb7436f8d0d29d1ae765167d10eeb24b30a73631399a428c`.
 
 ## Verification actually run
 
@@ -32,7 +34,7 @@ Updated 2026-09-01. This records checks actually run; it is not production-deplo
 
 ## Git / preservation
 
-- Public feature branch: `billcommons-scout`; hardened code head `22a6376` (code repair `51e2588`), with the reviewed demo and sanitized verification record published in artifact commit `5e1e769`. The remote head was independently confirmed after push, and the replacement demo received an independent **SHIP** verdict.
+- Public feature branch: `billcommons-scout`; hardened code head `22a6376` (code repair `51e2588`), with the original reviewed demo in artifact commit `5e1e769`. The strengthened live-proof replacement has completed independent and external-model review and is pending its public branch push at this checkpoint.
 - Preserve unrelated modified ingest health/full-text files and untracked `.claude`, operations, outreach, rendered, monitoring, and data-request files.
 - Scout production schema migration, worker service creation, RawStore topology, monitoring/canary, backup/restore proof, feature enablement, and web deployment have not run.
 

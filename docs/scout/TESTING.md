@@ -17,8 +17,9 @@ Most coverage uses deterministic fixtures and the mock browser. Live tests are e
 - PostgreSQL Scout default: **5 passed, 2 skipped**; live tests are skipped unless explicitly enabled.
 - Live direct official-source finding: passed against Florida Senate HB 625; one direct source and one finding whose excerpt supports both the identifier and action; mock browser unused.
 - Final live Solari smoke: passed; one page/action, 7,283 ms, recording/replay available, cleanup confirmed.
+- Public live Solari visual proof: passed; one page/action, 3,412 ms, recording disabled, cleanup confirmed; derivative image contains only official robots text, fixed safe labels, and a non-reversible run reference.
 - Chromium visual assertions/captures: passed at 1440x1100 and 390x844 with an explicitly labeled fixture.
-- Demo artifact probe: passed; H.264, 1440x900, 28.96 seconds, 2,967,055 bytes. Poster/contact-sheet inspection confirmed the deterministic/live-source/Solari boundary labels are legible. An independent reviewer sampled 100 transition frames at 10 fps, verified one-second keyframes and clean decoding, and returned **SHIP** after the audit-link and transition repairs.
+- Final strengthened demo: H.264, 1440x900, 25 fps, 849 frames, 33.96 seconds, 3,076,083 bytes. External Sonnet returned **SHIP**. An independent reviewer found contradictory cleanup tense in the first derivative; after correction it fully decoded the replacement, sampled frames 716–747 and 816–848, verified both visible cleanup labels, scanned metadata/printable strings, matched hashes, and returned **SHIP**.
 - Broad isolated shared/API gate: **617 passed, 30 skipped, 45 failed**. It is not green; failures are documented in `STATUS.md` and must not be presented as Scout-pass evidence.
 
 ## Reproducible commands
