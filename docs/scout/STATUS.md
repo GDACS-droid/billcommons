@@ -31,13 +31,13 @@ Updated 2026-09-01. This records checks actually run; it is not production-deplo
 
 ## Git / preservation
 
-- Feature branch: `billcommons-scout`; final adversarial code repair commit `51e2588`; the documentation/visual commit remains before push.
+- Public feature branch: `billcommons-scout`; hardened source/artifact head `7b593e8` (code repair `51e2588`). Remote head was independently confirmed after push.
 - Preserve unrelated modified ingest health/full-text files and untracked `.claude`, operations, outreach, rendered, monitoring, and data-request files.
 - Scout production schema migration, worker service creation, RawStore topology, monitoring/canary, backup/restore proof, feature enablement, and web deployment have not run.
 
 ## Remaining
 
 - The independent post-repair review's cancellation/finalization, duplicate cleanup, terminal-reason, usage-audit, daily-spend admission, expired-lease, bounded-polling, and outcome-unknown cleanup findings are repaired and locally green. The final adversarial reproduce-or-ship verdict is **SHIP**.
-- Push the final feature head, record a truthful demo, then publish/tag `@harrychow_` and `@getsolari`.
+- Record and publish a truthful demo, then tag `@harrychow_` and `@getsolari`. The public source artifact is ready; `https://billcommons.org/scout` is not deployed and must not be presented as a live product demo.
 - General production Scout rollout remains a separately authorized operation and is **not ready** until the deployment runbook's service, storage, migration, backup, monitoring, canary, and rollback gates are satisfied.
 - Stripe webhook state in the correct Bill Commons live Stripe account remains unknown; an authorized account operator must inspect/configure it and safely place the signing secret in Railway before paid provisioning can be called end-to-end verified.
