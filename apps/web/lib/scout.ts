@@ -24,6 +24,9 @@ export interface ScoutSource {
   retrievedAt?: string;
   contentHash?: string;
   status?: string;
+  priorSourceId?: string;
+  changeKind?: string;
+  changeSummary?: string;
 }
 
 export interface ScoutFinding {
@@ -58,6 +61,13 @@ export interface ScoutUsage {
 export interface ScoutReplay {
   available: boolean;
   url?: string;
+}
+
+export interface ScoutAnalyticsFact {
+  /** Client-only deduplication key. It is never sent to analytics. */
+  key: string;
+  event: string;
+  properties: Record<string, string | number | boolean>;
 }
 
 export interface ScoutJob {
@@ -168,6 +178,9 @@ function normalizeSource(value: unknown, index: number): ScoutSource {
     retrievedAt: optionalString(item.retrieved_at),
     contentHash: optionalString(item.content_hash),
     status: text(item.status),
+    priorSourceId: optionalString(item.prior_source_id),
+    changeKind: optionalString(item.change_kind),
+    changeSummary: optionalString(item.change_summary),
   };
 }
 
@@ -250,6 +263,59 @@ export function normalizeScoutJob(payload: unknown): ScoutJob {
 
 export function isScoutTerminal(status: ScoutStatus): status is ScoutTerminalStatus {
   return ["complete", "partial", "failed", "canceled"].includes(status);
+}
+
+/**
+ * Return aggregate, privacy-safe product facts observed in a persisted job.
+ * Keys may contain opaque local row ids solely to avoid duplicate calls while
+ * polling; properties intentionally exclude job/customer/session ids, query
+ * text, URLs, titles, excerpts, hashes, and replay links.
+ */
+export function scoutAnalyticsFacts(job: ScoutJob): ScoutAnalyticsFact[] {
+  const facts: ScoutAnalyticsFact[] = [];
+  const base = { jurisdiction: job.jurisdiction };
+  const stages = new Set(job.events.map((event) => event.stage));
+  const directUsed = job.sources.some((source) => source.retrievalMechanism === "direct") ||
+    stages.has("direct_retrieval");
+  const browserUsed = job.browserSessions.length > 0 ||
+    job.sources.some((source) => source.retrievalMechanism === "browser");
+
+  if (stages.has("structured_candidates")) {
+    facts.push({ key: `${job.id}:existing-data`, event: "scout_existing_data_used", properties: base });
+  }
+  if (directUsed) {
+    facts.push({ key: `${job.id}:direct`, event: "scout_direct_retrieval_used", properties: base });
+  }
+  if (browserUsed) {
+    facts.push({
+      key: `${job.id}:solari`,
+      event: "scout_solari_used",
+      properties: {
+        ...base,
+        sessions: job.browserSessions.length,
+        runtime_seconds: Math.round((job.usage.browserRuntimeMs ?? 0) / 1000),
+      },
+    });
+  }
+  for (const source of job.sources) {
+    const properties = {
+      ...base,
+      mechanism: source.retrievalMechanism ?? "unknown",
+      official: Boolean(source.officialDomain),
+    };
+    facts.push({ key: `${job.id}:source:${source.id}`, event: "scout_source_discovered", properties });
+    if (source.contentHash) {
+      facts.push({ key: `${job.id}:document:${source.id}`, event: "scout_document_discovered", properties });
+    }
+  }
+  for (const finding of job.findings) {
+    facts.push({
+      key: `${job.id}:finding:${finding.id}`,
+      event: "scout_finding_generated",
+      properties: { ...base, confidence: finding.confidence ?? "unknown" },
+    });
+  }
+  return facts;
 }
 
 /** Presentational copy is centralized so terminal states cannot be overstated. */

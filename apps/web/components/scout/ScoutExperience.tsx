@@ -9,6 +9,7 @@ import {
   getScoutJob,
   getScoutReplay,
   isScoutTerminal,
+  scoutAnalyticsFacts,
   type ScoutFinding,
   type ScoutJob,
   scoutStatusSummary,
@@ -312,6 +313,12 @@ function JobDetails({ job, refreshError, onCancel, canceling }: { job: ScoutJob;
                     {shortHash(source.contentHash) ? (
                       <p className="mt-1 font-mono text-xs text-slate-500">Content hash: {shortHash(source.contentHash)}</p>
                     ) : null}
+                    {source.changeKind && source.changeSummary ? (
+                      <p className="mt-2 text-xs leading-5 text-slate-600">
+                        <span className="font-semibold text-slate-700">Change: {label(source.changeKind)}.</span>{" "}
+                        {source.changeSummary}
+                      </p>
+                    ) : null}
                   </div>
                   {source.canonicalUrl ? (
                     <a href={source.canonicalUrl} target="_blank" rel="noreferrer noopener" onClick={() => track("scout_evidence_opened", { control: "source_metadata" })} className="shrink-0 text-sm font-medium text-blue-800 underline underline-offset-2 hover:text-blue-600">
@@ -368,6 +375,7 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
   const [error, setError] = useState("");
   const [refreshError, setRefreshError] = useState("");
   const lastTrackedState = useRef("");
+  const trackedFacts = useRef(new Set<string>());
 
   useEffect(() => {
     track("scout_opened", { availability: enabled ? "enabled" : "disabled" });
@@ -375,12 +383,24 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
 
   useEffect(() => {
     if (!job) return;
+    for (const fact of scoutAnalyticsFacts(job)) {
+      if (trackedFacts.current.has(fact.key)) continue;
+      trackedFacts.current.add(fact.key);
+      track(fact.event, fact.properties);
+    }
     const stateKey = `${job.id}:${job.status}`;
     if (lastTrackedState.current === stateKey) return;
     lastTrackedState.current = stateKey;
     if (job.status === "running") track("scout_job_started", { jurisdiction: job.jurisdiction });
     if (job.status === "partial") track("scout_job_partial", { findings: job.findings.length });
-    if (job.status === "complete") track("scout_job_completed", { findings: job.findings.length });
+    if (job.status === "complete") track("scout_job_completed", {
+      jurisdiction: job.jurisdiction,
+      findings: job.findings.length,
+      sources: job.sources.length,
+      direct_used: job.sources.some((source) => source.retrievalMechanism === "direct"),
+      browser_used: job.browserSessions.length > 0,
+      browser_seconds: Math.round((job.usage.browserRuntimeMs ?? 0) / 1000),
+    });
     if (job.status === "failed") track("scout_job_failed", { errors: job.errors.length });
   }, [job]);
 
