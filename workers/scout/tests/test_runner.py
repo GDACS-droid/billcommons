@@ -17,7 +17,7 @@ from billcommons_schema.base import Base
 from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutResearchJob, ScoutSource
 from billcommons_shared.rawstore import FilesystemRawStore
 from billcommons_shared.safe_http import SsrfRejected
-from billcommons_shared.scout import BrowserCapture, BrowserRequest, ScoutSettings
+from billcommons_shared.scout import BrowserCapture, BrowserRequest, ScoutSettings, content_hash
 from billcommons_scout.providers import MockResearchBrowserProvider
 from billcommons_scout.providers import ProviderSessionPersistenceError
 from billcommons_scout.providers import SolariProviderError
@@ -127,7 +127,7 @@ def test_prior_source_is_scoped_to_the_current_customer(tmp_path):
         assert newest.prior_source_id == own_prior_id
 
 
-def test_exact_tenant_local_source_reuses_raw_and_supported_finding_without_reinspection(tmp_path, monkeypatch):
+def test_exact_tenant_local_source_reuses_raw_but_regenerates_current_finding(tmp_path, monkeypatch):
     body = b"<h1>HB 12 Filed</h1>"
     runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", body))
     url = "https://www.flsenate.gov/Session/Bill/2026/12"
@@ -152,7 +152,6 @@ def test_exact_tenant_local_source_reuses_raw_and_supported_finding_without_rein
         return original_put(*args, **kwargs)
 
     monkeypatch.setattr(runner.rawstore, "put", count_put)
-    monkeypatch.setattr(runner, "_evidence_excerpt", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("reuse must happen before extraction")))
     runner._candidates = lambda _db, _job: [_candidate(url=url)]
     runner.process(job_id)
     assert put_calls["count"] == 0
@@ -161,8 +160,66 @@ def test_exact_tenant_local_source_reuses_raw_and_supported_finding_without_rein
         finding = db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalar_one()
         events = [event.kind for event in db.execute(select(ScoutJobEvent).where(ScoutJobEvent.job_id == job_id)).scalars()]
         assert (source.retrieval_mechanism, source.raw_ref, source.prior_source_id, source.change_kind) == ("reused", raw_ref, prior_source_id, "unchanged")
-        assert (finding.title, finding.what_happened, finding.extractor_version) == ("prior title", "prior happened", "prior-v1")
-        assert "direct_retrieval" in events and "finding_persisted" in events and "document_inspected" not in events
+        assert (finding.title, finding.what_happened, finding.extractor_version) == ("HB 12: HB 12", "Structured Florida status: Filed", "scout-p0-1")
+        assert "direct_retrieval" in events and "finding_persisted" in events and "document_inspected" in events
+
+
+def test_exact_raw_reuse_regenerates_finding_when_structured_context_changes(tmp_path, monkeypatch):
+    body = b"<h1>HB 12 Filed Vetoed</h1>"
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", body))
+    url = "https://www.flsenate.gov/Session/Bill/2026/12"
+    current_bill_id = uuid.uuid4()
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        prior_job = ScoutResearchJob(id=uuid.uuid4(), customer_id=job.customer_id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="completed", strategy={}, limits={}, usage={})
+        db.add(prior_job)
+        db.flush()
+        raw_ref = runner.rawstore.put(body, {"source_url": url})
+        prior = ScoutSource(job_id=prior_job.id, canonical_url=url, title="Old title", official=True, retrieval_mechanism="direct", content_hash=content_hash(body), document_hash=content_hash(body), raw_ref=raw_ref)
+        db.add(prior)
+        db.flush()
+        db.add(ScoutFinding(job_id=prior_job.id, source_id=prior.id, title="HB 12: Old title", what_happened="Latest structured action: Filed", excerpt="HB 12 Filed", excerpt_hash="old", confidence="high", extractor_version="old-extractor"))
+        db.commit()
+    original_put = runner.rawstore.put
+    calls = {"put": 0}
+    monkeypatch.setattr(runner.rawstore, "put", lambda *args, **kwargs: (calls.__setitem__("put", calls["put"] + 1), original_put(*args, **kwargs))[1])
+    metadata = {"identifier": "HB 12", "latest_action": "Vetoed", "latest_action_date": date(2026, 6, 1)}
+    source_id = runner._persist_capture(job_id, "initial-claim", current_bill_id, "Current title", "vetoed", metadata, url, "direct", 200, "text/html", body)
+    assert source_id is not None and calls["put"] == 0
+    with sessions() as db:
+        source = db.get(ScoutSource, source_id)
+        finding = db.execute(select(ScoutFinding).where(ScoutFinding.source_id == source_id)).scalar_one()
+        assert (source.retrieval_mechanism, source.title, source.raw_ref) == ("reused", "Current title", raw_ref)
+        assert (finding.title, finding.what_happened, finding.bill_id, finding.extractor_version) == (
+            "HB 12: Current title", "Latest structured action (2026-06-01): Vetoed", current_bill_id, "scout-p0-1",
+        )
+
+
+def test_a_to_b_to_a_reversion_compares_to_latest_url_observation_and_reuses_old_blob(tmp_path, monkeypatch):
+    runner, sessions, job_a = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", b""))
+    url = "https://www.flsenate.gov/Session/Bill/2026/12"
+    metadata = {"identifier": "HB 12", "latest_action": "Filed"}
+    body_a = b"HB 12 Filed version A"
+    body_b = b"HB 12 Filed version B"
+    source_a = runner._persist_capture(job_a, "initial-claim", None, "HB 12", "Filed", metadata, url, "direct", 200, "text/html", body_a)
+    assert source_a is not None
+    with sessions() as db:
+        first = db.get(ScoutResearchJob, job_a)
+        job_b = ScoutResearchJob(id=uuid.uuid4(), customer_id=first.customer_id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="claim-b", strategy={}, limits={}, usage={})
+        job_c = ScoutResearchJob(id=uuid.uuid4(), customer_id=first.customer_id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="claim-c", strategy={}, limits={}, usage={})
+        db.add_all((job_b, job_c))
+        db.commit()
+    source_b = runner._persist_capture(job_b.id, "claim-b", None, "HB 12", "Filed", metadata, url, "direct", 200, "text/html", body_b)
+    assert source_b is not None
+    original_put = runner.rawstore.put
+    calls = {"put": 0}
+    monkeypatch.setattr(runner.rawstore, "put", lambda *args, **kwargs: (calls.__setitem__("put", calls["put"] + 1), original_put(*args, **kwargs))[1])
+    source_c = runner._persist_capture(job_c.id, "claim-c", None, "HB 12", "Filed", metadata, url, "direct", 200, "text/html", body_a)
+    assert source_c is not None and calls["put"] == 0
+    with sessions() as db:
+        reverted = db.get(ScoutSource, source_c)
+        assert reverted.raw_ref == db.get(ScoutSource, source_a).raw_ref
+        assert (reverted.prior_source_id, reverted.change_kind) == (source_b, "material")
 
 
 def test_identical_other_tenant_source_is_not_reused(tmp_path, monkeypatch):
