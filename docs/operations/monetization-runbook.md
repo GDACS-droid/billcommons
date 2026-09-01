@@ -238,6 +238,13 @@ mode for local development):
   | `bc_snapshot_state` | $99 | `STRIPE_PRICE_SNAPSHOT_STATE` |
   | `bc_snapshot_full` | $499 | `STRIPE_PRICE_SNAPSHOT_FULL` |
 
+Snapshot Checkout currently sends `payment_method_types=["card"]`. That is a
+deliberate P0 fulfillment boundary: the webhook provisions only a paid
+`checkout.session.completed` event and does not subscribe to
+`checkout.session.async_payment_succeeded`. Do not enable delayed payment
+methods until that event is implemented and covered by an idempotent
+entitlement/notification test.
+
 Set `statement_descriptor_suffix = BILLCOMMONS` on both Products. The app
 reads price IDs from environment variables (never a `lookup_key` fetch at
 boot) -- copy each Price's `price_...` id into the matching Railway env var
