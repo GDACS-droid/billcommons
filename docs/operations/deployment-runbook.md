@@ -334,8 +334,13 @@ Current behavior is deliberately conservative:
   browser action.
 - `SIGTERM`/`SIGINT` asks the worker loop to drain: it stops before its next
   claim and lets the in-progress `run_once` follow its normal cleanup path.
-  Set a platform termination grace period that exceeds the configured browser
-  wall/cleanup budget; the repository cannot enforce a Railway stop timeout.
+  Set `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=300` for the reviewed P0 limits.
+  The grace must cover the whole serial job, not only one browser call: with
+  five external-request reservations, 15-second direct transport, and up to
+  two browser escalations at 60 seconds plus two 10-second cleanup boundaries,
+  the modeled upper bound is about 205 seconds before database overhead. Rework
+  and re-review the grace whenever any of those ceilings increases; the
+  repository cannot otherwise enforce a Railway stop timeout.
 - A running job has a lease/heartbeat. Existing work should be allowed to
   reach a terminal state, or become lease-expired; operator timing must cover
   the configured browser wall time, cleanup timeout, and lease.
