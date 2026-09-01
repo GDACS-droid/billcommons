@@ -95,8 +95,15 @@ body {
 
 .surface-card {
   border: 1px solid #e2e8f0;
-  border-radius: 0.375rem;
+  border-radius: 0.125rem;
   background: #ffffff;
+}
+
+/* The site shell intentionally uses a plain disclosure control rather than a
+   decorative menu trigger. Keep this scoped so content disclosures retain
+   their native marker. */
+.site-nav-summary::-webkit-details-marker {
+  display: none;
 }
 
 .data-table {

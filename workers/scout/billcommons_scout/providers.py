@@ -142,7 +142,15 @@ class SolariResearchBrowserProvider:
         return asyncio.run(self._capture_with_cleanup(request, on_started))
 
     async def _capture_with_cleanup(self, request: BrowserRequest, on_started) -> BrowserCapture:
-        """Drive work under the job timeout, then clean up outside that timeout."""
+        """Drive work under the job timeout, then close local SDK resources.
+
+        Remote-session release has exactly one owner: ``ScoutRunner``.  Once
+        ``on_started`` durably records the opaque provider ID, the runner's
+        finally path releases it on success, failure, timeout, and cancellation.
+        Keeping remote release out of this adapter prevents a successful
+        capture from being released here and then released a second time by
+        the lifecycle ledger.
+        """
         state: dict[str, Any] = {
             "phase": "create", "session_id": None, "browser": None,
             "context": None, "playwright": None, "solari": None,
@@ -150,7 +158,8 @@ class SolariResearchBrowserProvider:
         }
         try:
             # This intentionally bounds connect/navigation/extraction together,
-            # but not cleanup: cancellation of the drive must not skip release.
+            # but not local teardown. The runner's lifecycle finally owns the
+            # independently bounded remote release.
             return await asyncio.wait_for(self._capture(request, on_started, state), timeout=request.wall_seconds)
         except asyncio.CancelledError:
             raise
@@ -165,7 +174,7 @@ class SolariResearchBrowserProvider:
         except Exception as exc:
             raise SolariProviderError(str(state["phase"]), exc) from exc
         finally:
-            await self._cleanup_capture(
+            await self._close_capture_clients(
                 state, cleanup_seconds=request.cleanup_seconds or self._cleanup_seconds
             )
 
@@ -177,7 +186,14 @@ class SolariResearchBrowserProvider:
             raise RuntimeError("solari_sdk_unavailable") from exc
         from patchright.async_api import async_playwright
 
-        solari = Solari(api_key=self._api_key, timeout_ms=request.wall_seconds * 1000)
+        # Session creation is not safely retryable without a provider
+        # idempotency key: a lost success response could otherwise create a
+        # second paid browser whose ID Scout never received. Keep it one-shot.
+        solari = Solari(
+            api_key=self._api_key,
+            timeout_ms=request.wall_seconds * 1000,
+            max_attempts=1,
+        )
         state["solari"] = solari
         state["phase"] = "create"
         session = await solari.sessions.create(recording=True)
@@ -190,7 +206,8 @@ class SolariResearchBrowserProvider:
         try:
             on_started(session_id)
         except Exception as exc:
-            # The provider will self-clean in the enclosing finally block.
+            # The runner receives the ID through this typed exception and
+            # performs the single remote release in its lifecycle finally.
             raise ProviderSessionPersistenceError(session_id) from exc
 
         state["phase"] = "connect"
@@ -289,8 +306,12 @@ class SolariResearchBrowserProvider:
             routed_requests=int(state["routed_requests"]),
         )
 
-    async def _cleanup_capture(self, state: dict[str, Any], *, cleanup_seconds: int) -> None:
-        """Release the remote session inside one request-time cleanup budget."""
+    async def _close_capture_clients(self, state: dict[str, Any], *, cleanup_seconds: int) -> None:
+        """Close local browser/SDK clients inside one cleanup budget.
+
+        This deliberately does not call a remote session release endpoint;
+        ``ScoutRunner`` owns that state transition exactly once.
+        """
         deadline = time.monotonic() + cleanup_seconds
 
         async def bounded(awaitable) -> None:
@@ -306,11 +327,6 @@ class SolariResearchBrowserProvider:
                 pass
 
         solari = state.get("solari")
-        session_id = state.get("session_id")
-        # Remote release comes first: local browser teardown must not spend the
-        # bounded provider-session lifetime and defer the paid-session close.
-        if solari is not None and session_id:
-            await bounded(solari.sessions.release_and_wait(session_id))
         context = state.get("context")
         if context is not None:
             await bounded(context.close())
@@ -320,17 +336,6 @@ class SolariResearchBrowserProvider:
         playwright = state.get("playwright")
         if playwright is not None:
             await bounded(playwright.stop())
-        if solari is not None and session_id:
-            replay_url = None
-            try:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError
-                replay = await asyncio.wait_for(solari.sessions.get_replay_url(session_id), timeout=min(1.0, remaining))
-                replay_url = str(getattr(replay, "url", replay))
-            except Exception:
-                pass
-            self._closed_replays[session_id] = replay_url
         if solari is not None:
             await bounded(solari.close())
 
@@ -356,7 +361,11 @@ class SolariResearchBrowserProvider:
             from solari_browser import Solari
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("solari_sdk_unavailable") from exc
-        async with Solari(api_key=self._api_key, timeout_ms=cleanup_seconds * 1000) as solari:
+        async with Solari(
+            api_key=self._api_key,
+            timeout_ms=cleanup_seconds * 1000,
+            max_attempts=1,
+        ) as solari:
             await solari.sessions.release_and_wait(provider_session_id)
             replay_url = None
             deadline = time.monotonic() + max(0.0, cleanup_seconds - 1.0)
@@ -375,7 +384,11 @@ class SolariResearchBrowserProvider:
             from solari_browser import Solari
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("solari_sdk_unavailable") from exc
-        async with Solari(api_key=self._api_key, timeout_ms=self._cleanup_seconds * 1000) as solari:
+        async with Solari(
+            api_key=self._api_key,
+            timeout_ms=self._cleanup_seconds * 1000,
+            max_attempts=1,
+        ) as solari:
             replay = await asyncio.wait_for(solari.sessions.get_replay_url(provider_session_id), timeout=self._cleanup_seconds)
             replay_url = str(getattr(replay, "url", replay))
             self._closed_replays[provider_session_id] = replay_url

@@ -1,48 +1,75 @@
-# Scout status / durable checkpoint
+# Bill Commons Scout status
 
-Updated 2026-09-01. This records checks actually run; it is not production-deployment authority.
+Updated 2026-09-01.
 
-## Completed
+## Decision
 
-- Inspected the public Apache-2.0 Bill Commons monorepo and followed its Next.js 15, FastAPI, PostgreSQL/Alembic, Postgres-queue, Railway/Vercel, `ApiCustomer`, RawStore, Resend, Stripe, and Vercel Analytics conventions.
-- Implemented native authenticated `/scout`, owner-scoped API/job lifecycle, dedicated worker, structured-data-first routing, conservative Florida direct retrieval, an isolated Solari provider plus deterministic mock, immutable evidence/provenance, cache/dedupe/change primitives, analytics, partial results, and dark-launch controls.
-- Added bounded requests/retries/bytes/time/pages/actions/routed requests/concurrency/daily usage, DNS-pinned URL admission, private-network and redirect rejection, plain-text rendering, claim fencing, cancellation, browser cleanup/reaping, and replay authorization.
-- Repaired adversarial findings covering false terminal success after request exhaustion, late callback revival of abandoned browser slots, concurrent provenance forks, one-shot polling after transient errors, pre-provider usage inflation, provider-reported routed-request overruns, and false login-page classification.
-- Repaired the final browser-wallet review findings: jobs now reserve drive time plus both provider and runner cleanup windows, cleanup bounds are persisted and honored through normal/reaper/recovery paths, cross-midnight and missing-runtime sessions cannot escape the daily cap, legacy rows conservatively hold the full cap during rolling upgrades, infeasible enabled configurations fail at app construction, and old/new provider release signatures are dispatched once without a post-I/O retry.
-- Verified current first-party Solari and Congress.gov documentation. Congress.gov v3 live authentication passed without exposing the key; the account response reported a 20,000 request/hour limit.
-- Published the sanitized cookbook example at `GDACS-droid/solari-cookbook`, branch `billcommons-scout-challenge`, commit `1095a02`.
-- The production API-only Stripe billing hotfix was separately preflighted and deployed successfully. It did not deploy Scout, run a migration, change prices, or configure a webhook.
+- Challenge artifact: **SHIP** once the owner authorizes the post.
+- Scout application code: **READY FOR DARK DEPLOY / PRIVATE CANARY**.
+- Public production enablement: **CONDITIONAL** on authorized Railway inventory,
+  one production migration runner, and a current backup/restore drill. No deployment
+  was attempted.
 
-## Live evidence
+## Completed milestones
 
-- Final post-repair Solari smoke: pass; official `www.leg.state.fl.us/robots.txt`; one page/action; 7,283 ms; recording enabled; replay available; cleanup confirmed; non-reversible session fingerprint `186a068f3858`.
-- Public live Solari visual proof: pass; same harmless official target; one page/action; 3,412 ms; recording deliberately disabled; cleanup confirmed; non-reversible session fingerprint `b0dd77da148d`; reviewed derivative contains no signed provider capability.
-- Earlier product-path Solari check: real MyFloridaHouse `302` escalation; exactly one durable browser session; terminal state `released`; deliberately no unsupported bill finding.
-- Live direct product check: the official Florida Senate HB 625 page supported both `HB 625` and `Chapter No. 2026-141`; Scout retained one direct source and one exact evidence-backed finding without launching the mock browser.
-- Chromium visual assertions and full-page captures passed at 1440x1100 and 390x844 using an explicitly labeled result fixture. This is rendering proof, not a claimed live discovery.
-- A 33.96-second H.264 challenge demo was produced at 1440x900 with backend-driven deterministic product states, the separately live-verified HB 625 evidence contract, explicit claim boundaries, and a final five-second actual Solari cloud-browser proof. It is a challenge artifact, not a production recording.
-- Final demo verification: external Sonnet returned **SHIP** for comprehension, disclosure, and visible-secret checks. An independent frame reviewer initially returned **NO-SHIP** for contradictory future/past cleanup wording; the derivative was corrected without another live session, then fully decoded, re-scanned, re-sampled across the cut/ending, and returned **SHIP**. Current MP4 SHA-256 is `46f77fbcdf9be802bb7436f8d0d29d1ae765167d10eeb24b30a73631399a428c`.
+- M0–M1: repository architecture and product/security plan documented.
+- M2–M6: durable owned jobs, queue/events, structured-first router, bounded direct
+  retrieval, isolated Solari provider, immutable provenance, partial outcomes.
+- M7: native evidence-first `/scout` UI with restrained civic/legal visual language.
+- M8: query/source dedupe, content hashes, cache, freshness, and change relations.
+- M9–M10: SSRF/redirect/MIME/size/injection/IDOR/cost/cleanup tests and deterministic E2E.
+- M11–M12: real Solari Online Sunshine navigation and live Florida Senate HB 625
+  bill-page → analysis discovery.
+- M13–M14: existing Vercel Analytics events and desktop/mobile production renders.
+- M15–M17: guarded broad regression, independent adversarial/visual reviews,
+  sanitized 20.16-second demo, and production release runbook.
 
-## Verification actually run
+## Current implementation facts
 
-- Earlier full focused Scout Python gate: **226 passed, 2 live skipped**, 9 warnings. After the final browser-budget repair, the directly affected API/shared/worker gate passed **101 tests with 1 opt-in live skip**; the freshly migrated guarded PostgreSQL suite passed **6 tests with 2 opt-in live skips**.
-- Web: **8 passed**; targeted ESLint passed; TypeScript/Next production build passed and emitted `/scout`. Optional build-time localhost API fetches logged nonfatal connection refusals.
-- Guarded PostgreSQL Scout suite: **6 passed, 2 live skipped** in the final migrated disposable-database run. The opt-in live direct HB 625 test separately passed.
-- Billing/API-key/quota/rate-limit verification on disposable PostgreSQL: **227 passed**, 1 warning. Billing unit gate: **78 passed, 1 skipped**; real PostgreSQL reconciliation concurrency: **1 passed**.
-- Broad isolated shared/API regression is **not green**: **617 passed, 30 skipped, 45 failed**. Most failures require a populated legislative corpus or expose monolithic rate-limit state; a legacy `substituted` mortality-status mismatch also remains. Do not report this gate as passing.
-- A supplemental mixed Scout/security/change-feed run was interrupted during the unrelated `test_changes_and_batch` shared `TestClient` teardown after **168 passed, 1 skipped** and no reported assertion failure. The change-feed file also hung during fixture teardown when run alone; it is not counted as a passing regression gate.
-- Congress.gov authentication helper passed live. The final bounded Solari check passed as recorded above.
-- The explicitly named local disposable PostgreSQL database and temporary least-privilege `alberto` test role created for the final guarded gate were dropped after the run.
+- New jobs require authentication and the server feature flag. They also require
+  either a named `BILLCOMMONS_SCOUT_CANARY_EMAILS` cohort or the separate explicit
+  `BILLCOMMONS_SCOUT_ALLOW_PUBLIC=true` acknowledgement.
+- Equivalent active/fresh queries coalesce per owner/jurisdiction/cache key.
+- Florida checks Bill Commons first, then admitted Senate sources. A bill page can
+  discover same-session/same-bill official analyses and amendments; ordinary HTTP
+  remains preferred.
+- Browser escalation is allowlisted and quota-bound. Every provider session has a
+  durable row, recording state, usage, bounded cleanup, and reaper recovery.
+- Scout evidence uses PostgreSQL `scout_raw_blobs`, not a cross-service filesystem
+  mount. Blobs are capped at 2 MiB in application and schema, and expired unverified
+  stages/orphans are collected without racing live finalization. Migration `0025` is
+  additive and locally proven.
+- PDF extraction never runs in the Scout worker process; a spawned child is bounded
+  by wall time, CPU/address space, pages, and returned text.
+- Findings render as plain text and retain official URL, retrieval mechanism, MIME/
+  status, content hash, excerpt, retrieval time, confidence, and entity linkage.
 
-## Git / preservation
+## Latest verification
 
-- Public feature branch: `billcommons-scout`; final browser-budget code repair `f09c295`, with the strengthened live-proof demo published in artifact commit `9423090`. Independent and external-model reviews returned **SHIP**, and immutable raw demo/proof URLs returned HTTP 200 at their documented byte sizes.
-- Preserve unrelated modified ingest health/full-text files and untracked `.claude`, operations, outreach, rendered, monitoring, and data-request files.
-- Scout production schema migration, worker service creation, RawStore topology, monitoring/canary, backup/restore proof, feature enablement, and web deployment have not run.
+- Native isolated suites total **801 passed, 8 skipped, 11 dependency/fixture
+  deprecation warnings**: API 563 passed / 8 skipped, shared 153 passed, Scout
+  worker 85 passed.
+- Web: **8 passed**; targeted ESLint, TypeScript, and Next production build passed.
+- PostgreSQL store: concurrent two-instance put, database size constraint, and an
+  API-created job read by a fresh store instance passed.
+- Live Florida discovery: passed; HB 625 bill evidence and at least one official
+  analysis were retained without browser fallback.
+- Live public Solari: passed in 10.137s; 1 page, 2 actions, 38 routed requests;
+  recording/replay available; cleanup confirmed.
+- Live Bill Commons provider path after lifecycle repair: passed in 7.86s with one
+  real Solari session and a released terminal ledger state.
+- Demo: H.264 1440×900, 20.16s, 504 frames, fully decoded and visually inspected.
 
-## Remaining
+## Remaining human/external release evidence
 
-- The independent post-repair review's cancellation/finalization, duplicate cleanup, terminal-reason, usage-audit, daily-spend admission, expired-lease, bounded-polling, and outcome-unknown cleanup findings are repaired and locally green. The final adversarial reproduce-or-ship verdict is **SHIP**.
-- Have a human review and send the prepared X or LinkedIn post tagging `@harrychow_` and `@getsolari`. The public source artifact and reviewed recording are published; `https://billcommons.org/scout` is not deployed and must not be presented as a live product demo.
-- General production Scout rollout remains a separately authorized operation and is **not ready** until the deployment runbook's service, storage, migration, backup, monitoring, canary, and rollback gates are satisfied.
-- Stripe webhook state in the correct Bill Commons live Stripe account remains unknown; an authorized account operator must inspect/configure it and safely place the signing secret in Railway before paid provisioning can be called end-to-end verified.
+1. Confirm the real Railway Scout service, command, artifact, replicas, termination
+   grace, and dark environment variables.
+2. Name one authorized migration runner and record production pre/post revision.
+3. Create and restore a current production dump to a fresh disposable target; verify
+   a Scout blob hashes to its key.
+4. Before all-account expansion, record global queue/blob capacity and enable the
+   separate public/nav flags deliberately.
+5. Explicitly authorize deployment and later social publication.
+
+Stripe live-account webhook access is tracked separately and does not gate Scout.
+See [CLOSEOUT.md](CLOSEOUT.md) for every final disposition.

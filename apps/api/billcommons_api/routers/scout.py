@@ -49,6 +49,22 @@ def _require_enabled() -> ScoutSettings:
     return settings
 
 
+def _require_canary(customer: ApiCustomer, settings: ScoutSettings) -> None:
+    """Admit new work only for the configured private-canary cohort.
+
+    Existing owner-scoped jobs remain readable/cancelable if a customer is
+    later removed from the cohort; rollout controls must not strand retained
+    evidence or weaken ownership checks.
+    """
+    if settings.canary_emails and customer.email.strip().casefold() not in settings.canary_emails:
+        raise not_found("scout_not_available", "Scout is not available for this account.")
+    if not settings.canary_emails and not settings.allow_public_rollout:
+        # Enabling the worker/API flag alone must never accidentally expose an
+        # unbounded all-account rollout. Public expansion is a separate,
+        # deliberate capacity/cost decision.
+        raise not_found("scout_canary_not_configured", "Scout is not available for this account.")
+
+
 def _job_for_owner(db: Session, customer: ApiCustomer, job_id: uuid.UUID, *, lock: bool = False) -> ScoutResearchJob:
     stmt = select(ScoutResearchJob).where(
         ScoutResearchJob.id == job_id, ScoutResearchJob.customer_id == customer.id
@@ -231,6 +247,7 @@ def create_job(
     settings = _require_enabled()
     _check_origin(request)
     customer = _require_session(request, db)
+    _require_canary(customer, settings)
     try:
         jurisdiction = normalize_jurisdiction(body.jurisdiction)
         normalized = normalize_query(body.query, max_chars=settings.max_query_chars)
@@ -334,6 +351,8 @@ def create_job(
         if session.runtime_ms is not None and session.provider_session_id
         else _browser_session_reservation_ms(job, settings)
         if session.provider_session_id
+        else _browser_session_reservation_ms(job, settings)
+        if (session.error_class or "").startswith("create_outcome_unknown")
         else 0
         for session, job in terminal_sessions
     )
@@ -360,7 +379,7 @@ def create_job(
         jurisdiction=jurisdiction,
         cache_key=key,
         strategy={"adapter": "florida_p0", "mode": "structured_first"},
-        limits={"max_pages": settings.max_pages, "max_actions": settings.max_actions, "max_external_requests": settings.max_external_requests, "max_routed_requests": settings.max_browser_routed_requests, "max_retries": settings.max_retries, "daily_jobs": settings.per_customer_daily_jobs, "daily_browser_seconds": settings.per_customer_daily_browser_seconds, "browser_wall_seconds": settings.browser_wall_seconds, "browser_cleanup_seconds": settings.browser_cleanup_seconds, "daily_browser_reservation_ms": settings.max_external_requests * (settings.browser_wall_seconds + 2 * settings.browser_cleanup_seconds) * 1000},
+        limits={"max_pages": settings.max_pages, "max_actions": settings.max_actions, "max_external_requests": settings.max_external_requests, "max_related_documents": settings.max_related_documents, "max_direct_bytes": settings.max_direct_bytes, "max_pdf_pages": settings.max_pdf_pages, "max_pdf_text_chars": settings.max_pdf_text_chars, "max_pdf_extract_seconds": settings.max_pdf_extract_seconds, "max_pdf_extract_memory_bytes": settings.max_pdf_extract_memory_bytes, "max_pdf_extract_cpu_seconds": settings.max_pdf_extract_cpu_seconds, "max_routed_requests": settings.max_browser_routed_requests, "max_retries": settings.max_retries, "daily_jobs": settings.per_customer_daily_jobs, "daily_browser_seconds": settings.per_customer_daily_browser_seconds, "browser_wall_seconds": settings.browser_wall_seconds, "browser_cleanup_seconds": settings.browser_cleanup_seconds, "daily_browser_reservation_ms": settings.max_external_requests * (settings.browser_wall_seconds + 2 * settings.browser_cleanup_seconds) * 1000},
         usage={},
     )
     db.add(job)

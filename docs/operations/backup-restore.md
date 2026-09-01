@@ -1,11 +1,11 @@
 # Backup & restore
 
 Honest current state: **Bill Commons has no automated scheduled database
-dump today.** This doc documents what Railway's managed Postgres provides
-out of the box, a manual `pg_dump`/restore procedure, and how the other two
-data stores (raw source zips, the RawStore volume) can be reconstructed
-from scratch if lost — they don't need backing up the same way the
-database does, because they're re-derivable from public upstream sources.
+dump today.** This doc documents what Railway's managed Postgres provides,
+a manual `pg_dump`/restore procedure, and how ingestion's public-source files
+can be reconstructed. Scout evidence bytes live in PostgreSQL
+`scout_raw_blobs`; they are part of the database backup/restore contract and
+must not be described as a disposable cache.
 
 ## What Railway's managed Postgres provides
 
@@ -69,9 +69,9 @@ SQL) — smaller and supports selective/parallel restore. `--no-owner
    not separately maintained — `pg_restore` recreates them from the dump's
    DDL).
 
-## Re-fetching raw data if the database is lost entirely
+## Re-fetching ingestion raw data if its filesystem volume is lost
 
-Unlike the database, the two file-based stores are **not** the
+Unlike the database, the ingestion file-based stores are **not** the
 authoritative copy of anything — they're either public upstream mirrors or
 a cache, so total loss is an inconvenience (re-download time), not a data
 loss:
@@ -98,6 +98,11 @@ loss:
   `extracted_text` column is unaffected by losing the raw archive — only
   the ability to re-derive text with a different parser version, or to
   re-verify the original bytes, is lost until re-fetched).
+
+Scout does not use that volume. Its bounded, content-addressed source payloads
+are in `scout_raw_blobs` and are restored with the database. A restore drill
+must verify at least one known blob's stored bytes still hash to its `sha256`
+key before Scout is enabled.
 
 ## TODO — automated scheduled backups
 

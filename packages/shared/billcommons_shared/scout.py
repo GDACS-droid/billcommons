@@ -11,8 +11,9 @@ import ipaddress
 import os
 import re
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Callable, Literal, Protocol
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from billcommons_shared.safe_http import SsrfRejected, admit_url
 
@@ -49,6 +50,39 @@ _TOPICAL_STEMS = {
     "advertisement": "advertis",
     "advertisements": "advertis",
 }
+_FLORIDA_SENATE_HOSTS = frozenset({"www.flsenate.gov", "flsenate.gov"})
+_FLORIDA_SENATE_BILL_PATH = re.compile(
+    r"^/Session/Bill/(?P<session>\d{4})/(?P<bill>\d{1,6})(?:/.*)?$", re.I
+)
+_FLORIDA_SENATE_RELATED_PATH = re.compile(
+    r"^/Session/Bill/(?P<session>\d{4})/(?P<bill>\d{1,6})/"
+    r"(?P<kind>Analyses|Amendment)/(?P<document>[A-Za-z0-9._-]+)(?:/PDF)?$",
+    re.I,
+)
+
+
+class _HrefParser(HTMLParser):
+    """Collect href attributes from an already byte-bounded document."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() != "a":
+            return
+        for name, value in attrs:
+            if name.casefold() == "href" and value:
+                self.hrefs.append(value)
+                return
+
+
+@dataclass(frozen=True)
+class FloridaRelatedDocument:
+    """A safe, bill-scoped primary document discovered on a Senate bill page."""
+
+    canonical_url: str
+    artifact_type: Literal["committee analysis", "amendment"]
 
 
 class ScoutPolicyError(ValueError):
@@ -60,13 +94,24 @@ class ScoutSettings:
     """All Scout operational ceilings, sourced once per process from the environment."""
 
     enabled: bool = False
+    # Public rollout requires a separate explicit acknowledgement. Until then,
+    # a non-empty server-side canary cohort is mandatory for new work.
+    allow_public_rollout: bool = False
+    canary_emails: tuple[str, ...] = ()
     max_query_chars: int = 500
-    max_direct_bytes: int = 256 * 1024
+    max_direct_bytes: int = 2 * 1024 * 1024
     max_external_requests: int = 5
+    # A primary bill page can surface many attachments. Scout P0 inspects a
+    # small, useful subset rather than turning one bill request into a crawl.
+    max_related_documents: int = 2
     max_retries: int = 1
     cache_ttl_seconds: int = 3600
     max_pdf_pages: int = 20
     max_pdf_text_chars: int = 20_000
+    max_pdf_extract_seconds: int = 3
+    max_pdf_extract_memory_bytes: int = 256 * 1024 * 1024
+    max_pdf_extract_cpu_seconds: int = 2
+    staging_retention_seconds: int = 24 * 60 * 60
     lease_seconds: int = 90
     max_pages: int = 4
     max_actions: int = 12
@@ -83,6 +128,15 @@ class ScoutSettings:
     max_browser_routed_requests: int = 40
 
     def __post_init__(self) -> None:
+        if any(
+            not email
+            or "@" not in email
+            or email != email.strip().casefold()
+            for email in self.canary_emails
+        ):
+            raise ValueError(
+                "BILLCOMMONS_SCOUT_CANARY_EMAILS must contain normalized email addresses"
+            )
         # A browser-routed job may use every persisted external-request slot.
         # Its provider session includes both capture and bounded release time;
         # admitting a job whose worst case cannot fit the daily cap would make
@@ -105,15 +159,42 @@ class ScoutSettings:
                 return default
             return value if value > 0 else default
 
+        canary_emails = tuple(
+            sorted(
+                {
+                    value.strip().casefold()
+                    for value in os.environ.get(
+                        "BILLCOMMONS_SCOUT_CANARY_EMAILS", ""
+                    ).split(",")
+                    if value.strip()
+                }
+            )
+        )
+
         return cls(
             enabled=os.environ.get("BILLCOMMONS_SCOUT_ENABLED", "").lower() in {"1", "true", "yes"},
+            allow_public_rollout=os.environ.get(
+                "BILLCOMMONS_SCOUT_ALLOW_PUBLIC", ""
+            ).lower() in {"1", "true", "yes"},
+            canary_emails=canary_emails,
             max_query_chars=positive("BILLCOMMONS_SCOUT_MAX_QUERY_CHARS", 500),
-            max_direct_bytes=positive("BILLCOMMONS_SCOUT_MAX_DIRECT_BYTES", 256 * 1024),
+            max_direct_bytes=positive("BILLCOMMONS_SCOUT_MAX_DIRECT_BYTES", 2 * 1024 * 1024),
             max_external_requests=positive("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", 5),
+            max_related_documents=positive("BILLCOMMONS_SCOUT_MAX_RELATED_DOCUMENTS", 2),
             max_retries=positive("BILLCOMMONS_SCOUT_MAX_RETRIES", 1),
             cache_ttl_seconds=positive("BILLCOMMONS_SCOUT_CACHE_TTL_SECONDS", 3600),
             max_pdf_pages=positive("BILLCOMMONS_SCOUT_MAX_PDF_PAGES", 20),
             max_pdf_text_chars=positive("BILLCOMMONS_SCOUT_MAX_PDF_TEXT_CHARS", 20_000),
+            max_pdf_extract_seconds=positive("BILLCOMMONS_SCOUT_MAX_PDF_EXTRACT_SECONDS", 3),
+            max_pdf_extract_memory_bytes=positive(
+                "BILLCOMMONS_SCOUT_MAX_PDF_EXTRACT_MEMORY_BYTES", 256 * 1024 * 1024
+            ),
+            max_pdf_extract_cpu_seconds=positive(
+                "BILLCOMMONS_SCOUT_MAX_PDF_EXTRACT_CPU_SECONDS", 2
+            ),
+            staging_retention_seconds=positive(
+                "BILLCOMMONS_SCOUT_STAGING_RETENTION_SECONDS", 24 * 60 * 60
+            ),
             lease_seconds=positive("BILLCOMMONS_SCOUT_LEASE_SECONDS", 90),
             max_pages=positive("BILLCOMMONS_SCOUT_MAX_PAGES", 4),
             max_actions=positive("BILLCOMMONS_SCOUT_MAX_ACTIONS", 12),
@@ -155,6 +236,8 @@ def scout_cache_key(query: str, jurisdiction: str, *, freshness_bucket: str = "p
 
 def canonicalize_url(url: str) -> str:
     """Canonicalize an already-admitted official URL without weakening SSRF policy."""
+    if not isinstance(url, str) or len(url) > 4096:
+        raise ScoutPolicyError("url_rejected")
     try:
         admitted = admit_url(url)
     except SsrfRejected as exc:
@@ -174,6 +257,112 @@ def is_official_url(url: str) -> bool:
     except ScoutPolicyError:
         return False
     return True
+
+
+def discover_florida_senate_related_documents(
+    bill_page_url: str,
+    body: bytes,
+    *,
+    maximum: int = 2,
+    max_html_bytes: int = 256 * 1024,
+) -> tuple[FloridaRelatedDocument, ...]:
+    """Find a bounded set of bill-scoped Senate analyses/amendments.
+
+    This is deterministic link extraction, not a crawler and not an
+    instruction-following boundary. Every candidate is re-admitted through the
+    shared HTTPS/private-network policy, restricted to the same Senate host,
+    and required to carry the exact session and bill number from the parent.
+    """
+    if maximum <= 0 or max_html_bytes <= 0 or len(body) > max_html_bytes:
+        return ()
+    try:
+        parent = canonicalize_url(bill_page_url)
+    except ScoutPolicyError:
+        return ()
+    parent_parts = urlsplit(parent)
+    if parent_parts.hostname not in _FLORIDA_SENATE_HOSTS:
+        return ()
+    parent_match = _FLORIDA_SENATE_BILL_PATH.match(parent_parts.path)
+    if parent_match is None:
+        return ()
+
+    # ``body`` is the direct response already limited by the job's immutable
+    # byte ceiling. Parse all anchors in that bounded payload: a link after a
+    # long government navigation menu is no less authoritative than one near
+    # the top, while the byte cap keeps CPU and memory work finite.
+    parser = _HrefParser()
+    try:
+        parser.feed(body.decode("utf-8", "replace"))
+        parser.close()
+    except Exception:
+        # Malformed source HTML is an ordinary source-quality failure, never a
+        # reason to loosen the URL policy or retry arbitrary links.
+        return ()
+
+    parent_session = parent_match.group("session")
+    parent_bill = str(int(parent_match.group("bill")))
+    discovered: list[FloridaRelatedDocument] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for href in parser.hrefs:
+        try:
+            candidate = canonicalize_url(urljoin(parent, href))
+        except ScoutPolicyError:
+            continue
+        candidate_parts = urlsplit(candidate)
+        # Senate attachment paths identify documents by session/bill/category
+        # and document token. Query strings are not proven identity-bearing,
+        # so never fetch or persist a tracking/query alias as another source.
+        if candidate_parts.query:
+            candidate = urlunsplit((
+                candidate_parts.scheme,
+                candidate_parts.netloc,
+                candidate_parts.path,
+                "",
+                "",
+            ))
+            candidate_parts = urlsplit(candidate)
+        if candidate_parts.hostname != parent_parts.hostname:
+            continue
+        related_match = _FLORIDA_SENATE_RELATED_PATH.match(candidate_parts.path)
+        if related_match is None:
+            continue
+        if (
+            related_match.group("session") != parent_session
+            or str(int(related_match.group("bill"))) != parent_bill
+            or (
+                related_match.group("session"),
+                str(int(related_match.group("bill"))),
+                related_match.group("kind").casefold(),
+                related_match.group("document").casefold(),
+            ) in seen
+        ):
+            continue
+        kind = related_match.group("kind").casefold()
+        artifact_type: Literal["committee analysis", "amendment"] = (
+            "committee analysis" if kind == "analyses" else "amendment"
+        )
+        discovered.append(FloridaRelatedDocument(candidate, artifact_type))
+        seen.add((
+            related_match.group("session"),
+            str(int(related_match.group("bill"))),
+            related_match.group("kind").casefold(),
+            related_match.group("document").casefold(),
+        ))
+
+    # Senate markup order is presentation, not an importance contract. Favor a
+    # staff/committee analysis, then an amendment, and keep ties stable by URL.
+    discovered.sort(key=lambda item: (item.artifact_type != "committee analysis", item.canonical_url))
+    return tuple(discovered[:maximum])
+
+
+def is_pdf_attachment_payload(mime_type: str | None, body: bytes) -> bool:
+    """Require both declared PDF MIME and the PDF file signature.
+
+    Related Senate attachment routes are PDF endpoints. Government portals
+    sometimes return an HTML error page with a 200 status at such URLs; that
+    page is a failed attachment, never high-confidence PDF evidence.
+    """
+    return (mime_type or "").split(";", 1)[0].strip().lower() == "application/pdf" and body.startswith(b"%PDF-")
 
 
 def browser_required(

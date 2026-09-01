@@ -16,6 +16,7 @@ from billcommons_shared.scout import BrowserRequest, ScoutSettings
 from sqlalchemy import text
 
 from billcommons_scout.providers import SolariProviderError, SolariResearchBrowserProvider, resolve_solari_api_key
+from billcommons_scout.rawstore import PostgresScoutRawStore
 from billcommons_scout.runner import ScoutRunner
 
 
@@ -51,8 +52,20 @@ def _safe_solari_diagnostic(exc: BaseException, *, fallback_phase: str) -> str:
     return " ".join(fields)
 
 
+def _rawstore():
+    """Return Scout's service-independent store, with an explicit local escape hatch."""
+    backend = os.environ.get("BILLCOMMONS_SCOUT_RAWSTORE_BACKEND", "postgres").strip().casefold()
+    if backend == "postgres":
+        return PostgresScoutRawStore(get_sessionmaker())
+    if backend == "filesystem" and os.environ.get("BILLCOMMONS_SCOUT_ALLOW_FILESYSTEM_RAWSTORE") == "1":
+        # Compatibility only for local tests/dev. Production must not silently
+        # couple Scout to an ingest-service mounted volume.
+        return FilesystemRawStore()
+    raise RuntimeError("invalid_scout_rawstore_backend")
+
+
 def _runner() -> ScoutRunner:
-    return ScoutRunner(get_sessionmaker(), FilesystemRawStore(), SolariResearchBrowserProvider())
+    return ScoutRunner(get_sessionmaker(), _rawstore(), SolariResearchBrowserProvider())
 
 
 def _check_readiness() -> int:
@@ -66,15 +79,19 @@ def _check_readiness() -> int:
     except Exception:
         pass
     try:
-        store = FilesystemRawStore()
-        payload = f"scout-readiness-{uuid.uuid4().hex}".encode()
-        key = store.put(payload, {"kind": "scout_readiness"})
-        rawstore_ok = store.get(key) == payload
-        # FilesystemRawStore is deliberately content addressed and has no
-        # general delete API. Delete only this freshly random probe key.
-        data_path, meta_path = store._paths(key)
-        data_path.unlink(missing_ok=True)
-        meta_path.unlink(missing_ok=True)
+        store = _rawstore()
+        healthcheck = getattr(store, "healthcheck", None)
+        if callable(healthcheck):
+            rawstore_ok = bool(healthcheck())
+        else:
+            # The explicitly opted-in filesystem compatibility backend has no
+            # read-only health API. Its probe is deleted immediately.
+            payload = f"scout-readiness-{uuid.uuid4().hex}".encode()
+            key = store.put(payload, {"kind": "scout_readiness"})
+            rawstore_ok = store.get(key) == payload
+            data_path, meta_path = store._paths(key)
+            data_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
     except Exception:
         rawstore_ok = False
     configured = bool(resolve_solari_api_key())
@@ -106,6 +123,7 @@ def _run_worker_loop(runner: ScoutRunner, *, once: bool, worker_id: str) -> int:
         while not draining:
             if time.monotonic() >= next_reap:
                 runner.reap_sessions()
+                runner.reap_staging_blobs()
                 next_reap = time.monotonic() + 60
             # run_once is the drain boundary: a signal received during a run
             # waits for process/finally cleanup, then stops before next claim.
@@ -134,7 +152,12 @@ def main() -> int:
     # rollback disables new jobs/claims first, then must still be able to reap
     # sessions that were already created by the previous revision.
     if args.command == "reap":
-        print(f"reap_candidates={_runner().reap_sessions()}")
+        runner = _runner()
+        staging = runner.reap_staging_blobs()
+        print(
+            f"reap_candidates={runner.reap_sessions()} "
+            f"staged_sources={staging['staged_sources']} raw_blobs={staging['raw_blobs']}"
+        )
         return 0
     if args.command == "rollback":
         result = _runner().rollback_reconcile()
@@ -174,8 +197,8 @@ def main() -> int:
         try:
             replay = provider.release(capture.provider_session_id)
         except Exception as exc:
-            # Capture already succeeded. This is the redundant, durable-reaper
-            # confirmation failing—not evidence that navigation failed.
+            # Capture already succeeded. The one lifecycle release failed;
+            # this is not evidence that navigation itself failed.
             print(
                 f"solari_check=partial capture=ok cleanup=release_unconfirmed "
                 f"{_safe_solari_diagnostic(exc, fallback_phase='release')}"

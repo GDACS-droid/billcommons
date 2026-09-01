@@ -18,7 +18,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from billcommons_schema.base import Base
-from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutResearchJob, ScoutSource
+from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutRawBlob, ScoutResearchJob, ScoutSource
 from billcommons_shared.rawstore import FilesystemRawStore
 from billcommons_shared.db import _use_psycopg3
 from billcommons_shared.safe_http import SsrfRejected
@@ -63,12 +63,61 @@ def _candidate(url="https://www.flsenate.gov/Session/Bill/2026/12", bill_id=None
     })
 
 
+def _pdf_with_text(value: str) -> bytes:
+    """Tiny deterministic PDF fixture whose extracted text includes ``value``."""
+    stream = f"BT /F1 12 Tf 72 720 Td ({value}) Tj ET".encode()
+    objects = (
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    )
+    document = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(len(document))
+        document.extend(f"{index} 0 obj\n".encode())
+        document.extend(obj)
+        document.extend(b"\nendobj\n")
+    xref = len(document)
+    document.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode())
+    document.extend(b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets[1:]))
+    document.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return bytes(document)
+
+
+def test_rejected_failed_url_is_event_only_and_never_persisted_as_clickable_source(tmp_path):
+    runner, sessions, job_id = _runner(
+        tmp_path,
+        MockResearchBrowserProvider(),
+        lambda _url: (500, "text/html", b"failure"),
+    )
+
+    runner._record_failed_source(
+        job_id,
+        "initial-claim",
+        "javascript:alert(document.cookie)",
+        "direct",
+        None,
+        None,
+    )
+
+    with sessions() as db:
+        assert db.execute(select(ScoutSource)).scalars().all() == []
+        events = db.execute(select(ScoutJobEvent)).scalars().all()
+        assert [(event.kind, event.detail) for event in events] == [
+            ("source_failed", {"mechanism": "direct", "status": None})
+        ]
+
+
 def test_candidates_choose_current_session_and_dedupe_topical_identifiers(tmp_path):
     """Exercise the real ORM query against duplicate identifiers by session."""
     runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", b""))
     engine = sessions.kw["bind"]
     current = uuid.uuid4()
     old = uuid.uuid4()
+    undated = uuid.uuid4()
     jurisdiction = uuid.uuid4()
     with engine.begin() as conn:
         conn.execute(text("CREATE TABLE jurisdictions (id CHAR(32) PRIMARY KEY, abbreviation TEXT NOT NULL)"))
@@ -79,19 +128,160 @@ def test_candidates_choose_current_session_and_dedupe_topical_identifiers(tmp_pa
         conn.execute(text("INSERT INTO sessions (id, jurisdiction_id, identifier, name, active, start_date, end_date) VALUES (:id, :jurisdiction, :identifier, :name, :active, :start, :end)"), [
             {"id": str(old), "jurisdiction": str(jurisdiction), "identifier": "2024", "name": "2024 Regular", "active": False, "start": date(2024, 1, 1), "end": date(2024, 3, 1)},
             {"id": str(current), "jurisdiction": str(jurisdiction), "identifier": "2026", "name": "2026 Regular", "active": True, "start": date(2026, 1, 1), "end": date(2026, 3, 1)},
+            {"id": str(undated), "jurisdiction": str(jurisdiction), "identifier": "unknown", "name": "Undated placeholder", "active": True, "start": None, "end": None},
         ])
         conn.execute(text("INSERT INTO bills (id, jurisdiction_id, session_id, identifier, identifier_norm, title, description, status, latest_action_text, source_url, updated_at) VALUES (:id, :jurisdiction, :session, :identifier, :norm, :title, :description, 'Filed', 'Filed', :url, :updated)"), [
             {"id": str(uuid.uuid4()), "jurisdiction": str(jurisdiction), "session": str(old), "identifier": "HB 12", "norm": "HB 12", "title": "Clean energy", "description": "clean energy", "url": "https://www.flsenate.gov/old", "updated": datetime(2026, 1, 1)},
             {"id": str(uuid.uuid4()), "jurisdiction": str(jurisdiction), "session": str(current), "identifier": "HB 12", "norm": "HB 12", "title": "Clean energy", "description": "clean energy", "url": "https://www.flsenate.gov/current", "updated": datetime(2026, 1, 2)},
             {"id": str(uuid.uuid4()), "jurisdiction": str(jurisdiction), "session": str(current), "identifier": "HB 13", "norm": "HB 13", "title": "Clean energy storage", "description": "clean energy", "url": "https://www.flsenate.gov/other", "updated": datetime(2026, 1, 3)},
+            {"id": str(uuid.uuid4()), "jurisdiction": str(jurisdiction), "session": str(undated), "identifier": "HB 12", "norm": "HB 12", "title": "Clean energy", "description": "clean energy", "url": "https://www.flsenate.gov/placeholder", "updated": datetime(2026, 1, 4)},
+            {"id": str(uuid.uuid4()), "jurisdiction": str(jurisdiction), "session": str(undated), "identifier": "HB 14", "norm": "HB 14", "title": "Clean energy", "description": "clean energy", "url": None, "updated": datetime(2026, 1, 5)},
         ])
     with sessions() as db:
         job = db.get(ScoutResearchJob, job_id)
         assert runner._candidates(db, job)[0][0] == "https://www.flsenate.gov/current"
         job.original_query = "clean energy"
         topical = runner._candidates(db, job)
+        job.original_query = "HB 14"
+        assert runner._candidates(db, job) == []
+        assert runner._has_structured_match_without_source(db, job)
     assert [candidate[0] for candidate in topical] == ["https://www.flsenate.gov/other", "https://www.flsenate.gov/current"]
     assert all(candidate[4]["session_identifier"] == "2026" for candidate in topical)
+
+
+def test_source_less_structured_hit_is_truthful_partial_not_unsupported(tmp_path, monkeypatch):
+    runner, sessions, job_id = _runner(
+        tmp_path,
+        MockResearchBrowserProvider(),
+        lambda _url: (200, "text/html", b""),
+    )
+    monkeypatch.setattr(runner, "_candidates", lambda _db, _job: [])
+    monkeypatch.setattr(runner, "_has_structured_match_without_source", lambda _db, _job: True)
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert (job.status, job.error_class, job.partial_success) == (
+            "partial",
+            "official_source_missing",
+            False,
+        )
+        assert "structured_source_missing" in {
+            event.kind for event in db.execute(select(ScoutJobEvent)).scalars()
+        }
+
+
+def test_reaper_removes_only_expired_terminal_stages_and_unreferenced_blobs(tmp_path):
+    settings = ScoutSettings(
+        enabled=True,
+        browser_cleanup_seconds=1,
+        staging_retention_seconds=60,
+    )
+    runner, sessions, job_id = _runner(
+        tmp_path,
+        MockResearchBrowserProvider(),
+        lambda _url: (200, "text/html", b""),
+        settings=settings,
+    )
+    engine = sessions.kw["bind"]
+    Base.metadata.create_all(
+        engine,
+        tables=[Base.metadata.tables["scout_raw_blobs"]],
+    )
+    old = datetime.now(timezone.utc) - timedelta(minutes=5)
+    stale_key = "a" * 64
+    retained_key = "b" * 64
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.status = "canceled"
+        stale = ScoutSource(
+            job_id=job_id,
+            canonical_url="https://www.flsenate.gov/staged",
+            official=False,
+            retrieval_mechanism="staged",
+            raw_ref=stale_key,
+            retrieved_at=old,
+        )
+        retained = ScoutSource(
+            job_id=job_id,
+            canonical_url="https://www.flsenate.gov/evidence",
+            official=True,
+            retrieval_mechanism="direct",
+            raw_ref=retained_key,
+            retrieved_at=old,
+        )
+        db.add_all(
+            (
+                stale,
+                retained,
+                ScoutRawBlob(sha256=stale_key, data=b"stale", metadata_json={}, created_at=old),
+                ScoutRawBlob(sha256=retained_key, data=b"retained", metadata_json={}, created_at=old),
+            )
+        )
+        db.commit()
+
+    assert runner.reap_staging_blobs() == {"staged_sources": 1, "raw_blobs": 1}
+
+    with sessions() as db:
+        assert db.get(ScoutRawBlob, stale_key) is None
+        assert db.get(ScoutRawBlob, retained_key) is not None
+        sources = db.execute(select(ScoutSource)).scalars().all()
+        assert [(source.official, source.raw_ref) for source in sources] == [
+            (True, retained_key)
+        ]
+
+
+def test_fresh_unresolved_stage_blocks_old_orphan_gc_until_reference_attaches(tmp_path):
+    settings = ScoutSettings(
+        enabled=True,
+        browser_cleanup_seconds=1,
+        staging_retention_seconds=60,
+    )
+    runner, sessions, job_id = _runner(
+        tmp_path,
+        MockResearchBrowserProvider(),
+        lambda _url: (200, "text/html", b""),
+        settings=settings,
+    )
+    engine = sessions.kw["bind"]
+    Base.metadata.create_all(
+        engine,
+        tables=[Base.metadata.tables["scout_raw_blobs"]],
+    )
+    old = datetime.now(timezone.utc) - timedelta(minutes=5)
+    orphan_key = "c" * 64
+    with sessions() as db:
+        pending = ScoutSource(
+            job_id=job_id,
+            canonical_url="https://www.flsenate.gov/pending",
+            official=False,
+            retrieval_mechanism="staged",
+        )
+        db.add_all((
+            pending,
+            ScoutRawBlob(
+                sha256=orphan_key,
+                data=b"old-orphan",
+                metadata_json={},
+                created_at=old,
+            ),
+        ))
+        db.commit()
+        pending_id = pending.id
+
+    assert runner.reap_staging_blobs() == {"staged_sources": 0, "raw_blobs": 0}
+    with sessions() as db:
+        assert db.get(ScoutRawBlob, orphan_key) is not None
+        pending = db.get(ScoutSource, pending_id)
+        pending.raw_ref = orphan_key
+        db.commit()
+
+    # Once attached, the evidence reference—not the temporary barrier—keeps
+    # the old content-addressed bytes alive.
+    assert runner.reap_staging_blobs() == {"staged_sources": 0, "raw_blobs": 0}
+    with sessions() as db:
+        assert db.get(ScoutRawBlob, orphan_key) is not None
 
 
 def test_evidence_window_supports_the_claim_or_refuses_the_finding(tmp_path):
@@ -328,6 +518,226 @@ def test_html_entities_are_decoded_before_evidence_support_is_checked(tmp_path):
         assert "Chapter No. 2026-141" in finding.excerpt
 
 
+def test_florida_bill_page_discovers_dedupes_and_persists_related_primary_document(tmp_path):
+    bill_url = "https://www.flsenate.gov/Session/Bill/2026/625/ByCategory"
+    analysis_url = "https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF"
+    amendment_url = "https://www.flsenate.gov/Session/Bill/2026/625/Amendment/154926/PDF"
+    bill_page = b"""
+        <main>HB 625 Filed
+          <a href="/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF">Committee analysis</a>
+          <a href="/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF?campaign=tracker">Duplicate analysis alias</a>
+          <a href="/Session/Bill/2026/625/Amendment/154926/PDF">Amendment</a>
+          <a href="https://example.test/Session/Bill/2026/625/Analyses/evil.pdf">Offsite</a>
+        </main>
+    """
+    calls: list[str] = []
+
+    def fetcher(url):
+        calls.append(url)
+        if url == bill_url:
+            return 200, "text/html", bill_page
+        if url == analysis_url:
+            return 200, "application/pdf", _pdf_with_text("Florida Senate committee analysis for HB 625.")
+        if url == amendment_url:
+            return 200, "text/html", b"<html><title>Document unavailable</title>HB 625</html>"
+        raise AssertionError(f"unexpected fetch {url}")
+
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), fetcher)
+    candidate = _candidate(url=bill_url, title="HB 625", status="Filed")
+    candidate[4]["latest_action_date"] = date(2026, 6, 19)
+    runner._candidates = lambda _db, _job: [candidate]
+    runner.process(job_id)
+    assert calls == [bill_url, analysis_url, amendment_url]
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        sources = db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalars().all()
+        related = next(source for source in sources if source.canonical_url == analysis_url)
+        finding = db.scalar(select(ScoutFinding).where(ScoutFinding.source_id == related.id))
+        assert (job.status, job.partial_success) == ("partial", True)
+        assert (related.official, related.retrieval_mechanism, related.title) == (
+            True, "direct", "HB 625: Official Florida Senate committee analysis",
+        )
+        assert finding is not None
+        assert finding.what_happened == "Official Florida Senate committee analysis retrieved for HB 625."
+        assert finding.bill_id is None and "HB 625" in finding.excerpt
+        assert finding.relevant_date is None
+        assert any(not source.official and source.canonical_url == amendment_url for source in sources)
+        assert "related_sources_discovered" in [
+            event.kind for event in db.execute(select(ScoutJobEvent).where(ScoutJobEvent.job_id == job_id)).scalars()
+        ]
+        related_events = [
+            event for event in db.execute(select(ScoutJobEvent).where(ScoutJobEvent.job_id == job_id)).scalars()
+            if event.kind == "direct_retrieval" and event.detail.get("related_document") == "committee analysis"
+        ]
+        assert len(related_events) == 1
+
+
+def test_florida_related_documents_obey_the_shared_request_budget(tmp_path):
+    bill_url = "https://www.flsenate.gov/Session/Bill/2026/625/ByCategory"
+    analysis_url = "https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF"
+    amendment_url = "https://www.flsenate.gov/Session/Bill/2026/625/Amendment/154926/PDF"
+    bill_page = (
+        b"HB 625 Filed"
+        b'<a href="/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF">Analysis</a>'
+        b'<a href="/Session/Bill/2026/625/Amendment/154926/PDF">Amendment</a>'
+    )
+    calls: list[str] = []
+
+    def fetcher(url):
+        calls.append(url)
+        if url == bill_url:
+            return 200, "text/html", bill_page
+        if url == analysis_url:
+            return 200, "application/pdf", _pdf_with_text("HB 625 official analysis")
+        raise AssertionError(f"request budget should prevent {url}")
+
+    runner, sessions, job_id = _runner(
+        tmp_path, MockResearchBrowserProvider(), fetcher, limits={"max_external_requests": 2, "max_retries": 0},
+    )
+    runner._candidates = lambda _db, _job: [_candidate(url=bill_url, title="HB 625", status="Filed")]
+    runner.process(job_id)
+    assert calls == [bill_url, analysis_url]
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert (job.status, job.error_class, job.usage["external_requests"]) == (
+            "partial", "external_request_limit", 2,
+        )
+
+
+def test_queued_job_retains_snapshotted_related_document_cap_after_settings_change(tmp_path):
+    bill_url = "https://www.flsenate.gov/Session/Bill/2026/625/ByCategory"
+    analysis_url = "https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF"
+    amendment_url = "https://www.flsenate.gov/Session/Bill/2026/625/Amendment/154926/PDF"
+    bill_page = (
+        b"HB 625 Filed"
+        b'<a href="/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF">Analysis</a>'
+        b'<a href="/Session/Bill/2026/625/Amendment/154926/PDF">Amendment</a>'
+    )
+    calls: list[str] = []
+
+    def fetcher(url):
+        calls.append(url)
+        if url == bill_url:
+            return 200, "text/html", bill_page
+        if url == analysis_url:
+            return 200, "application/pdf", _pdf_with_text("HB 625 official analysis")
+        raise AssertionError(f"queued cap should prevent {url}")
+
+    runner, sessions, job_id = _runner(
+        tmp_path,
+        MockResearchBrowserProvider(),
+        fetcher,
+        # Simulates a worker restarted after the job was queued with a larger
+        # process-level attachment setting.
+        settings=ScoutSettings(enabled=True, browser_cleanup_seconds=1, max_related_documents=2),
+        limits={"max_related_documents": 1, "max_retries": 0},
+    )
+    runner._candidates = lambda _db, _job: [_candidate(url=bill_url, title="HB 625", status="Filed")]
+    runner.process(job_id)
+    assert calls == [bill_url, analysis_url]
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert job.status == "completed"
+        assert len(db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id, ScoutSource.official.is_(True))).scalars().all()) == 2
+
+
+def test_queued_job_honors_snapshotted_direct_and_text_limits_after_settings_change(tmp_path):
+    runner, sessions, job_id = _runner(
+        tmp_path,
+        MockResearchBrowserProvider(),
+        lambda _url: (200, "text/html", b""),
+        settings=ScoutSettings(enabled=True, browser_cleanup_seconds=1, max_direct_bytes=1024, max_pdf_text_chars=1024),
+        limits={"max_direct_bytes": 64, "max_pdf_text_chars": 13},
+    )
+    metadata = {"identifier": "HB 625", "latest_action": "Filed"}
+    # The runner setting would admit this; the queued row's frozen byte cap
+    # rejects it before RawStore persistence.
+    assert runner._persist_capture(
+        job_id, "initial-claim", None, "HB 625", "Filed", metadata,
+        "https://www.flsenate.gov/Session/Bill/2026/625", "direct", 200, "text/html", b"x" * 65,
+    ) is None
+    source_id = runner._persist_capture(
+        job_id, "initial-claim", None, "HB 625", "Filed", metadata,
+        "https://www.flsenate.gov/Session/Bill/2026/625", "direct", 200, "text/html",
+        b"HB 625 Filed retained text must not be extracted",
+    )
+    assert source_id is not None
+    with sessions() as db:
+        finding = db.scalar(select(ScoutFinding).where(ScoutFinding.source_id == source_id))
+        assert finding is not None and finding.excerpt == "HB 625 Filed"
+
+
+def test_queued_job_honors_snapshotted_pdf_page_limit_after_settings_change(tmp_path, monkeypatch):
+    from io import BytesIO
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.add_blank_page(width=612, height=792)
+    document = BytesIO()
+    writer.write(document)
+    runner, sessions, job_id = _runner(
+        tmp_path,
+        MockResearchBrowserProvider(),
+        lambda _url: (200, "text/html", b""),
+        settings=ScoutSettings(enabled=True, browser_cleanup_seconds=1, max_pdf_pages=2),
+        limits={"max_pdf_pages": 1},
+    )
+    monkeypatch.setattr(runner, "_related_evidence_excerpt", lambda *_args: ("HB 625", 0, 6))
+    source_id = runner._persist_capture(
+        job_id, "initial-claim", None, "HB 625", "Filed",
+        {"identifier": "HB 625", "related_artifact_type": "committee analysis"},
+        "https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF",
+        "direct", 200, "application/pdf", document.getvalue(),
+    )
+    assert source_id is None
+    with sessions() as db:
+        assert db.execute(select(ScoutSource).where(ScoutSource.official.is_(True))).scalars().all() == []
+
+
+def test_related_document_uses_tenant_local_history_for_unchanged_and_changed_bytes(tmp_path):
+    runner, sessions, first_job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", b""))
+    url = "https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF"
+    metadata = {"identifier": "HB 625", "related_artifact_type": "committee analysis"}
+    first = runner._persist_capture(
+        first_job_id, "initial-claim", None, "HB 625", "Filed", metadata, url, "direct", 200, "text/html", b"HB 625 analysis A",
+    )
+    assert first is not None
+    with sessions() as db:
+        current = db.get(ScoutResearchJob, first_job_id)
+        second = ScoutResearchJob(
+            id=uuid.uuid4(), customer_id=current.customer_id, original_query="HB 625", normalized_query="hb 625",
+            jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="second-claim",
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), strategy={}, limits={}, usage={},
+        )
+        db.add(second)
+        db.commit()
+        second_id = second.id
+    unchanged = runner._persist_capture(
+        second_id, "second-claim", None, "HB 625", "Filed", metadata, url, "direct", 200, "text/html", b"HB 625 analysis A",
+    )
+    assert unchanged is not None
+    with sessions() as db:
+        source = db.get(ScoutSource, unchanged)
+        assert (source.prior_source_id, source.change_kind, source.retrieval_mechanism) == (first, "unchanged", "reused")
+        third = ScoutResearchJob(
+            id=uuid.uuid4(), customer_id=db.get(ScoutResearchJob, second_id).customer_id,
+            original_query="HB 625", normalized_query="hb 625", jurisdiction="FL", cache_key=uuid.uuid4().hex,
+            status="running", claim_token="third-claim", lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            strategy={}, limits={}, usage={},
+        )
+        db.add(third)
+        db.commit()
+        third_id = third.id
+    changed = runner._persist_capture(
+        third_id, "third-claim", None, "HB 625", "Filed", metadata, url, "direct", 200, "text/html", b"HB 625 analysis B",
+    )
+    assert changed is not None
+    with sessions() as db:
+        source = db.get(ScoutSource, changed)
+        assert (source.prior_source_id, source.change_kind) == (unchanged, "material")
+
+
 def test_solari_key_uses_explicit_environment_then_safe_local_file(tmp_path, monkeypatch):
     local_env = tmp_path / ".env"
     local_env.write_text("IGNORED=value\nSOLARI_API_KEY='local-test-key'\n")
@@ -401,6 +811,93 @@ def test_browser_mock_release_and_cleanup_failure_are_durable(tmp_path):
     runner.process(job_id)
     with sessions() as db:
         assert db.execute(select(ScoutBrowserSession)).scalar_one().status == "cleanup_failed"
+
+
+def test_one_shot_browser_create_unknown_is_truthful_and_cost_reserved(tmp_path):
+    url = "https://www.myfloridahouse.gov/Sections/Bills/billsdetail.aspx"
+
+    class UnknownCreateProvider(MockResearchBrowserProvider):
+        captures_attempted = 0
+
+        def capture(self, _request, *, on_started):
+            del on_started
+            self.captures_attempted += 1
+            raise SolariProviderError("create", TimeoutError())
+
+    runner, sessions, job_id = _runner(
+        tmp_path,
+        UnknownCreateProvider(),
+        lambda _url: (403, "text/html", b"javascript challenge"),
+        settings=ScoutSettings(
+            enabled=True,
+            browser_cleanup_seconds=1,
+            browser_wall_seconds=1,
+            max_concurrent_browser_sessions=1,
+        ),
+    )
+    runner._candidates = lambda _db, _job: [
+        _candidate(url=url),
+        _candidate(url=url + "?candidate=2", title="HB 13"),
+    ]
+    runner.process(job_id)
+
+    with sessions() as db:
+        session = db.execute(select(ScoutBrowserSession)).scalar_one()
+        assert (
+            session.status,
+            session.provider_session_id,
+            session.error_class,
+        ) == ("cleanup_failed", None, "create_outcome_unknown")
+        assert db.get(ScoutResearchJob, job_id).error_class == "browser_create_outcome_unknown"
+        events = db.execute(select(ScoutJobEvent)).scalars().all()
+        assert any(
+            event.kind == "browser_create_outcome_unknown"
+            and event.detail == {"accounting": "full_session_reservation"}
+            for event in events
+        )
+        # A second job cannot over-admit another cloud browser while the
+        # outcome-unknown session may still be alive at the provider.
+        job = db.get(ScoutResearchJob, job_id)
+        second = ScoutResearchJob(
+            id=uuid.uuid4(),
+            customer_id=job.customer_id,
+            original_query="HB 14",
+            normalized_query="hb 14",
+            jurisdiction="FL",
+            cache_key=uuid.uuid4().hex,
+            status="running",
+            claim_token="second-claim",
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            strategy={},
+            limits={},
+            usage={},
+        )
+        db.add(second)
+        db.commit()
+        second_id = second.id
+    assert runner.provider.captures_attempted == 1
+    assert runner._reserve_browser_slot(second_id, "second-claim") is None
+    assert runner.reap_sessions() == 0
+    with sessions() as db:
+        session = db.execute(select(ScoutBrowserSession)).scalar_one()
+        # A slot created before a slow provider call cannot shorten the hold;
+        # the fresh unknown-outcome timestamp is the lifecycle authority.
+        session.created_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        db.commit()
+    assert runner.reap_sessions() == 0
+    assert runner._reserve_browser_slot(second_id, "second-claim") is None
+    with sessions() as db:
+        session = db.execute(select(ScoutBrowserSession)).scalar_one()
+        session.cleanup_attempted_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        db.commit()
+    assert runner.reap_sessions() == 0
+    with sessions() as db:
+        session = db.execute(select(ScoutBrowserSession)).scalar_one()
+        assert (session.status, session.error_class) == (
+            "abandoned",
+            "create_outcome_unknown_expired",
+        )
+    assert runner._reserve_browser_slot(second_id, "second-claim") is not None
 
 
 def test_internal_release_type_error_is_not_retried(tmp_path):
@@ -747,7 +1244,7 @@ def test_rawstore_failure_isolated_and_job_becomes_partial(tmp_path):
         assert db.get(ScoutResearchJob, job_id).status == "partial"
 
 
-def test_solari_provider_releases_and_reconciles_delayed_replay(monkeypatch):
+def test_solari_provider_capture_leaves_one_remote_release_to_lifecycle_owner(monkeypatch):
     calls = {"released": [], "replay": 0, "goto": [], "context_options": []}
     class Page:
         url = "https://www.flsenate.gov/final"
@@ -793,13 +1290,13 @@ def test_solari_provider_releases_and_reconciles_delayed_replay(monkeypatch):
     assert capture.url == "https://www.flsenate.gov/final"
     assert calls["context_options"] == [{"service_workers": "block"}]
     assert calls["goto"] == [{"timeout": 2000, "wait_until": "domcontentloaded"}]
-    assert calls["released"] == ["solari-1"]
-    assert calls["replay"] == 1
+    assert calls["released"] == []
+    assert calls["replay"] == 0
     assert provider.release("solari-1") == "https://replay.example/session"
     # A fresh worker/provider has no in-process cache but can still reap the
     # durable provider ID through the SDK's idempotent release endpoint.
     assert SolariResearchBrowserProvider("test-key").release("solari-1") == "https://replay.example/session"
-    assert calls["released"] == ["solari-1", "solari-1", "solari-1"]
+    assert calls["released"] == ["solari-1", "solari-1"]
 
 
 def test_solari_provider_context_routes_validate_redirects_and_capture_final_url(monkeypatch):
@@ -891,10 +1388,10 @@ def test_solari_provider_context_routes_validate_redirects_and_capture_final_url
         provider.capture(BrowserRequest("https://www.flsenate.gov/start", 1, 1, 1, 1024), on_started=lambda _id: None)
     assert calls["fetch"] == [{"max_redirects": 0, "max_retries": 0}]
     assert calls["abort"] == 1 and calls["fulfill"] == []
-    assert calls["released"] == ["opaque-provider-id"]
+    assert calls["released"] == []
 
 
-def test_solari_provider_callback_failure_self_cleans_without_exposing_id(monkeypatch):
+def test_solari_provider_callback_failure_returns_id_to_lifecycle_owner_without_exposing_it(monkeypatch):
     calls = {"released": []}
     class Sessions:
         async def create(self, **_kwargs): return types.SimpleNamespace(id="opaque-provider-id", ws_endpoint="wss://private.example/token")
@@ -909,7 +1406,7 @@ def test_solari_provider_callback_failure_self_cleans_without_exposing_id(monkey
     provider = SolariResearchBrowserProvider("test-key", cleanup_seconds=0.01)
     with pytest.raises(ProviderSessionPersistenceError) as raised:
         provider.capture(BrowserRequest("https://www.flsenate.gov/start", 1, 1, 1, 1024), on_started=lambda _id: (_ for _ in ()).throw(RuntimeError("db unavailable")))
-    assert calls["released"] == ["opaque-provider-id"]
+    assert calls["released"] == []
     assert "opaque-provider-id" not in str(raised.value)
 
 
@@ -1235,7 +1732,7 @@ def test_timed_out_release_registry_survives_cleanup_keepalive_db_failure(tmp_pa
     assert provider.release_calls == 1
 
 
-def test_solari_preconnect_cancellation_releases_persisted_session(monkeypatch):
+def test_solari_preconnect_cancellation_leaves_release_to_runner(monkeypatch):
     calls = {"created": [], "released": []}
     class Sessions:
         async def create(self, **_kwargs):
@@ -1261,11 +1758,11 @@ def test_solari_preconnect_cancellation_releases_persisted_session(monkeypatch):
         SolariResearchBrowserProvider("test-key", cleanup_seconds=0.01).capture(
             BrowserRequest("https://www.flsenate.gov/", 1, 1, 1, 1024), on_started=started.append,
         )
-    assert calls == {"created": [True], "released": ["created-before-connect"]}
+    assert calls == {"created": [True], "released": []}
     assert started == ["created-before-connect"]
 
 
-def test_solari_browser_close_has_its_own_timeout_and_still_releases(monkeypatch):
+def test_solari_browser_close_has_its_own_timeout_without_stealing_remote_release(monkeypatch):
     calls = {"released": []}
     class Page:
         url = "https://www.flsenate.gov/"
@@ -1302,7 +1799,7 @@ def test_solari_browser_close_has_its_own_timeout_and_still_releases(monkeypatch
     capture = provider.capture(BrowserRequest("https://www.flsenate.gov/", 1, 1, 2, 1024), on_started=lambda _id: None)
     assert time.monotonic() - started < 0.15
     assert capture.provider_session_id == "slow-close"
-    assert calls["released"] == ["slow-close"]
+    assert calls["released"] == []
 
 
 def test_solari_cli_failure_diagnostics_are_redacted_and_release_is_truthful(monkeypatch, capsys):
@@ -1424,13 +1921,15 @@ def test_reaper_remains_available_when_feature_flag_is_disabled(monkeypatch, cap
     class Reaper:
         def reap_sessions(self):
             return 2
+        def reap_staging_blobs(self):
+            return {"staged_sources": 1, "raw_blobs": 1}
 
     monkeypatch.setattr(scout_cli, "_runner", lambda: Reaper())
     monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "false")
     monkeypatch.setattr(sys, "argv", ["billcommons-scout", "reap"])
 
     assert scout_cli.main() == 0
-    assert capsys.readouterr().out == "reap_candidates=2\n"
+    assert capsys.readouterr().out == "reap_candidates=2 staged_sources=1 raw_blobs=1\n"
 
 
 def test_reaper_never_touches_fresh_running_owner_but_claims_expired_once(tmp_path):
@@ -1485,7 +1984,7 @@ def test_stale_idless_reservation_becomes_abandoned_and_no_longer_counts_against
 
 
 def test_late_browser_started_callback_cannot_revive_reaped_idless_slot(tmp_path):
-    """A provider callback after reaping must fail into provider cleanup."""
+    """A late provider ID is released once without reviving its old slot."""
     url = "https://www.myfloridahouse.gov/Sections/Bills/billsdetail.aspx"
     callback_ready = threading.Event()
     allow_callback = threading.Event()
@@ -1497,9 +1996,8 @@ def test_late_browser_started_callback_cannot_revive_reaped_idless_slot(tmp_path
             try:
                 on_started("late-provider-id")
             except Exception as exc:
-                # Match the real provider contract: a rejected callback
-                # triggers provider-side cleanup before returning control.
-                self.release("late-provider-id")
+                # Match the real provider contract: return the opaque ID to
+                # the runner, which owns the one remote release.
                 raise ProviderSessionPersistenceError("late-provider-id") from exc
             raise AssertionError("late callback unexpectedly persisted")
 
@@ -1537,13 +2035,23 @@ def test_postgres_concurrent_source_finalization_forms_immediate_predecessor_cha
     postgres_url = os.environ["BILLCOMMONS_TEST_POSTGRES_URL"]
     parsed = urlsplit(postgres_url)
     database = parsed.path.rstrip("/").rsplit("/", 1)[-1]
-    socket_host = parse_qs(parsed.query).get("host", [""])[0]
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query_hosts = query.get("host", [])
+    ambiguous_target = (
+        len(query_hosts) > 1
+        or bool(parsed.hostname and query_hosts)
+        or any(query.get(key) for key in ("hostaddr", "service", "servicefile"))
+    )
+    socket_host = query_hosts[0] if len(query_hosts) == 1 else ""
     local = parsed.hostname in {"localhost", "127.0.0.1", "::1"} or (
         not parsed.hostname and socket_host == "/var/run/postgresql"
     )
     if (
-        not local
-        or not re.fullmatch(r"billcommons_scout_(?:test|verify)_\d{8}", database)
+        ambiguous_target
+        or not local
+            or not re.fullmatch(
+                r"billcommons_scout_(?:test|verify|closeout)_\d{8}_test", database
+            )
         or os.environ.get("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE") != "1"
     ):
         raise RuntimeError("refusing Scout runner PostgreSQL DDL outside an acknowledged local disposable database")
@@ -1630,6 +2138,7 @@ def test_worker_term_drain_stops_before_a_second_claim_without_signaling_pytest(
     class Runner:
         def __init__(self): self.claims = 0
         def reap_sessions(self): return 0
+        def reap_staging_blobs(self): return {"staged_sources": 0, "raw_blobs": 0}
         def run_once(self, _worker_id):
             self.claims += 1
             handlers[scout_cli.signal.SIGTERM](scout_cli.signal.SIGTERM, None)
@@ -1647,26 +2156,42 @@ def test_readiness_check_exercises_required_dependencies_without_echoing_configu
         def execute(self, _statement): return None
 
     class Store:
-        def __init__(self): self.payloads = {}
-        def put(self, payload, _meta):
-            key = hashlib.sha256(payload).hexdigest()
-            self.payloads[key] = payload
-            data, meta = self._paths(key)
-            data.parent.mkdir(parents=True, exist_ok=True)
-            data.write_bytes(payload)
-            meta.write_text("{}")
-            return key
-        def get(self, key): return self.payloads[key]
-        def _paths(self, key): return tmp_path / key / "probe.bin", tmp_path / key / "probe.json"
+        def __init__(self, _sessions): self.checked = False
+        def healthcheck(self):
+            self.checked = True
+            return True
 
     monkeypatch.setattr(scout_cli, "get_sessionmaker", lambda: lambda: Db())
-    monkeypatch.setattr(scout_cli, "FilesystemRawStore", Store)
+    monkeypatch.delenv("BILLCOMMONS_SCOUT_RAWSTORE_BACKEND", raising=False)
+    monkeypatch.setattr(scout_cli, "PostgresScoutRawStore", Store)
     monkeypatch.setattr(scout_cli, "resolve_solari_api_key", lambda: None)
     monkeypatch.setattr(scout_cli.importlib.util, "find_spec", lambda _name: None)
     assert scout_cli._check_readiness() == 0
     output = capsys.readouterr().out
     assert output == "database=ok scout_tables=ok rawstore=ok solari_configured=False solari_sdk=missing\n"
-    assert not list(tmp_path.rglob("probe.*"))
+
+
+def test_scout_rawstore_defaults_to_postgres_and_filesystem_needs_explicit_local_override(monkeypatch):
+    calls: list[str] = []
+
+    class PostgresStore:
+        def __init__(self, _sessions): calls.append("postgres")
+
+    class FilesystemStore:
+        def __init__(self): calls.append("filesystem")
+
+    monkeypatch.setattr(scout_cli, "get_sessionmaker", lambda: object())
+    monkeypatch.setattr(scout_cli, "PostgresScoutRawStore", PostgresStore)
+    monkeypatch.setattr(scout_cli, "FilesystemRawStore", FilesystemStore)
+    monkeypatch.delenv("BILLCOMMONS_SCOUT_RAWSTORE_BACKEND", raising=False)
+    monkeypatch.delenv("BILLCOMMONS_SCOUT_ALLOW_FILESYSTEM_RAWSTORE", raising=False)
+    scout_cli._rawstore()
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_RAWSTORE_BACKEND", "filesystem")
+    with pytest.raises(RuntimeError, match="invalid_scout_rawstore_backend"):
+        scout_cli._rawstore()
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ALLOW_FILESYSTEM_RAWSTORE", "1")
+    scout_cli._rawstore()
+    assert calls == ["postgres", "filesystem"]
 
 
 def test_rollback_reconcile_is_idempotent_and_preserves_fresh_claim(tmp_path):

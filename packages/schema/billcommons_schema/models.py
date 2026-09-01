@@ -27,6 +27,7 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    LargeBinary,
     Numeric,
     Text,
     UniqueConstraint,
@@ -1479,4 +1480,31 @@ class ScoutBrowserSession(UUIDPkMixin, Base):
         ),
         Index("ix_scout_browser_sessions_live", "status", "created_at"),
         Index("ix_scout_browser_sessions_job", "job_id"),
+    )
+
+
+class ScoutRawBlob(Base):
+    """Scout-only immutable, content-addressed raw payload storage.
+
+    This deliberately does not replace the ingestion RawStore. Scout workers
+    can run on a separate service without a shared volume, while each source
+    row still owns its observation/provenance and points here only by SHA-256.
+    Metadata is first-observation-only and bounded by the store implementation.
+    """
+
+    __tablename__ = "scout_raw_blobs"
+
+    sha256: Mapped[str] = mapped_column(Text, primary_key=True)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSON, nullable=False, server_default=text("'{}'"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("length(sha256) = 64", name="ck_scout_raw_blobs_sha256_length"),
+        CheckConstraint(
+            "length(data) <= 2097152",
+            name="ck_scout_raw_blobs_data_size",
+        ),
     )

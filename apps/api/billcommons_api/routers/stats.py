@@ -25,7 +25,11 @@ router = APIRouter(prefix="/stats", tags=["stats"])
 _ENACTED = {"enacted"}
 _DIED_ON_ADJOURNMENT = {"died_on_adjournment"}
 _KILLED = {"dead", "vetoed", "withdrawn"}
-_PENDING = {"introduced", "in_committee", "passed_one_chamber", "passed_both", "enrolled"}
+# A substituted print remains procedurally live until its survivor reaches an
+# outcome.  Treating it as unknown makes the mortality table fail to partition
+# the ingest status vocabulary and turns an ordinary legislative transition
+# into a misleading "unclassified" outcome.
+_PENDING = {"introduced", "in_committee", "substituted", "passed_one_chamber", "passed_both", "enrolled"}
 
 
 @router.get("/mortality", response_model=MortalityReportEnvelope)

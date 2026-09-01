@@ -29,7 +29,7 @@ successful CI run, or a Railway "Online" badge is not release authority.
 | Railway service handles | API `<API_SERVICE>`; MCP `<MCP_SERVICE>`; ingest `<INGEST_SERVICE>`; Scout `<SCOUT_SERVICE>` |
 | Vercel project/environment | `<VERCEL_PROJECT>` / `<VERCEL_ENVIRONMENT>` |
 | Database target and current Alembic revision | `<OPERATOR_INPUT>`; record only hostname/database label and revision, never URL/password |
-| RawStore authority and mount proof | `<OPERATOR_INPUT>` |
+| Scout evidence backend and migration proof | PostgreSQL `scout_raw_blobs`; record migration `0025` and readiness output |
 | Backup artifact, checksum, restore-drill evidence | `<OPERATOR_INPUT>` |
 | Rollback decision owner and communications contact | `<OPERATOR_INPUT>` |
 
@@ -97,29 +97,33 @@ variables, browser logs, or this evidence log.
 | API | `DATABASE_URL`; account/billing/Resend configuration in [the monetization runbook](monetization-runbook.md#required-environment-variables); `BILLCOMMONS_SCOUT_ENABLED=false` for dark launch |
 | MCP | `DATABASE_URL`; any existing MCP telemetry configuration; no Scout provider key needed |
 | Ingest | `DATABASE_URL`, configured host-auth secrets if applicable, and durable `RAWSTORE_ROOT` |
-| Scout worker | `DATABASE_URL`, the **same durable RawStore authority** at `RAWSTORE_ROOT`, `SOLARI_API_KEY`, all `BILLCOMMONS_SCOUT_*` ceilings, and `BILLCOMMONS_SCOUT_ENABLED=false` for dark launch |
-| Vercel web | `NEXT_PUBLIC_API_BASE=https://api.billcommons.org`, intended `NEXT_PUBLIC_SITE_URL`, and `NEXT_PUBLIC_SCOUT_ENABLED=false` for dark launch. `NEXT_PUBLIC_*` values are public by design; never put `SOLARI_API_KEY`, Stripe secret material, `DATABASE_URL`, or internal-client secrets there. |
+| Scout worker | `DATABASE_URL`, `BILLCOMMONS_SCOUT_RAWSTORE_BACKEND=postgres`, `SOLARI_API_KEY`, all `BILLCOMMONS_SCOUT_*` ceilings, and `BILLCOMMONS_SCOUT_ENABLED=false` for dark launch |
+| Vercel web | `NEXT_PUBLIC_API_BASE=https://api.billcommons.org`, intended `NEXT_PUBLIC_SITE_URL`, and both `NEXT_PUBLIC_SCOUT_ENABLED=false` / `NEXT_PUBLIC_SCOUT_NAV_ENABLED=false` for dark launch. `NEXT_PUBLIC_*` values are public by design; never put `SOLARI_API_KEY`, Stripe secret material, `DATABASE_URL`, or internal-client secrets there. |
 
-### RawStore is a hard Scout gate
+### Scout evidence storage is a hard gate
 
-Scout only commits a finding after retaining the exact bytes in RawStore. The
-local Compose file mounts one named volume at `/data/rawstore` for ingest and
-Scout, but that is **local topology evidence only**. Railway volume sharing
-between separate services is not configured in this repo.
+Scout only commits a finding after retaining the exact bytes. Migration `0025`
+adds the Scout-only, SHA-256-addressed `scout_raw_blobs` table; the worker uses
+that PostgreSQL backend by default. This deliberately separates Scout evidence
+from ingestion's filesystem `RAWSTORE_ROOT`, so separate Railway services do
+not need a shared volume.
 
 Before enabling Scout, record all of the following:
 
-1. the durable storage owner/backend and its lifecycle owner;
-2. the exact `RAWSTORE_ROOT` seen by ingest and Scout;
-3. evidence that both point at the same persistent authority when they are
-   expected to share artifacts, or an approved documented separation; and
-4. a redeploy/persistence check showing a retained Scout artifact survives a
-   worker restart.
+1. migration `0025` is current on the exact production database;
+2. the worker has `BILLCOMMONS_SCOUT_RAWSTORE_BACKEND=postgres` or leaves the
+   default intact (filesystem requires a second explicit local-only opt-in);
+3. `python -m billcommons_scout check` reports `rawstore=ok`; and
+4. the production backup/restore proof includes `scout_raw_blobs`, because
+   retained Scout evidence is part of the auditable record.
 
-Do not enable Scout with two empty, service-local directories that happen to
-share the same path string. If Railway cannot provide the required durable
-shared backing, keep the flag off until RawStore has a supported shared
-backend.
+The repository's guarded PostgreSQL test proves concurrent idempotent writes
+and retrieval through a recreated store instance. Application and database
+constraints both cap a blob at 2 MiB; the worker reaps expired unverified stages
+and old unreferenced blobs after a 24-hour default retention barrier. Record the
+chosen `BILLCOMMONS_SCOUT_STAGING_RETENTION_SECONDS` and monitor table growth. A
+real deployment restart is still post-deploy evidence, not a reason to reintroduce
+a cross-service mount.
 
 ### Pre-deploy health and capacity evidence
 
@@ -143,7 +147,7 @@ queue/freshness monitors before increasing service count or DB pool settings.
 
 ## 2. Backup and restore proof before migrations
 
-All Scout migrations (`0022`–`0024`) are additive, but an additive migration
+All Scout migrations (`0022`–`0025`) are additive, but an additive migration
 can still exhaust capacity, block DDL, or be applied to the wrong database.
 Do not run any migration until this section is complete.
 
@@ -189,8 +193,9 @@ This order keeps an additive schema compatible with old readers. No
 destructive downgrade is permitted in a production rollback.
 
 1. Keep both flags false:
-   `BILLCOMMONS_SCOUT_ENABLED=false` in API and Scout worker, and
-   `NEXT_PUBLIC_SCOUT_ENABLED=false` in Vercel.
+   `BILLCOMMONS_SCOUT_ENABLED=false` / `BILLCOMMONS_SCOUT_ALLOW_PUBLIC=false`
+   in API and Scout worker, and `NEXT_PUBLIC_SCOUT_ENABLED=false` /
+   `NEXT_PUBLIC_SCOUT_NAV_ENABLED=false` in Vercel.
 2. Deploy the pinned API/MCP/ingest/Scout artifacts to their respective
    services **without enabling Scout traffic**. Confirm each deployment ID
    maps to `<RELEASE_SHA>` and each service command matches the table above.
@@ -221,28 +226,33 @@ a release precondition, not an excuse to drop data.
 
 ## 4. Scout cohort/canary enablement
 
-Scout has no repository-defined percentage/cohort feature-flag implementation.
-Therefore a public all-user flag flip is prohibited until an operator-defined,
-auditable cohort mechanism exists. A private controlled canary account is the
-minimum viable rollout method.
+Scout has a server-side email allowlist for private canaries. When
+`BILLCOMMONS_SCOUT_CANARY_EMAILS` is non-empty, only those normalized account
+emails may create new jobs; existing owners can still read/cancel their jobs.
+An empty allowlist denies new jobs unless the separate
+`BILLCOMMONS_SCOUT_ALLOW_PUBLIC=true` acknowledgement is set. The global flag
+alone can therefore never accidentally create an all-account rollout.
 
-1. Verify the rawstore gate, Solari secret scope, browser ceilings, and a
-   tested owner-scoped canary account.
-2. Enable `BILLCOMMONS_SCOUT_ENABLED=true` only for the API/Scout environment
-   serving the controlled canary, and keep Vercel `NEXT_PUBLIC_SCOUT_ENABLED`
-   false unless the canary has a non-public entry path. Record why this cannot
-   expose jobs to other accounts.
-3. Verify worker readiness without exposing secrets. The check performs a
-   database/table read and a temporary RawStore put/get/delete probe; it does
-   not create a browser session:
+1. Verify the evidence-store gate, Solari secret scope, browser ceilings, and
+   set `BILLCOMMONS_SCOUT_CANARY_EMAILS` to the reviewed canary accounts.
+2. Enable `BILLCOMMONS_SCOUT_ENABLED=true` with
+   `BILLCOMMONS_SCOUT_ALLOW_PUBLIC=false` only for the API/Scout environment
+   serving the controlled canary. Build Vercel with
+   `NEXT_PUBLIC_SCOUT_ENABLED=true` and `NEXT_PUBLIC_SCOUT_NAV_ENABLED=false`:
+   the direct `/scout` entry works for the canary, while global navigation does
+   not advertise it and the API returns 404 to non-allowlisted accounts.
+3. Verify worker readiness without exposing secrets. With the PostgreSQL backend,
+   the check performs read-only database/table/RawStore queries; it does not create
+   a blob or browser session:
 
    ```bash
    BILLCOMMONS_SCOUT_ENABLED=1 \
      python -m billcommons_scout check
    ```
 
-   A healthy check requires `enabled=True`, RawStore configured, and Solari
-   configured. It must not print a key or provider session capability.
+   A healthy check requires database/tables and RawStore `ok`; if Solari is
+   configured, the SDK must be available. It must not print a key or provider
+   session capability.
 4. Run one controlled, evidence-supported job. Inspect durable job events,
    source/finding provenance, RawStore retention, usage ceilings, owner
    isolation, and browser-session terminal state. A provider browser session
@@ -253,11 +263,14 @@ minimum viable rollout method.
    `abandoned`, failed/partial jobs, and unexpected spend. Do not expand the
    cohort if any unknown terminal state, unreleased provider session, or
    provenance failure appears.
-6. Only after the canary evidence is accepted, deploy a new immutable Vercel
+6. Only after the canary evidence is accepted and a global queue/storage
+   capacity policy is recorded, deliberately clear the server allowlist, set
+   `BILLCOMMONS_SCOUT_ALLOW_PUBLIC=true`, and deploy a new immutable Vercel
    artifact with `NEXT_PUBLIC_SCOUT_ENABLED=true`. Re-run the public web,
-   API, worker, and owner-isolation checks. Expansion beyond the defined
+   API, worker, and owner-isolation checks with
+   `NEXT_PUBLIC_SCOUT_NAV_ENABLED=true`. Expansion beyond the defined
    cohort needs a written cost and support decision; no percentage ramp is
-   encoded by the current feature flag.
+   encoded, but the allowlist supports a controlled account-by-account ramp.
 
 ### Drain, reap, and rollback semantics
 
@@ -409,8 +422,8 @@ Follow-ups with owner/date: <...>
 This runbook makes gaps visible; it does not make them disappear. Before a
 general public Scout launch, resolve and prove at least these conditions:
 
-1. the real Railway Scout service, its pinned artifact mapping, and durable
-   RawStore topology;
+1. the real Railway Scout service, its pinned artifact mapping, and proof that it
+   uses the migrated PostgreSQL Scout RawStore backend;
 2. Scout inclusion in service-state/alerting and an agreed canary mechanism;
 3. a current production backup plus successful isolated restore drill;
 4. a green, isolated full regression gate or documented triage of unrelated

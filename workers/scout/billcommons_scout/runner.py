@@ -12,19 +12,21 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
-from sqlalchemy import and_, exists, or_, select, text
+from sqlalchemy import and_, delete, exists, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from billcommons_schema.models import Bill, BillSubject, Jurisdiction, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutResearchJob, ScoutSource, Session as LegislativeSession
+from billcommons_schema.models import Bill, BillSubject, Jurisdiction, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutRawBlob, ScoutResearchJob, ScoutSource, Session as LegislativeSession
 from billcommons_shared.rawstore import RawStore
 from billcommons_shared.safe_http import SafeHttpError, SsrfRejected, new_safe_http_client
 from billcommons_shared.scout import (
     BrowserCapture, BrowserRequest, ResearchBrowserProvider, ScoutPolicyError,
     ScoutSettings, browser_required, canonicalize_url, classify_direct_response,
-    content_hash, extract_florida_bill_identifier, summarize_content_change,
-    topical_search_terms,
+    content_hash, discover_florida_senate_related_documents,
+    extract_florida_bill_identifier, summarize_content_change,
+    is_pdf_attachment_payload, topical_search_terms,
 )
-from billcommons_scout.providers import ProviderSessionPersistenceError
+from billcommons_scout.providers import ProviderSessionPersistenceError, SolariProviderError
+from billcommons_scout.pdf_extract import extract_pdf_text
 
 Fetcher = Callable[[str], tuple[int, str | None, bytes]]
 _INFLIGHT_CLEANUP_LOCK = threading.Lock()
@@ -101,7 +103,18 @@ class ScoutRunner:
         self.rawstore = rawstore
         self.provider = provider
         self.settings = settings or ScoutSettings.from_env()
-        self.fetcher = fetcher or (lambda url: safe_direct_fetch(url, max_body_bytes=self.settings.max_direct_bytes))
+        self.fetcher = fetcher
+
+    def _direct_fetch(self, url: str, *, max_body_bytes: int) -> tuple[int, str | None, bytes]:
+        """Use the job's frozen byte ceiling for production transport.
+
+        Test fixture fetchers retain the narrow legacy callable shape; their
+        returned bytes are checked against the same frozen ceiling immediately
+        after retrieval.
+        """
+        if self.fetcher is not None:
+            return self.fetcher(url)
+        return safe_direct_fetch(url, max_body_bytes=max_body_bytes)
 
     def claim_next(self, worker_id: str) -> Claim | None:
         """Claim one queued/expired job using SKIP LOCKED where supported."""
@@ -187,7 +200,10 @@ class ScoutRunner:
             Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id
         ).join(
             LegislativeSession, LegislativeSession.id == Bill.session_id
-        ).where(Jurisdiction.abbreviation == "FL")
+        ).where(
+            Jurisdiction.abbreviation == "FL",
+            Bill.source_url.is_not(None),
+        )
         if identifier is not None:
             # Identifiers are unique only within a legislative session.  A
             # direct lookup must therefore select one current/newest session,
@@ -195,8 +211,8 @@ class ScoutRunner:
             rows = db.execute(
                 stmt.where(Bill.identifier_norm == identifier).order_by(
                     LegislativeSession.active.desc(),
-                    LegislativeSession.end_date.desc(),
-                    LegislativeSession.start_date.desc(),
+                    LegislativeSession.end_date.desc().nulls_last(),
+                    LegislativeSession.start_date.desc().nulls_last(),
                     Bill.updated_at.desc(),
                 ).limit(1)
             ).all()
@@ -225,8 +241,8 @@ class ScoutRunner:
             # distinct when old sessions are present.
             rows = db.execute(stmt.order_by(
                 LegislativeSession.active.desc(),
-                LegislativeSession.end_date.desc(),
-                LegislativeSession.start_date.desc(),
+                LegislativeSession.end_date.desc().nulls_last(),
+                LegislativeSession.start_date.desc().nulls_last(),
                 Bill.updated_at.desc(),
             ).limit(25)).all()
 
@@ -251,6 +267,40 @@ class ScoutRunner:
                 break
         return candidates
 
+    def _has_structured_match_without_source(self, db: Session, job: ScoutResearchJob) -> bool:
+        """Distinguish missing official provenance from an unsupported query.
+
+        Scout does not emit an evidence-free finding, but a structured Bill
+        Commons record whose ``source_url`` is absent is still a corpus hit.
+        This bounded existence query lets the terminal state say exactly that
+        instead of falsely reporting the request as unsupported.
+        """
+        identifier = extract_florida_bill_identifier(job.original_query)
+        stmt = select(Bill.id).join(
+            Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id
+        ).where(
+            Jurisdiction.abbreviation == "FL",
+            Bill.source_url.is_(None),
+        )
+        if identifier is not None:
+            stmt = stmt.where(Bill.identifier_norm == identifier)
+        else:
+            terms = topical_search_terms(job.original_query)
+            if not terms:
+                return False
+            stmt = stmt.where(and_(*(
+                or_(
+                    Bill.title.ilike(f"%{term}%"),
+                    Bill.description.ilike(f"%{term}%"),
+                    exists(select(BillSubject.id).where(
+                        BillSubject.bill_id == Bill.id,
+                        BillSubject.subject.ilike(f"%{term}%"),
+                    )),
+                )
+                for term in terms
+            )))
+        return db.execute(stmt.limit(1)).scalar_one_or_none() is not None
+
     def process(self, job_id: uuid.UUID, claim_token: str | None = None) -> None:
         """Perform slow I/O after the claim transaction has committed."""
         with self.sessions() as db:
@@ -266,7 +316,15 @@ class ScoutRunner:
             cancel_version = job.cancel_version
             candidates = self._candidates(db, job)
             if not candidates:
-                self._finish(db, job, token, "partial", "unsupported_query", False)
+                if self._has_structured_match_without_source(db, job):
+                    db.add(ScoutJobEvent(
+                        job_id=job.id,
+                        kind="structured_source_missing",
+                        detail={"reason": "official_source_url_unavailable"},
+                    ))
+                    self._finish(db, job, token, "partial", "official_source_missing", False)
+                else:
+                    self._finish(db, job, token, "partial", "unsupported_query", False)
                 return
             strategy = dict(job.strategy or {})
             strategy["candidate_count"] = len(candidates)
@@ -279,6 +337,8 @@ class ScoutRunner:
         failures = 0
         request_limit_reached = False
         routed_request_limit_reached = False
+        browser_create_outcome_unknown = False
+        seen_related_urls: set[str] = set()
         for url, bill_id, bill_title, bill_status, metadata in candidates:
             with self.sessions() as db:
                 job = self._fenced(db, job_id, token)
@@ -294,12 +354,15 @@ class ScoutRunner:
                     if active_job is None:
                         return
                     max_retries = self._job_limit(active_job, "max_retries", self.settings.max_retries)
+                    max_direct_bytes = self._job_limit(
+                        active_job, "max_direct_bytes", self.settings.max_direct_bytes
+                    )
                 for attempt in range(max_retries + 1):
                     if not self._reserve_external_attempt(job_id, token):
                         request_limit_reached = True
                         break
                     try:
-                        status, mime, body = self.fetcher(canonical)
+                        status, mime, body = self._direct_fetch(canonical, max_body_bytes=max_direct_bytes)
                         break
                     except SafeHttpError as exc:
                         last_error = exc
@@ -311,7 +374,7 @@ class ScoutRunner:
                     break
                 if not self._heartbeat(job_id, token):
                     return
-                if len(body) > self.settings.max_direct_bytes:
+                if len(body) > max_direct_bytes:
                     raise RuntimeError("direct_body_too_large")
                 mode = classify_direct_response(status, mime, body)
                 # The response has crossed the direct-retrieval boundary.
@@ -336,6 +399,21 @@ class ScoutRunner:
             if mode == "usable":
                 if self._persist_capture(job_id, token, bill_id, bill_title, bill_status, metadata, canonical, "direct", status, mime, body):
                     successes += 1
+                    related_successes, related_failures, related_limit = self._inspect_florida_related_documents(
+                        job_id,
+                        token,
+                        cancel_version,
+                        bill_id,
+                        bill_title,
+                        bill_status,
+                        metadata,
+                        canonical,
+                        body,
+                        seen_related_urls,
+                    )
+                    successes += related_successes
+                    failures += related_failures
+                    request_limit_reached = request_limit_reached or related_limit
                 else:
                     failures += 1
             elif mode == "browser_required" and browser_required(canonical, status=status, body=body):
@@ -346,10 +424,14 @@ class ScoutRunner:
                     failures += 1
                     request_limit_reached = request_limit_reached or reason == "external_request_limit"
                     routed_request_limit_reached = routed_request_limit_reached or reason == "browser_routed_request_limit"
+                    browser_create_outcome_unknown = (
+                        browser_create_outcome_unknown
+                        or reason == "browser_create_outcome_unknown"
+                    )
             else:
                 failures += 1
                 self._record_failed_source(job_id, token, canonical, "direct", status, mime)
-            if request_limit_reached:
+            if request_limit_reached or browser_create_outcome_unknown:
                 break
 
         with self.sessions() as db:
@@ -364,6 +446,15 @@ class ScoutRunner:
                 self._finish(db, job, token, "partial", "external_request_limit", successes > 0)
             elif routed_request_limit_reached:
                 self._finish(db, job, token, "partial", "browser_routed_request_limit", successes > 0)
+            elif browser_create_outcome_unknown:
+                self._finish(
+                    db,
+                    job,
+                    token,
+                    "partial",
+                    "browser_create_outcome_unknown",
+                    successes > 0,
+                )
             elif successes and failures:
                 self._finish(db, job, token, "partial", None, True)
             elif successes:
@@ -371,11 +462,135 @@ class ScoutRunner:
             else:
                 self._finish(db, job, token, "partial", "no_usable_source", False)
 
+    def _inspect_florida_related_documents(
+        self,
+        job_id: uuid.UUID,
+        token: str,
+        cancel_version: int,
+        bill_id: uuid.UUID | None,
+        bill_title: str,
+        bill_status: str | None,
+        metadata: dict,
+        parent_url: str,
+        parent_body: bytes,
+        seen_urls: set[str],
+    ) -> tuple[int, int, bool]:
+        """Persist a small set of official Senate attachments without crawling.
+
+        The parent page was already retrieved and verified as an official bill
+        source. Related links remain independently URL-admitted, budgeted,
+        fetched, and persisted so a broken attachment leaves the primary
+        finding usable while producing a truthful partial job outcome.
+        """
+        with self.sessions() as db:
+            job = self._fenced(db, job_id, token)
+            if job is None or self._canceled(db, job, cancel_version, token):
+                return 0, 0, False
+            maximum = self._job_limit(job, "max_related_documents", self.settings.max_related_documents)
+            max_direct_bytes = self._job_limit(job, "max_direct_bytes", self.settings.max_direct_bytes)
+        related = discover_florida_senate_related_documents(
+            parent_url, parent_body, maximum=maximum, max_html_bytes=max_direct_bytes
+        )
+        if related:
+            with self.sessions() as db:
+                if self._fenced(db, job_id, token) is not None:
+                    db.add(ScoutJobEvent(job_id=job_id, kind="related_sources_discovered", detail={"count": len(related)}))
+                    db.commit()
+
+        successes = 0
+        failures = 0
+        for document in related:
+            if document.canonical_url in seen_urls:
+                continue
+            seen_urls.add(document.canonical_url)
+            with self.sessions() as db:
+                job = self._fenced(db, job_id, token)
+                if job is None or self._canceled(db, job, cancel_version, token):
+                    return successes, failures, False
+                max_retries = self._job_limit(job, "max_retries", self.settings.max_retries)
+                max_direct_bytes = self._job_limit(job, "max_direct_bytes", self.settings.max_direct_bytes)
+            try:
+                for attempt in range(max_retries + 1):
+                    if not self._reserve_external_attempt(job_id, token):
+                        return successes, failures, True
+                    try:
+                        status, mime, body = self._direct_fetch(
+                            document.canonical_url, max_body_bytes=max_direct_bytes
+                        )
+                        break
+                    except SafeHttpError:
+                        if attempt == max_retries:
+                            raise
+                else:  # pragma: no cover - every branch breaks, returns, or raises
+                    raise RuntimeError("related_direct_fetch_failed")
+                if not self._heartbeat(job_id, token):
+                    return successes, failures, False
+                if len(body) > max_direct_bytes:
+                    raise RuntimeError("direct_body_too_large")
+                mode = classify_direct_response(status, mime, body)
+                with self.sessions() as db:
+                    if self._fenced(db, job_id, token) is None:
+                        return successes, failures, False
+                    db.add(ScoutJobEvent(job_id=job_id, kind="direct_retrieval", detail={
+                        "status": status,
+                        "mime_type": (mime or "").split(";", 1)[0].lower(),
+                        "related_document": document.artifact_type,
+                    }))
+                    db.commit()
+                # Florida Senate attachments use ordinary direct retrieval. A
+                # shell/redirect is a failed attachment, not an excuse to
+                # escalate into a costly generic browser route.
+                if mode != "usable" or not is_pdf_attachment_payload(mime, body):
+                    self._record_failed_source(job_id, token, document.canonical_url, "direct", status, mime)
+                    failures += 1
+                    continue
+                related_metadata = dict(metadata)
+                related_metadata["related_artifact_type"] = document.artifact_type
+                source_id = self._persist_capture(
+                    job_id,
+                    token,
+                    bill_id,
+                    bill_title,
+                    bill_status,
+                    related_metadata,
+                    document.canonical_url,
+                    "direct",
+                    status,
+                    mime,
+                    body,
+                )
+                if source_id is None:
+                    failures += 1
+                else:
+                    successes += 1
+            except (ScoutPolicyError, SafeHttpError):
+                self._record_failed_source(job_id, token, document.canonical_url, "direct", None, None)
+                failures += 1
+            except Exception:
+                self._record_failed_source(job_id, token, document.canonical_url, "direct", None, None)
+                failures += 1
+        return successes, failures, False
+
     def _record_failed_source(self, job_id: uuid.UUID, token: str, url: str, mechanism: str, status: int | None, mime: str | None) -> None:
+        try:
+            safe_url = canonicalize_url(url)
+        except ScoutPolicyError:
+            safe_url = None
         with self.sessions() as db:
             if self._fenced(db, job_id, token) is None:
                 return
-            db.add(ScoutSource(job_id=job_id, canonical_url=url[:4000], official=False, retrieval_mechanism=mechanism, http_status=status, mime_type=mime))
+            # A rejected URL is hostile input, not provenance. Never persist it
+            # in a field the API/UI may render as an external link. Safe
+            # official URLs still retain a failed observation for diagnostics.
+            if safe_url is not None:
+                db.add(ScoutSource(
+                    job_id=job_id,
+                    canonical_url=safe_url,
+                    official=False,
+                    retrieval_mechanism=mechanism,
+                    http_status=status,
+                    mime_type=mime,
+                ))
             db.add(ScoutJobEvent(job_id=job_id, kind="source_failed", detail={"mechanism": mechanism, "status": status}))
             db.commit()
 
@@ -450,6 +665,34 @@ class ScoutRunner:
 
     def _persist_capture(self, job_id: uuid.UUID, token: str, bill_id: uuid.UUID | None, bill_title: str, bill_status: str | None, metadata: dict, url: str, mechanism: str, status: int | None, mime: str | None, body: bytes) -> uuid.UUID | None:
         try:
+            with self.sessions() as db:
+                active_job = self._fenced(db, job_id, token)
+                if active_job is None:
+                    return None
+                max_direct_bytes = self._job_limit(
+                    active_job, "max_direct_bytes", self.settings.max_direct_bytes
+                )
+                max_pdf_pages = self._job_limit(active_job, "max_pdf_pages", self.settings.max_pdf_pages)
+                max_pdf_text_chars = self._job_limit(
+                    active_job, "max_pdf_text_chars", self.settings.max_pdf_text_chars
+                )
+                max_pdf_extract_seconds = self._job_limit(
+                    active_job,
+                    "max_pdf_extract_seconds",
+                    self.settings.max_pdf_extract_seconds,
+                )
+                max_pdf_extract_memory_bytes = self._job_limit(
+                    active_job,
+                    "max_pdf_extract_memory_bytes",
+                    self.settings.max_pdf_extract_memory_bytes,
+                )
+                max_pdf_extract_cpu_seconds = self._job_limit(
+                    active_job,
+                    "max_pdf_extract_cpu_seconds",
+                    self.settings.max_pdf_extract_cpu_seconds,
+                )
+            if len(body) > max_direct_bytes:
+                raise RuntimeError("direct_body_too_large")
             digest = content_hash(body)
             exact_raw_ref = self._exact_raw_ref(job_id, token, url, digest)
             if exact_raw_ref:
@@ -460,23 +703,24 @@ class ScoutRunner:
                     exact_raw_ref = None
             mime_base = (mime or "").split(";", 1)[0].lower()
             if mime_base == "application/pdf":
-                from io import BytesIO
-                from pypdf import PdfReader
-                reader = PdfReader(BytesIO(body))
-                if len(reader.pages) > self.settings.max_pdf_pages:
-                    raise RuntimeError("pdf_page_limit")
-                parts: list[str] = []
-                remaining = self.settings.max_pdf_text_chars
-                for page in reader.pages:
-                    part = (page.extract_text() or "")[:remaining]
-                    parts.append(part)
-                    remaining -= len(part)
-                    if remaining <= 0:
-                        break
-                text = " ".join(parts).strip()
+                text = extract_pdf_text(
+                    body,
+                    max_pages=max_pdf_pages,
+                    max_text_chars=max_pdf_text_chars,
+                    timeout_seconds=max_pdf_extract_seconds,
+                    memory_limit_bytes=max_pdf_extract_memory_bytes,
+                    cpu_limit_seconds=max_pdf_extract_cpu_seconds,
+                )
             else:
-                text = html.unescape(_TAG_RE.sub(" ", body.decode("utf-8", "replace")))[:self.settings.max_pdf_text_chars].strip()
-            evidence = self._evidence_excerpt(text, metadata, bill_status)
+                text = html.unescape(_TAG_RE.sub(" ", body.decode("utf-8", "replace")))[:max_pdf_text_chars].strip()
+            related_artifact_type = metadata.get("related_artifact_type")
+            if related_artifact_type not in {"committee analysis", "amendment"}:
+                related_artifact_type = None
+            evidence = (
+                self._related_evidence_excerpt(text, metadata)
+                if related_artifact_type
+                else self._evidence_excerpt(text, metadata, bill_status)
+            )
             if evidence is None:
                 self._record_failed_source(job_id, token, url, mechanism, status, mime)
                 return None
@@ -552,7 +796,11 @@ class ScoutRunner:
                     source = db.get(ScoutSource, stage_id)
                     if source is None:  # pragma: no cover - stage is committed above
                         return None
-                    source.title = bill_title
+                    identifier = str(metadata.get("identifier") or bill_title)
+                    source.title = (
+                        f"{identifier}: Official Florida Senate {related_artifact_type}"
+                        if related_artifact_type else bill_title
+                    )
                     source.official = True
                     source.retrieval_mechanism = "reused" if exact_raw_ref else mechanism
                     source.content_hash = digest
@@ -566,13 +814,35 @@ class ScoutRunner:
                     # actual finalization instant so URL history has a stable newest
                     # observation for A→B→A comparisons.
                     source.retrieved_at = datetime.now(timezone.utc)
-                    identifier = str(metadata.get("identifier") or bill_title)
                     action = metadata.get("latest_action")
                     action_date = metadata.get("latest_action_date") or metadata.get("status_date")
-                    development = f"Latest structured action{f' ({action_date.isoformat()})' if isinstance(action_date, date) else ''}: {action}" if action else f"Structured Florida status: {bill_status or 'unreported'}"
-                    # _evidence_excerpt refuses a finding unless this exact
-                    # displayed window supports both the identifier and action.
-                    db.add(ScoutFinding(job_id=job_id, source_id=source.id, title=f"{identifier}: {bill_title}", what_happened=development, why_it_matters="The structured development is paired with retained official source bytes.", relevant_date=action_date if isinstance(action_date, date) else None, excerpt=excerpt, excerpt_hash=content_hash(excerpt.encode()), excerpt_start=excerpt_start, excerpt_end=excerpt_end, confidence="high", extractor_version="scout-p0-1", bill_id=bill_id))
+                    if related_artifact_type:
+                        finding = ScoutFinding(
+                            job_id=job_id,
+                            source_id=source.id,
+                            title=f"{identifier}: Official Florida Senate {related_artifact_type}",
+                            what_happened=(
+                                f"Official Florida Senate {related_artifact_type} retrieved for {identifier}."
+                            ),
+                            why_it_matters=(
+                                "This bill-scoped primary document was discovered from the official Senate bill page "
+                                "and retained as evidence."
+                            ),
+                            relevant_date=None,
+                            excerpt=excerpt,
+                            excerpt_hash=content_hash(excerpt.encode()),
+                            excerpt_start=excerpt_start,
+                            excerpt_end=excerpt_end,
+                            confidence="high",
+                            extractor_version="scout-p0-2-related",
+                            bill_id=bill_id,
+                        )
+                    else:
+                        development = f"Latest structured action{f' ({action_date.isoformat()})' if isinstance(action_date, date) else ''}: {action}" if action else f"Structured Florida status: {bill_status or 'unreported'}"
+                        # _evidence_excerpt refuses a finding unless this exact
+                        # displayed window supports both the identifier and action.
+                        finding = ScoutFinding(job_id=job_id, source_id=source.id, title=f"{identifier}: {bill_title}", what_happened=development, why_it_matters="The structured development is paired with retained official source bytes.", relevant_date=action_date if isinstance(action_date, date) else None, excerpt=excerpt, excerpt_hash=content_hash(excerpt.encode()), excerpt_start=excerpt_start, excerpt_end=excerpt_end, confidence="high", extractor_version="scout-p0-1", bill_id=bill_id)
+                    db.add(finding)
                     persisted_mechanism = "reused" if exact_raw_ref else mechanism
                     db.add(ScoutJobEvent(job_id=job_id, kind="document_inspected", detail={"mechanism": persisted_mechanism, "mime_type": mime_base}))
                     db.add(ScoutJobEvent(job_id=job_id, kind="source_persisted", detail={"mechanism": persisted_mechanism, "change_kind": change.kind if change else None}))
@@ -615,6 +885,30 @@ class ScoutRunner:
             return None
         return excerpt, start, end
 
+    @staticmethod
+    def _related_evidence_excerpt(text: str, metadata: dict, *, maximum: int = 500) -> tuple[str, int, int] | None:
+        """Require the linked bill identifier in an adjacent primary document.
+
+        The artifact category is constrained by the canonical Senate URL, and
+        the finding makes no claim about its substantive contents. The excerpt
+        therefore only needs to prove that this retained document identifies
+        the same bill as the page from which it was discovered.
+        """
+        display_text = _SPACE_RE.sub(" ", text).strip()
+        identifier = _SPACE_RE.sub(" ", str(metadata.get("identifier") or "")).strip()
+        if not display_text or not identifier:
+            return None
+        position = display_text.casefold().find(identifier.casefold())
+        if position < 0:
+            return None
+        start = max(0, position - (maximum - len(identifier)) // 2)
+        end = min(len(display_text), start + maximum)
+        start = max(0, end - maximum)
+        excerpt = display_text[start:end]
+        if identifier.casefold() not in excerpt.casefold():
+            return None
+        return excerpt, start, end
+
     def _browser_capture(self, job_id: uuid.UUID, token: str, bill_id: uuid.UUID | None, bill_title: str, bill_status: str | None, metadata: dict, url: str) -> tuple[bool, str | None]:
         with self.sessions() as db:
             active_job = self._fenced(db, job_id, token)
@@ -638,12 +932,13 @@ class ScoutRunner:
         started: float | None = None
         provider_id: str | None = None
         durable_provider_id = False
+        create_outcome_unknown = False
 
         def on_started(created_provider_id: str) -> None:
             nonlocal provider_id, durable_provider_id
             # This transaction couples the durable provider ID and usage
-            # increment. A failed callback is propagated to the provider,
-            # which self-cleans before returning control to us.
+            # increment. A failed callback is propagated with the opaque ID;
+            # this runner still owns the one remote release in its finally.
             self._record_browser_started(session_id, job_id, token, created_provider_id)
             provider_id = created_provider_id
             durable_provider_id = True
@@ -651,7 +946,7 @@ class ScoutRunner:
         try:
             started = time.monotonic()
             capture = self.provider.capture(
-                BrowserRequest(url=url, max_pages=max_pages, max_actions=max_actions, wall_seconds=browser_wall_seconds, max_bytes=self.settings.max_direct_bytes, max_routed_requests=self._job_limit(active_job, "max_routed_requests", self.settings.max_browser_routed_requests), cleanup_seconds=browser_cleanup_seconds),
+                BrowserRequest(url=url, max_pages=max_pages, max_actions=max_actions, wall_seconds=browser_wall_seconds, max_bytes=self._job_limit(active_job, "max_direct_bytes", self.settings.max_direct_bytes), max_routed_requests=self._job_limit(active_job, "max_routed_requests", self.settings.max_browser_routed_requests), cleanup_seconds=browser_cleanup_seconds),
                 on_started=on_started,
             )
             # Provider implementations must call on_started immediately after
@@ -694,18 +989,26 @@ class ScoutRunner:
             self._heartbeat(job_id, token, "browser_routed_requests", capture.routed_requests)
             return True, None
         except ProviderSessionPersistenceError as exc:
-            # The provider has already self-cleaned. Retry only the durable
-            # ledger write; if DB recovered we can record and idempotently
-            # release the true provider ID. Never log the opaque value.
+            # Retry only the durable ledger write; if DB recovered we can
+            # record and release the true provider ID exactly once. Never log
+            # the opaque value.
             provider_id = exc.provider_session_id
             durable_provider_id = self._recover_browser_session(session_id, job_id, token, provider_id)
             if not durable_provider_id and self._browser_slot_abandoned(session_id):
                 # The reaper already declared this ID-less slot terminal. The
-                # callback was rejected and the provider has performed its
-                # own cleanup, so a second release must not recreate/alter
-                # the abandoned ledger row.
-                provider_id = None
+                # The callback was rejected after the reaper terminalized the
+                # slot. We still hold a real provider ID, so retain it for the
+                # untracked one-shot release below without reviving the slot.
+                durable_provider_id = False
             return False, None
+        except SolariProviderError as exc:
+            if exc.phase == "create" and provider_id is None:
+                # A one-shot create response may be lost after the provider
+                # accepted it. There is no ID to release or reconcile, so
+                # retain a truthful ledger state and charge the full frozen
+                # session reservation instead of claiming nothing started.
+                create_outcome_unknown = True
+            return False, "browser_create_outcome_unknown" if create_outcome_unknown else None
         except Exception:
             return False, "browser_routed_request_limit" if capture is not None and capture.routed_requests > self._job_limit(active_job, "max_routed_requests", self.settings.max_browser_routed_requests) else None
         finally:
@@ -740,6 +1043,8 @@ class ScoutRunner:
                     provider_id, cleanup_seconds=browser_cleanup_seconds
                 )
                 self._finalize_untracked_browser_slot(session_id, job_id, provider_id, released, replay)
+            elif create_outcome_unknown:
+                self._mark_unknown_browser_creation(session_id, job_id)
             else:
                 self._discard_unstarted_browser_slot(session_id)
 
@@ -854,6 +1159,37 @@ class ScoutRunner:
                 session.released_at = datetime.now(timezone.utc)
                 db.commit()
 
+    def _mark_unknown_browser_creation(
+        self, session_id: uuid.UUID, job_id: uuid.UUID
+    ) -> None:
+        """Record an unreconcilable one-shot create outcome without lying.
+
+        Solari does not expose create idempotency keys or list-by-request. A
+        lost successful response therefore has no releasable ID. The API cost
+        ledger treats this marker as a full session reservation for the day.
+        """
+        with self.sessions() as db:
+            session = db.get(ScoutBrowserSession, session_id)
+            if (
+                session is None
+                or session.job_id != job_id
+                or session.provider_session_id is not None
+            ):
+                return
+            # Keep this row globally live for the full frozen drive + cleanup
+            # horizon. The provider may have accepted the create even though
+            # Scout never received an ID; immediately freeing the slot could
+            # exceed the configured cloud-browser concurrency ceiling.
+            session.status = "cleanup_failed"
+            session.error_class = "create_outcome_unknown"
+            session.cleanup_attempted_at = datetime.now(timezone.utc)
+            db.add(ScoutJobEvent(
+                job_id=job_id,
+                kind="browser_create_outcome_unknown",
+                detail={"accounting": "full_session_reservation"},
+            ))
+            db.commit()
+
     def _browser_slot_abandoned(self, session_id: uuid.UUID) -> bool:
         with self.sessions() as db:
             session = db.get(ScoutBrowserSession, session_id)
@@ -918,9 +1254,9 @@ class ScoutRunner:
                 if session is None or job is None or session.job_id != job_id:
                     return False
                 if session.provider_session_id is None:
-                    # A late callback for a reaped ID-less slot has already
-                    # gone through provider cleanup. Do not recreate ledger
-                    # usage or consume global capacity after abandonment.
+                    # A late callback for a reaped ID-less slot is released by
+                    # the caller before this finalization. Do not recreate
+                    # ledger usage or consume capacity after abandonment.
                     if session.status != "starting":
                         return False
                     session.provider_session_id = provider_id
@@ -1137,11 +1473,30 @@ class ScoutRunner:
                 if not eligible:
                     continue
                 if not row.provider_session_id:
+                    if row.error_class == "create_outcome_unknown":
+                        # Anchor the conservative hold when the create became
+                        # outcome-unknown, not when the local slot was first
+                        # reserved. A slow create may consume nearly the whole
+                        # drive timeout before its accepted response is lost.
+                        hold_started_at = row.cleanup_attempted_at or row.created_at
+                        if hold_started_at.tzinfo is None:
+                            hold_started_at = hold_started_at.replace(tzinfo=timezone.utc)
+                        unknown_hold_seconds = self._job_limit(
+                            job,
+                            "browser_wall_seconds",
+                            self.settings.browser_wall_seconds,
+                        ) + cleanup_seconds
+                        if hold_started_at + timedelta(seconds=unknown_hold_seconds) > now:
+                            continue
                     # No remote resource was ever identified. A stale/dead
                     # reservation must stop consuming the global cap, but is
                     # not falsely reported as released.
                     row.status = "abandoned"
-                    row.error_class = "abandoned_without_provider_id"
+                    row.error_class = (
+                        "create_outcome_unknown_expired"
+                        if row.error_class == "create_outcome_unknown"
+                        else "abandoned_without_provider_id"
+                    )
                     row.cleanup_attempted_at = now
                     row.released_at = now
                     continue
@@ -1169,6 +1524,61 @@ class ScoutRunner:
         for session_id, provider_id, attempts in replay_ids:
             self._probe_replay(session_id, provider_id, attempts)
         return released + len(replay_ids)
+
+    def reap_staging_blobs(self) -> dict[str, int]:
+        """Delete expired unverified stages and old unreferenced raw bytes.
+
+        Final evidence remains immutable. Only terminal jobs' unverified
+        staging rows age out, and a raw blob is deleted only when it is older
+        than the same safety window and no Scout source references its hash.
+        The age check protects the short interval between a concurrent
+        content-addressed put and attaching its reference to the staged row.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=self.settings.staging_retention_seconds
+        )
+        terminal_statuses = ("completed", "partial", "failed", "canceled")
+        with self.sessions() as db:
+            stale_stages = select(ScoutSource.id).join(
+                ScoutResearchJob, ScoutResearchJob.id == ScoutSource.job_id
+            ).where(
+                ScoutSource.retrieval_mechanism == "staged",
+                ScoutSource.official.is_(False),
+                ScoutSource.retrieved_at < cutoff,
+                ScoutResearchJob.status.in_(terminal_statuses),
+            )
+            source_result = db.execute(
+                delete(ScoutSource).where(ScoutSource.id.in_(stale_stages))
+            )
+            referenced = exists(
+                select(ScoutSource.id).where(
+                    ScoutSource.raw_ref == ScoutRawBlob.sha256
+                )
+            )
+            # A stage is committed before RawStore.put. An identical old
+            # orphan may therefore be returned by put just before this worker
+            # attaches its hash. Treat any fresh unresolved stage as a short
+            # global GC barrier. Crashed barriers age out with the same cutoff;
+            # active finalizers cannot lose bytes between put and attachment.
+            unresolved_fresh_stage = exists(
+                select(ScoutSource.id).where(
+                    ScoutSource.retrieval_mechanism == "staged",
+                    ScoutSource.raw_ref.is_(None),
+                    ScoutSource.retrieved_at >= cutoff,
+                )
+            )
+            blob_result = db.execute(
+                delete(ScoutRawBlob).where(
+                    ScoutRawBlob.created_at < cutoff,
+                    ~referenced,
+                    ~unresolved_fresh_stage,
+                )
+            )
+            db.commit()
+            return {
+                "staged_sources": max(0, source_result.rowcount or 0),
+                "raw_blobs": max(0, blob_result.rowcount or 0),
+            }
 
     @staticmethod
     def _replay_attempts(error_class: str | None) -> int:

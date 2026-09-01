@@ -15,7 +15,7 @@ Scout remains inside the existing monorepo and deploy topology:
 - PostgreSQL/Alembic remains the only durable schema authority and queue.
 - a dedicated Scout worker performs slow external I/O outside request transactions;
 - `packages/shared` holds pure URL, normalization, hashing, diff, policy, and provider contracts importable by API and worker containers;
-- the existing content-addressed RawStore retains fetched artifacts. Scout cannot be enabled unless durable RawStore is configured, and no finding may commit before the exact extracted bytes do.
+- Scout uses its own PostgreSQL content-addressed RawStore (`scout_raw_blobs`) for fetched evidence. It is independent of ingestion's filesystem RawStore, so the dedicated worker does not require a cross-service volume. Application and schema cap blobs at 2 MiB; expired unverified stages/orphans are collected behind a live-finalization barrier. Scout cannot be enabled unless the additive migration and durable store are configured, and no finding may commit before the exact extracted bytes do.
 
 `ingest_jobs`, `BillEvent`, and entity-oriented `SourceRecord` are not public Scout job/result stores. Scout uses additive tables because it needs user ownership, progress events, partial success, browser usage, and evidence relationships.
 
@@ -43,13 +43,14 @@ authenticated request
 - `scout_sources`: canonical URL, official-domain decision, retrieval mechanism, HTTP/MIME outcome, content/document hash, raw reference, retrieved/update time, prior-source relation.
 - `scout_findings`: source/job link, title, what happened, why it matters, relevant date/excerpt, confidence, extraction version, structured Bill Commons entity link.
 - `scout_browser_sessions`: provider/session ID, recording/replay fields, pages/actions/runtime, timestamps, terminal status, normalized error. Never secrets.
+- `scout_raw_blobs`: SHA-256-keyed immutable bytes plus bounded first-observation metadata. The primary key makes concurrent `put` idempotent; sources retain their own URL/tenant provenance separately.
 
 The first migration is additive and reversible by dropping only these new objects. Production migration/deploy is not authorized by this build request.
 
 ## Research router
 
 1. Query the local corpus through shared search logic/SQL, not a loopback HTTP call. For P0, Florida results yield candidate bill identifiers and their already-retained official URLs; Scout supplements the corpus result by checking those official pages/documents rather than stopping at the database hit.
-2. Canonicalize those candidates through one Florida adapter and fetch only registry/adapter-derived official URLs with per-hop URL admission, robots/politeness, byte/time/redirect caps, an identifying user agent, and deterministic HTML/PDF extraction. A query with no safely supported candidate ends as `partial`/`unsupported_query`; it never becomes a generic crawl.
+2. Canonicalize those candidates through one Florida adapter and fetch only registry/adapter-derived official URLs with per-hop URL admission, robots/politeness, byte/time/redirect caps, an identifying user agent, and deterministic HTML extraction plus isolated, resource-bounded PDF extraction. A query with no structured match ends as `partial`/`unsupported_query`; a structured record lacking an official source ends as `partial`/`official_source_missing`. Neither becomes an evidence-free finding or generic crawl.
 3. Classify direct responses as usable, blocked, browser-required, or failed. Usable requires an admitted MIME plus required extracted fields. 404/410, 429, login/challenge/captcha markers, off-registry redirects, and garbage HTML never escalate to a browser. Browser-required is an explicit allowlisted host/path behavior, not a fallback for every extraction failure.
 4. Use `ResearchBrowserProvider` only for browser-required sources. `MockResearchBrowserProvider` drives deterministic tests; `SolariResearchBrowserProvider` owns all provider-specific calls.
 5. Normalize, hash, compare, extract, and persist each useful source independently. One failure cannot erase earlier findings.
@@ -80,6 +81,10 @@ Current Solari docs (checked 2026-09-01) support both `launch()` and the lower-l
 ## Cost controls
 
 All limits live in one Scout settings object. Equivalent in-flight queries coalesce atomically by owner, jurisdiction, normalized query, and freshness bucket through a database constraint/retry path. Canonical URL plus immutable raw-byte hash deduplicates sources/documents, and prior-source links retain changes. PostgreSQL source finalization is serialized per tenant and canonical URL so concurrent observations form one immediate-predecessor chain. Active jobs, daily new jobs, every external attempt, and concurrent/cleanup-failed browser sessions are durably bounded. Job creation reserves worst-case browser runtime under the customer-row lock; terminal actual runtime replaces that reservation, and the worker honors the stored request-time wall ceiling. Provider-reported pages, actions, and routed requests are checked again before evidence is admitted. Reservation is intentionally conservative: capacity is returned only when a job terminalizes without a live browser slot.
+
+## Evidence storage tradeoff
+
+Scout P0 stores bounded source payloads in PostgreSQL so its worker, queue, and retained evidence share one durable service rather than depending on a mounted filesystem across deployments. This is intentionally scoped to Scout's strict document-size ceiling and content-address dedupe; it increases managed-Postgres storage, backup, and I/O cost compared with object storage. Before payload volume makes that tradeoff unattractive, introduce an S3-compatible `RawStore` implementation behind the existing protocol, migrate immutable blobs by SHA-256 with read-after-write verification, retain PostgreSQL keys/provenance, and keep the database implementation as a backward-compatible reader during cutover. Ingest storage is not changed by this decision.
 
 ## Runtime and rollout
 

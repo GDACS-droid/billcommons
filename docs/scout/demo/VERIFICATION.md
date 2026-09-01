@@ -1,74 +1,93 @@
 # Demo verification record
 
-This sanitized record supports the separate live checks summarized in the Scout demo. It contains no API key, provider session ID, replay bearer URL, customer data, or private database value.
+This sanitized record contains no API key, provider session ID, replay bearer URL,
+customer data, cookie, browser connection endpoint, or private database value.
 
-Recorded on 2026-09-01 against hardened code revision [`22a6376`](https://github.com/GDACS-droid/billcommons/commit/22a6376bb16c9e1f35a2808f987e9002c31d215e). Full context and failure history are in [`LIVE_TESTS.md`](../LIVE_TESTS.md).
+## Product segment: deterministic UI
 
-## Shown product run: deterministic UI
+The first 11.12 seconds show the production-built `/scout` page consuming three
+local API fixtures: queued, running, and completed. The completed fixture contains
+two linked findings, two retained official sources, one released browser session,
+and measured usage. The on-screen bottom rail labels the segment
+`DETERMINISTIC PRODUCT FIXTURE | DURABLE JOB EVENTS` throughout.
 
-The first 28.96 seconds of the MP4 show the real `/scout` UI consuming deterministic local queued, running, and completed API states. It is not a production recording and makes no network request to a government site. The shown job uses direct retrieval and correctly reports that no browser session was needed.
+Runtime assertions executed against the production build at desktop and mobile
+viewports:
 
-## Separately checked: HB 625 evidence contract
+- the Florida Senate HB 625 → Chapter No. 2026-141 finding rendered;
+- the Florida Statutes §43.16 current-law finding rendered;
+- the compact `Solari: released · 1 page · 2 actions` summary rendered;
+- the terminal status referenced retained source metadata;
+- both official-record evidence controls rendered;
+- no Next.js development indicator appeared.
 
-- Official source: <https://flsenate.gov/Session/Bill/2026/625/ByCategory>
-- Opt-in test: `apps/api/tests/test_scout_postgres.py::test_live_direct_flsenate_hb_625_retains_exact_supported_evidence`
-- Recorded result: pass
-- Contract: exactly one direct official source and one finding; retained excerpt contains both `HB 625` and `Chapter No. 2026-141`; mock browser unused
-- Scope: this verifies retention of a known official action. It does not claim Scout discovered a previously unknown development.
+This segment proves UI hierarchy and state handling. It does not claim a production
+deployment or live API job.
 
-The test uses the repository's destructive-test guard and must target a newly created, explicitly acknowledged disposable PostgreSQL database:
+## Live segment: real Solari browser
 
-```bash
-BILLCOMMONS_TEST_DATABASE_URL='postgresql:///REPLACE_WITH_NEW_DISPOSABLE_DB?host=/var/run/postgresql' \
-BILLCOMMONS_TEST_POSTGRES_URL="$BILLCOMMONS_TEST_DATABASE_URL" \
-BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE=1 \
-BILLCOMMONS_SCOUT_LIVE_FINDING_CHECK=1 \
-PYTHONPATH=apps/api:packages/schema:packages/shared:workers/scout \
-.venv/bin/pytest -q \
-  apps/api/tests/test_scout_postgres.py::test_live_direct_flsenate_hb_625_retains_exact_supported_evidence
-```
-
-Do not reuse that placeholder literally or point the command at a shared/production database.
-
-## Separately checked: Solari lifecycle
-
-- Official target: <https://www.leg.state.fl.us/robots.txt>
-- Recorded result: `solari_check=ok`
-- Non-reversible session fingerprint: `186a068f3858`
-- Pages/actions: 1 / 1
-- Runtime: 7,283 ms
-- Deterministic assertion: `User-agent` marker present
-- Recording: enabled
-- Replay: available during the bounded post-release probe
-- Cleanup: confirmed through idempotent release
-
-Explicitly billable reproduction command:
+The final nine seconds use before-and-after screenshots from one post-hardening live
+command in the public cookbook example:
 
 ```bash
-BILLCOMMONS_SCOUT_ENABLED=true \
-BILLCOMMONS_SCOUT_SOLARI_CHECK=1 \
-PYTHONPATH=apps/api:packages/schema:packages/shared:workers/scout \
-.venv/bin/python -m billcommons_scout solari-check
+cd examples/bill-commons-scout-py
+.venv/bin/python main.py --live
 ```
 
-The command emits fixed safe fields and a SHA-256 session fingerprint. By design it does not log the API key, signed provider session ID, response body, raw exception text, or replay bearer URL. A replay URL was therefore not retained as a public artifact. The independently runnable public provider example is at [`GDACS-droid/solari-cookbook`](https://github.com/GDACS-droid/solari-cookbook/tree/billcommons-scout-challenge/examples/bill-commons-scout-py).
+Observed on 2026-09-01:
 
-## Shown live Solari proof: separate non-recorded session
+| Field | Result |
+|---|---|
+| Provider | `solari_browser` |
+| Official navigation | Chapter 43 contents → section 43.16 |
+| Extracted section | `43.16` |
+| Required current-law text | exact paragraph beginning “(d) One judge, or senior judge …” |
+| Required history | `s. 1, ch. 2026-141` |
+| Runtime | 10,137 ms |
+| Pages | 1 |
+| Actions | 2 |
+| Routed requests | 38 of 48 maximum |
+| Recording/replay capability | available |
+| Remote cleanup | confirmed |
+| Captured HTML SHA-256 | `2e70542918802d1e9e744ea98d8e7ecfc911731cbdca1f98fcd76cc7a9bb7e3c` |
 
-The final five seconds are an actual screenshot captured from a Solari-controlled cloud browser while it displayed the harmless official target. This was a new session, separate from both the deterministic HB 625 product sequence and the earlier recorded/replay smoke.
+The output exposed no session identifier, WebSocket/CDP endpoint, replay URL,
+credential, cookie, or raw provider exception. Both screenshots were visually
+inspected at their original 1280×720 resolution and contain only public Florida
+Legislature pages. Their public-example SHA-256 values are:
 
-- Official target: <https://www.leg.state.fl.us/robots.txt>
-- Recorded result: `solari_live_visual=ok`
-- Non-reversible session fingerprint: `b0dd77da148d`
-- Pages/actions: 1 / 1
-- Runtime: 3,412 ms
-- Deterministic assertion: `User-agent` marker present
-- Recording: disabled for this public visual proof
-- Cleanup: confirmed before the derivative image was added to the repository
-- Public proof SHA-256: `13e92dbcbbfb61ea738cd882587f13d2cae27cc8b4cdd2e7b1b00b71ca71b840`
+- chapter contents: `7c91920fa2b7f1e398468fcef533a0964baab1cb092eae76100ff446e568005e`
+- statute result: `23a1c251cc3ceaf75ed035a763f5cfcaee4f769bd62a75e6bb3a4f42a83cfd3b`
 
-The derivative image contains no address bar, API key, WebSocket endpoint, provider session ID, replay URL, cookies, or account data. Disabling recording avoids creating another retained rrweb artifact merely for marketing evidence; the prior opt-in smoke remains the recording/replay lifecycle proof.
+The live command uses one non-retrying session-create request. If creation times out
+after an ambiguous provider outcome, cleanup is explicitly *not* reported as
+confirmed. Cancellation is re-raised after cleanup, the final route must semantically
+equal the exact §43.16 page, and evidence fields must come from one scoped `.Section`
+container. Twelve deterministic tests cover those contracts.
+
+Public source and proof:
+
+- [`GDACS-droid/solari-cookbook` challenge branch](https://github.com/GDACS-droid/solari-cookbook/tree/billcommons-scout-challenge/examples/bill-commons-scout-py)
+- public two-frame example commit `1233dd2`
 
 ## Claim boundary
 
-Solari was not used for the HB 625 product run shown in the video. The final segment is explicitly a separate live Solari visual proof. The recorded Solari check proves the bounded recording/replay/cleanup lifecycle; a separate MyFloridaHouse redirect test proves Scout's persisted fallback path. None of those browser runs produced the HB 625 finding.
+The Solari command verifies current §43.16 text and its 2026 chapter-law history.
+The product case file separately associates that chapter law with HB 625 through an
+official Florida Senate bill record. The demo does not claim that the browser command
+independently establishes the bill-to-law mapping.
+
+## Media integrity
+
+The MP4 fully decoded with `ffmpeg -v error`.
+
+- H.264, 1440×900, 25 fps, 504 frames, `yuv420p`
+- 20.160000 seconds
+- 864,333 bytes
+- SHA-256 `c783e4b1efb21d712195fd5b7bd6da2012edafeba43051b27265300e7122d472`
+
+Poster SHA-256:
+`22ed4db376ea0a2b18d5230cc630842f66de88ce55daa5fcdde0be06ac4f6f2a`
+
+Two-step live-proof image SHA-256:
+`21991ca0699009401c438cceb5c40f2e55a9fc6dce98cbbe02abd0046fc883a6`

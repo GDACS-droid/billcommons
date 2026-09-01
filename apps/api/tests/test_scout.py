@@ -36,6 +36,7 @@ def _app(monkeypatch):
         db.add_all((owner, other))
         db.commit()
     monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ALLOW_PUBLIC", "1")
     monkeypatch.setattr(scout, "_check_origin", lambda request: None)
     monkeypatch.setattr(scout, "_require_session", lambda request, db: db.get(ApiCustomer, uuid.UUID(request.headers["x-test-customer"])))
     app = create_app()
@@ -86,7 +87,38 @@ def test_scout_create_coalesces_and_owner_scopes_reads(monkeypatch):
                     ScoutJobEvent.kind == "finished",
                 )
             ).scalars().all()
-            assert [event.detail["status"] for event in terminal] == ["canceled"]
+        assert [event.detail["status"] for event in terminal] == ["canceled"]
+
+
+def test_scout_creation_snapshots_document_processing_caps(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_RELATED_DOCUMENTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DIRECT_BYTES", "1024")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_PDF_PAGES", "3")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_PDF_TEXT_CHARS", "400")
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/scout/jobs", json={"query": "HB 625"}, headers={"x-test-customer": str(owner.id)}
+        )
+        assert created.status_code == 201
+        job_id = uuid.UUID(created.json()["job"]["id"])
+        # A subsequent rollout may change its process setting, but this queued
+        # job retains the cap under which it was admitted.
+        monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_RELATED_DOCUMENTS", "2")
+        monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DIRECT_BYTES", "2048")
+        monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_PDF_PAGES", "4")
+        monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_PDF_TEXT_CHARS", "800")
+        with sessions() as db:
+            limits = db.get(ScoutResearchJob, job_id).limits
+            assert {
+                name: limits[name]
+                for name in ("max_related_documents", "max_direct_bytes", "max_pdf_pages", "max_pdf_text_chars")
+            } == {
+                "max_related_documents": 1,
+                "max_direct_bytes": 1024,
+                "max_pdf_pages": 3,
+                "max_pdf_text_chars": 400,
+            }
 
 
 def test_scout_is_dark_when_feature_flag_is_off(monkeypatch):
@@ -95,6 +127,52 @@ def test_scout_is_dark_when_feature_flag_is_off(monkeypatch):
     with TestClient(app) as client:
         response = client.post("/api/v1/scout/jobs", json={"query": "HB 12"}, headers={"x-test-customer": str(owner.id)})
     assert response.status_code == 404
+
+
+def test_scout_requires_canary_or_explicit_public_rollout(monkeypatch):
+    app, owner, _other, _sessions = _app(monkeypatch)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ALLOW_PUBLIC", "0")
+    monkeypatch.delenv("BILLCOMMONS_SCOUT_CANARY_EMAILS", raising=False)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/scout/jobs",
+            json={"query": "HB 12"},
+            headers={"x-test-customer": str(owner.id)},
+        )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "scout_canary_not_configured"
+
+
+def test_scout_private_canary_gates_new_jobs_but_not_existing_owner_access(monkeypatch):
+    app, owner, other, _sessions = _app(monkeypatch)
+    headers = {"x-test-customer": str(owner.id)}
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/scout/jobs", json={"query": "HB 625"}, headers=headers
+        )
+        assert created.status_code == 201
+        job_id = created.json()["job"]["id"]
+
+        monkeypatch.setenv(
+            "BILLCOMMONS_SCOUT_CANARY_EMAILS", f" {other.email.upper()} "
+        )
+        denied = client.post(
+            "/api/v1/scout/jobs", json={"query": "SB 2"}, headers=headers
+        )
+        assert denied.status_code == 404
+        assert denied.json()["error"]["code"] == "scout_not_available"
+
+        allowed = client.post(
+            "/api/v1/scout/jobs",
+            json={"query": "SB 2"},
+            headers={"x-test-customer": str(other.id)},
+        )
+        assert allowed.status_code == 201
+
+        # Removing an owner from the create cohort never strands their durable
+        # record or prevents them from canceling already-admitted work.
+        assert client.get(f"/api/v1/scout/jobs/{job_id}", headers=headers).status_code == 200
+        assert client.post(f"/api/v1/scout/jobs/{job_id}/cancel", headers=headers).status_code == 200
 
 
 def test_existing_owner_scoped_scout_reads_and_cancel_survive_dark_rollback(monkeypatch):
@@ -363,6 +441,48 @@ def test_scout_charges_started_released_session_without_runtime_telemetry(monkey
     with TestClient(app) as client:
         limited = client.post(
             "/api/v1/scout/jobs", json={"query": "HB 99"}, headers={"x-test-customer": str(owner.id)}
+        )
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "scout_daily_browser_limit"
+
+
+def test_scout_charges_full_reservation_for_unknown_create_outcome(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "3")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_CLEANUP_SECONDS", "1")
+    with sessions() as db:
+        job = ScoutResearchJob(
+            customer_id=owner.id,
+            original_query="unknown create",
+            normalized_query="unknown create",
+            jurisdiction="FL",
+            cache_key=uuid.uuid4().hex,
+            status="partial",
+            strategy={},
+            limits={
+                "max_external_requests": 1,
+                "browser_wall_seconds": 1,
+                "browser_cleanup_seconds": 1,
+            },
+            usage={},
+        )
+        db.add(job)
+        db.flush()
+        db.add(ScoutBrowserSession(
+            job_id=job.id,
+            provider="SolariResearchBrowserProvider",
+            provider_session_id=None,
+            status="abandoned",
+            error_class="create_outcome_unknown",
+        ))
+        db.commit()
+    with TestClient(app) as client:
+        limited = client.post(
+            "/api/v1/scout/jobs",
+            json={"query": "HB 96"},
+            headers={"x-test-customer": str(owner.id)},
         )
     assert limited.status_code == 429
     assert limited.json()["error"]["code"] == "scout_daily_browser_limit"

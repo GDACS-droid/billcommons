@@ -1,81 +1,135 @@
 # Bill Commons Scout — submission working brief
 
-## Pitch
+Do not publish the social post until the owner explicitly authorizes it.
 
-Bill Commons Scout is an evidence-first government-research feature that checks the structured Bill Commons corpus, revisits admitted official bill sources for missing developments, and retains only findings supported by the fetched evidence instead of returning unsupported chat.
+## One-sentence pitch
 
-## Why it matters
+Bill Commons Scout is an evidence-first government research layer that uses the
+structured corpus when it can, direct official retrieval when that is sufficient,
+and a bounded Solari cloud browser when it must navigate the government web.
 
-Legislative databases are strongest at normalized bills and weakest at the messy surrounding web: agendas, amendments, fiscal notes, hearings, agency notices, and JS-heavy portals. The Florida P0 routes structured candidates and direct retrieval first, then uses a recorded Solari browser only for an explicitly admitted browser-required source. Independent source discovery beyond URLs already linked to Bill Commons bills is future adapter work, not a shipped claim.
+## Problem and product value
 
-## Public strategy
+Legislative databases normalize bills well but miss much of the surrounding primary
+record: amendments, staff analyses, agendas, hearings, fiscal material, and old or
+interactive portals. Scout turns that gap into a durable research job rather than an
+unsupported chatbot answer. Every material finding links to retained official-source
+metadata, excerpt, retrieval time, and content hash.
 
-Bill Commons is already public at `GDACS-droid/billcommons` under Apache-2.0. The preferred challenge path is a documented Scout implementation here plus a small reproducible example contributed from a user fork of `solari-sdk/solari-cookbook`. Do not publish secrets, private customer data, fake metrics, or unverified government findings.
+Florida P0 now provides incremental value beyond revisiting a known bill URL. From
+an official Senate bill page it discovers same-session/same-bill staff analyses and
+amendments, validates/fetches the bounded PDFs, and retains related findings and
+change history. Direct HTTP remains the correct route for those documents.
 
-Published cookbook branch: `https://github.com/GDACS-droid/solari-cookbook/tree/billcommons-scout-challenge/examples/bill-commons-scout-py` at hardened commit `1095a02`. The free fixture, native provider, and public example live paths are verified and pushed.
+Solari is used where a browser is the capability under test or interaction is needed.
+The headline public example opens Online Sunshine chapter 43, visibly follows
+§43.16, verifies current statutory language and chapter-law history, records the
+session, then releases it. It does not claim that HTTP was impossible or that the
+browser independently discovered HB 625's bill-to-law mapping.
 
-Published Bill Commons feature branch: `https://github.com/GDACS-droid/billcommons/tree/billcommons-scout`. Final browser-budget repair `f09c295` builds on the post-review lifecycle, evidence, analytics, polling, concurrency, and outcome-unknown cleanup repairs. Production flags remain off; publishing source and a local demo artifact is not a production deployment.
+## Architecture
 
-## Setup
-
-Bill Commons local configuration follows `.env.example`. Store the browser secret without printing or committing it:
-
-```bash
-./scripts/setup-solari.sh
+```text
+authenticated query
+  → Bill Commons structured lookup
+  → admitted direct official HTML/PDF
+  → Solari only for an allowlisted browser route
+  → normalize / hash / compare / extract
+  → PostgreSQL evidence + findings + usage + durable events
+  → evidence-first Scout UI
 ```
 
-The public cookbook example has a free deterministic path:
+FastAPI owns owner-scoped jobs; PostgreSQL/Alembic owns queue/state and immutable
+Scout blobs; a dedicated worker performs network/browser I/O; Next.js renders the
+native `/scout` instrument. Provider calls stay behind `ResearchBrowserProvider`.
+
+## Public repositories
+
+- Reproducible Solari example:
+  `https://github.com/GDACS-droid/solari-cookbook/tree/billcommons-scout-challenge/examples/bill-commons-scout-py`
+  at public commit `1233dd2`.
+- Bill Commons Scout feature branch:
+  `https://github.com/GDACS-droid/billcommons/tree/billcommons-scout`.
+
+The cookbook is the small clone/install/run challenge entry. Bill Commons is the
+permanent product implementation. Neither artifact contains the Solari key, private
+replay capability, customer data, or fabricated usage metrics.
+
+## Setup and tests
 
 ```bash
 cd examples/bill-commons-scout-py
-python main.py
-```
-
-and an explicitly paid path:
-
-```bash
+./setup-solari.sh
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt
-SOLARI_API_KEY=... .venv/bin/python main.py --live
+.venv/bin/python main.py --live
 ```
 
-## Truthful 30-second demo
+Free deterministic path:
 
-[Watch the 33.96-second challenge artifact](demo/scout-demo.mp4) or inspect its [product poster](demo/scout-demo-poster.png) and [live Solari proof](demo/scout-solari-live-proof.png). Its [provenance note](demo/README.md) and [sanitized audit record](demo/VERIFICATION.md) describe exactly which portions are deterministic and which checks ran live.
+```bash
+python3 -m unittest discover -s tests -v
+python3 main.py
+```
 
-1. Open `/scout`: “Bill Commons already normalizes state legislation; Scout follows the official record beyond the database.”
-2. Submit a real Florida bill/query selected by the live preflight. Show backend-driven stages, never timers.
-3. Open the retained finding and official source. Say: “Every material claim has source metadata, an excerpt, and a content hash.”
-4. If and only if that run required Solari, open Agent Replay: “Ordinary HTTP runs first; Solari handles the browser-only portal and is always released.”
-5. Show sources checked, browser pages/actions/time, and cache state: “The same research is reusable, so spend is bounded.”
-6. End on the separate live Solari cloud-browser proof: “This is an actual bounded Solari session on an official Florida source; one page, one action, and cleanup confirmed.”
+The latest native isolated Bill Commons suites total **801 passed / 8 skipped**,
+with 8 passing web contracts plus passing targeted lint, TypeScript, production build,
+PostgreSQL concurrency/restart/vertical storage proof, live Florida discovery, and a
+post-repair live Solari product-path lifecycle. Exact commands are in
+[TESTING.md](TESTING.md).
 
-The product UI sequence uses deterministic backend job states and says so on screen. The displayed HB 625 evidence contract separately passed an opt-in live-source test: the official page supported the exact bill/action before Scout retained it. The final five seconds show a separate actual, non-recorded Solari cloud-browser session after confirmed cleanup. Earlier infrastructure evidence proves the recorded Online Sunshine SDK/provider replay lifecycle, while a real MyFloridaHouse `302` route proved product router/browser/session persistence and durable release. None of the browser runs asserted the HB 625 finding.
+## Truthful 20-second demo
 
-## Product proof and analytics
+[Watch the 20.16-second artifact](demo/scout-demo.mp4), inspect the
+[poster](demo/scout-demo-poster.png), [two-frame Solari proof](demo/scout-solari-live-proof.png),
+and [verification record](demo/VERIFICATION.md).
 
-The native client records Scout opened, example selected, job created/started/partial/completed/failed, cache hit, evidence opened, replay resolved, and replay opened through the existing Vercel Analytics integration. No adoption, retention, revenue, or usefulness metric exists yet; do not fabricate one.
+Suggested narration:
+
+1. “Bill Commons already normalizes legislation. Scout investigates the official
+   record around it and keeps the evidence.”
+2. “This HB 625 case ties the Senate bill action to Chapter 2026-141, then verifies
+   the current §43.16 text from a second primary source.”
+3. “The product segment uses deterministic durable job fixtures and says so on
+   screen. This next sequence is the actual Solari run: chapter contents, click
+   §43.16, exact result, recording available, cleanup confirmed.”
+
+No dead opening, no fake timer, no secret replay URL, and no claim that the browser
+proved more than it did.
+
+## Live proof and economics
+
+The real run passed in 10.137 seconds with one page, two actions, 38 admitted routed
+requests, recording/replay available, and confirmed release. At current first-party
+browser rates, that is approximately $0.00042 Free / $0.00028 Starter / $0.00020
+Professional. An equivalent fresh cache hit launches no browser. See
+[LIVE_TESTS.md](LIVE_TESTS.md) for calculations and claim boundaries.
+
+## Analytics and traction boundary
+
+The existing Vercel Analytics integration records Scout open, example selection,
+job create/start/partial/complete/fail, cache hit, evidence open, replay resolve/open,
+and related product events. There are no public adoption, retention, revenue, or
+usefulness metrics yet. Do not fabricate them.
 
 ## Known limitations
 
-- Florida-only P0; no generic web crawl or arbitrary URL input.
-- Solari auth/session/recording/replay/cleanup passed on the official Online Sunshine smoke. `www.flsenate.gov` reset the Solari browser connection during separate diagnostics even though direct HTTP was healthy; partial-source handling is therefore material, not theoretical.
-- The Online Sunshine smoke calls the provider directly. A separate opt-in PostgreSQL/API product-path test against real MyFloridaHouse `BillId=84174` verified safe `302` escalation, database-backed browser-slot/session lifecycle, exactly one Solari session, and durable release. It did not produce a retained bill finding. A separate direct live Florida Senate HB 625 check did retain exact bill/action evidence, but did not require Solari.
-- Florida P0 revisits official `Bill.source_url` candidates already present in the corpus. New agenda/agency/source discovery is not yet implemented.
-- Broader popup/download planning, production cohorts, service telemetry, and graceful drain are rollout work. Daily job/runtime and per-job request/retry limits are implemented, with active-job ceilings bounding in-flight overshoot.
-- Full legacy API regression is not green and is unsafe without isolated-database wiring.
-- Stripe checkout creation passes, but webhook registration and a completed paid provisioning round trip are not verified.
+- Florida-only P0; no arbitrary URL input or generic 50-state planner.
+- Browser navigation remains narrowly allowlisted; generic clicks/downloads require
+  additional policy and tests.
+- Scout blobs in Postgres are appropriate for bounded P0 volume; object storage is a
+  future scale step behind the existing interface.
+- Production enablement still requires authorized Railway inventory, one migration
+  runner, and a current backup/restore drill. Deployment is not authorized.
+- Stripe live-account webhook verification is separate and incomplete.
 
-## Recommended X post (human sends after reviewing the public links)
+## Recommended X post — owner sends later
 
-Attach `docs/scout/demo/scout-demo.mp4` natively, then post this 277-character weighted draft:
+> I built Bill Commons Scout as a permanent evidence-first research layer. It checks our structured legislative corpus, uses direct official sources when they are enough, and invokes a real @getsolari browser for the messy government web. Here is the actual Florida Legislature run: [demo link] [code link] @harrychow_
 
-> Built Bill Commons Scout: evidence-first legislative research. It checks structured data and official HTTP first, then uses @getsolari for browser-only government portals. Findings retain primary evidence. Demo: https://github.com/GDACS-droid/billcommons/blob/billcommons-scout/docs/scout/demo/scout-demo.mp4 Code: https://github.com/GDACS-droid/billcommons/tree/billcommons-scout @harrychow_
+## Recommended LinkedIn post — owner sends later
 
-## Recommended LinkedIn post (human sends after reviewing the public links)
+> Legislative databases normalize bills, but professional research also depends on amendments, staff analyses, agendas, hearings, and older government portals. I built Bill Commons Scout as a permanent evidence-first layer: structured corpus first, direct primary sources second, and a bounded Solari browser only when interaction is useful. Findings retain the source, excerpt, hash, retrieval path, and browser lifecycle. The demo shows the deterministic product workflow and then the actual recorded Florida Legislature browser sequence, including confirmed cleanup. [demo] [code]
 
-Attach `docs/scout/demo/scout-demo.mp4`, then post:
-
-> Legislative databases are good at normalized bills and weak at the surrounding government web: agendas, amendments, fiscal notes, hearings, and older interactive portals. I built Bill Commons Scout as a permanent evidence-first research feature. It checks Bill Commons and direct official retrieval first, then uses a bounded Solari browser only when interaction is genuinely required. The system retains provenance, hashes evidence, coalesces duplicate research, limits spend, handles partial failures, and treats replay as audit material—not primary evidence. Demo and code: https://github.com/GDACS-droid/billcommons/tree/billcommons-scout Reproducible Solari example: https://github.com/GDACS-droid/solari-cookbook/tree/billcommons-scout-challenge/examples/bill-commons-scout-py @Harry Chow / Solari
-
-Required remaining public sequence: have a human review and publish the X or LinkedIn post, tagging `@harrychow_` and `@getsolari`. The public source, reviewed demo, live Solari SDK/provider, product browser-fallback/session lifecycle, and direct official finding-retention gaps are closed. Do not imply the Solari smoke discovered a bill development or that the known HB 625 action was previously unknown.
+Before posting: verify the final public Bill Commons commit/link, attach the MP4
+natively, review every claim, and explicitly tag `@harrychow_` and `@getsolari`.

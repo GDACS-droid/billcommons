@@ -1,51 +1,73 @@
 # Scout testing
 
-Most coverage uses deterministic fixtures and the mock browser. Live tests are explicitly opt-in and never CI-default.
+Deterministic fixtures and a mock provider cover the normal suite. Live government
+and Solari checks are explicit opt-ins and never CI defaults.
 
-## Coverage
+## Final evidence — 2026-09-01
 
-- Shared unit: query/jurisdiction normalization, cache keys, URL admission/canonicalization, DNS/redirect rejection, hashing/diff, source classification, retries/limits, hostile-text boundaries.
-- API: feature flag, authentication/CSRF/IDOR, create/read/cancel, quotas, atomic active-query coalescing, partial/error/result contracts, owner-scoped prior evidence and replay.
-- Worker: structured-first routing, direct response failures, malformed/oversize/MIME cases, mock Solari failures, cancellation/lease/reaping, cleanup, request/page/action/routed-request ceilings, content reuse/change history, and partial persistence.
-- PostgreSQL: migration/E2E, simultaneous job admission, source-history advisory-lock concurrency, and Stripe reconciliation concurrency.
-- Browser: real Chromium result assertions and desktop/mobile captures.
+| Gate | Result |
+| --- | --- |
+| Guarded API suite | **563 passed, 8 skipped, 1 warning** in 21.66s |
+| Shared suite | **153 passed, 1 warning** in 15.74s |
+| Scout worker suite (including Postgres proofs) | **85 passed, 9 warnings** in 6.54s |
+| Native-suite total | **801 passed, 8 skipped, 11 warnings** |
+| Focused source/session repair | **28 passed** |
+| Public cookbook deterministic contracts | **12 passed** |
+| Web Scout contract | **8 passed** |
+| Targeted web ESLint | pass |
+| TypeScript `--noEmit` | pass |
+| Next production build | pass; `/scout` emitted |
+| PostgreSQL RawStore concurrent/restart proof | **1 passed** |
+| Live Florida HB 625 bill → analysis workflow | **1 passed** |
+| Live Bill Commons Solari product path | **1 passed** in 7.86s; released terminal state |
+| Demo decode / metadata | pass; 20.16s, 504 frames |
 
-## Evidence recorded 2026-09-01
+The broad suite's eight skips are explicitly optional integrations/live checks. Its
+warnings are Starlette/httpx, future cryptography certificate parsing, and Python
+3.12 SQLite fixture date/datetime adapter deprecations; no assertion failed.
 
-- Earlier full focused command: **226 passed, 2 live skipped**, 9 warnings. This included worker/shared/API coverage, outcome-unknown cleanup ownership, and guarded real-PostgreSQL source-history and daily-budget concurrency regressions before the final browser-budget repair.
-- Final browser-budget repair gate: **101 passed, 1 opt-in live skipped** across the directly affected API/shared/worker suites. The newly migrated guarded PostgreSQL suite then passed **6 tests, 2 opt-in live skipped**, including simultaneous distinct submissions and the two-job owner-lock test under an explicit test-only 800-second capacity.
-- Web contract: **8 passed**; targeted ESLint passed; Next production build/typecheck passed with `/scout` emitted. Optional localhost API fetches failed closed during static generation and did not fail the build.
-- PostgreSQL Scout final guarded run: **6 passed, 2 skipped**; live tests are skipped unless explicitly enabled.
-- Live direct official-source finding: passed against Florida Senate HB 625; one direct source and one finding whose excerpt supports both the identifier and action; mock browser unused.
-- Final live Solari smoke: passed; one page/action, 7,283 ms, recording/replay available, cleanup confirmed.
-- Public live Solari visual proof: passed; one page/action, 3,412 ms, recording disabled, cleanup confirmed; derivative image contains only official robots text, fixed safe labels, and a non-reversible run reference.
-- Chromium visual assertions/captures: passed at 1440x1100 and 390x844 with an explicitly labeled fixture.
-- Final strengthened demo: H.264, 1440x900, 25 fps, 849 frames, 33.96 seconds, 3,076,083 bytes. External Sonnet returned **SHIP**. An independent reviewer found contradictory cleanup tense in the first derivative; after correction it fully decoded the replacement, sampled frames 716–747 and 816–848, verified both visible cleanup labels, scanned metadata/printable strings, matched hashes, and returned **SHIP**.
-- Broad isolated shared/API gate: **617 passed, 30 skipped, 45 failed**. It is not green; failures are documented in `STATUS.md` and must not be presented as Scout-pass evidence.
-- A supplemental mixed Scout/security/change-feed run was interrupted at the existing change-feed `TestClient` teardown after **168 passed, 1 skipped** and no assertion failures. It is not a passing gate and did not replace the focused or guarded PostgreSQL evidence above.
+## Covered behavior
+
+- normalization, cache keys, coalescing, URL canonicalization/admission, public DNS
+  pinning, redirect revalidation, private-network rejection, hashing and diffs;
+- authentication, CSRF, owner-scoped create/read/cancel/evidence/replay, canary
+  allowlist, quotas, simultaneous submissions, partial/error truthfulness;
+- structured-first lookup, usable/direct/browser-required classification, Florida
+  analysis/amendment discovery, URL/source dedupe, PDF MIME/signature plus isolated
+  child-process wall/CPU/memory/page/text bounds;
+- browser success/failure/cancel/timeout, session persistence, page/action/routed-
+  request/runtime limits, cleanup uncertainty, delayed replay, reaping and drain;
+- unchanged/changed related documents, stale refresh, request-time immutable limits,
+  cache reuse, and content-addressed evidence retention;
+- desktop/mobile rendering, safe evidence controls, terminal polling, analytics
+  normalization, and no unsafe HTML rendering.
 
 ## Reproducible commands
 
 ```bash
-BILLCOMMONS_TEST_DATABASE_URL='postgresql:///billcommons_scout_verify_20260901?host=/var/run/postgresql' \
-BILLCOMMONS_TEST_POSTGRES_URL='postgresql:///billcommons_scout_verify_20260901?host=/var/run/postgresql' \
+# API suite. This refuses remote or non-_test databases.
+BILLCOMMONS_TEST_DATABASE_URL='postgresql:///billcommons_scout_test_20260901_test?host=/var/run/postgresql' \
+BILLCOMMONS_TEST_POSTGRES_URL='postgresql:///billcommons_scout_test_20260901_test?host=/var/run/postgresql' \
 BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE=1 \
-PYTHONDONTWRITEBYTECODE=1 \
-PYTHONPATH=apps/api:packages/schema:packages/shared:workers/scout \
-.venv/bin/pytest -q workers/scout/tests packages/shared/tests \
-  apps/api/tests/test_scout.py apps/api/tests/test_scout_postgres.py
+PYTHONPATH=apps/api:workers/scout:packages/schema:packages/shared \
+.venv/bin/python -m pytest -q apps/api/tests
+
+# Shared package suite.
+PYTHONPATH=packages/shared:packages/schema \
+.venv/bin/python -m pytest -q packages/shared/tests
+
+# Scout worker suite, including guarded PostgreSQL storage/concurrency proofs.
+BILLCOMMONS_TEST_POSTGRES_URL='postgresql:///billcommons_scout_test_20260901_test?host=/var/run/postgresql' \
+BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE=1 \
+PYTHONPATH=workers/scout:packages/schema:packages/shared \
+.venv/bin/python -m pytest -q workers/scout/tests
 
 cd apps/web
 npm run test:scout
-npx eslint components/scout/ScoutExperience.tsx lib/scout.ts
+npx eslint components/scout/ScoutExperience.tsx components/SiteHeader.tsx
+npx tsc --noEmit
 npm run build
-
-# Explicitly opt-in and billable; never run in default CI.
-BILLCOMMONS_SCOUT_ENABLED=true BILLCOMMONS_SCOUT_SOLARI_CHECK=1 \
-PYTHONPATH=apps/api:packages/schema:packages/shared:workers/scout \
-.venv/bin/python -m billcommons_scout solari-check
 ```
 
-The PostgreSQL URL must identify an acknowledged local disposable database matching the test guard. Never point these tests at production.
-
-The documented `billcommons_scout_verify_20260901` and monetization test databases plus their temporary local role were removed after the recorded final run; recreate a newly dated disposable target before rerunning PostgreSQL coverage.
+The two named local databases were disposable verification targets, not production.
+Recreate a newly dated `_test` database and migrate it to head before a future run.

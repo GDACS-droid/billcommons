@@ -1,15 +1,81 @@
 # Scout security
 
-External content is hostile data, never instruction. P0 accepts a query and jurisdiction, not an arbitrary URL.
+External content is hostile data, never instruction. P0 accepts a query and
+jurisdiction, not an arbitrary URL.
 
-Required controls: account ownership on every job/session/evidence action; CSRF origin checks on writes; HTTPS public-network URL admission with DNS and redirect revalidation; body/MIME/decompression limits; plain-text rendering; no shell/tool access from extractors; centralized request/page/action/time/retry/concurrency/daily budgets; durable usage; cancellation; provider cleanup in `finally`; error classes without source/user text in logs; no secrets in job rows, replay metadata, screenshots, or prompts.
+## Enforced boundaries
 
-Implemented and fixture-tested controls include private/loopback/link-local/metadata/NAT64 rejection, redirect-to-private rejection with pinned address use, injection inertness, plain-text React rendering, IDOR denial by `customer_id`, CSRF origin checks, oversized/bad MIME handling, bounded PDF extraction, browser wall/page/action/body ceilings, cleanup claims with outcome-unknown heartbeats, a process-wide in-flight registry, idempotent provider release and reaping, active-query coalescing, claim fencing/cancellation, browser concurrency limits, and partial-success truthfulness. Browser captures use a fresh context with service workers blocked; context-level HTTP routing fetches with automatic redirects disabled and validates every redirect `Location` before fulfillment, all WebSockets are closed, unexpected popups are closed, and final admitted page URL—not the requested pre-redirect URL—is retained as provenance.
+- Every job/session/evidence/replay operation authenticates the account and scopes
+  by `customer_id`; writes also apply the existing CSRF origin policy.
+- Direct URL admission permits only HTTPS public destinations, pins resolved public
+  addresses, and revalidates every redirect. Loopback, private, link-local, metadata,
+  NAT64-private, userinfo, non-default ports, `file:`, `data:`, and URLs over 4096
+  characters are rejected.
+- Direct retrieval has request/redirect/retry/time/decompression limits and a 2 MiB
+  body ceiling. PDFs additionally require MIME plus `%PDF-`; parsing occurs only in
+  a spawned child with parent wall timeout, CPU/address-space, page, and returned-text
+  caps. There is no in-process parser fallback.
+- Retrieved excerpts render as React text, never HTML. Extractors cannot execute a
+  shell, call tools, read credentials, or treat document prose as instructions.
+- Browser work uses an allowlisted target, a fresh context, blocked service workers,
+  no WebSockets, closed popups, per-request route validation, and independent wall,
+  page, action, routed-request, byte, concurrency, daily-runtime, and cleanup bounds.
+- Provider IDs and replay URLs are never public evidence. Replay resolution is
+  owner-authorized operational context; safe logs contain normalized error classes.
+- Session creation, use, release uncertainty, replay, and usage are durable. Cleanup
+  runs on success/error/cancellation; leases, outcome-unknown heartbeats, an in-flight
+  registry, and the reaper cover timeout/process failure.
+- Session creation is one-shot (`max_attempts=1`) because create has no idempotency
+  key. If its outcome is unknown, Scout stops further browser escalation, charges a
+  full session reservation, and holds a global slot from the outcome timestamp through
+  the frozen drive-plus-cleanup horizon before marking it expired.
 
-P0 does not accept arbitrary URLs and does not click arbitrary links, open popups, or initiate downloads. The Solari adapter intercepts its single admitted page and subresource requests; broader interactive navigation/download policy must be added and tested before generic agent planning is enabled. Durable daily-job and recorded-browser-runtime admission checks, active-job and global browser-session caps, persisted per-job request/retry ceilings, cleanup-failed slot accounting, and bounded replay probes are denial-of-wallet controls. Failed browser runtime is recorded. At most the already-admitted active jobs can overshoot a newly reached daily runtime threshold.
+The cloud browser cannot pin the provider's DNS resolution the way the direct client
+does. Browser navigation is therefore restricted to fixed official HTTPS hostnames,
+re-admits every requested/redirect URL, blocks other schemes/hosts and WebSockets,
+and depends on Solari's network resolver against DNS rebinding. This is an explicit
+provider-boundary residual, not a claim of direct-client-equivalent IP pinning.
 
-Post-red-team repairs additionally make request-budget exhaustion a durable partial result, prevent reaped ID-less reservations from being revived by delayed provider callbacks, reject provider-reported routed-request overruns before evidence persistence, exclude never-started slots from product analytics, and serialize tenant-local canonical-URL provenance finalization on PostgreSQL. Customer-scoped job creation durably reserves the request-time maximum browser runtime under a PostgreSQL row lock; terminal actual runtime replaces the reservation, closing concurrent daily-budget admission races. The worker enforces the stored request-time wall ceiling even if later process configuration is higher.
+## Florida discovery boundary
 
-Known pre-existing issue outside Scout: local magic-link fallback logs the link body when Resend is absent. Scout must not copy that behavior; production configuration must be checked separately.
+Related-document links are untrusted data. Scout accepts only same-host,
+same-session, same-bill Senate analysis/amendment paths, removes non-identity query
+aliases, deduplicates before fetch, applies the job's immutable budgets, and rejects
+HTML soft errors at PDF routes. Unchanged bytes reuse the content identity; changed
+bytes retain a predecessor relation.
 
-Repository test-safety issue discovered during verification: the default shared/API suite can resolve the normal local fallback `DATABASE_URL`, which in this environment was live. Scout's new PostgreSQL tests have an explicit local-only database URL and hosted-host refusal guard. The legacy suite needs a repository-wide destructive-test guard before it is safe to run indiscriminately.
+## Authorization and denial-of-wallet
+
+Equivalent active/fresh queries coalesce. New jobs are limited per customer and
+require either normalized server-side canary emails or a separate explicit public-
+rollout acknowledgement. Customer-row locking reserves
+worst-case browser time before admission; terminal actual runtime replaces the
+reservation. Global live/cleanup-failed sessions consume durable slots. Request-
+budget exhaustion becomes a truthful partial result, never a false completion.
+
+There is no all-account queue byte ceiling in P0. Each raw blob is capped at 2 MiB by
+both application and database constraints; expired terminal staging rows and old
+unreferenced blobs are reaped behind a live-finalization barrier. The private cohort,
+per-owner quotas, serial worker, and global browser cap bound the canary. The explicit
+public flag must remain false until canary evidence supports a written global capacity
+and monitoring decision.
+
+Scout evidence is immutable, SHA-256-addressed PostgreSQL data. Concurrent puts are
+idempotent; reads re-hash bytes before returning them. Fresh unresolved stages block
+orphan collection until a hash attaches or the retention window expires. This removes
+the insecure assumption that two deployment services share a filesystem path.
+
+## Verification and residual operations
+
+Tests cover SSRF/private redirects, hostile prompt text, bad/oversized MIME, malformed
+PDFs, XSS-safe rendering, CSRF/IDOR, duplicate/adversarial submissions, quotas,
+browser crash/cancel/timeout, cleanup failure/reaping, delayed replay, and related-
+document scope/dedupe/change. The guarded API/shared suite now refuses any database
+other than an explicitly acknowledged local `_test` Postgres target. The final
+isolated API/shared/Scout suites total 801 passing tests.
+
+Fresh independent review found no open critical/high Scout code issue. Production
+secret scope, service bindings, database revision, backup/restore, termination grace,
+and monitoring still require verification during an authorized dark-deploy window.
+The pre-existing local magic-link fallback logging behavior is outside Scout; Resend
+must be configured correctly before production account flows take traffic.

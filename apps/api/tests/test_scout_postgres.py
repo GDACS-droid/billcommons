@@ -7,7 +7,7 @@ partial indexes and row locks that SQLite cannot emulate.
 
 Run (only against the named disposable local database)::
 
-    BILLCOMMONS_TEST_DATABASE_URL='postgresql:///billcommons_scout_verify_20260901?host=/var/run/postgresql' \
+    BILLCOMMONS_TEST_DATABASE_URL='postgresql:///billcommons_scout_verify_20260901_test?host=/var/run/postgresql' \
     BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE=1 \
     PYTHONPATH=apps/api:packages/schema:packages/shared:workers/scout \
     pytest -q apps/api/tests/test_scout_postgres.py
@@ -23,7 +23,7 @@ import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -52,6 +52,7 @@ from billcommons_schema.models import (
     Jurisdiction,
     ScoutBrowserSession,
     ScoutFinding,
+    ScoutRawBlob,
     ScoutResearchJob,
     ScoutSource,
     Session as LegislativeSession,
@@ -61,11 +62,12 @@ from billcommons_shared.rawstore import FilesystemRawStore
 from billcommons_shared.scout import BrowserCapture, ScoutSettings, canonicalize_url, content_hash
 from billcommons_scout.providers import MockResearchBrowserProvider
 from billcommons_scout.providers import SolariResearchBrowserProvider
+from billcommons_scout.rawstore import PostgresScoutRawStore
 from billcommons_scout.runner import ScoutRunner
 
 
 _URL = os.environ.get("BILLCOMMONS_TEST_DATABASE_URL")
-_DISPOSABLE_DB_RE = re.compile(r"^billcommons_scout_(?:test|verify)_\d{8}$")
+_DISPOSABLE_DB_RE = re.compile(r"^billcommons_scout_(?:test|verify|closeout)_\d{8}_test$")
 
 
 def _assert_disposable_database(url: str) -> None:
@@ -78,16 +80,23 @@ def _assert_disposable_database(url: str) -> None:
     parsed = urlsplit(url)
     host = (parsed.hostname or "").lower()
     database = parsed.path.rstrip("/").rsplit("/", 1)[-1].lower()
-    query_host = parse_qs(parsed.query).get("host", [""])[0]
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query_hosts = query.get("host", [])
+    ambiguous_target = (
+        len(query_hosts) > 1
+        or bool(host and query_hosts)
+        or any(query.get(key) for key in ("hostaddr", "service", "servicefile"))
+    )
+    query_host = query_hosts[0] if len(query_hosts) == 1 else ""
     if any(token in url.lower() for token in ("railway", "render.com", "supabase", "neon.tech")):
         raise RuntimeError("REFUSING Scout Postgres tests against a hosted/production-like database URL")
     local_tcp = host in {"localhost", "127.0.0.1", "::1"}
     local_socket = not host and query_host == "/var/run/postgresql"
-    if not (local_tcp or local_socket) or not _DISPOSABLE_DB_RE.fullmatch(database):
+    if ambiguous_target or not (local_tcp or local_socket) or not _DISPOSABLE_DB_RE.fullmatch(database):
         raise RuntimeError(
             "REFUSING Scout Postgres tests: require localhost or /var/run/postgresql "
-            "and database name billcommons_scout_test_YYYYMMDD or "
-            "billcommons_scout_verify_YYYYMMDD"
+            "and a dated database name billcommons_scout_test_YYYYMMDD_test, "
+            "billcommons_scout_verify_YYYYMMDD_test, or billcommons_scout_closeout_YYYYMMDD_test"
         )
     if os.environ.get("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE") != "1":
         raise RuntimeError(
@@ -112,6 +121,7 @@ class PostgresScoutHarness:
     bill_ids: list[uuid.UUID] = field(default_factory=list)
     session_ids: list[uuid.UUID] = field(default_factory=list)
     jurisdiction_ids: list[uuid.UUID] = field(default_factory=list)
+    raw_blob_keys: list[str] = field(default_factory=list)
 
     def customer(self, label: str) -> ApiCustomer:
         customer = ApiCustomer(id=uuid.uuid4(), email=f"scout-pg-{label}-{uuid.uuid4().hex[:12]}@example.test")
@@ -151,6 +161,9 @@ class PostgresScoutHarness:
                 identifier=f"scout-pg-{uuid.uuid4().hex}",
                 name="Scout PostgreSQL fixture",
                 classification="primary",
+                active=True,
+                start_date=date(2026, 1, 1),
+                end_date=date(2026, 12, 31),
             )
             bill = Bill(
                 id=uuid.uuid4(),
@@ -177,6 +190,8 @@ class PostgresScoutHarness:
             if self.customer_ids:
                 # All Scout children use ON DELETE CASCADE from their job.
                 db.execute(delete(ScoutResearchJob).where(ScoutResearchJob.customer_id.in_(self.customer_ids)))
+            if self.raw_blob_keys:
+                db.execute(delete(ScoutRawBlob).where(ScoutRawBlob.sha256.in_(self.raw_blob_keys)))
             if self.bill_ids:
                 db.execute(delete(BillSubject).where(BillSubject.bill_id.in_(self.bill_ids)))
                 db.execute(delete(Bill).where(Bill.id.in_(self.bill_ids)))
@@ -208,6 +223,7 @@ def pg_scout() -> Iterator[PostgresScoutHarness]:
 @pytest.fixture()
 def scout_api(monkeypatch, pg_scout: PostgresScoutHarness):
     monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ALLOW_PUBLIC", "1")
     monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_ACTIVE_JOBS", "2")
     monkeypatch.setattr(scout, "_check_origin", lambda request: None)
     monkeypatch.setattr(
@@ -233,7 +249,7 @@ def _direct_request() -> Request:
 
 
 def test_postgres_vertical_slice_api_owner_runner_provenance_and_constraints(
-    tmp_path, pg_scout: PostgresScoutHarness, scout_api
+    pg_scout: PostgresScoutHarness, scout_api
 ):
     customer = pg_scout.customer("vertical")
     bill = pg_scout.florida_bill()
@@ -249,9 +265,10 @@ def test_postgres_vertical_slice_api_owner_runner_provenance_and_constraints(
             b"<main><h1>HB 9999 AI Generated Political Advertising Act</h1>"
             b"<p>Referred to the Committee on Ethics and Elections</p></main>"
         )
+        rawstore = PostgresScoutRawStore(pg_scout.sessions)
         runner = ScoutRunner(
             pg_scout.sessions,
-            FilesystemRawStore(tmp_path / "raw"),
+            rawstore,
             MockResearchBrowserProvider(),
             settings=ScoutSettings(enabled=True),
             fetcher=lambda url: (200, "text/html; charset=utf-8", body),
@@ -263,6 +280,16 @@ def test_postgres_vertical_slice_api_owner_runner_provenance_and_constraints(
         response = client.get(f"/api/v1/scout/jobs/{job_id}", headers=headers)
         assert response.status_code == 200, response.text
         payload = response.json()
+
+    with pg_scout.sessions() as db:
+        source = db.scalar(select(ScoutSource).where(ScoutSource.job_id == job_id))
+        assert source is not None and source.raw_ref
+        pg_scout.raw_blob_keys.append(source.raw_ref)
+        assert db.get(ScoutRawBlob, source.raw_ref) is not None
+        raw_ref = source.raw_ref
+    # A fresh store instance (representing a restarted worker) reads the exact
+    # evidence retained by the API-created job's real Postgres worker path.
+    assert PostgresScoutRawStore(pg_scout.sessions).get(raw_ref) == body
 
     assert payload["status"] == "completed"
     assert payload["partial_success"] is False
@@ -480,8 +507,9 @@ def test_live_direct_flsenate_hb_625_retains_exact_supported_evidence(
 
     This is deliberately separate from billable Solari smoke coverage. The
     official Senate page must remain directly retrievable and support both the
-    exact structured identifier and action before Scout is allowed to retain a
-    finding. It is skipped in ordinary CI and uses the guarded disposable DB.
+    exact structured identifier/action and at least one bill-scoped adjacent
+    analysis before Scout is allowed to complete. It is skipped in ordinary CI
+    and uses the guarded disposable DB.
     """
     customer = pg_scout.customer("live-direct-hb625")
     source_url = "https://flsenate.gov/Session/Bill/2026/625/ByCategory"
@@ -503,8 +531,17 @@ def test_live_direct_flsenate_hb_625_retains_exact_supported_evidence(
             pg_scout.sessions,
             FilesystemRawStore(tmp_path / "raw"),
             provider,
-            settings=ScoutSettings(enabled=True, max_external_requests=1, max_retries=0),
+            settings=ScoutSettings(
+                enabled=True,
+                max_external_requests=3,
+                max_related_documents=2,
+                max_retries=0,
+            ),
         )
+        with pg_scout.sessions() as db:
+            queued = db.get(ScoutResearchJob, job_id)
+            assert queued is not None
+            assert runner._candidates(db, queued), "live HB 625 fixture did not enter the structured-first route"
         claim = runner.claim_next("scout-live-direct-finding")
         assert claim is not None and claim.job_id == job_id
         runner.process(claim.job_id, claim.token)
@@ -514,14 +551,29 @@ def test_live_direct_flsenate_hb_625_retains_exact_supported_evidence(
 
     # A browser fallback would make this live direct contract untruthful.
     assert provider.released == []
-    assert payload["status"] == "completed"
-    assert len(payload["sources"]) == 1 and payload["sources"][0]["mechanism"] == "direct"
-    assert len(payload["findings"]) == 1
-    finding = payload["findings"][0]
-    excerpt = finding["excerpt"].casefold()
+    assert payload["status"] == "completed", {
+        "error_class": payload.get("error_class"),
+        "events": [event.get("kind") for event in payload.get("events", [])],
+        "source_statuses": [
+            (source.get("url"), source.get("status"), source.get("mime_type"))
+            for source in payload.get("sources", [])
+        ],
+    }
+    assert len(payload["sources"]) >= 2
+    assert all(source["mechanism"] == "direct" for source in payload["sources"])
+    bill_finding = next(
+        finding for finding in payload["findings"]
+        if finding["source_url"] == canonicalize_url(source_url)
+    )
+    excerpt = bill_finding["excerpt"].casefold()
     assert "hb 625" in excerpt
     assert "chapter no. 2026-141" in excerpt
-    assert finding["source_url"] == canonicalize_url(source_url)
+    related = [
+        finding for finding in payload["findings"]
+        if "/Analyses/" in finding["source_url"]
+    ]
+    assert related
+    assert any("hb 625" in finding["excerpt"].casefold() for finding in related)
 
 
 def test_postgres_simultaneous_identical_submissions_coalesce(
