@@ -79,6 +79,11 @@ export interface ScoutAnalyticsFact {
   properties: Record<string, string | number | boolean>;
 }
 
+export interface ScoutBrowserProviderUsage {
+  sessions: number;
+  runtimeSeconds: number;
+}
+
 export interface ScoutJob {
   id: string;
   query: string;
@@ -231,6 +236,28 @@ function normalizeBrowserSession(value: unknown, index: number): ScoutBrowserSes
   };
 }
 
+// `starting` is only a durable capacity reservation. The worker records
+// `running` once the provider has returned an opaque session ID; every later
+// cleanup lifecycle state likewise represents a provider session that started.
+const PROVIDER_STARTED_BROWSER_SESSION_STATUSES = new Set([
+  "running",
+  "released",
+  "cleanup_failed",
+  "reaping",
+]);
+
+export function scoutBrowserProviderUsage(job: ScoutJob): ScoutBrowserProviderUsage {
+  const sessions = job.browserSessions.filter((session) =>
+    PROVIDER_STARTED_BROWSER_SESSION_STATUSES.has(session.status),
+  );
+  if (!sessions.length) return { sessions: 0, runtimeSeconds: 0 };
+  const runtimeMs = job.usage.browserRuntimeMs ?? sessions.reduce(
+    (total, session) => total + (session.runtimeMs ?? 0),
+    0,
+  );
+  return { sessions: sessions.length, runtimeSeconds: Math.round(runtimeMs / 1000) };
+}
+
 /** Accept either the direct API object or a conventional { data } / { job } envelope. */
 export function normalizeScoutJob(payload: unknown): ScoutJob {
   const outer = record(payload) ?? {};
@@ -247,6 +274,9 @@ export function normalizeScoutJob(payload: unknown): ScoutJob {
   const errorClass = optionalString(item.error_class);
   if (errorClass && !errors.includes(errorClass)) errors.push(errorClass);
   const browserSessions = list(item.browser_sessions).map(normalizeBrowserSession);
+  const providerStartedBrowserSessions = browserSessions.filter((session) =>
+    PROVIDER_STARTED_BROWSER_SESSION_STATUSES.has(session.status),
+  );
   const reportedBrowserPages = number(usage.browser_pages);
   const reportedBrowserActions = number(usage.browser_actions);
 
@@ -268,10 +298,10 @@ export function normalizeScoutJob(payload: unknown): ScoutJob {
     completedAt: optionalString(item.completed_at),
     usage: {
       externalRequests: number(usage.external_requests),
-      browserPages: reportedBrowserPages ?? (browserSessions.length ? browserSessions.reduce((total, session) => total + (session.pages ?? 0), 0) : undefined),
-      browserActions: reportedBrowserActions ?? (browserSessions.length ? browserSessions.reduce((total, session) => total + (session.actions ?? 0), 0) : undefined),
-      browserRuntimeMs: number(usage.browser_runtime_ms) ?? (browserSessions.length ? browserSessions.reduce((total, session) => total + (session.runtimeMs ?? 0), 0) : undefined),
-      browserRoutedRequests: number(usage.browser_routed_requests) ?? (browserSessions.length ? browserSessions.reduce((total, session) => total + (session.routedRequests ?? 0), 0) : undefined),
+      browserPages: reportedBrowserPages ?? (providerStartedBrowserSessions.length ? providerStartedBrowserSessions.reduce((total, session) => total + (session.pages ?? 0), 0) : undefined),
+      browserActions: reportedBrowserActions ?? (providerStartedBrowserSessions.length ? providerStartedBrowserSessions.reduce((total, session) => total + (session.actions ?? 0), 0) : undefined),
+      browserRuntimeMs: number(usage.browser_runtime_ms) ?? (providerStartedBrowserSessions.length ? providerStartedBrowserSessions.reduce((total, session) => total + (session.runtimeMs ?? 0), 0) : undefined),
+      browserRoutedRequests: number(usage.browser_routed_requests) ?? (providerStartedBrowserSessions.length ? providerStartedBrowserSessions.reduce((total, session) => total + (session.routedRequests ?? 0), 0) : undefined),
     },
     events: list(item.events).map(normalizeEvent),
     sources: list(item.sources).map(normalizeSource),
@@ -283,6 +313,13 @@ export function normalizeScoutJob(payload: unknown): ScoutJob {
 
 export function isScoutTerminal(status: ScoutStatus): status is ScoutTerminalStatus {
   return ["complete", "partial", "failed", "canceled"].includes(status);
+}
+
+export const SCOUT_POLL_INTERVAL_MS = 2_500;
+
+/** A terminal job must never be refreshed; all other snapshots are retried. */
+export function scoutPollRetryDelay(status: ScoutStatus): number | undefined {
+  return isScoutTerminal(status) ? undefined : SCOUT_POLL_INTERVAL_MS;
 }
 
 /**
@@ -301,8 +338,8 @@ export function scoutAnalyticsFacts(job: ScoutJob): ScoutAnalyticsFact[] {
   const stages = new Set(job.events.map((event) => event.stage));
   const directUsed = job.sources.some((source) => source.retrievalMechanism === "direct") ||
     stages.has("direct_retrieval");
-  const browserUsed = job.browserSessions.length > 0 ||
-    job.sources.some((source) => source.retrievalMechanism === "browser");
+  const browserUsage = scoutBrowserProviderUsage(job);
+  const browserUsed = browserUsage.sessions > 0;
 
   if (stages.has("structured_candidates")) {
     facts.push({ key: `${job.id}:existing-data`, event: "scout_existing_data_used", properties: base });
@@ -316,8 +353,8 @@ export function scoutAnalyticsFacts(job: ScoutJob): ScoutAnalyticsFact[] {
       event: "scout_solari_used",
       properties: {
         ...base,
-        sessions: job.browserSessions.length,
-        runtime_seconds: Math.round((job.usage.browserRuntimeMs ?? 0) / 1000),
+        sessions: browserUsage.sessions,
+        runtime_seconds: browserUsage.runtimeSeconds,
       },
     });
   }

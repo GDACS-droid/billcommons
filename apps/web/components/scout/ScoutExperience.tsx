@@ -10,6 +10,8 @@ import {
   getScoutReplay,
   isScoutTerminal,
   scoutAnalyticsFacts,
+  scoutBrowserProviderUsage,
+  scoutPollRetryDelay,
   type ScoutFinding,
   type ScoutJob,
   scoutStatusSummary,
@@ -21,8 +23,6 @@ const EXAMPLES = [
   "What changed recently for Florida SB 1344?",
   "Investigate Florida activity involving social media.",
 ];
-const POLL_INTERVAL_MS = 2_500;
-
 function label(value?: string | null): string {
   return value ? value.replaceAll("_", " ") : "Not recorded";
 }
@@ -385,6 +385,8 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
   const [error, setError] = useState("");
   const [refreshError, setRefreshError] = useState("");
   const trackedFacts = useRef(new Set<string>());
+  const pollJobId = job?.id;
+  const pollJobStatus = job?.status;
 
   useEffect(() => {
     track("scout_opened", { availability: enabled ? "enabled" : "disabled" });
@@ -411,6 +413,7 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
     for (const fact of scoutAnalyticsFacts(job)) {
       trackOnce(fact.key, fact.event, fact.properties);
     }
+    const browserUsage = scoutBrowserProviderUsage(job);
     if (job.status === "running") trackOnce(`${job.id}:status:running`, "scout_job_started", { jurisdiction: job.jurisdiction });
     if (job.status === "partial") trackOnce(`${job.id}:status:partial`, "scout_job_partial", { findings: job.findings.length });
     if (job.status === "complete") trackOnce(`${job.id}:status:complete`, "scout_job_completed", {
@@ -418,33 +421,43 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
       findings: job.findings.length,
       sources: job.sources.length,
       direct_used: job.sources.some((source) => source.retrievalMechanism === "direct"),
-      browser_used: job.browserSessions.length > 0,
-      browser_seconds: Math.round((job.usage.browserRuntimeMs ?? 0) / 1000),
+      browser_used: browserUsage.sessions > 0,
+      browser_seconds: browserUsage.runtimeSeconds,
     });
     if (job.status === "failed") trackOnce(`${job.id}:status:failed`, "scout_job_failed", { errors: job.errors.length });
   }, [job]);
 
   useEffect(() => {
-    if (!job || isScoutTerminal(job.status)) return;
+    if (!pollJobId || !pollJobStatus || isScoutTerminal(pollJobStatus)) return;
     let active = true;
     const controller = new AbortController();
-    const timer = window.setTimeout(async () => {
+    let timer: number | undefined;
+
+    const schedule = (status: ScoutJob["status"]) => {
+      const delay = scoutPollRetryDelay(status);
+      if (delay !== undefined && active) timer = window.setTimeout(poll, delay);
+    };
+    const poll = async () => {
       try {
-        const next = await getScoutJob(job.id, controller.signal);
+        const next = await getScoutJob(pollJobId, controller.signal);
         if (!active) return;
         setJob(next);
         setRefreshError("");
+        schedule(next.status);
       } catch (reason) {
         if (!active || (reason instanceof DOMException && reason.name === "AbortError")) return;
         setRefreshError(reason instanceof Error ? reason.message : "Scout could not refresh this job. Retrying shortly.");
+        schedule(pollJobStatus);
       }
-    }, POLL_INTERVAL_MS);
+    };
+
+    schedule(pollJobStatus);
     return () => {
       active = false;
-      window.clearTimeout(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
       controller.abort();
     };
-  }, [job]);
+  }, [pollJobId, pollJobStatus]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

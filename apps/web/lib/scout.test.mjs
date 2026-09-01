@@ -15,7 +15,16 @@ const javascript = ts.transpileModule(source, {
 const compiled = { exports: {} };
 new Function("exports", "module", javascript)(compiled.exports, compiled);
 
-const { isScoutTerminal, normalizeScoutJob, safeHttpsUrl, scoutAnalyticsFacts, scoutStatusSummary } = compiled.exports;
+const {
+  isScoutTerminal,
+  normalizeScoutJob,
+  safeHttpsUrl,
+  scoutAnalyticsFacts,
+  scoutBrowserProviderUsage,
+  scoutPollRetryDelay,
+  scoutStatusSummary,
+  SCOUT_POLL_INTERVAL_MS,
+} = compiled.exports;
 
 test("normalizes the API's snake-case Scout job into safe display data", () => {
   const job = normalizeScoutJob({
@@ -63,6 +72,16 @@ test("only known terminal states stop polling and failed jobs never claim a find
     scoutStatusSummary(normalizeScoutJob({ id: "job-2", status: "failed", findings: [{ title: "ignored" }] })),
     /No unverified result/i
   );
+});
+
+test("returns a retry schedule for every nonterminal Scout snapshot", () => {
+  assert.equal(scoutPollRetryDelay("queued"), SCOUT_POLL_INTERVAL_MS);
+  assert.equal(scoutPollRetryDelay("running"), SCOUT_POLL_INTERVAL_MS);
+  assert.equal(scoutPollRetryDelay("unknown"), SCOUT_POLL_INTERVAL_MS);
+  assert.equal(scoutPollRetryDelay("complete"), undefined);
+  assert.equal(scoutPollRetryDelay("partial"), undefined);
+  assert.equal(scoutPollRetryDelay("failed"), undefined);
+  assert.equal(scoutPollRetryDelay("canceled"), undefined);
 });
 
 test("source controls reject non-HTTPS and credential-bearing URLs", () => {
@@ -154,4 +173,32 @@ test("defers mutable analytics until terminal and preserves official-source trut
   });
   const sourceFact = scoutAnalyticsFacts(complete).find((fact) => fact.event === "scout_source_discovered");
   assert.equal(sourceFact.properties.official, false);
+});
+
+test("does not count pre-provider browser slots in terminal analytics", () => {
+  const job = normalizeScoutJob({
+    id: "job-provider-lifecycle",
+    status: "complete",
+    usage: { browser_runtime_ms: 6100 },
+    browser_sessions: [
+      { id: "reserved", status: "starting", runtime_ms: 5000 },
+      { id: "never-started", status: "abandoned", runtime_ms: 1000 },
+    ],
+  });
+
+  assert.deepEqual(scoutBrowserProviderUsage(job), { sessions: 0, runtimeSeconds: 0 });
+  assert.equal(scoutAnalyticsFacts(job).some((fact) => fact.event === "scout_solari_used"), false);
+
+  const started = normalizeScoutJob({
+    id: "job-provider-started",
+    status: "complete",
+    usage: { browser_runtime_ms: 2100 },
+    browser_sessions: [
+      { id: "reserved", status: "abandoned", runtime_ms: 5000 },
+      { id: "provider-started", status: "released", runtime_ms: 2100 },
+    ],
+  });
+  assert.deepEqual(scoutBrowserProviderUsage(started), { sessions: 1, runtimeSeconds: 2 });
+  const solari = scoutAnalyticsFacts(started).find((fact) => fact.event === "scout_solari_used");
+  assert.deepEqual(solari?.properties, { jurisdiction: "FL", sessions: 1, runtime_seconds: 2 });
 });
