@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "billcommons-scout"
+version = "0.1.0"
+description = "Bill Commons Scout worker; external research stays outside the API container"
+requires-python = ">=3.12"
+dependencies = [
+    "billcommons-schema",
+    "billcommons-shared",
+    "sqlalchemy>=2.0",
+    "pypdf",
+    # The import is lazy so normal/offline tests do not require provider access.
+    "solari-browser>=0.1.2,<0.2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["billcommons_scout"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

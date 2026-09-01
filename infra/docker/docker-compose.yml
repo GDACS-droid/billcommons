@@ -43,6 +43,21 @@ services:
     volumes:
       - billcommons_rawstore:/data/rawstore
 
+  scout-worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.scout-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://billcommons:billcommons@postgres:5432/billcommons
+      RAWSTORE_ROOT: /data/rawstore
+      BILLCOMMONS_SCOUT_ENABLED: ${BILLCOMMONS_SCOUT_ENABLED:-false}
+    volumes:
+      - billcommons_rawstore:/data/rawstore
+
   mcp:
     build:
       context: ../..

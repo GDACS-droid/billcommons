@@ -26,6 +26,7 @@ from sqlalchemy import (
     Identity,
     Index,
     Integer,
+    JSON,
     Numeric,
     Text,
     UniqueConstraint,
@@ -1298,4 +1299,174 @@ class SnapshotDownload(Base):
 
     __table_args__ = (
         Index("ix_snapshot_downloads_customer_requested_at", "customer_id", "requested_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scout research (P0, 2026-09-01)
+# ---------------------------------------------------------------------------
+
+
+class ScoutResearchJob(UUIDPkMixin, TimestampMixin, Base):
+    """An owner-scoped, durable Scout research request.
+
+    This is intentionally separate from ``ingest_jobs``: Scout jobs have
+    account ownership, cancellation versions, partial outcomes, and browser
+    accounting that do not belong to corpus ingestion.
+    """
+
+    __tablename__ = "scout_research_jobs"
+
+    customer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_customers.id", ondelete="CASCADE"), nullable=False
+    )
+    original_query: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_query: Mapped[str] = mapped_column(Text, nullable=False)
+    jurisdiction: Mapped[str] = mapped_column(Text, nullable=False)
+    cache_key: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'queued'"))
+    strategy: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    claim_owner: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Opaque per-claim fencing token. A reclaimed worker may finish its own
+    # network call, but cannot write/finish after a newer claimant owns it.
+    claim_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    error_class: Mapped[str | None] = mapped_column(Text, nullable=True)
+    limits: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    usage: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    partial_success: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    fresh_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('queued','running','completed','partial','failed','canceled')",
+            name="ck_scout_research_jobs_status",
+        ),
+        Index("ix_scout_research_jobs_claim", "status", "lease_expires_at", "created_at"),
+        Index("ix_scout_research_jobs_customer_created", "customer_id", "created_at"),
+        Index(
+            "uq_scout_research_jobs_active_cache",
+            "customer_id",
+            "cache_key",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+            sqlite_where=text("status IN ('queued', 'running')"),
+        ),
+    )
+
+
+class ScoutJobEvent(UUIDPkMixin, Base):
+    """Append-only, worker-authored Scout progress event (never fake time progress)."""
+
+    __tablename__ = "scout_job_events"
+
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("scout_research_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    detail: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (Index("ix_scout_job_events_job_created", "job_id", "created_at"),)
+
+
+class ScoutSource(UUIDPkMixin, Base):
+    """One immutable fetched source version, linked to its exact raw bytes."""
+
+    __tablename__ = "scout_sources"
+
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("scout_research_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    official: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    retrieval_mechanism: Mapped[str] = mapped_column(Text, nullable=False)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    document_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retrieved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    upstream_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    prior_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("scout_sources.id", ondelete="SET NULL"), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_scout_sources_job", "job_id"),
+        Index("ix_scout_sources_url_hash", "canonical_url", "content_hash"),
+    )
+
+
+class ScoutFinding(UUIDPkMixin, Base):
+    """A material, cited finding. Excerpts are bound to the source raw hash."""
+
+    __tablename__ = "scout_findings"
+
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("scout_research_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("scout_sources.id", ondelete="CASCADE"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    what_happened: Mapped[str] = mapped_column(Text, nullable=False)
+    why_it_matters: Mapped[str | None] = mapped_column(Text, nullable=True)
+    relevant_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    excerpt_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    excerpt_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    excerpt_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    confidence: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'low'"))
+    extractor_version: Mapped[str] = mapped_column(Text, nullable=False)
+    bill_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bills.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (Index("ix_scout_findings_job", "job_id"),)
+
+
+class ScoutBrowserSession(UUIDPkMixin, Base):
+    """Provider lifecycle ledger; provider IDs/replays are never public by themselves."""
+
+    __tablename__ = "scout_browser_sessions"
+
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("scout_research_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("scout_sources.id", ondelete="SET NULL"), nullable=True
+    )
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    provider_session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    replay_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'starting'"))
+    pages: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    actions: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    runtime_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_class: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('starting','running','released','cleanup_failed')",
+            name="ck_scout_browser_sessions_status",
+        ),
+        Index("ix_scout_browser_sessions_live", "status", "created_at"),
+        Index("ix_scout_browser_sessions_job", "job_id"),
     )

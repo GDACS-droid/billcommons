@@ -17,6 +17,8 @@ const NAV = [
   { href: "/about", label: "About" },
 ];
 
+const SCOUT_ENABLED = process.env.NEXT_PUBLIC_SCOUT_ENABLED === "true";
+
 export default function SiteHeader() {
   const pathname = usePathname();
 
@@ -35,7 +37,7 @@ export default function SiteHeader() {
           className="order-3 w-full overflow-x-auto sm:order-2 sm:w-auto sm:flex-1"
         >
           <ul className="flex min-w-max gap-1 text-[0.8125rem] font-medium text-slate-500 sm:min-w-0 sm:flex-wrap">
-            {NAV.map((item) => {
+            {(SCOUT_ENABLED ? [{ href: "/scout", label: "Scout" }, ...NAV] : NAV).map((item) => {
               const active =
                 pathname === item.href || pathname.startsWith(`${item.href}/`);
               return (

@@ -37,6 +37,7 @@ from billcommons_api.routers import (
     search,
     sessions,
     sitemap,
+    scout,
     sources,
     stats,
     topics,
@@ -187,6 +188,7 @@ def create_app() -> FastAPI:
         stats.router,
         topics.router,
         webhooks.router,
+        scout.router,
     ):
         app.include_router(router, prefix=API_PREFIX)
 

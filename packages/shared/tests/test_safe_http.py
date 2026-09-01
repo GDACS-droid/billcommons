@@ -450,6 +450,25 @@ def test_response_over_64kb_decoded_is_rejected(https_server, trust_test_ca):
         client.fetch(f"https://{TEST_HOSTNAME}/hook", body=b"{}")
 
 
+def test_explicit_body_cap_can_safely_raise_the_default_for_scout(https_server, trust_test_ca):
+    cap = safe_http.MAX_BODY_BYTES + 2048
+    body = b"a" * (safe_http.MAX_BODY_BYTES + 1024)
+
+    def behavior(handler):
+        handler.send_response(200)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    port, cert_pem = https_server(behavior)
+    trust_test_ca(cert_pem)
+    raised = safe_http.SafeHttpClient(resolver=_resolver_for(), port=port, address_policy=_allow_all_policy, max_body_bytes=cap)
+    assert raised.fetch(f"https://{TEST_HOSTNAME}/hook", body=b"{}").body == body
+    exact = safe_http.SafeHttpClient(resolver=_resolver_for(), port=port, address_policy=_allow_all_policy, max_body_bytes=len(body) - 1)
+    with pytest.raises(safe_http.TooLarge):
+        exact.fetch(f"https://{TEST_HOSTNAME}/hook", body=b"{}")
+
+
 def test_drip_feed_trips_the_total_wall_clock_budget_not_just_the_read_timeout(
     https_server, trust_test_ca, monkeypatch
 ):
@@ -1112,4 +1131,3 @@ def test_production_factory_has_the_guard_enabled():
     client = safe_http.new_safe_http_client()
     with pytest.raises(safe_http.SsrfRejected):
         client.fetch("https://localhost/hook", body=b"{}")
-

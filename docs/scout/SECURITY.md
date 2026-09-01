@@ -1,0 +1,13 @@
+# Scout security
+
+External content is hostile data, never instruction. P0 accepts a query and jurisdiction, not an arbitrary URL.
+
+Required controls: account ownership on every job/session/evidence action; CSRF origin checks on writes; HTTPS public-network URL admission with DNS and redirect revalidation; body/MIME/decompression limits; plain-text rendering; no shell/tool access from extractors; centralized request/page/action/time/retry/concurrency/daily budgets; durable usage; cancellation; provider cleanup in `finally`; error classes without source/user text in logs; no secrets in job rows, replay metadata, screenshots, or prompts.
+
+Implemented and fixture-tested controls include private/loopback/link-local/metadata/NAT64 rejection, redirect-to-private rejection with pinned address use, injection inertness, plain-text React rendering, IDOR denial by `customer_id`, CSRF origin checks, oversized/bad MIME handling, bounded PDF extraction, browser wall/page/action/body ceilings, cleanup attempts/reaping, active-query coalescing, claim fencing/cancellation, browser concurrency limits, and partial-success truthfulness. Browser captures use a fresh context with service workers blocked; context-level HTTP routing fetches with automatic redirects disabled and validates every redirect `Location` before fulfillment, all WebSockets are closed, unexpected popups are closed, and final admitted page URL—not the requested pre-redirect URL—is retained as provenance.
+
+P0 does not accept arbitrary URLs and does not click arbitrary links, open popups, or initiate downloads. The Solari adapter intercepts its single admitted page and subresource requests; broader interactive navigation/download policy must be added and tested before generic agent planning is enabled. Durable daily-job and recorded-browser-runtime admission checks, active-job and global browser-session caps, persisted per-job request/retry ceilings, cleanup-failed slot accounting, and bounded replay probes are denial-of-wallet controls. Failed browser runtime is recorded. At most the already-admitted active jobs can overshoot a newly reached daily runtime threshold.
+
+Known pre-existing issue outside Scout: local magic-link fallback logs the link body when Resend is absent. Scout must not copy that behavior; production configuration must be checked separately.
+
+Repository test-safety issue discovered during verification: the default shared/API suite can resolve the normal local fallback `DATABASE_URL`, which in this environment was live. Scout's new PostgreSQL tests have an explicit local-only database URL and hosted-host refusal guard. The legacy suite needs a repository-wide destructive-test guard before it is safe to run indiscriminately.

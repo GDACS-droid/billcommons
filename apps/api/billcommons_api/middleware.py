@@ -38,14 +38,15 @@ class SecureHeadersMiddleware(BaseHTTPMiddleware):
 
 
 class AccountCorsMiddleware(BaseHTTPMiddleware):
-    """Round-2 amendment C10: `/api/v1/account/*` and `/api/v1/billing/*`
-    are cookie-authenticated (the session cookie, `routers/account.py`),
+    """Round-2 amendment C10: `/api/v1/account/*`, `/api/v1/billing/*`,
+    and `/api/v1/scout/*` are cookie-authenticated (the session cookie,
+    `routers/account.py`),
     which needs CORS *with credentials* -- and the Fetch spec forbids a
     credentialed response from ever carrying `Access-Control-Allow-Origin:
     *` (browsers reject it client-side no matter what the server sends).
     The REST of this API stays open (`allow_origins=["*"]`, no
     credentials) via the app's own `CORSMiddleware` -- this middleware
-    only overrides behavior for the two cookie-authenticated prefixes,
+    only overrides behavior for the cookie-authenticated prefixes,
     echoing back the caller's `Origin` (only if it is on the
     `BILLCOMMONS_ALLOWED_ORIGINS` allowlist) instead of `*`.
 
@@ -57,7 +58,7 @@ class AccountCorsMiddleware(BaseHTTPMiddleware):
     middleware or route.
     """
 
-    _PREFIXES = ("/api/v1/account", "/api/v1/billing")
+    _PREFIXES = ("/api/v1/account", "/api/v1/billing", "/api/v1/scout")
 
     def _matches(self, path: str) -> bool:
         return any(path == prefix or path.startswith(prefix + "/") for prefix in self._PREFIXES)
