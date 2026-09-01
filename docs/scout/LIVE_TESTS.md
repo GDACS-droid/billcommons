@@ -75,6 +75,18 @@ checks only the stable `43.16` and `Justice Administrative Commission` markers, 
 releases the session and probes replay. Its sanitized output labels that direct,
 no-click capture and withholds the provider session ID and replay capability URL.
 
+For an authorized named-account release canary, use
+`billcommons-scout solari-lifecycle-canary --email <named-canary-email>` with
+`BILLCOMMONS_SCOUT_SOLARI_LIFECYCLE_CANARY=1`. Unlike `solari-check`, it is a
+durable operator validation: it rejects a disabled/public/non-allowlisted/absent
+account, creates one fixed private owner-scoped job, persists the session ID before
+connection through `ScoutRunner`, retains the official source and raw bytes, and
+uses the ordinary release/reaper path. It deliberately creates **no finding** and
+is one-shot once terminal for that account. The command's fixed output omits account,
+job, provider-session, source URL/body, cookies, replay, and capability details.
+This command has deterministic test coverage only at this point; no additional live
+provider call has been made by this change.
+
 After the final single-owner lifecycle repair, the opt-in real product-path test ran
 one Solari session through the Bill Commons runner in **7.86 seconds** and verified a
 `released` terminal ledger state. The provider uses a one-shot create; an outcome-

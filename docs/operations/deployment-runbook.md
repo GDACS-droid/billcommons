@@ -291,6 +291,24 @@ alone can therefore never accidentally create an all-account rollout.
    BILLCOMMONS_SCOUT_SOLARI_CHECK=1 \
      python -m billcommons_scout solari-check
    ```
+   For the release-window browser cleanup proof, use the separate durable
+   lifecycle canary **only** after the named account exists and is present in
+   the private allowlist. It refuses a disabled Scout, a public rollout, an
+   absent/non-allowlisted account, or a missing explicit opt-in. It creates one
+   fixed owner-scoped validation job, persists the provider session through the
+   normal Runner/reaper ledger before connecting, captures the same bounded
+   official statute source, retains source/raw provenance, and creates no
+   finding. A terminal validation is one-shot for that account, so re-running
+   it cannot spend a second browser session. Its output intentionally contains
+   no account, job, provider-session, source URL/body, cookie, replay, or
+   capability data:
+
+   ```bash
+   BILLCOMMONS_SCOUT_ENABLED=1 \
+   BILLCOMMONS_SCOUT_ALLOW_PUBLIC=false \
+   BILLCOMMONS_SCOUT_SOLARI_LIFECYCLE_CANARY=1 \
+     python -m billcommons_scout solari-lifecycle-canary --email <named-canary-email>
+   ```
 5. Observe a full browser ceiling/window plus the Scout lease and cleanup
    intervals. Review durable rows for `cleanup_failed`, `reaping`,
    `abandoned`, failed/partial jobs, and unexpected spend. Do not expand the

@@ -15,7 +15,7 @@ from typing import Callable
 from sqlalchemy import and_, delete, exists, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from billcommons_schema.models import Bill, BillSubject, Jurisdiction, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutRawBlob, ScoutResearchJob, ScoutSource, Session as LegislativeSession
+from billcommons_schema.models import ApiCustomer, Bill, BillSubject, Jurisdiction, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutRawBlob, ScoutResearchJob, ScoutSource, Session as LegislativeSession
 from billcommons_shared.rawstore import RawStore
 from billcommons_shared.safe_http import SafeHttpError, SsrfRejected, new_safe_http_client
 from billcommons_shared.scout import (
@@ -38,6 +38,13 @@ _SHELL_MARKERS = (
     "enable javascript", "javascript is required", "please enable javascript",
     "loading...", "loading…",
 )
+_OPERATOR_CANARY_URL = (
+    "https://www.leg.state.fl.us/statutes/index.cfm?App_mode=Display_Statute&"
+    "Search_String=&URL=0000-0099/0043/Sections/0043.16.html"
+)
+_OPERATOR_CANARY_MARKERS = (b"43.16", b"Justice Administrative Commission")
+_OPERATOR_CANARY_CACHE_KEY = "scout-operator-solari-lifecycle-v1"
+_OPERATOR_CANARY_QUERY = "operator solari lifecycle validation"
 @dataclass(frozen=True)
 class Claim:
     job_id: uuid.UUID
@@ -166,6 +173,118 @@ class ScoutRunner:
             return False
         self.process(claim.job_id, claim.token)
         return True
+
+    def run_operator_lifecycle_canary(self, customer_id: uuid.UUID) -> str:
+        """Run one durable, non-user-facing Solari lifecycle validation.
+
+        The command-line entrypoint owns rollout and account admission.  This
+        method deliberately accepts only an already-verified customer ID and
+        writes a fixed, one-shot job that never creates a user finding.  Its
+        deterministic cache key makes a completed, failed, or partially
+        cleaned-up validation non-repeatable without a deliberate code change.
+        That keeps an operator retry from becoming an unbounded browser-spend
+        path or a source of misleading research results.
+        """
+        token = secrets.token_urlsafe(24)
+        with self.sessions() as db:
+            # A customer with no prior Scout jobs is valid. Lock the actual
+            # account row rather than relying on a job row for serialization.
+            account = db.execute(
+                select(ApiCustomer).where(ApiCustomer.id == customer_id).with_for_update()
+            ).scalar_one_or_none()
+            if account is None:
+                return "missing_customer"
+            existing = db.execute(
+                select(ScoutResearchJob).where(
+                    ScoutResearchJob.customer_id == customer_id,
+                    ScoutResearchJob.cache_key == _OPERATOR_CANARY_CACHE_KEY,
+                ).order_by(ScoutResearchJob.created_at.desc()).limit(1)
+            ).scalar_one_or_none()
+            if existing is not None:
+                return "already_running" if existing.status in {"queued", "running"} else "already_terminal"
+            limits = {
+                "max_pages": 1,
+                "max_actions": 1,
+                "max_external_requests": 1,
+                "max_direct_bytes": self.settings.max_direct_bytes,
+                "max_routed_requests": min(20, self.settings.max_browser_routed_requests),
+                "max_retries": 0,
+                "browser_wall_seconds": self.settings.browser_wall_seconds,
+                "browser_cleanup_seconds": self.settings.browser_cleanup_seconds,
+                "daily_browser_reservation_ms": (
+                    self.settings.browser_wall_seconds
+                    + 2 * self.settings.browser_cleanup_seconds
+                ) * 1000,
+            }
+            now = datetime.now(timezone.utc)
+            job = ScoutResearchJob(
+                customer_id=customer_id,
+                original_query=_OPERATOR_CANARY_QUERY,
+                normalized_query=_OPERATOR_CANARY_QUERY,
+                jurisdiction="FL",
+                cache_key=_OPERATOR_CANARY_CACHE_KEY,
+                status="running",
+                claim_owner="operator-solari-lifecycle",
+                claim_token=token,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=self.settings.lease_seconds),
+                strategy={
+                    "mode": "operator_lifecycle_validation",
+                    "router": "forced_browser_validation",
+                    "user_finding": False,
+                },
+                limits=limits,
+                usage={},
+            )
+            db.add(job)
+            db.flush()
+            db.add(ScoutJobEvent(
+                job_id=job.id,
+                kind="operator_lifecycle_canary_started",
+                detail={"mode": "forced_browser_validation"},
+            ))
+            db.commit()
+            job_id = job.id
+
+        captured, reason = self._browser_capture(
+            job_id,
+            token,
+            None,
+            "Official Florida statute — Scout lifecycle validation",
+            None,
+            {},
+            _OPERATOR_CANARY_URL,
+            create_finding=False,
+            required_markers=_OPERATOR_CANARY_MARKERS,
+        )
+        with self.sessions() as db:
+            job = self._fenced(db, job_id, token)
+            if job is None:
+                return "fence_lost"
+            session = db.execute(
+                select(ScoutBrowserSession)
+                .where(ScoutBrowserSession.job_id == job_id)
+                .order_by(ScoutBrowserSession.created_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if captured and session is not None and session.status == "released":
+                db.add(ScoutJobEvent(
+                    job_id=job_id,
+                    kind="operator_lifecycle_canary_complete",
+                    detail={"source_retained": True, "session_released": True},
+                ))
+                self._finish(db, job, token, "completed", None, False)
+                return "completed"
+            error_class = (
+                "browser_cleanup_failed" if captured else reason or "browser_lifecycle_validation_failed"
+            )
+            db.add(ScoutJobEvent(
+                job_id=job_id,
+                kind="operator_lifecycle_canary_incomplete",
+                detail={"source_retained": bool(captured), "session_released": False},
+            ))
+            self._finish(db, job, token, "partial" if captured else "failed", error_class, bool(captured))
+            return "partial" if captured else "failed"
 
     def _canceled(self, db: Session, job: ScoutResearchJob, version: int, token: str) -> bool:
         db.refresh(job)
@@ -663,7 +782,22 @@ class ScoutRunner:
                 return None
             return self._latest_observation_for_customer(db, job.customer_id, url)
 
-    def _persist_capture(self, job_id: uuid.UUID, token: str, bill_id: uuid.UUID | None, bill_title: str, bill_status: str | None, metadata: dict, url: str, mechanism: str, status: int | None, mime: str | None, body: bytes) -> uuid.UUID | None:
+    def _persist_capture(
+        self,
+        job_id: uuid.UUID,
+        token: str,
+        bill_id: uuid.UUID | None,
+        bill_title: str,
+        bill_status: str | None,
+        metadata: dict,
+        url: str,
+        mechanism: str,
+        status: int | None,
+        mime: str | None,
+        body: bytes,
+        *,
+        create_finding: bool = True,
+    ) -> uuid.UUID | None:
         try:
             with self.sessions() as db:
                 active_job = self._fenced(db, job_id, token)
@@ -702,29 +836,30 @@ class ScoutRunner:
                 except Exception:
                     exact_raw_ref = None
             mime_base = (mime or "").split(";", 1)[0].lower()
-            if mime_base == "application/pdf":
-                text = extract_pdf_text(
-                    body,
-                    max_pages=max_pdf_pages,
-                    max_text_chars=max_pdf_text_chars,
-                    timeout_seconds=max_pdf_extract_seconds,
-                    memory_limit_bytes=max_pdf_extract_memory_bytes,
-                    cpu_limit_seconds=max_pdf_extract_cpu_seconds,
-                )
-            else:
-                text = html.unescape(_TAG_RE.sub(" ", body.decode("utf-8", "replace")))[:max_pdf_text_chars].strip()
             related_artifact_type = metadata.get("related_artifact_type")
             if related_artifact_type not in {"committee analysis", "amendment"}:
                 related_artifact_type = None
-            evidence = (
-                self._related_evidence_excerpt(text, metadata)
-                if related_artifact_type
-                else self._evidence_excerpt(text, metadata, bill_status)
-            )
-            if evidence is None:
-                self._record_failed_source(job_id, token, url, mechanism, status, mime)
-                return None
-            excerpt, excerpt_start, excerpt_end = evidence
+            evidence: tuple[str, int, int] | None = None
+            if create_finding:
+                if mime_base == "application/pdf":
+                    text = extract_pdf_text(
+                        body,
+                        max_pages=max_pdf_pages,
+                        max_text_chars=max_pdf_text_chars,
+                        timeout_seconds=max_pdf_extract_seconds,
+                        memory_limit_bytes=max_pdf_extract_memory_bytes,
+                        cpu_limit_seconds=max_pdf_extract_cpu_seconds,
+                    )
+                else:
+                    text = html.unescape(_TAG_RE.sub(" ", body.decode("utf-8", "replace")))[:max_pdf_text_chars].strip()
+                evidence = (
+                    self._related_evidence_excerpt(text, metadata)
+                    if related_artifact_type
+                    else self._evidence_excerpt(text, metadata, bill_status)
+                )
+                if evidence is None:
+                    self._record_failed_source(job_id, token, url, mechanism, status, mime)
+                    return None
         except Exception:
             self._record_failed_source(job_id, token, url, mechanism, status, mime)
             return None
@@ -799,7 +934,7 @@ class ScoutRunner:
                     identifier = str(metadata.get("identifier") or bill_title)
                     source.title = (
                         f"{identifier}: Official Florida Senate {related_artifact_type}"
-                        if related_artifact_type else bill_title
+                        if create_finding and related_artifact_type else bill_title
                     )
                     source.official = True
                     source.retrieval_mechanism = "reused" if exact_raw_ref else mechanism
@@ -816,7 +951,9 @@ class ScoutRunner:
                     source.retrieved_at = datetime.now(timezone.utc)
                     action = metadata.get("latest_action")
                     action_date = metadata.get("latest_action_date") or metadata.get("status_date")
-                    if related_artifact_type:
+                    if create_finding and related_artifact_type:
+                        assert evidence is not None
+                        excerpt, excerpt_start, excerpt_end = evidence
                         finding = ScoutFinding(
                             job_id=job_id,
                             source_id=source.id,
@@ -837,16 +974,20 @@ class ScoutRunner:
                             extractor_version="scout-p0-2-related",
                             bill_id=bill_id,
                         )
-                    else:
+                    elif create_finding:
+                        assert evidence is not None
+                        excerpt, excerpt_start, excerpt_end = evidence
                         development = f"Latest structured action{f' ({action_date.isoformat()})' if isinstance(action_date, date) else ''}: {action}" if action else f"Structured Florida status: {bill_status or 'unreported'}"
                         # _evidence_excerpt refuses a finding unless this exact
                         # displayed window supports both the identifier and action.
                         finding = ScoutFinding(job_id=job_id, source_id=source.id, title=f"{identifier}: {bill_title}", what_happened=development, why_it_matters="The structured development is paired with retained official source bytes.", relevant_date=action_date if isinstance(action_date, date) else None, excerpt=excerpt, excerpt_hash=content_hash(excerpt.encode()), excerpt_start=excerpt_start, excerpt_end=excerpt_end, confidence="high", extractor_version="scout-p0-1", bill_id=bill_id)
-                    db.add(finding)
+                    if create_finding:
+                        db.add(finding)
                     persisted_mechanism = "reused" if exact_raw_ref else mechanism
                     db.add(ScoutJobEvent(job_id=job_id, kind="document_inspected", detail={"mechanism": persisted_mechanism, "mime_type": mime_base}))
                     db.add(ScoutJobEvent(job_id=job_id, kind="source_persisted", detail={"mechanism": persisted_mechanism, "change_kind": change.kind if change else None}))
-                    db.add(ScoutJobEvent(job_id=job_id, kind="finding_persisted", detail={"mechanism": persisted_mechanism}))
+                    if create_finding:
+                        db.add(ScoutJobEvent(job_id=job_id, kind="finding_persisted", detail={"mechanism": persisted_mechanism}))
                     db.commit()
                     return source.id
         except Exception:
@@ -909,7 +1050,19 @@ class ScoutRunner:
             return None
         return excerpt, start, end
 
-    def _browser_capture(self, job_id: uuid.UUID, token: str, bill_id: uuid.UUID | None, bill_title: str, bill_status: str | None, metadata: dict, url: str) -> tuple[bool, str | None]:
+    def _browser_capture(
+        self,
+        job_id: uuid.UUID,
+        token: str,
+        bill_id: uuid.UUID | None,
+        bill_title: str,
+        bill_status: str | None,
+        metadata: dict,
+        url: str,
+        *,
+        create_finding: bool = True,
+        required_markers: tuple[bytes, ...] = (),
+    ) -> tuple[bool, str | None]:
         with self.sessions() as db:
             active_job = self._fenced(db, job_id, token)
             if active_job is None:
@@ -971,8 +1124,14 @@ class ScoutRunner:
                         session_id, job_id, token, capture.routed_requests, max_routed_requests,
                     )
                 raise RuntimeError("browser_limit_exceeded")
+            if required_markers and not all(marker in capture.body for marker in required_markers):
+                raise RuntimeError("browser_unexpected_content")
             final_url = canonicalize_url(capture.url)
-            source_id = self._persist_capture(job_id, token, bill_id, bill_title, bill_status, metadata, final_url, "browser", 200, capture.mime_type, capture.body)
+            source_id = self._persist_capture(
+                job_id, token, bill_id, bill_title, bill_status, metadata,
+                final_url, "browser", 200, capture.mime_type, capture.body,
+                create_finding=create_finding,
+            )
             if source_id is None:
                 return False, None
             with self.sessions() as db:

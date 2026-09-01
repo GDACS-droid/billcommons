@@ -13,7 +13,8 @@ import uuid
 from billcommons_shared.db import get_sessionmaker
 from billcommons_shared.rawstore import FilesystemRawStore
 from billcommons_shared.scout import BrowserRequest, ScoutSettings
-from sqlalchemy import text
+from sqlalchemy import func, select, text
+from billcommons_schema.models import ApiCustomer
 
 from billcommons_scout.providers import SolariProviderError, SolariResearchBrowserProvider, resolve_solari_api_key
 from billcommons_scout.rawstore import PostgresScoutRawStore
@@ -73,6 +74,61 @@ def _rawstore():
 
 def _runner() -> ScoutRunner:
     return ScoutRunner(get_sessionmaker(), _rawstore(), SolariResearchBrowserProvider())
+
+
+def _operator_canary_customer_id(email: str) -> uuid.UUID | None:
+    """Return an existing canary account without creating or disclosing one."""
+    normalized = email.strip().casefold()
+    if not normalized or "@" not in normalized:
+        return None
+    with get_sessionmaker()() as db:
+        return db.execute(
+            select(ApiCustomer.id).where(func.lower(ApiCustomer.email) == normalized)
+        ).scalar_one_or_none()
+
+
+def _run_solari_lifecycle_canary(settings: ScoutSettings, email: str) -> int:
+    """Run the explicit, durable one-shot lifecycle validation.
+
+    This is intentionally separate from ``solari-check``: the latter is an
+    inexpensive SDK smoke probe, while this command creates a durable,
+    owner-scoped validation job and uses the normal Runner release/reaper
+    lifecycle.  Output remains a small fixed vocabulary because provider IDs,
+    source URLs, body text, replay capabilities, and account details are not
+    safe terminal diagnostics.
+    """
+    normalized = email.strip().casefold()
+    if os.environ.get("BILLCOMMONS_SCOUT_SOLARI_LIFECYCLE_CANARY") != "1":
+        print("Refusing Solari lifecycle canary; explicit opt-in is required.")
+        return 2
+    if not settings.enabled:
+        print("Refusing Solari lifecycle canary; Scout is disabled.")
+        return 2
+    if settings.allow_public_rollout:
+        print("Refusing Solari lifecycle canary; public rollout must remain disabled.")
+        return 2
+    if not settings.canary_emails or normalized not in settings.canary_emails:
+        print("Refusing Solari lifecycle canary; account is not allowlisted.")
+        return 2
+    customer_id = _operator_canary_customer_id(normalized)
+    if customer_id is None:
+        print("Refusing Solari lifecycle canary; named canary account is absent.")
+        return 2
+    result = _runner().run_operator_lifecycle_canary(customer_id)
+    if result == "completed":
+        print("solari_lifecycle_canary=completed source=retained finding=none cleanup=released")
+        return 0
+    if result == "partial":
+        print("solari_lifecycle_canary=partial source=retained finding=none cleanup=pending_reaper")
+        return 1
+    if result == "already_terminal":
+        print("solari_lifecycle_canary=already_terminal provider_call=skipped")
+        return 0
+    if result == "already_running":
+        print("solari_lifecycle_canary=already_running provider_call=skipped")
+        return 1
+    print("solari_lifecycle_canary=failed source=not_retained cleanup=handled")
+    return 1
 
 
 def _check_readiness() -> int:
@@ -179,6 +235,11 @@ def main() -> int:
     sub.add_parser("reap", help="retry durable cleanup_failed browser sessions")
     sub.add_parser("rollback", help="reap eligible sessions and terminalize safely abandoned jobs")
     sub.add_parser("solari-check", help="EXPLICIT opt-in one-session Solari smoke check")
+    lifecycle_canary = sub.add_parser(
+        "solari-lifecycle-canary",
+        help="EXPLICIT opt-in durable private-canary Solari lifecycle validation",
+    )
+    lifecycle_canary.add_argument("--email", required=True)
     args = parser.parse_args()
     settings = ScoutSettings.from_env()
     if args.command == "check":
@@ -198,6 +259,8 @@ def main() -> int:
         result = _runner().rollback_reconcile()
         print(f"reaped={result['reaped']} terminalized={result['terminalized']}")
         return 0
+    if args.command == "solari-lifecycle-canary":
+        return _run_solari_lifecycle_canary(settings, args.email)
     if not settings.enabled:
         # Dark launch blocks both API creation and worker claims.
         if args.command == "worker" and not args.once:

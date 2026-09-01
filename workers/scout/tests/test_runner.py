@@ -1931,6 +1931,145 @@ def test_solari_cli_success_prints_fingerprint_not_signed_session(monkeypatch, c
     ]
 
 
+def test_operator_lifecycle_canary_is_durable_source_only_and_one_shot(tmp_path):
+    provider = MockResearchBrowserProvider({
+        "https://www.leg.state.fl.us/statutes/index.cfm?App_mode=Display_Statute&Search_String=&URL=0000-0099/0043/Sections/0043.16.html": BrowserCapture(
+            "opaque-operator-session",
+            "https://www.leg.state.fl.us/statutes/index.cfm?App_mode=Display_Statute&Search_String=&URL=0000-0099/0043/Sections/0043.16.html",
+            "text/html",
+            b"<h1>43.16</h1><p>Justice Administrative Commission</p>",
+            1,
+            1,
+        ),
+    })
+    runner, sessions, _job_id = _runner(tmp_path, provider, lambda _url: (200, "text/html", b""))
+    with sessions() as db:
+        customer_id = db.execute(select(ApiCustomer.id)).scalar_one()
+
+    assert runner.run_operator_lifecycle_canary(customer_id) == "completed"
+    assert runner.run_operator_lifecycle_canary(customer_id) == "already_terminal"
+    assert provider.released == ["opaque-operator-session"]
+    with sessions() as db:
+        job = db.execute(select(ScoutResearchJob).where(
+            ScoutResearchJob.cache_key == "scout-operator-solari-lifecycle-v1"
+        )).scalar_one()
+        source = db.execute(select(ScoutSource).where(ScoutSource.job_id == job.id)).scalar_one()
+        browser = db.execute(select(ScoutBrowserSession).where(ScoutBrowserSession.job_id == job.id)).scalar_one()
+        assert job.status == "completed"
+        assert job.strategy["mode"] == "operator_lifecycle_validation"
+        assert job.strategy["user_finding"] is False
+        assert source.official is True and source.retrieval_mechanism == "browser"
+        assert source.raw_ref and browser.source_id == source.id
+        assert browser.status == "released"
+        assert db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job.id)).scalars().all() == []
+
+
+def test_operator_lifecycle_canary_cleanup_failure_is_reaped(tmp_path):
+    class ReleaseFailsOnce(MockResearchBrowserProvider):
+        def __init__(self):
+            super().__init__({
+                "https://www.leg.state.fl.us/statutes/index.cfm?App_mode=Display_Statute&Search_String=&URL=0000-0099/0043/Sections/0043.16.html": BrowserCapture(
+                    "opaque-cleanup-session",
+                    "https://www.leg.state.fl.us/statutes/index.cfm?App_mode=Display_Statute&Search_String=&URL=0000-0099/0043/Sections/0043.16.html",
+                    "text/html",
+                    b"<h1>43.16</h1><p>Justice Administrative Commission</p>",
+                    1,
+                    1,
+                ),
+            })
+            self.release_attempts = 0
+
+        def release(self, provider_session_id, *, cleanup_seconds=None):
+            self.release_attempts += 1
+            if self.release_attempts == 1:
+                raise RuntimeError("provider endpoint must not escape")
+            return super().release(provider_session_id, cleanup_seconds=cleanup_seconds)
+
+    provider = ReleaseFailsOnce()
+    runner, sessions, _job_id = _runner(tmp_path, provider, lambda _url: (200, "text/html", b""))
+    with sessions() as db:
+        customer_id = db.execute(select(ApiCustomer.id)).scalar_one()
+    assert runner.run_operator_lifecycle_canary(customer_id) == "partial"
+    with sessions() as db:
+        browser = db.execute(select(ScoutBrowserSession).where(
+            ScoutBrowserSession.provider_session_id == "opaque-cleanup-session"
+        )).scalar_one()
+        assert browser.status == "cleanup_failed"
+    assert runner.reap_sessions() == 1
+    with sessions() as db:
+        browser = db.execute(select(ScoutBrowserSession).where(
+            ScoutBrowserSession.provider_session_id == "opaque-cleanup-session"
+        )).scalar_one()
+        assert browser.status == "released"
+
+
+def test_operator_lifecycle_canary_persistence_failure_releases_untracked_provider(tmp_path, monkeypatch):
+    class PersistenceAwareProvider(MockResearchBrowserProvider):
+        def capture(self, request, *, on_started):
+            try:
+                on_started("opaque-persistence-session")
+            except Exception as exc:
+                raise ProviderSessionPersistenceError("opaque-persistence-session") from exc
+            raise AssertionError("test must force persistence failure")
+
+    provider = PersistenceAwareProvider()
+    runner, sessions, _job_id = _runner(tmp_path, provider, lambda _url: (200, "text/html", b""))
+    monkeypatch.setattr(runner, "_record_browser_started", lambda *_args: (_ for _ in ()).throw(RuntimeError("db down")))
+    with sessions() as db:
+        customer_id = db.execute(select(ApiCustomer.id)).scalar_one()
+    assert runner.run_operator_lifecycle_canary(customer_id) == "failed"
+    assert provider.released == ["opaque-persistence-session"]
+    with sessions() as db:
+        job = db.execute(select(ScoutResearchJob).where(
+            ScoutResearchJob.cache_key == "scout-operator-solari-lifecycle-v1"
+        )).scalar_one()
+        browser = db.execute(select(ScoutBrowserSession).where(ScoutBrowserSession.job_id == job.id)).scalar_one()
+        assert (job.status, browser.status, browser.provider_session_id) == (
+            "failed", "released", "opaque-persistence-session"
+        )
+
+
+def test_solari_lifecycle_canary_cli_guards_and_redacts_account_data(monkeypatch, capsys):
+    email = "named-canary@example.test"
+    monkeypatch.setattr(sys, "argv", ["billcommons-scout", "solari-lifecycle-canary", "--email", email])
+    monkeypatch.delenv("BILLCOMMONS_SCOUT_SOLARI_LIFECYCLE_CANARY", raising=False)
+    assert scout_cli.main() == 2
+    assert email not in capsys.readouterr().out
+
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_SOLARI_LIFECYCLE_CANARY", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ALLOW_PUBLIC", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_CANARY_EMAILS", email)
+    assert scout_cli.main() == 2
+    assert email not in capsys.readouterr().out
+
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ALLOW_PUBLIC", "0")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_CANARY_EMAILS", "other@example.test")
+    assert scout_cli.main() == 2
+    assert email not in capsys.readouterr().out
+
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_CANARY_EMAILS", email)
+    monkeypatch.setattr(scout_cli, "_operator_canary_customer_id", lambda _email: None)
+    assert scout_cli.main() == 2
+    assert email not in capsys.readouterr().out
+
+    class CompleteRunner:
+        def run_operator_lifecycle_canary(self, customer_id):
+            assert customer_id == uuid.UUID("12345678-1234-5678-1234-567812345678")
+            return "completed"
+
+    monkeypatch.setattr(
+        scout_cli,
+        "_operator_canary_customer_id",
+        lambda _email: uuid.UUID("12345678-1234-5678-1234-567812345678"),
+    )
+    monkeypatch.setattr(scout_cli, "_runner", lambda: CompleteRunner())
+    assert scout_cli.main() == 0
+    output = capsys.readouterr().out
+    assert output == "solari_lifecycle_canary=completed source=retained finding=none cleanup=released\n"
+    assert email not in output and "12345678" not in output
+
+
 def test_reaper_remains_available_when_feature_flag_is_disabled(monkeypatch, capsys):
     class Reaper:
         def reap_sessions(self):
