@@ -199,16 +199,33 @@ destructive downgrade is permitted in a production rollback.
 2. Apply the schema once, from a single controlled migration runner against
    the verified production database. The repo does not declare which Railway
    service is the migration runner; `<MIGRATION_RUNNER>` is an operator input.
+   Do **not** shell-expand `DATABASE_URL="$DATABASE_PUBLIC_URL"`: an empty
+   expansion can cause Alembic's normal developer-dotenv fallback to target the
+   wrong database. Use the fail-closed wrapper instead. It accepts only a
+   separately named nonempty selected target (or a complete proxy PG binding),
+   checks explicit Railway binding provenance, prints only a one-way target
+   fingerprint plus revisions, and invokes Alembic exactly once.
 
    ```bash
-   cd packages/schema
-   DATABASE_URL="$DATABASE_URL" ../../.venv/bin/alembic current
-   DATABASE_URL="$DATABASE_URL" ../../.venv/bin/alembic upgrade head
-   DATABASE_URL="$DATABASE_URL" ../../.venv/bin/alembic current
+   # Set BILLCOMMONS_MIGRATION_DATABASE_URL (or complete PG* proxy variables)
+   # and BILLCOMMONS_MIGRATION_BINDING_{PROJECT,ENVIRONMENT,SERVICE}_ID in a
+   # controlled command context. Never print either connection material.
+   python scripts/controlled_migration.py --check-only \
+     --expected-project-id "$RAILWAY_PROJECT_ID" \
+     --expected-environment-id "$RAILWAY_ENVIRONMENT_ID" \
+     --expected-service-id "$TARGET_POSTGRES_SERVICE_ID" \
+     --expected-provenance railway-production-postgres-public-proxy
+
+   python scripts/controlled_migration.py --upgrade \
+     --acknowledge-upgrade-0025 --expected-current 0021 \
+     --expected-project-id "$RAILWAY_PROJECT_ID" \
+     --expected-environment-id "$RAILWAY_ENVIRONMENT_ID" \
+     --expected-service-id "$TARGET_POSTGRES_SERVICE_ID" \
+     --expected-provenance railway-production-postgres-public-proxy
    ```
 
-   Record the pre/post revision. Do not execute this from more than one
-   service, do not rely on app startup to migrate, and do not run a downgrade
+   Record the sanitized pre/post result. Do not execute this from more than
+   one service, do not rely on app startup to migrate, and do not run a downgrade
    as a routine rollback action. The dedicated Scout image readiness check
    queries both `scout_research_jobs` and `scout_raw_blobs` even while the
    worker flag is false, so migrations through `0025` must succeed before the
