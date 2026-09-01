@@ -289,6 +289,7 @@ function JobDetails({ job, refreshError, onCancel, canceling }: { job: ScoutJob;
               <div><dt className="text-slate-500">Requests</dt><dd className="font-semibold">{job.usage.externalRequests ?? "—"}</dd></div>
               <div><dt className="text-slate-500">Browser pages</dt><dd className="font-semibold">{job.usage.browserPages ?? "—"}</dd></div>
               <div><dt className="text-slate-500">Actions</dt><dd className="font-semibold">{job.usage.browserActions ?? "—"}</dd></div>
+              <div><dt className="text-slate-500">Browser requests</dt><dd className="font-semibold">{job.usage.browserRoutedRequests ?? "—"}</dd></div>
               <div><dt className="text-slate-500">Browser time</dt><dd className="font-semibold">{job.usage.browserRuntimeMs === undefined ? "—" : `${Math.round(job.usage.browserRuntimeMs / 1000)}s`}</dd></div>
             </dl>
           </section>
@@ -317,6 +318,15 @@ function JobDetails({ job, refreshError, onCancel, canceling }: { job: ScoutJob;
                       <p className="mt-2 text-xs leading-5 text-slate-600">
                         <span className="font-semibold text-slate-700">Change: {label(source.changeKind)}.</span>{" "}
                         {source.changeSummary}
+                      </p>
+                    ) : null}
+                    {source.priorSource ? (
+                      <p className="mt-1 text-xs leading-5 text-slate-500">
+                        Prior evidence: {time(source.priorSource.retrievedAt) || "time not recorded"}
+                        {shortHash(source.priorSource.contentHash) ? ` · ${shortHash(source.priorSource.contentHash)}` : ""}
+                        {source.priorSource.canonicalUrl ? (
+                          <>{" · "}<a className="underline underline-offset-2 hover:text-slate-700" href={source.priorSource.canonicalUrl} target="_blank" rel="noreferrer noopener">source ↗</a></>
+                        ) : null}
                       </p>
                     ) : null}
                   </div>
@@ -374,7 +384,6 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
   const [canceling, setCanceling] = useState(false);
   const [error, setError] = useState("");
   const [refreshError, setRefreshError] = useState("");
-  const lastTrackedState = useRef("");
   const trackedFacts = useRef(new Set<string>());
 
   useEffect(() => {
@@ -383,17 +392,28 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
 
   useEffect(() => {
     if (!job) return;
+    const trackOnce = (key: string, event: string, properties: Record<string, string | number | boolean>) => {
+      if (trackedFacts.current.has(key)) return;
+      const storageKey = `billcommons:scout:analytics:${key}`;
+      try {
+        if (window.localStorage.getItem(storageKey)) {
+          trackedFacts.current.add(key);
+          return;
+        }
+        window.localStorage.setItem(storageKey, "1");
+      } catch {
+        // Privacy modes may deny storage. The in-memory set still prevents
+        // duplicate polling emissions for the current component lifetime.
+      }
+      trackedFacts.current.add(key);
+      track(event, properties);
+    };
     for (const fact of scoutAnalyticsFacts(job)) {
-      if (trackedFacts.current.has(fact.key)) continue;
-      trackedFacts.current.add(fact.key);
-      track(fact.event, fact.properties);
+      trackOnce(fact.key, fact.event, fact.properties);
     }
-    const stateKey = `${job.id}:${job.status}`;
-    if (lastTrackedState.current === stateKey) return;
-    lastTrackedState.current = stateKey;
-    if (job.status === "running") track("scout_job_started", { jurisdiction: job.jurisdiction });
-    if (job.status === "partial") track("scout_job_partial", { findings: job.findings.length });
-    if (job.status === "complete") track("scout_job_completed", {
+    if (job.status === "running") trackOnce(`${job.id}:status:running`, "scout_job_started", { jurisdiction: job.jurisdiction });
+    if (job.status === "partial") trackOnce(`${job.id}:status:partial`, "scout_job_partial", { findings: job.findings.length });
+    if (job.status === "complete") trackOnce(`${job.id}:status:complete`, "scout_job_completed", {
       jurisdiction: job.jurisdiction,
       findings: job.findings.length,
       sources: job.sources.length,
@@ -401,7 +421,7 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
       browser_used: job.browserSessions.length > 0,
       browser_seconds: Math.round((job.usage.browserRuntimeMs ?? 0) / 1000),
     });
-    if (job.status === "failed") track("scout_job_failed", { errors: job.errors.length });
+    if (job.status === "failed") trackOnce(`${job.id}:status:failed`, "scout_job_failed", { errors: job.errors.length });
   }, [job]);
 
   useEffect(() => {

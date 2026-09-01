@@ -25,7 +25,7 @@ test("normalizes the API's snake-case Scout job into safe display data", () => {
       jurisdiction: "FL",
       status: "partial",
       cache_hit: true,
-      usage: { external_requests: 2, browser_runtime_ms: 1499 },
+      usage: { external_requests: 2, browser_runtime_ms: 1499, browser_routed_requests: 9 },
       events: [{ id: "e-1", stage: "direct_retrieval", message: "Source retained." }],
       sources: [
         { id: "s-1", title: "Official page", canonical_url: "https://www.leg.state.fl.us/bills" },
@@ -40,6 +40,7 @@ test("normalizes the API's snake-case Scout job into safe display data", () => {
   assert.equal(job.status, "partial");
   assert.equal(job.cacheHit, true);
   assert.equal(job.usage.externalRequests, 2);
+  assert.equal(job.usage.browserRoutedRequests, 9);
   assert.equal(job.sources[0].canonicalUrl, "https://www.leg.state.fl.us/bills");
   assert.equal(job.sources[1].canonicalUrl, undefined);
   assert.equal(job.browserSessions[0].replayAvailable, true);
@@ -55,6 +56,8 @@ test("only known terminal states stop polling and failed jobs never claim a find
   assert.equal(isScoutTerminal("partial"), true);
   assert.equal(isScoutTerminal("failed"), true);
   assert.equal(isScoutTerminal("canceled"), true);
+  assert.equal(normalizeScoutJob({ id: "queued-job", status: "queued" }).status, "queued");
+  assert.equal(normalizeScoutJob({ id: "running-job", status: "running" }).status, "running");
   assert.equal(normalizeScoutJob({ id: "legacy-job", status: "completed" }).status, "complete");
   assert.match(
     scoutStatusSummary(normalizeScoutJob({ id: "job-2", status: "failed", findings: [{ title: "ignored" }] })),
@@ -77,7 +80,7 @@ test("accepts the compact P0 API aliases without losing source evidence", () => 
       status: "completed",
       error_class: "partial_source_failure",
       events: [{ kind: "source_retained", detail: { message: "Official source retained." } }],
-      sources: [{ id: "source-3", url: "https://www.leg.state.fl.us/record", official: true, mechanism: "direct", status: 200, mime_type: "text/html", content_hash: "a".repeat(64), prior_source_id: "source-2", change_kind: "material", change_summary: "Normalized text changed (10→12 chars; first difference at 7)." }],
+      sources: [{ id: "source-3", url: "https://www.leg.state.fl.us/record", official: true, mechanism: "direct", status: 200, mime_type: "text/html", content_hash: "a".repeat(64), prior_source_id: "source-2", prior_source: { job_id: "job-2", canonical_url: "https://www.leg.state.fl.us/prior", content_hash: "b".repeat(64), retrieved_at: "2026-08-31T12:00:00Z" }, change_kind: "material", change_summary: "Normalized text changed (10→12 chars; first difference at 7)." }],
       findings: [{ id: "finding-3", title: "Finding", what_happened: "Recorded", why_it_matters: "Relevant", excerpt: "Primary text", source_url: "https://www.leg.state.fl.us/record" }],
       browser_sessions: [{ id: "session-3", status: "released", pages: 2, actions: 3, replay_available: true }],
     },
@@ -89,9 +92,12 @@ test("accepts the compact P0 API aliases without losing source evidence", () => 
   assert.equal(job.events[0].message, "Official source retained.");
   assert.equal(job.sources[0].canonicalUrl, "https://www.leg.state.fl.us/record");
   assert.equal(job.sources[0].officialDomain, "Official source");
+  assert.equal(job.sources[0].official, true);
   assert.equal(job.sources[0].priorSourceId, "source-2");
   assert.equal(job.sources[0].changeKind, "material");
   assert.match(job.sources[0].changeSummary, /Normalized text changed/);
+  assert.equal(job.sources[0].priorSource.jobId, "job-2");
+  assert.equal(job.sources[0].priorSource.contentHash, "b".repeat(64));
   assert.equal(job.findings[0].evidenceExcerpt, "Primary text");
   assert.equal(job.findings[0].sourceUrl, "https://www.leg.state.fl.us/record");
   assert.equal(job.usage.browserPages, 2);
@@ -130,4 +136,22 @@ test("derives aggregate analytics without exposing research or provider data", (
   ]) {
     assert.equal(serializedProperties.includes(forbidden), false);
   }
+});
+
+test("defers mutable analytics until terminal and preserves official-source truth", () => {
+  const running = normalizeScoutJob({
+    id: "job-running",
+    status: "running",
+    sources: [{ id: "s1", url: "https://example.com", official: false }],
+    browser_sessions: [{ id: "b1", status: "running", runtime_ms: 0 }],
+  });
+  assert.deepEqual(scoutAnalyticsFacts(running), []);
+
+  const complete = normalizeScoutJob({
+    id: "job-complete",
+    status: "complete",
+    sources: [{ id: "s1", url: "https://example.com", official: false }],
+  });
+  const sourceFact = scoutAnalyticsFacts(complete).find((fact) => fact.event === "scout_source_discovered");
+  assert.equal(sourceFact.properties.official, false);
 });

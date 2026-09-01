@@ -172,8 +172,53 @@ def test_scout_payload_exposes_bounded_source_change_provenance(monkeypatch):
         payload = client.get(f"/api/v1/scout/jobs/{job_id}", headers=headers).json()
     returned = next(source for source in payload["sources"] if source["id"] == source_id)
     assert returned["prior_source_id"] == str(prior.id)
+    assert returned["prior_source"]["job_id"] == str(job_id)
+    assert returned["prior_source"]["canonical_url"] == "https://www.flsenate.gov/prior"
     assert returned["change_kind"] == "material"
     assert returned["change_summary"] == "Normalized text changed (12→20 chars; first difference at 8)."
+
+
+def test_scout_payload_never_describes_cross_customer_prior_source(monkeypatch):
+    app, owner, other, sessions = _app(monkeypatch)
+    with TestClient(app) as client:
+        owner_job = client.post(
+            "/api/v1/scout/jobs",
+            json={"query": "HB 12"},
+            headers={"x-test-customer": str(owner.id)},
+        ).json()["job"]
+        other_job = client.post(
+            "/api/v1/scout/jobs",
+            json={"query": "SB 99"},
+            headers={"x-test-customer": str(other.id)},
+        ).json()["job"]
+        with sessions() as db:
+            foreign = ScoutSource(
+                job_id=uuid.UUID(other_job["id"]),
+                canonical_url="https://www.flsenate.gov/foreign",
+                official=True,
+                retrieval_mechanism="direct",
+                content_hash="f" * 64,
+            )
+            db.add(foreign)
+            db.flush()
+            current = ScoutSource(
+                job_id=uuid.UUID(owner_job["id"]),
+                canonical_url="https://www.flsenate.gov/current",
+                official=True,
+                retrieval_mechanism="direct",
+                prior_source_id=foreign.id,
+                change_kind="material",
+            )
+            db.add(current)
+            db.commit()
+            current_id = str(current.id)
+        payload = client.get(
+            f"/api/v1/scout/jobs/{owner_job['id']}",
+            headers={"x-test-customer": str(owner.id)},
+        ).json()
+    returned = next(source for source in payload["sources"] if source["id"] == current_id)
+    assert returned["prior_source_id"] is not None
+    assert returned["prior_source"] is None
 
 
 def test_scout_quota_decision_locks_the_customer_row_before_counting():

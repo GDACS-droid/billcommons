@@ -19,6 +19,7 @@ export interface ScoutSource {
   title: string;
   canonicalUrl?: string;
   officialDomain?: string;
+  official?: boolean;
   sourceType?: string;
   retrievalMechanism?: string;
   retrievedAt?: string;
@@ -27,6 +28,12 @@ export interface ScoutSource {
   priorSourceId?: string;
   changeKind?: string;
   changeSummary?: string;
+  priorSource?: {
+    jobId: string;
+    canonicalUrl?: string;
+    retrievedAt?: string;
+    contentHash?: string;
+  };
 }
 
 export interface ScoutFinding {
@@ -49,6 +56,7 @@ export interface ScoutBrowserSession {
   pages?: number;
   actions?: number;
   runtimeMs?: number;
+  routedRequests?: number;
 }
 
 export interface ScoutUsage {
@@ -56,6 +64,7 @@ export interface ScoutUsage {
   browserPages?: number;
   browserActions?: number;
   browserRuntimeMs?: number;
+  browserRoutedRequests?: number;
 }
 
 export interface ScoutReplay {
@@ -135,6 +144,7 @@ function status(value: unknown): ScoutStatus {
   switch (value) {
     case "queued":
     case "running":
+      return value;
     case "complete":
     // Early P0 workers persisted `completed`; accept it during the API
     // transition, but expose one stable terminal vocabulary to the page.
@@ -166,6 +176,7 @@ function normalizeEvent(value: unknown, index: number): ScoutEvent {
 
 function normalizeSource(value: unknown, index: number): ScoutSource {
   const item = record(value) ?? {};
+  const prior = record(item.prior_source);
   const officialDomain = optionalString(item.official_domain) ?? optionalString(item.domain) ??
     (boolean(item.official) === true ? "Official source" : undefined);
   return {
@@ -173,6 +184,7 @@ function normalizeSource(value: unknown, index: number): ScoutSource {
     title: optionalString(item.title) ?? "Untitled source",
     canonicalUrl: safeHttpsUrl(optionalString(item.canonical_url) ?? optionalString(item.url)),
     officialDomain,
+    official: boolean(item.official),
     sourceType: optionalString(item.source_type) ?? optionalString(item.mime_type),
     retrievalMechanism: optionalString(item.retrieval_mechanism) ?? optionalString(item.mechanism),
     retrievedAt: optionalString(item.retrieved_at),
@@ -181,6 +193,12 @@ function normalizeSource(value: unknown, index: number): ScoutSource {
     priorSourceId: optionalString(item.prior_source_id),
     changeKind: optionalString(item.change_kind),
     changeSummary: optionalString(item.change_summary),
+    priorSource: prior ? {
+      jobId: optionalString(prior.job_id) ?? "",
+      canonicalUrl: safeHttpsUrl(optionalString(prior.canonical_url)),
+      retrievedAt: optionalString(prior.retrieved_at),
+      contentHash: optionalString(prior.content_hash),
+    } : undefined,
   };
 }
 
@@ -209,6 +227,7 @@ function normalizeBrowserSession(value: unknown, index: number): ScoutBrowserSes
     pages: number(item.pages),
     actions: number(item.actions),
     runtimeMs: number(item.runtime_ms),
+    routedRequests: number(item.routed_requests),
   };
 }
 
@@ -252,6 +271,7 @@ export function normalizeScoutJob(payload: unknown): ScoutJob {
       browserPages: reportedBrowserPages ?? (browserSessions.length ? browserSessions.reduce((total, session) => total + (session.pages ?? 0), 0) : undefined),
       browserActions: reportedBrowserActions ?? (browserSessions.length ? browserSessions.reduce((total, session) => total + (session.actions ?? 0), 0) : undefined),
       browserRuntimeMs: number(usage.browser_runtime_ms) ?? (browserSessions.length ? browserSessions.reduce((total, session) => total + (session.runtimeMs ?? 0), 0) : undefined),
+      browserRoutedRequests: number(usage.browser_routed_requests) ?? (browserSessions.length ? browserSessions.reduce((total, session) => total + (session.routedRequests ?? 0), 0) : undefined),
     },
     events: list(item.events).map(normalizeEvent),
     sources: list(item.sources).map(normalizeSource),
@@ -272,6 +292,10 @@ export function isScoutTerminal(status: ScoutStatus): status is ScoutTerminalSta
  * text, URLs, titles, excerpts, hashes, and replay links.
  */
 export function scoutAnalyticsFacts(job: ScoutJob): ScoutAnalyticsFact[] {
+  // Polling snapshots are mutable. Emit discovery/runtime facts only after the
+  // durable job reaches a terminal state so counts and browser runtime cannot
+  // be frozen at their initial zero values.
+  if (!isScoutTerminal(job.status)) return [];
   const facts: ScoutAnalyticsFact[] = [];
   const base = { jurisdiction: job.jurisdiction };
   const stages = new Set(job.events.map((event) => event.stage));
@@ -301,7 +325,7 @@ export function scoutAnalyticsFacts(job: ScoutJob): ScoutAnalyticsFact[] {
     const properties = {
       ...base,
       mechanism: source.retrievalMechanism ?? "unknown",
-      official: Boolean(source.officialDomain),
+      official: source.official === true,
     };
     facts.push({ key: `${job.id}:source:${source.id}`, event: "scout_source_discovered", properties });
     if (source.contentHash) {

@@ -95,6 +95,35 @@ def _job_payload(db: Session, job: ScoutResearchJob) -> dict:
         source.id: source
         for source in db.execute(select(ScoutSource).where(ScoutSource.job_id == job.id)).scalars()
     }
+    prior_ids = {source.prior_source_id for source in sources.values() if source.prior_source_id}
+    prior_sources: dict[uuid.UUID, tuple[ScoutSource, ScoutResearchJob]] = {}
+    if prior_ids:
+        # The descriptor is inspectable provenance, but only when the prior
+        # source belongs to this same authenticated customer. A malformed or
+        # legacy cross-tenant pointer remains opaque.
+        prior_sources = {
+            prior_source.id: (prior_source, prior_job)
+            for prior_source, prior_job in db.execute(
+                select(ScoutSource, ScoutResearchJob)
+                .join(ScoutResearchJob, ScoutResearchJob.id == ScoutSource.job_id)
+                .where(
+                    ScoutSource.id.in_(prior_ids),
+                    ScoutResearchJob.customer_id == job.customer_id,
+                )
+            ).all()
+        }
+
+    def prior_descriptor(source: ScoutSource) -> dict | None:
+        prior = prior_sources.get(source.prior_source_id)
+        if prior is None:
+            return None
+        prior_source, prior_job = prior
+        return {
+            "job_id": str(prior_job.id),
+            "canonical_url": prior_source.canonical_url,
+            "content_hash": prior_source.content_hash,
+            "retrieved_at": prior_source.retrieved_at.isoformat() if prior_source.retrieved_at else None,
+        }
     payload["events"] = [
         {"id": str(event.id), "kind": event.kind, "message": event.kind.replace("_", " "), "detail": event.detail, "created_at": event.created_at.isoformat()}
         for event in db.execute(
@@ -106,6 +135,7 @@ def _job_payload(db: Session, job: ScoutResearchJob) -> dict:
          "mechanism": source.retrieval_mechanism, "status": source.http_status,
          "type": source.mime_type, "mime_type": source.mime_type, "content_hash": source.content_hash,
          "prior_source_id": str(source.prior_source_id) if source.prior_source_id else None,
+         "prior_source": prior_descriptor(source),
          "change_kind": source.change_kind, "change_summary": source.change_summary,
          "retrieved_at": source.retrieved_at.isoformat() if source.retrieved_at else None}
         for source in sources.values()
