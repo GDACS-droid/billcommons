@@ -53,7 +53,7 @@ class FilesystemRawStore:
     Payloads are sharded by the first two hex characters of their key to
     avoid dumping millions of files into a single directory, e.g.:
         <root>/ab/ab34...ef.bin
-        <root>/ab/ab34...ef.meta.json   (if meta was provided)
+        <root>/ab/ab34...ef.meta.json   (immutable first-observation metadata)
     """
 
     def __init__(self, root: str | Path | None = None) -> None:
@@ -77,7 +77,18 @@ class FilesystemRawStore:
         if not data_path.exists():
             data_path.write_bytes(data)
         if meta is not None:
-            meta_path.write_text(json.dumps(meta, default=str))
+            # The payload key identifies bytes, not a source observation. Two
+            # URLs or tenants may legitimately retrieve identical bytes, so a
+            # later put must never rewrite the shared sidecar and silently
+            # change the blob's provenance. Source-specific metadata belongs
+            # in the caller's database row; this file records only the first
+            # observation. Exclusive creation also makes concurrent puts safe.
+            serialized = json.dumps(meta, default=str)
+            try:
+                with meta_path.open("x") as handle:
+                    handle.write(serialized)
+            except FileExistsError:
+                pass
         return key
 
     def get(self, key: str) -> bytes:
