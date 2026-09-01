@@ -64,6 +64,12 @@ def main() -> int:
     if args.command == "check":
         print(f"enabled={settings.enabled} rawstore_configured={bool(os.environ.get('RAWSTORE_ROOT'))} solari_configured={bool(resolve_solari_api_key())}")
         return 0 if settings.enabled and os.environ.get("RAWSTORE_ROOT") else 2
+    # Cleanup is deliberately available while the feature flag is off. A
+    # rollback disables new jobs/claims first, then must still be able to reap
+    # sessions that were already created by the previous revision.
+    if args.command == "reap":
+        print(f"reap_candidates={_runner().reap_sessions()}")
+        return 0
     if not settings.enabled:
         # Dark launch blocks both API creation and worker claims.
         print("Scout is disabled; no jobs claimed.")
@@ -118,9 +124,6 @@ def main() -> int:
         )
         return 0
     runner = _runner()
-    if args.command == "reap":
-        print(f"reap_candidates={runner.reap_sessions()}")
-        return 0
     if args.once:
         return 0 if runner.run_once(f"scout-{os.getpid()}") else 1
     next_reap = time.monotonic()

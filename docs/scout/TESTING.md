@@ -13,7 +13,7 @@ Tests must record only checks actually run. Most coverage uses fixtures and the 
 ## Evidence recorded on 2026-09-01
 
 - Focused unit/API/worker/guard gate: 23 passed, one TestClient deprecation warning.
-- Pre-live combined Scout gate after adversarial repair: 101 passed. The final post-hardening focused regression expanded to 144 passed; warnings were limited to the known TestClient and SQLite adapter deprecations.
+- Pre-live combined Scout gate after adversarial repair: 101 passed. The final post-hardening focused regression expanded to 145 passed; warnings were limited to the known TestClient and SQLite adapter deprecations. The last added regression proves session reaping remains available while the feature flag is off during rollback.
 - Disposable PostgreSQL Scout E2E + contention + migration constraints: 4 passed, 1 skipped (the explicit live product-path test). Ten same-query submissions produced one job; ten distinct submissions produced two jobs and eight `429` responses.
 - MCP served-session coverage/session-UUID gate: 29 passed.
 - Web contract tests: 4 passed. ESLint passed. Production Next build/typecheck passed with `/scout` present.

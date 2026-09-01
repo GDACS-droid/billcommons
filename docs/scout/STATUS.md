@@ -57,7 +57,7 @@
 ## Verification actually run
 
 - `apps/web`: `npm run test:scout` (4 passed), `npm run lint`, and `NEXT_PUBLIC_SCOUT_ENABLED=true npm run build` passed; the production build emitted `/scout`.
-- Pre-live combined Scout Python gate: 101 passed. The final post-hardening focused regression expanded to 144 passed, with only the known TestClient and SQLite adapter deprecations. These cover shared URL/security tests, API/CORS/owner contracts, MCP session behavior, and worker adversarial/lifecycle tests; disposable-PostgreSQL E2E is recorded separately.
+- Pre-live combined Scout Python gate: 101 passed. The final post-hardening focused regression expanded to 145 passed, with only the known TestClient and SQLite adapter deprecations. These cover shared URL/security tests, API/CORS/owner contracts, MCP session behavior, worker adversarial/lifecycle tests, and reaping while the feature flag is disabled; disposable-PostgreSQL E2E is recorded separately.
 - Disposable PostgreSQL Scout E2E/concurrency/migration gate: 4 passed, 1 live test skipped by default, one TestClient deprecation warning. The explicit live product-path test passed after the final browser-egress hardening with the Solari key configured.
 - MCP session/coverage gate: 29 passed.
 - `git diff --check` and Python `compileall` passed.

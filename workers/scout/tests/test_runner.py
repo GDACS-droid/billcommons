@@ -904,3 +904,16 @@ def test_solari_cli_success_prints_fingerprint_not_signed_session(monkeypatch, c
     assert "solari_check=ok session_ref=" in output
     assert "replay=available cleanup=confirmed" in output
     assert signed_id not in output and "signed-replay" not in output
+
+
+def test_reaper_remains_available_when_feature_flag_is_disabled(monkeypatch, capsys):
+    class Reaper:
+        def reap_sessions(self):
+            return 2
+
+    monkeypatch.setattr(scout_cli, "_runner", lambda: Reaper())
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "false")
+    monkeypatch.setattr(sys, "argv", ["billcommons-scout", "reap"])
+
+    assert scout_cli.main() == 0
+    assert capsys.readouterr().out == "reap_candidates=2\n"
