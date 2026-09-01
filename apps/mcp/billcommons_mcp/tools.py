@@ -443,6 +443,7 @@ def get_bill_record(
         db = get_session()
         try:
             bill: Bill | None = None
+            selected_session: SessionModel | None = None
             if bill_id:
                 try:
                     bid = uuid.UUID(bill_id)
@@ -468,12 +469,28 @@ def get_bill_record(
                     raise ToolError(
                         "invalid_argument", f"Could not parse bill identifier: {identifier!r}"
                     ) from e
+                if session is not None:
+                    session_conditions = [SessionModel.identifier == session]
+                    try:
+                        session_conditions.append(SessionModel.id == uuid.UUID(session))
+                    except ValueError:
+                        pass
+                    session_stmt = select(SessionModel).where(
+                        SessionModel.jurisdiction_id == jurisdiction_row.id,
+                        or_(*session_conditions),
+                    )
+                    selected_session = db.execute(session_stmt).scalar_one_or_none()
+                    if selected_session is None:
+                        raise ToolError(
+                            "invalid_session",
+                            "The session is not valid for the specified jurisdiction.",
+                        )
                 stmt = _bill_query_base().where(
                     Bill.jurisdiction_id == jurisdiction_row.id,
                     Bill.identifier_norm == norm,
                 )
-                if session:
-                    stmt = stmt.join(SessionModel).where(SessionModel.identifier == session)
+                if selected_session is not None:
+                    stmt = stmt.where(Bill.session_id == selected_session.id)
                 candidates = list(db.execute(stmt).unique().scalars().all())
                 if len(candidates) > 1:
                     raise ToolError(
@@ -490,7 +507,11 @@ def get_bill_record(
                 if jurisdiction:
                     jr = find_jurisdiction(db, jurisdiction)
                     if jr is not None:
-                        warning = coverage_warning_for_jurisdiction(db, jr)
+                        warning = coverage_warning_for_jurisdiction(
+                            db,
+                            jr,
+                            session_id=selected_session.id if selected_session else None,
+                        )
                 err = ToolError(
                     "bill_not_found",
                     "No bill matched the given identifiers.",
@@ -506,7 +527,9 @@ def get_bill_record(
             }
             jr = db.get(Jurisdiction, bill.jurisdiction_id)
             if jr is not None:
-                warning = coverage_warning_for_jurisdiction(db, jr)
+                warning = coverage_warning_for_jurisdiction(
+                    db, jr, session_id=bill.session_id
+                )
                 if warning:
                     payload["coverage_warning"] = warning
             return payload
