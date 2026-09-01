@@ -114,6 +114,7 @@ class MockResearchBrowserProvider:
         return result
 
     def release(self, provider_session_id: str) -> str | None:
+        """Fixture release is idempotent; the call ledger remains test-only telemetry."""
         self.released.append(provider_session_id)
         return None
 

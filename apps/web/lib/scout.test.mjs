@@ -23,6 +23,7 @@ const {
   scoutBrowserProviderUsage,
   scoutPollRetryDelay,
   scoutStatusSummary,
+  SCOUT_MAX_UNKNOWN_POLLS,
   SCOUT_POLL_INTERVAL_MS,
 } = compiled.exports;
 
@@ -77,7 +78,8 @@ test("only known terminal states stop polling and failed jobs never claim a find
 test("returns a retry schedule for every nonterminal Scout snapshot", () => {
   assert.equal(scoutPollRetryDelay("queued"), SCOUT_POLL_INTERVAL_MS);
   assert.equal(scoutPollRetryDelay("running"), SCOUT_POLL_INTERVAL_MS);
-  assert.equal(scoutPollRetryDelay("unknown"), SCOUT_POLL_INTERVAL_MS);
+  assert.equal(scoutPollRetryDelay("unknown", SCOUT_MAX_UNKNOWN_POLLS - 1), SCOUT_POLL_INTERVAL_MS);
+  assert.equal(scoutPollRetryDelay("unknown", SCOUT_MAX_UNKNOWN_POLLS), undefined);
   assert.equal(scoutPollRetryDelay("complete"), undefined);
   assert.equal(scoutPollRetryDelay("partial"), undefined);
   assert.equal(scoutPollRetryDelay("failed"), undefined);
@@ -201,4 +203,15 @@ test("does not count pre-provider browser slots in terminal analytics", () => {
   assert.deepEqual(scoutBrowserProviderUsage(started), { sessions: 1, runtimeSeconds: 2 });
   const solari = scoutAnalyticsFacts(started).find((fact) => fact.event === "scout_solari_used");
   assert.deepEqual(solari?.properties, { jurisdiction: "FL", sessions: 1, runtime_seconds: 2 });
+
+  const mixedAggregate = normalizeScoutJob({
+    id: "job-provider-mixed-aggregate",
+    status: "complete",
+    usage: { browser_runtime_ms: 99000 },
+    browser_sessions: [
+      { id: "abandoned", status: "abandoned", runtime_ms: 90000 },
+      { id: "released", status: "released", runtime_ms: 2100 },
+    ],
+  });
+  assert.deepEqual(scoutBrowserProviderUsage(mixedAggregate), { sessions: 1, runtimeSeconds: 2 });
 });

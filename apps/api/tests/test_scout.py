@@ -251,6 +251,8 @@ def test_scout_daily_job_budget_is_durable_but_cached_work_remains_reusable(monk
 def test_scout_daily_browser_runtime_blocks_new_spend(monkeypatch):
     app, owner, _other, sessions = _app(monkeypatch)
     monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
     headers = {"x-test-customer": str(owner.id)}
     with TestClient(app) as client:
         created = client.post("/api/v1/scout/jobs", json={"query": "HB 12"}, headers=headers)
@@ -263,3 +265,46 @@ def test_scout_daily_browser_runtime_blocks_new_spend(monkeypatch):
         limited = client.post("/api/v1/scout/jobs", json={"query": "HB 13"}, headers=headers)
         assert limited.status_code == 429
         assert limited.json()["error"]["code"] == "scout_daily_browser_limit"
+
+
+def test_scout_daily_browser_budget_reserves_queued_work(monkeypatch):
+    app, owner, _other, _sessions = _app(monkeypatch)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    headers = {"x-test-customer": str(owner.id)}
+    with TestClient(app) as client:
+        created = client.post("/api/v1/scout/jobs", json={"query": "HB 12"}, headers=headers)
+        assert created.status_code == 201
+        limited = client.post("/api/v1/scout/jobs", json={"query": "HB 13"}, headers=headers)
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "scout_daily_browser_limit"
+
+
+def test_scout_owner_payload_derives_browser_routed_requests_from_started_sessions(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    headers = {"x-test-customer": str(owner.id)}
+    with TestClient(app) as client:
+        created = client.post("/api/v1/scout/jobs", json={"query": "HB 12"}, headers=headers)
+        job_id = uuid.UUID(created.json()["job"]["id"])
+        with sessions() as db:
+            db.add(
+                ScoutBrowserSession(
+                    job_id=job_id,
+                    provider="mock",
+                    provider_session_id="started-session",
+                    status="released",
+                    routed_requests=3,
+                )
+            )
+            db.commit()
+        payload = client.get(f"/api/v1/scout/jobs/{job_id}", headers=headers).json()
+    assert payload["usage"]["browser_routed_requests"] == 3
+
+
+def test_scout_owner_payload_omits_unknown_browser_routed_requests(monkeypatch):
+    app, owner, _other, _sessions = _app(monkeypatch)
+    headers = {"x-test-customer": str(owner.id)}
+    with TestClient(app) as client:
+        created = client.post("/api/v1/scout/jobs", json={"query": "HB 12"}, headers=headers)
+    assert "browser_routed_requests" not in created.json()["job"]["usage"]

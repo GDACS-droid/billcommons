@@ -251,7 +251,10 @@ export function scoutBrowserProviderUsage(job: ScoutJob): ScoutBrowserProviderUs
     PROVIDER_STARTED_BROWSER_SESSION_STATUSES.has(session.status),
   );
   if (!sessions.length) return { sessions: 0, runtimeSeconds: 0 };
-  const runtimeMs = job.usage.browserRuntimeMs ?? sessions.reduce(
+  // Session rows are the lifecycle authority. A future aggregate could also
+  // include pre-provider reservations, so never attribute that wider number
+  // to Solari/provider use.
+  const runtimeMs = sessions.reduce(
     (total, session) => total + (session.runtimeMs ?? 0),
     0,
   );
@@ -277,6 +280,16 @@ export function normalizeScoutJob(payload: unknown): ScoutJob {
   const providerStartedBrowserSessions = browserSessions.filter((session) =>
     PROVIDER_STARTED_BROWSER_SESSION_STATUSES.has(session.status),
   );
+  const sessionTotal = (metric: (session: ScoutBrowserSession) => number | undefined) => {
+    const values = providerStartedBrowserSessions.map(metric).filter(
+      (value): value is number => value !== undefined,
+    );
+    return values.length ? values.reduce((total, value) => total + value, 0) : undefined;
+  };
+  const sessionBrowserPages = sessionTotal((session) => session.pages);
+  const sessionBrowserActions = sessionTotal((session) => session.actions);
+  const sessionBrowserRuntimeMs = sessionTotal((session) => session.runtimeMs);
+  const sessionBrowserRoutedRequests = sessionTotal((session) => session.routedRequests);
   const reportedBrowserPages = number(usage.browser_pages);
   const reportedBrowserActions = number(usage.browser_actions);
 
@@ -298,10 +311,10 @@ export function normalizeScoutJob(payload: unknown): ScoutJob {
     completedAt: optionalString(item.completed_at),
     usage: {
       externalRequests: number(usage.external_requests),
-      browserPages: reportedBrowserPages ?? (providerStartedBrowserSessions.length ? providerStartedBrowserSessions.reduce((total, session) => total + (session.pages ?? 0), 0) : undefined),
-      browserActions: reportedBrowserActions ?? (providerStartedBrowserSessions.length ? providerStartedBrowserSessions.reduce((total, session) => total + (session.actions ?? 0), 0) : undefined),
-      browserRuntimeMs: number(usage.browser_runtime_ms) ?? (providerStartedBrowserSessions.length ? providerStartedBrowserSessions.reduce((total, session) => total + (session.runtimeMs ?? 0), 0) : undefined),
-      browserRoutedRequests: number(usage.browser_routed_requests) ?? (providerStartedBrowserSessions.length ? providerStartedBrowserSessions.reduce((total, session) => total + (session.routedRequests ?? 0), 0) : undefined),
+      browserPages: sessionBrowserPages ?? reportedBrowserPages,
+      browserActions: sessionBrowserActions ?? reportedBrowserActions,
+      browserRuntimeMs: sessionBrowserRuntimeMs ?? number(usage.browser_runtime_ms),
+      browserRoutedRequests: sessionBrowserRoutedRequests ?? number(usage.browser_routed_requests),
     },
     events: list(item.events).map(normalizeEvent),
     sources: list(item.sources).map(normalizeSource),
@@ -316,10 +329,13 @@ export function isScoutTerminal(status: ScoutStatus): status is ScoutTerminalSta
 }
 
 export const SCOUT_POLL_INTERVAL_MS = 2_500;
+export const SCOUT_MAX_UNKNOWN_POLLS = 3;
 
-/** A terminal job must never be refreshed; all other snapshots are retried. */
-export function scoutPollRetryDelay(status: ScoutStatus): number | undefined {
-  return isScoutTerminal(status) ? undefined : SCOUT_POLL_INTERVAL_MS;
+/** Terminal jobs never refresh; protocol-unknown snapshots get a small bound. */
+export function scoutPollRetryDelay(status: ScoutStatus, unknownPolls = 0): number | undefined {
+  if (isScoutTerminal(status)) return undefined;
+  if (status === "unknown" && unknownPolls >= SCOUT_MAX_UNKNOWN_POLLS) return undefined;
+  return SCOUT_POLL_INTERVAL_MS;
 }
 
 /**
@@ -397,7 +413,7 @@ export function scoutStatusSummary(job: ScoutJob): string {
     case "running":
       return "Research is running. Updates appear only when the service records them.";
     default:
-      return "Scout returned an unrecognized status. The page will keep checking for a current record.";
+      return "Scout returned an unrecognized status. The page will retry briefly for a current record.";
   }
 }
 

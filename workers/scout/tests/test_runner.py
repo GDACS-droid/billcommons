@@ -46,7 +46,7 @@ def _runner(tmp_path, provider, fetcher, *, settings=None, limits=None):
     Base.metadata.create_all(engine, tables=tables)
     sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     customer = ApiCustomer(id=uuid.uuid4(), email="runner@example.test")
-    job = ScoutResearchJob(id=uuid.uuid4(), customer_id=customer.id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="initial-claim", strategy={}, limits=limits or {}, usage={})
+    job = ScoutResearchJob(id=uuid.uuid4(), customer_id=customer.id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="initial-claim", lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), strategy={}, limits=limits or {}, usage={})
     with sessions() as db:
         db.add_all((customer, job))
         db.commit()
@@ -210,8 +210,8 @@ def test_a_to_b_to_a_reversion_compares_to_latest_url_observation_and_reuses_old
     assert source_a is not None
     with sessions() as db:
         first = db.get(ScoutResearchJob, job_a)
-        job_b = ScoutResearchJob(id=uuid.uuid4(), customer_id=first.customer_id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="claim-b", strategy={}, limits={}, usage={})
-        job_c = ScoutResearchJob(id=uuid.uuid4(), customer_id=first.customer_id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="claim-c", strategy={}, limits={}, usage={})
+        job_b = ScoutResearchJob(id=uuid.uuid4(), customer_id=first.customer_id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="claim-b", lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), strategy={}, limits={}, usage={})
+        job_c = ScoutResearchJob(id=uuid.uuid4(), customer_id=first.customer_id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="claim-c", lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), strategy={}, limits={}, usage={})
         db.add_all((job_b, job_c))
         db.commit()
     source_b = runner._persist_capture(job_b.id, "claim-b", None, "HB 12", "Filed", metadata, url, "direct", 200, "text/html", body_b)
@@ -276,7 +276,7 @@ def test_changed_sources_record_cosmetic_then_material_bounded_summaries(tmp_pat
         assert (cosmetic.prior_source_id, cosmetic.change_kind) == (prior_id, "cosmetic")
         assert len(cosmetic.change_summary) <= 180
         job = db.get(ScoutResearchJob, job_id)
-        second = ScoutResearchJob(id=uuid.uuid4(), customer_id=job.customer_id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="second-claim", strategy={}, limits={}, usage={})
+        second = ScoutResearchJob(id=uuid.uuid4(), customer_id=job.customer_id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="second-claim", lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), strategy={}, limits={}, usage={})
         db.add(second)
         db.commit()
         second_id = second.id
@@ -414,7 +414,14 @@ def test_browser_budget_denial_creates_no_slot_or_browser_usage(tmp_path):
     runner.process(job_id)
     with sessions() as db:
         job = db.get(ScoutResearchJob, job_id)
-        assert job.usage == {"external_requests": 1}
+        assert (job.status, job.error_class, job.usage) == (
+            "partial", "external_request_limit", {"external_requests": 1},
+        )
+        assert any(
+            event.kind == "finished"
+            and event.detail == {"status": "partial", "error_class": "external_request_limit"}
+            for event in db.execute(select(ScoutJobEvent).where(ScoutJobEvent.job_id == job_id)).scalars()
+        )
         assert db.execute(select(ScoutBrowserSession)).scalars().all() == []
     assert provider.released == []
 
@@ -438,6 +445,37 @@ def test_browser_capture_rejects_provider_routed_request_overrun(tmp_path):
         # Preserve the provider-reported overrun for audit even though its
         # bytes were not admitted as a source.
         assert session.routed_requests == 2
+        assert (job.error_class, job.usage["browser_routed_requests"]) == (
+            "browser_routed_request_limit", 2,
+        )
+        assert any(
+            event.kind == "browser_routed_request_limit_reached"
+            and event.detail == {"limit": 1, "used": 2}
+            for event in db.execute(select(ScoutJobEvent).where(ScoutJobEvent.job_id == job_id)).scalars()
+        )
+
+
+def test_browser_capture_honors_request_time_wall_reservation(tmp_path):
+    url = "https://www.myfloridahouse.gov/Sections/Bills/billsdetail.aspx"
+
+    class RequestRecordingProvider(MockResearchBrowserProvider):
+        request = None
+
+        def capture(self, request, *, on_started):
+            self.request = request
+            return super().capture(request, on_started=on_started)
+
+    provider = RequestRecordingProvider({
+        url: BrowserCapture("bounded", url, "text/html", b"HB 12 Filed", 1, 1),
+    })
+    runner, _sessions, job_id = _runner(
+        tmp_path, provider, lambda _url: (403, "text/html", b"javascript challenge"),
+        settings=ScoutSettings(enabled=True, browser_wall_seconds=60),
+        limits={"browser_wall_seconds": 7},
+    )
+    runner._candidates = lambda _db, _job: [_candidate(url=url)]
+    runner.process(job_id)
+    assert provider.request is not None and provider.request.wall_seconds == 7
 
 
 def test_browser_precreate_failure_removes_slot_without_browser_usage(tmp_path):
@@ -982,6 +1020,169 @@ def test_cancellation_after_rawstore_write_retains_unverified_staging_reference(
         assert db.execute(select(ScoutFinding)).scalars().all() == []
 
 
+@pytest.mark.parametrize("terminal", ("canceled", "expired"))
+def test_final_capture_fence_refuses_terminal_owner_before_source_promotion(tmp_path, monkeypatch, terminal):
+    """The last DB transaction must not promote staged bytes after its fence loses."""
+    runner, sessions, job_id = _runner(
+        tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", b"HB 12 Filed"),
+    )
+    original_latest = runner._latest_observation
+    raced = {"done": False}
+
+    def lose_fence(*args, **kwargs):
+        if not raced["done"]:
+            raced["done"] = True
+            with sessions() as db:
+                job = db.get(ScoutResearchJob, job_id)
+                if terminal == "canceled":
+                    job.status = "canceled"
+                    job.cancel_version += 1
+                else:
+                    job.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+                db.commit()
+        return original_latest(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_latest_observation", lose_fence)
+    runner._candidates = lambda _db, _job: [_candidate()]
+    runner.process(job_id)
+    with sessions() as db:
+        sources = db.execute(select(ScoutSource)).scalars().all()
+        assert len(sources) == 1
+        assert sources[0].official is False and sources[0].retrieval_mechanism == "staged"
+        assert db.execute(select(ScoutFinding)).scalars().all() == []
+
+
+def test_persisted_id_cancel_reaper_race_releases_only_once(tmp_path):
+    """A canceled worker and reaper contend for one ledger cleanup claim."""
+    release_started = threading.Event()
+    release_finish = threading.Event()
+
+    class BlockingReleaseProvider(MockResearchBrowserProvider):
+        def release(self, provider_session_id):
+            self.released.append(provider_session_id)
+            release_started.set()
+            assert release_finish.wait(timeout=2)
+            return None
+
+    provider = BlockingReleaseProvider()
+    runner, sessions, job_id = _runner(tmp_path, provider, lambda _url: (200, "text/html", b"HB 12 Filed"))
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.status = "canceled"
+        db.add(ScoutBrowserSession(
+            job_id=job_id, provider="fixture", provider_session_id="persisted-race", status="running",
+        ))
+        db.commit()
+        session_id = db.execute(select(ScoutBrowserSession.id)).scalar_one()
+
+    reaper = threading.Thread(target=runner.reap_sessions)
+    reaper.start()
+    assert release_started.wait(timeout=2)
+    # The worker loses to the reaper's committed ``reaping`` claim.
+    assert runner._release_browser_session(session_id, "persisted-race") is False
+    release_finish.set()
+    reaper.join(timeout=2)
+    assert not reaper.is_alive()
+    assert provider.released == ["persisted-race"]
+    with sessions() as db:
+        assert db.get(ScoutBrowserSession, session_id).status == "released"
+
+
+def test_timed_out_release_keeps_claim_until_original_provider_call_settles(tmp_path):
+    """An outcome-unknown daemon release must not become concurrently retryable."""
+    url = "https://www.myfloridahouse.gov/Sections/Bills/billsdetail.aspx"
+    release_started = threading.Event()
+    release_finish = threading.Event()
+
+    class BlockingReleaseProvider(MockResearchBrowserProvider):
+        release_calls = 0
+
+        def release(self, provider_session_id):
+            self.release_calls += 1
+            release_started.set()
+            assert release_finish.wait(timeout=3)
+            return None
+
+    provider = BlockingReleaseProvider({
+        url: BrowserCapture("timeout-session", url, "text/html", b"HB 12 Filed", 1, 1),
+    })
+    runner, sessions, job_id = _runner(
+        tmp_path, provider, lambda _url: (403, "text/html", b"javascript challenge"),
+        settings=ScoutSettings(enabled=True, browser_cleanup_seconds=1),
+    )
+    runner._candidates = lambda _db, _job: [_candidate(url=url)]
+    worker = threading.Thread(target=runner.process, args=(job_id, "initial-claim"))
+    worker.start()
+    assert release_started.wait(timeout=2)
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert runner.reap_sessions() == 0
+    assert provider.release_calls == 1
+    release_finish.set()
+    for _attempt in range(50):
+        with sessions() as db:
+            if db.execute(select(ScoutBrowserSession.status)).scalar_one() == "released":
+                break
+        time.sleep(0.02)
+    with sessions() as db:
+        assert db.execute(select(ScoutBrowserSession.status)).scalar_one() == "released"
+    assert provider.release_calls == 1
+
+
+def test_timed_out_release_registry_survives_cleanup_keepalive_db_failure(tmp_path, monkeypatch):
+    """A local DB heartbeat failure cannot permit a same-process duplicate call."""
+    release_started = threading.Event()
+    release_finish = threading.Event()
+
+    class BlockingReleaseProvider(MockResearchBrowserProvider):
+        release_calls = 0
+
+        def release(self, provider_session_id):
+            self.release_calls += 1
+            release_started.set()
+            assert release_finish.wait(timeout=4)
+            return None
+
+    provider = BlockingReleaseProvider()
+    runner, sessions, job_id = _runner(
+        tmp_path, provider, lambda _url: (200, "text/html", b"HB 12 Filed"),
+        settings=ScoutSettings(enabled=True, browser_cleanup_seconds=1),
+    )
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.status = "canceled"
+        db.add(ScoutBrowserSession(
+            job_id=job_id, provider="fixture", provider_session_id="db-failure",
+            status="running",
+        ))
+        db.commit()
+        session_id = db.execute(select(ScoutBrowserSession.id)).scalar_one()
+
+    monkeypatch.setattr(
+        runner, "_touch_browser_cleanup",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated_cleanup_heartbeat_failure")
+        ),
+    )
+    caller = threading.Thread(
+        target=runner._release_browser_session, args=(session_id, "db-failure")
+    )
+    caller.start()
+    assert release_started.wait(timeout=2)
+    caller.join(timeout=2)
+    assert not caller.is_alive()
+    time.sleep(1.1)
+    assert runner.reap_sessions() == 0
+    assert provider.release_calls == 1
+    release_finish.set()
+    for _attempt in range(50):
+        with sessions() as db:
+            if db.get(ScoutBrowserSession, session_id).status == "released":
+                break
+        time.sleep(0.02)
+    assert provider.release_calls == 1
+
+
 def test_solari_preconnect_cancellation_releases_persisted_session(monkeypatch):
     calls = {"created": [], "released": []}
     class Sessions:
@@ -1300,9 +1501,9 @@ def test_postgres_concurrent_source_finalization_forms_immediate_predecessor_cha
     try:
         customer = ApiCustomer(id=uuid.uuid4(), email="pg-runner@example.test")
         customer_id = customer.id
-        initial = ScoutResearchJob(id=uuid.uuid4(), customer_id=customer.id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="initial", strategy={}, limits={}, usage={})
-        second = ScoutResearchJob(id=uuid.uuid4(), customer_id=customer.id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="second", strategy={}, limits={}, usage={})
-        third = ScoutResearchJob(id=uuid.uuid4(), customer_id=customer.id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="third", strategy={}, limits={}, usage={})
+        initial = ScoutResearchJob(id=uuid.uuid4(), customer_id=customer.id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="initial", lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), strategy={}, limits={}, usage={})
+        second = ScoutResearchJob(id=uuid.uuid4(), customer_id=customer.id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="second", lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), strategy={}, limits={}, usage={})
+        third = ScoutResearchJob(id=uuid.uuid4(), customer_id=customer.id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="third", lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5), strategy={}, limits={}, usage={})
         with sessions() as db:
             db.add_all((customer, initial, second, third))
             db.commit()

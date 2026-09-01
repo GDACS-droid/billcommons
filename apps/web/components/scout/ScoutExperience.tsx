@@ -385,6 +385,7 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
   const [error, setError] = useState("");
   const [refreshError, setRefreshError] = useState("");
   const trackedFacts = useRef(new Set<string>());
+  const unknownPolls = useRef(0);
   const pollJobId = job?.id;
   const pollJobStatus = job?.status;
 
@@ -434,7 +435,11 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
     let timer: number | undefined;
 
     const schedule = (status: ScoutJob["status"]) => {
-      const delay = scoutPollRetryDelay(status);
+      unknownPolls.current = status === "unknown" ? unknownPolls.current + 1 : 0;
+      const delay = scoutPollRetryDelay(status, unknownPolls.current);
+      if (delay === undefined && status === "unknown" && active) {
+        setRefreshError("Scout returned an unrecognized status repeatedly. Refresh the page to try again.");
+      }
       if (delay !== undefined && active) timer = window.setTimeout(poll, delay);
     };
     const poll = async () => {

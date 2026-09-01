@@ -344,7 +344,12 @@ class ResearchBrowserProvider(Protocol):
         ...
 
     def release(self, provider_session_id: str) -> str | None:
-        """Release the provider session and optionally return its replay URL."""
+        """Idempotently release a session and optionally return its replay URL.
+
+        Implementations must treat an already-released/not-found session as
+        success. Durable crash recovery is necessarily at-least-once across a
+        process/network partition; idempotency keeps that recovery safe.
+        """
         ...
 
     def probe_replay(self, provider_session_id: str) -> str | None:

@@ -61,8 +61,40 @@ def _job_for_owner(db: Session, customer: ApiCustomer, job_id: uuid.UUID, *, loc
     return job
 
 
+def _browser_reservation_ms(job: ScoutResearchJob, settings: ScoutSettings) -> int:
+    """Return the browser capacity durably reserved for one nonterminal job.
+
+    A Scout job can issue at most ``max_external_requests`` browser captures,
+    each bounded by its wall-clock limit.  New jobs persist that bound so a
+    later settings change cannot alter an already-admitted reservation.  The
+    fallback keeps pre-reservation jobs conservative during a rolling deploy.
+    """
+    limits = job.limits or {}
+    reservation = limits.get("daily_browser_reservation_ms")
+    if isinstance(reservation, int) and reservation >= 0:
+        return reservation
+    max_requests = limits.get("max_external_requests", settings.max_external_requests)
+    wall_seconds = limits.get("browser_wall_seconds", settings.browser_wall_seconds)
+    if not isinstance(max_requests, int) or max_requests < 0:
+        max_requests = settings.max_external_requests
+    if not isinstance(wall_seconds, int) or wall_seconds < 0:
+        wall_seconds = settings.browser_wall_seconds
+    return max_requests * wall_seconds * 1000
+
+
 def _job_payload(db: Session, job: ScoutResearchJob) -> dict:
     findings = db.scalar(select(func.count()).select_from(ScoutFinding).where(ScoutFinding.job_id == job.id))
+    browser_sessions = list(
+        db.execute(select(ScoutBrowserSession).where(ScoutBrowserSession.job_id == job.id)).scalars()
+    )
+    usage = dict(job.usage or {})
+    # Older jobs may have browser-session ledger rows without the aggregate
+    # heartbeat field.  A provider ID proves the paid session actually started;
+    # an unstarted reservation must not be reported as a zero-request session.
+    if "browser_routed_requests" not in usage:
+        started_sessions = [session for session in browser_sessions if session.provider_session_id]
+        if started_sessions:
+            usage["browser_routed_requests"] = sum(session.routed_requests for session in started_sessions)
     fresh_until = job.fresh_until
     if fresh_until is not None and fresh_until.tzinfo is None:
         # SQLite test/dev rows do not round-trip timezone info.  Stored Scout
@@ -80,17 +112,18 @@ def _job_payload(db: Session, job: ScoutResearchJob) -> dict:
         "strategy_detail": job.strategy or {},
         "cache_status": "fresh" if fresh_until and fresh_until > datetime.now(timezone.utc) else "miss",
         "usage": {
-            "external_requests": int((job.usage or {}).get("external_requests", (job.usage or {}).get("direct_requests", 0))),
-            "browser_sessions": int((job.usage or {}).get("browser_sessions", 0)),
-            "browser_pages": int((job.usage or {}).get("browser_pages", 0)),
-            "browser_actions": int((job.usage or {}).get("browser_actions", 0)),
-            "browser_routed_requests": int((job.usage or {}).get("browser_routed_requests", 0)),
+            "external_requests": int(usage.get("external_requests", usage.get("direct_requests", 0))),
+            "browser_sessions": int(usage.get("browser_sessions", 0)),
+            "browser_pages": int(usage.get("browser_pages", 0)),
+            "browser_actions": int(usage.get("browser_actions", 0)),
         },
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "started_at": job.heartbeat_at.isoformat() if job.heartbeat_at else None,
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
         "finding_count": findings or 0,
     }
+    if "browser_routed_requests" in usage:
+        payload["usage"]["browser_routed_requests"] = int(usage["browser_routed_requests"])
     sources = {
         source.id: source
         for source in db.execute(select(ScoutSource).where(ScoutSource.job_id == job.id)).scalars()
@@ -154,7 +187,7 @@ def _job_payload(db: Session, job: ScoutResearchJob) -> dict:
          "actions": session.actions, "runtime_ms": session.runtime_ms,
          "routed_requests": session.routed_requests,
          "replay_available": session.status == "released" and bool(session.replay_url)}
-        for session in db.execute(select(ScoutBrowserSession).where(ScoutBrowserSession.job_id == job.id)).scalars()
+        for session in browser_sessions
     ]
     return payload
 
@@ -182,12 +215,13 @@ def create_job(
     # The partial cache-key index remains the authority for equivalent jobs.
     db.execute(select(ApiCustomer.id).where(ApiCustomer.id == customer.id).with_for_update())
 
-    active_count = db.scalar(
-        select(func.count()).select_from(ScoutResearchJob).where(
+    active_jobs = list(
+        db.execute(select(ScoutResearchJob).where(
             ScoutResearchJob.customer_id == customer.id,
             ScoutResearchJob.status.in_(("queued", "running")),
-        )
-    ) or 0
+        )).scalars()
+    )
+    active_count = len(active_jobs)
     # An equivalent request is allowed to coalesce even when the owner has
     # exhausted their unrelated active-job budget.
     existing = db.execute(
@@ -226,15 +260,38 @@ def create_job(
     ) or 0
     if daily_jobs >= settings.per_customer_daily_jobs:
         raise too_many_requests("scout_daily_job_limit", "Daily Scout job limit reached.", 3600)
+    # Active jobs reserve their maximum possible browser spend before any
+    # provider session exists.  Without this durable reservation, serialized
+    # creates can each observe the same runtime ledger and over-admit work.
+    # A canceled/terminal job retains its reservation while a live provider
+    # slot exists, then its actual daily runtime replaces that reservation.
+    reserved_job_ids = {job.id for job in active_jobs}
+    reserved_job_ids.update(
+        db.scalars(
+            select(ScoutBrowserSession.job_id)
+            .join(ScoutResearchJob, ScoutResearchJob.id == ScoutBrowserSession.job_id)
+            .where(
+                ScoutResearchJob.customer_id == customer.id,
+                ScoutBrowserSession.status.in_(("starting", "running", "cleanup_failed", "reaping")),
+            )
+        ).all()
+    )
     daily_browser_ms = db.scalar(
         select(func.coalesce(func.sum(ScoutBrowserSession.runtime_ms), 0))
         .join(ScoutResearchJob, ScoutResearchJob.id == ScoutBrowserSession.job_id)
         .where(
             ScoutResearchJob.customer_id == customer.id,
             ScoutBrowserSession.created_at >= day_start,
+            ScoutResearchJob.id.not_in(reserved_job_ids),
         )
     ) or 0
-    if daily_browser_ms >= settings.per_customer_daily_browser_seconds * 1000:
+    reserved_browser_ms = sum(
+        _browser_reservation_ms(job, settings)
+        for job in db.scalars(select(ScoutResearchJob).where(ScoutResearchJob.id.in_(reserved_job_ids))).all()
+    )
+    if daily_browser_ms + reserved_browser_ms + (
+        settings.max_external_requests * settings.browser_wall_seconds * 1000
+    ) > settings.per_customer_daily_browser_seconds * 1000:
         raise too_many_requests("scout_daily_browser_limit", "Daily Scout browser budget reached.", 3600)
     if active_count >= settings.per_customer_active_jobs:
         raise too_many_requests("scout_active_job_limit", "Too many active Scout jobs.", 60)
@@ -246,7 +303,7 @@ def create_job(
         jurisdiction=jurisdiction,
         cache_key=key,
         strategy={"adapter": "florida_p0", "mode": "structured_first"},
-        limits={"max_pages": settings.max_pages, "max_actions": settings.max_actions, "max_external_requests": settings.max_external_requests, "max_routed_requests": settings.max_browser_routed_requests, "max_retries": settings.max_retries, "daily_jobs": settings.per_customer_daily_jobs, "daily_browser_seconds": settings.per_customer_daily_browser_seconds},
+        limits={"max_pages": settings.max_pages, "max_actions": settings.max_actions, "max_external_requests": settings.max_external_requests, "max_routed_requests": settings.max_browser_routed_requests, "max_retries": settings.max_retries, "daily_jobs": settings.per_customer_daily_jobs, "daily_browser_seconds": settings.per_customer_daily_browser_seconds, "browser_wall_seconds": settings.browser_wall_seconds, "daily_browser_reservation_ms": settings.max_external_requests * settings.browser_wall_seconds * 1000},
         usage={},
     )
     db.add(job)

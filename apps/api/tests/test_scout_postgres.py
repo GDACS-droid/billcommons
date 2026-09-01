@@ -595,6 +595,39 @@ def test_postgres_ten_distinct_submissions_cannot_bypass_owner_active_limit(
     assert active_count == 2
 
 
+def test_postgres_simultaneous_distinct_submissions_reserve_daily_browser_budget(
+    monkeypatch, pg_scout: PostgresScoutHarness, scout_api
+):
+    customer = pg_scout.customer("daily-browser-reservation")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    monkeypatch.setattr(scout, "_require_session", lambda _request, db: db.get(ApiCustomer, customer.id))
+    barrier = threading.Barrier(2)
+
+    def submit(number: int) -> str:
+        with pg_scout.sessions() as db:
+            barrier.wait(timeout=10)
+            try:
+                result = scout.create_job(
+                    scout.CreateScoutJob(query=f"daily browser topic {number}", jurisdiction="FL"),
+                    _direct_request(),
+                    Response(),
+                    db,
+                )
+                return "created" if not result["coalesced"] else "coalesced"
+            except HTTPException as exc:
+                assert exc.status_code == 429
+                assert exc.detail["code"] == "scout_daily_browser_limit"
+                return "limited"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(submit, range(2)))
+
+    assert results.count("created") == 1
+    assert results.count("limited") == 1
+
+
 def test_postgres_global_browser_cap_and_reaper_claim_are_cross_runner_atomic(tmp_path, pg_scout: PostgresScoutHarness):
     """Use independent DB sessions: SQLite cannot prove advisory-lock behavior."""
     customer = pg_scout.customer("browser-contention")
