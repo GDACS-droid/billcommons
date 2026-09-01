@@ -196,10 +196,7 @@ destructive downgrade is permitted in a production rollback.
    `BILLCOMMONS_SCOUT_ENABLED=false` / `BILLCOMMONS_SCOUT_ALLOW_PUBLIC=false`
    in API and Scout worker, and `NEXT_PUBLIC_SCOUT_ENABLED=false` /
    `NEXT_PUBLIC_SCOUT_NAV_ENABLED=false` in Vercel.
-2. Deploy the pinned API/MCP/ingest/Scout artifacts to their respective
-   services **without enabling Scout traffic**. Confirm each deployment ID
-   maps to `<RELEASE_SHA>` and each service command matches the table above.
-3. Apply the schema once, from a single controlled migration runner against
+2. Apply the schema once, from a single controlled migration runner against
    the verified production database. The repo does not declare which Railway
    service is the migration runner; `<MIGRATION_RUNNER>` is an operator input.
 
@@ -212,7 +209,13 @@ destructive downgrade is permitted in a production rollback.
 
    Record the pre/post revision. Do not execute this from more than one
    service, do not rely on app startup to migrate, and do not run a downgrade
-   as a routine rollback action.
+   as a routine rollback action. The dedicated Scout image readiness check
+   queries both `scout_research_jobs` and `scout_raw_blobs` even while the
+   worker flag is false, so migrations through `0025` must succeed before the
+   first Scout worker deployment can become healthy.
+3. Deploy the pinned API/MCP/ingest/Scout artifacts to their respective
+   services **without enabling Scout traffic**. Confirm each deployment ID
+   maps to `<RELEASE_SHA>` and each service command matches the table above.
 4. Recheck API and MCP read paths with flags still dark. Confirm no Scout job
    can be created while the API flag is false, that the Scout image readiness
    check succeeds before the process enters the worker, and that the disabled
