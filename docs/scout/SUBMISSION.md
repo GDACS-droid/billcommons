@@ -14,7 +14,7 @@ Bill Commons is already public at `GDACS-droid/billcommons` under Apache-2.0. Th
 
 Published cookbook branch: `https://github.com/GDACS-droid/solari-cookbook/tree/billcommons-scout-challenge/examples/bill-commons-scout-py` at hardened commit `1095a02`. The free fixture, native provider, and public example live paths are verified and pushed.
 
-Published Bill Commons feature branch: `https://github.com/GDACS-droid/billcommons/tree/billcommons-scout`. Hardened code head `22a6376` includes post-review lifecycle, evidence, analytics, polling, concurrency, budget, and outcome-unknown cleanup repairs. Production flags remain off; publishing source and a local demo artifact is not a production deployment.
+Published Bill Commons feature branch: `https://github.com/GDACS-droid/billcommons/tree/billcommons-scout`. Final browser-budget repair `f09c295` builds on the post-review lifecycle, evidence, analytics, polling, concurrency, and outcome-unknown cleanup repairs. Production flags remain off; publishing source and a local demo artifact is not a production deployment.
 
 ## Setup
 
