@@ -84,6 +84,7 @@ def _job_payload(db: Session, job: ScoutResearchJob) -> dict:
             "browser_sessions": int((job.usage or {}).get("browser_sessions", 0)),
             "browser_pages": int((job.usage or {}).get("browser_pages", 0)),
             "browser_actions": int((job.usage or {}).get("browser_actions", 0)),
+            "browser_routed_requests": int((job.usage or {}).get("browser_routed_requests", 0)),
         },
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "started_at": job.heartbeat_at.isoformat() if job.heartbeat_at else None,
@@ -121,6 +122,7 @@ def _job_payload(db: Session, job: ScoutResearchJob) -> dict:
     payload["browser_sessions"] = [
         {"id": str(session.id), "status": session.status, "pages": session.pages,
          "actions": session.actions, "runtime_ms": session.runtime_ms,
+         "routed_requests": session.routed_requests,
          "replay_available": session.status == "released" and bool(session.replay_url)}
         for session in db.execute(select(ScoutBrowserSession).where(ScoutBrowserSession.job_id == job.id)).scalars()
     ]
@@ -214,7 +216,7 @@ def create_job(
         jurisdiction=jurisdiction,
         cache_key=key,
         strategy={"adapter": "florida_p0", "mode": "structured_first"},
-        limits={"max_pages": settings.max_pages, "max_actions": settings.max_actions, "max_external_requests": settings.max_external_requests, "max_retries": settings.max_retries, "daily_jobs": settings.per_customer_daily_jobs, "daily_browser_seconds": settings.per_customer_daily_browser_seconds},
+        limits={"max_pages": settings.max_pages, "max_actions": settings.max_actions, "max_external_requests": settings.max_external_requests, "max_routed_requests": settings.max_browser_routed_requests, "max_retries": settings.max_retries, "daily_jobs": settings.per_customer_daily_jobs, "daily_browser_seconds": settings.per_customer_daily_browser_seconds},
         usage={},
     )
     db.add(job)
@@ -244,7 +246,6 @@ def create_job(
 
 @router.get("/jobs/{job_id}")
 def get_job(job_id: uuid.UUID, request: Request, response: Response, db: Session = Depends(get_db)):
-    _require_enabled()
     customer = _require_session(request, db)
     response.headers["Cache-Control"] = "no-store"
     return _job_payload(db, _job_for_owner(db, customer, job_id))
@@ -252,7 +253,6 @@ def get_job(job_id: uuid.UUID, request: Request, response: Response, db: Session
 
 @router.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: uuid.UUID, request: Request, response: Response, db: Session = Depends(get_db)):
-    _require_enabled()
     _check_origin(request)
     customer = _require_session(request, db)
     # Serialize cancellation so concurrent requests cannot append duplicate
@@ -274,7 +274,6 @@ def cancel_job(job_id: uuid.UUID, request: Request, response: Response, db: Sess
 
 @router.get("/jobs/{job_id}/evidence")
 def get_evidence(job_id: uuid.UUID, request: Request, response: Response, db: Session = Depends(get_db)):
-    _require_enabled()
     customer = _require_session(request, db)
     _job_for_owner(db, customer, job_id)
     sources = {
@@ -297,7 +296,6 @@ def get_evidence(job_id: uuid.UUID, request: Request, response: Response, db: Se
 
 @router.get("/jobs/{job_id}/browser-sessions/{session_id}/replay")
 def get_replay(job_id: uuid.UUID, session_id: uuid.UUID, request: Request, response: Response, db: Session = Depends(get_db)):
-    _require_enabled()
     customer = _require_session(request, db)
     _job_for_owner(db, customer, job_id)
     session = db.execute(

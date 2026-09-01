@@ -145,6 +145,7 @@ class SolariResearchBrowserProvider:
         state: dict[str, Any] = {
             "phase": "create", "session_id": None, "browser": None,
             "context": None, "playwright": None, "solari": None,
+            "routed_requests": 0,
         }
         try:
             # This intentionally bounds connect/navigation/extraction together,
@@ -205,6 +206,17 @@ class SolariResearchBrowserProvider:
             # Fetch with redirects disabled, then admit the Location before
             # Chromium sees it. ``continue_`` delegates redirect handling to
             # the browser and is therefore insufficient for this boundary.
+            state["routed_requests"] = int(state["routed_requests"]) + 1
+            if int(state["routed_requests"]) > request.max_routed_requests:
+                await route.abort()
+                return
+            resource_type = str(getattr(route.request, "resource_type", "document")).lower()
+            # P0 extracts text from the top-level official document. Images,
+            # media, and fonts are neither evidence nor needed for DOM-ready
+            # extraction, but can be a high-cardinality wallet attack.
+            if resource_type in {"image", "media", "font"}:
+                await route.abort()
+                return
             request_url = route.request.url
             if not is_official_url(request_url):
                 await route.abort()
@@ -271,6 +283,7 @@ class SolariResearchBrowserProvider:
             body=content,
             pages=1,
             actions=1,
+            routed_requests=int(state["routed_requests"]),
         )
 
     async def _cleanup_capture(self, state: dict[str, Any]) -> None:

@@ -96,6 +96,19 @@ def test_scout_is_dark_when_feature_flag_is_off(monkeypatch):
     assert response.status_code == 404
 
 
+def test_existing_owner_scoped_scout_reads_and_cancel_survive_dark_rollback(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    with TestClient(app) as client:
+        headers = {"x-test-customer": str(owner.id)}
+        created = client.post("/api/v1/scout/jobs", json={"query": "HB 12"}, headers=headers)
+        assert created.status_code == 201
+        job_id = created.json()["job"]["id"]
+        monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "0")
+        assert client.get(f"/api/v1/scout/jobs/{job_id}", headers=headers).status_code == 200
+        assert client.get(f"/api/v1/scout/jobs/{job_id}/evidence", headers=headers).status_code == 200
+        assert client.post(f"/api/v1/scout/jobs/{job_id}/cancel", headers=headers).status_code == 200
+
+
 def test_scout_reuses_only_fresh_terminal_cache(monkeypatch):
     app, owner, _other, sessions = _app(monkeypatch)
     headers = {"x-test-customer": str(owner.id)}

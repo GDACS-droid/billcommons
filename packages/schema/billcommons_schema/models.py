@@ -1460,16 +1460,21 @@ class ScoutBrowserSession(UUIDPkMixin, Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'starting'"))
     pages: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     actions: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    routed_requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     runtime_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_class: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # A reaper claims external cleanup in a short DB transaction before calling
+    # the provider. This prevents multiple worker revisions from releasing the
+    # same paid session concurrently.
+    cleanup_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
-            "status in ('starting','running','released','cleanup_failed')",
+            "status in ('starting','running','released','cleanup_failed','reaping','abandoned')",
             name="ck_scout_browser_sessions_status",
         ),
         Index("ix_scout_browser_sessions_live", "status", "created_at"),

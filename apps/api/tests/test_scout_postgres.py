@@ -18,10 +18,12 @@ import os
 import re
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -123,6 +125,9 @@ class PostgresScoutHarness:
         self,
         *,
         source_url: str = "https://www.flsenate.gov/Session/Bill/2026/9999",
+        identifier: str = "HB 9999",
+        title: str = "AI Generated Political Advertising Act",
+        latest_action_text: str = "Referred to the Committee on Ethics and Elections",
     ) -> Bill:
         """Seed the smallest real structured-data path for a topical query."""
         with self.sessions() as db:
@@ -151,12 +156,12 @@ class PostgresScoutHarness:
                 id=uuid.uuid4(),
                 jurisdiction_id=florida.id,
                 session_id=legislative_session.id,
-                identifier="HB 9999",
-                identifier_norm="HB 9999",
-                title="AI Generated Political Advertising Act",
+                identifier=identifier,
+                identifier_norm=identifier,
+                title=title,
                 description="Florida legislation concerning AI generated political advertising.",
                 status="in_committee",
-                latest_action_text="Referred to the Committee on Ethics and Elections",
+                latest_action_text=latest_action_text,
                 source_name="scout-postgres-test",
                 source_url=source_url,
             )
@@ -464,6 +469,61 @@ def test_live_product_path_routes_house_rejection_through_solari_and_releases(
             assert "referred to the committee on ethics and elections" in displayed
 
 
+@pytest.mark.skipif(
+    os.environ.get("BILLCOMMONS_SCOUT_LIVE_FINDING_CHECK") != "1",
+    reason="explicitly opt-in live direct official-source finding check",
+)
+def test_live_direct_flsenate_hb_625_retains_exact_supported_evidence(
+    tmp_path, pg_scout: PostgresScoutHarness, scout_api
+):
+    """Live contract, documented 2026-09-01; fail closed if the source changes.
+
+    This is deliberately separate from billable Solari smoke coverage. The
+    official Senate page must remain directly retrievable and support both the
+    exact structured identifier and action before Scout is allowed to retain a
+    finding. It is skipped in ordinary CI and uses the guarded disposable DB.
+    """
+    customer = pg_scout.customer("live-direct-hb625")
+    source_url = "https://flsenate.gov/Session/Bill/2026/625/ByCategory"
+    pg_scout.florida_bill(
+        source_url=source_url,
+        identifier="HB 625",
+        title="Scout live direct evidence fixture",
+        latest_action_text="Chapter No. 2026-141",
+    )
+    headers = {"x-test-customer": str(customer.id)}
+    provider = MockResearchBrowserProvider()
+    with TestClient(scout_api) as client:
+        created = client.post(
+            "/api/v1/scout/jobs", json={"query": "HB 625", "jurisdiction": "FL"}, headers=headers
+        )
+        assert created.status_code == 201, created.text
+        job_id = uuid.UUID(created.json()["job"]["id"])
+        runner = ScoutRunner(
+            pg_scout.sessions,
+            FilesystemRawStore(tmp_path / "raw"),
+            provider,
+            settings=ScoutSettings(enabled=True, max_external_requests=1, max_retries=0),
+        )
+        claim = runner.claim_next("scout-live-direct-finding")
+        assert claim is not None and claim.job_id == job_id
+        runner.process(claim.job_id, claim.token)
+        response = client.get(f"/api/v1/scout/jobs/{job_id}", headers=headers)
+        assert response.status_code == 200, response.text
+        payload = response.json()
+
+    # A browser fallback would make this live direct contract untruthful.
+    assert provider.released == []
+    assert payload["status"] == "completed"
+    assert len(payload["sources"]) == 1 and payload["sources"][0]["mechanism"] == "direct"
+    assert len(payload["findings"]) == 1
+    finding = payload["findings"][0]
+    excerpt = finding["excerpt"].casefold()
+    assert "hb 625" in excerpt
+    assert "chapter no. 2026-141" in excerpt
+    assert finding["source_url"] == canonicalize_url(source_url)
+
+
 def test_postgres_simultaneous_identical_submissions_coalesce(
     monkeypatch, pg_scout: PostgresScoutHarness, scout_api
 ):
@@ -533,3 +593,53 @@ def test_postgres_ten_distinct_submissions_cannot_bypass_owner_active_limit(
             )
         )
     assert active_count == 2
+
+
+def test_postgres_global_browser_cap_and_reaper_claim_are_cross_runner_atomic(tmp_path, pg_scout: PostgresScoutHarness):
+    """Use independent DB sessions: SQLite cannot prove advisory-lock behavior."""
+    customer = pg_scout.customer("browser-contention")
+    now = datetime.now(timezone.utc)
+    with pg_scout.sessions() as db:
+        jobs = [
+            ScoutResearchJob(
+                id=uuid.uuid4(), customer_id=customer.id, original_query=f"job {n}", normalized_query=f"job {n}",
+                jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token=f"token-{n}",
+                lease_expires_at=now + timedelta(minutes=5), strategy={}, limits={}, usage={},
+            )
+            for n in range(2)
+        ]
+        db.add_all(jobs)
+        db.commit()
+    settings = ScoutSettings(enabled=True, max_concurrent_browser_sessions=1, browser_cleanup_seconds=1)
+    provider = MockResearchBrowserProvider()
+    runners = [ScoutRunner(pg_scout.sessions, FilesystemRawStore(tmp_path / f"raw-{n}"), provider, settings=settings) for n in range(2)]
+    barrier = threading.Barrier(2)
+
+    def reserve(index: int):
+        barrier.wait(timeout=10)
+        return runners[index]._reserve_browser_slot(jobs[index].id, f"token-{index}")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        slots = list(pool.map(reserve, range(2)))
+    assert sum(slot is not None for slot in slots) == 1
+
+    with pg_scout.sessions() as db:
+        slot = db.scalar(select(ScoutBrowserSession).where(ScoutBrowserSession.id == next(item for item in slots if item is not None)))
+        assert slot is not None
+        slot.provider_session_id = "one-orphan"
+        slot.status = "cleanup_failed"
+        db.commit()
+
+    class CountingProvider(MockResearchBrowserProvider):
+        def release(self, provider_session_id):
+            self.released.append(provider_session_id)
+            time.sleep(0.05)
+            return None
+
+    shared = CountingProvider()
+    reapers = [ScoutRunner(pg_scout.sessions, FilesystemRawStore(tmp_path / f"reap-{n}"), shared, settings=settings) for n in range(2)]
+    barrier = threading.Barrier(2)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda runner: (barrier.wait(timeout=10), runner.reap_sessions())[1], reapers))
+    assert sum(outcomes) == 1
+    assert shared.released == ["one-orphan"]

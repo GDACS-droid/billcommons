@@ -23,7 +23,7 @@ from billcommons_scout.providers import ProviderSessionPersistenceError
 from billcommons_scout.providers import SolariProviderError
 from billcommons_scout.providers import SolariResearchBrowserProvider
 from billcommons_scout.providers import resolve_solari_api_key
-from billcommons_scout.runner import ScoutRunner, safe_direct_fetch
+from billcommons_scout.runner import ScoutRunner, _bounded_call, safe_direct_fetch
 import billcommons_scout.__main__ as scout_cli
 
 
@@ -341,7 +341,10 @@ def test_browser_precreate_failure_removes_slot_without_browser_usage(tmp_path):
     with sessions() as db:
         job = db.get(ScoutResearchJob, job_id)
         assert "browser_sessions" not in job.usage
-        assert db.execute(select(ScoutBrowserSession)).scalars().all() == []
+        session = db.execute(select(ScoutBrowserSession)).scalar_one()
+        assert (session.status, session.error_class, session.provider_session_id) == (
+            "abandoned", "abandoned_before_provider_id", None,
+        )
 
 
 def test_browser_source_provenance_uses_provider_final_url(tmp_path):
@@ -600,14 +603,14 @@ def test_solari_provider_releases_and_reconciles_delayed_replay(monkeypatch):
 
 def test_solari_provider_context_routes_validate_redirects_and_capture_final_url(monkeypatch):
     """Exercise the provider boundary without a real browser/provider session."""
-    def install(response_status, response_headers, final_url):
+    def install(response_status, response_headers, final_url, *, resource_type="document"):
         calls = {"created": [], "released": [], "fetch": [], "fulfill": [], "abort": 0, "contexts": [], "websocket_closed": 0, "popup_closed": 0}
 
         class Response:
             status = response_status
             async def all_headers(self): return response_headers
         class Route:
-            def __init__(self): self.request = types.SimpleNamespace(url="https://www.flsenate.gov/start")
+            def __init__(self): self.request = types.SimpleNamespace(url="https://www.flsenate.gov/start", resource_type=resource_type)
             async def fetch(self, **kwargs):
                 calls["fetch"].append(kwargs)
                 return Response()
@@ -666,10 +669,21 @@ def test_solari_provider_context_routes_validate_redirects_and_capture_final_url
     provider, calls = install(302, {"Location": "/final"}, "https://www.flsenate.gov/final")
     capture = provider.capture(BrowserRequest("https://www.flsenate.gov/start", 1, 1, 1, 1024), on_started=lambda _id: None)
     assert capture.url == "https://www.flsenate.gov/final"
+    assert capture.routed_requests == 1
     assert calls["contexts"] == [{"service_workers": "block"}]
     assert calls["fetch"] == [{"max_redirects": 0, "max_retries": 0}]
     assert len(calls["fulfill"]) == 1 and calls["abort"] == 0
     assert calls["websocket_closed"] == 1 and calls["popup_closed"] == 1
+
+    provider, calls = install(200, {}, "https://www.flsenate.gov/final", resource_type="image")
+    with pytest.raises(SolariProviderError):
+        provider.capture(BrowserRequest("https://www.flsenate.gov/start", 1, 1, 1, 1024, max_routed_requests=1), on_started=lambda _id: None)
+    assert calls["abort"] == 1 and calls["fetch"] == []
+
+    provider, calls = install(200, {}, "https://www.flsenate.gov/final")
+    with pytest.raises(SolariProviderError):
+        provider.capture(BrowserRequest("https://www.flsenate.gov/start", 1, 1, 1, 1024, max_routed_requests=0), on_started=lambda _id: None)
+    assert calls["abort"] == 1 and calls["fetch"] == []
 
     provider, calls = install(302, {"location": "https://example.invalid/private"}, "https://www.flsenate.gov/final")
     with pytest.raises(SolariProviderError):
@@ -1026,3 +1040,131 @@ def test_reaper_remains_available_when_feature_flag_is_disabled(monkeypatch, cap
 
     assert scout_cli.main() == 0
     assert capsys.readouterr().out == "reap_candidates=2\n"
+
+
+def test_reaper_never_touches_fresh_running_owner_but_claims_expired_once(tmp_path):
+    class ReleaseCounter(MockResearchBrowserProvider):
+        def release(self, provider_session_id):
+            self.released.append(provider_session_id)
+            return None
+
+    provider = ReleaseCounter()
+    runner, sessions, job_id = _runner(tmp_path, provider, lambda _url: (200, "text/html", b"HB 12 Filed"))
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        session = ScoutBrowserSession(job_id=job_id, provider="fixture", provider_session_id="fresh", status="running")
+        db.add(session)
+        db.commit()
+    assert runner.reap_sessions() == 0
+    assert provider.released == []
+    with sessions() as db:
+        session = db.execute(select(ScoutBrowserSession)).scalar_one()
+        assert session.status == "running"
+        db.get(ScoutResearchJob, job_id).lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+    assert runner.reap_sessions() == 1
+    # A later replay probe may be counted, but it must not release again.
+    runner.reap_sessions()
+    assert provider.released == ["fresh"]
+    with sessions() as db:
+        assert db.execute(select(ScoutBrowserSession)).scalar_one().status == "released"
+
+
+def test_stale_idless_reservation_becomes_abandoned_and_no_longer_counts_against_cap(tmp_path):
+    runner, sessions, job_id = _runner(
+        tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", b"HB 12 Filed"),
+        settings=ScoutSettings(enabled=True, max_concurrent_browser_sessions=1),
+    )
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.add(ScoutBrowserSession(job_id=job_id, provider="fixture", status="starting"))
+        db.commit()
+    assert runner.reap_sessions() == 0
+    with sessions() as db:
+        session = db.execute(select(ScoutBrowserSession)).scalar_one()
+        assert (session.status, session.error_class) == ("abandoned", "abandoned_without_provider_id")
+        # A new genuine reservation is no longer blocked by an ID-less crash.
+        job = db.get(ScoutResearchJob, job_id)
+        job.status, job.claim_token = "running", "next-claim"
+        job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+        db.commit()
+    assert runner._reserve_browser_slot(job_id, "next-claim") is not None
+
+
+def test_bounded_provider_call_timeout_does_not_wait_for_hung_non_daemon_executor():
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        _bounded_call(time.sleep, 0.5, timeout=0.01)
+    assert time.monotonic() - started < 0.2
+
+
+def test_worker_term_drain_stops_before_a_second_claim_without_signaling_pytest(monkeypatch):
+    handlers = {}
+
+    def fake_signal(kind, handler):
+        previous = handlers.get(kind)
+        handlers[kind] = handler
+        return previous
+
+    monkeypatch.setattr(scout_cli.signal, "signal", fake_signal)
+
+    class Runner:
+        def __init__(self): self.claims = 0
+        def reap_sessions(self): return 0
+        def run_once(self, _worker_id):
+            self.claims += 1
+            handlers[scout_cli.signal.SIGTERM](scout_cli.signal.SIGTERM, None)
+            return True
+
+    runner = Runner()
+    assert scout_cli._run_worker_loop(runner, once=False, worker_id="test") == 0
+    assert runner.claims == 1
+
+
+def test_readiness_check_exercises_required_dependencies_without_echoing_configuration(monkeypatch, tmp_path, capsys):
+    class Db:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+        def execute(self, _statement): return None
+
+    class Store:
+        def __init__(self): self.payloads = {}
+        def put(self, payload, _meta):
+            key = hashlib.sha256(payload).hexdigest()
+            self.payloads[key] = payload
+            data, meta = self._paths(key)
+            data.parent.mkdir(parents=True, exist_ok=True)
+            data.write_bytes(payload)
+            meta.write_text("{}")
+            return key
+        def get(self, key): return self.payloads[key]
+        def _paths(self, key): return tmp_path / key / "probe.bin", tmp_path / key / "probe.json"
+
+    monkeypatch.setattr(scout_cli, "get_sessionmaker", lambda: lambda: Db())
+    monkeypatch.setattr(scout_cli, "FilesystemRawStore", Store)
+    monkeypatch.setattr(scout_cli, "resolve_solari_api_key", lambda: None)
+    monkeypatch.setattr(scout_cli.importlib.util, "find_spec", lambda _name: None)
+    assert scout_cli._check_readiness() == 0
+    output = capsys.readouterr().out
+    assert output == "database=ok scout_tables=ok rawstore=ok solari_configured=False solari_sdk=missing\n"
+    assert not list(tmp_path.rglob("probe.*"))
+
+
+def test_rollback_reconcile_is_idempotent_and_preserves_fresh_claim(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", b"HB 12 Filed"))
+    with sessions() as db:
+        fresh = db.get(ScoutResearchJob, job_id)
+        fresh.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        queued = ScoutResearchJob(id=uuid.uuid4(), customer_id=fresh.customer_id, original_query="queued", normalized_query="queued", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="queued", strategy={}, limits={}, usage={})
+        expired = ScoutResearchJob(id=uuid.uuid4(), customer_id=fresh.customer_id, original_query="expired", normalized_query="expired", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="expired", lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1), strategy={}, limits={}, usage={})
+        db.add_all((queued, expired))
+        db.commit()
+    result = runner.rollback_reconcile()
+    assert result["terminalized"] == 2
+    assert runner.rollback_reconcile()["terminalized"] == 0
+    with sessions() as db:
+        assert db.get(ScoutResearchJob, job_id).status == "running"
+        rows = db.execute(select(ScoutResearchJob).where(ScoutResearchJob.id.in_((queued.id, expired.id)))).scalars().all()
+        assert {(row.status, row.error_class) for row in rows} == {("failed", "rolled_back")}

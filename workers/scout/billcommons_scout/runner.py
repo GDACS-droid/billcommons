@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import re
 import secrets
+import threading
 import time
 import uuid
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
@@ -36,6 +36,34 @@ _SHELL_MARKERS = (
 class Claim:
     job_id: uuid.UUID
     token: str
+
+
+def _bounded_call(fn, *args, timeout: float):
+    """Return a bounded provider call without a non-daemon executor shutdown.
+
+    Providers are remote I/O and cannot be forcibly cancelled safely from
+    Python.  The daemon deliberately does not keep a draining worker process
+    alive after its caller times out; the durable `cleanup_failed` ledger and
+    reaper handle the resulting uncertainty.
+    """
+    result: dict[str, object] = {}
+    done = threading.Event()
+
+    def invoke() -> None:
+        try:
+            result["value"] = fn(*args)
+        except BaseException as exc:  # propagate provider failures unchanged
+            result["error"] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=invoke, name="scout-bounded-provider-call", daemon=True)
+    thread.start()
+    if not done.wait(timeout):
+        raise TimeoutError("provider_call_timeout")
+    if "error" in result:
+        raise result["error"]  # type: ignore[misc]
+    return result.get("value")
 
 
 def safe_direct_fetch(url: str, *, max_body_bytes: int) -> tuple[int, str | None, bytes]:
@@ -624,7 +652,7 @@ class ScoutRunner:
         try:
             started = time.monotonic()
             capture = self.provider.capture(
-                BrowserRequest(url=url, max_pages=max_pages, max_actions=max_actions, wall_seconds=self.settings.browser_wall_seconds, max_bytes=self.settings.max_direct_bytes),
+                BrowserRequest(url=url, max_pages=max_pages, max_actions=max_actions, wall_seconds=self.settings.browser_wall_seconds, max_bytes=self.settings.max_direct_bytes, max_routed_requests=self._job_limit(active_job, "max_routed_requests", self.settings.max_browser_routed_requests)),
                 on_started=on_started,
             )
             # Provider implementations must call on_started immediately after
@@ -649,9 +677,11 @@ class ScoutRunner:
                     session.actions = capture.actions
                     session.source_id = source_id
                     session.runtime_ms = int((time.monotonic() - started) * 1000)
+                    session.routed_requests = capture.routed_requests
                     db.commit()
             self._heartbeat(job_id, token, "browser_pages", capture.pages)
             self._heartbeat(job_id, token, "browser_actions", capture.actions)
+            self._heartbeat(job_id, token, "browser_routed_requests", capture.routed_requests)
             return True
         except ProviderSessionPersistenceError as exc:
             # The provider has already self-cleaned. Retry only the durable
@@ -674,6 +704,7 @@ class ScoutRunner:
                             if capture is not None:
                                 session.pages = max(session.pages, capture.pages)
                                 session.actions = max(session.actions, capture.actions)
+                                session.routed_requests = max(session.routed_requests, capture.routed_requests)
                             db.commit()
                 except Exception:
                     # Do not let best-effort runtime telemetry prevent the
@@ -703,7 +734,7 @@ class ScoutRunner:
             if db.bind is not None and db.bind.dialect.name == "postgresql":
                 db.execute(text("SELECT pg_advisory_xact_lock(81420901)"))
             active = db.query(ScoutBrowserSession).filter(
-                ScoutBrowserSession.status.in_(("starting", "running", "cleanup_failed"))
+                ScoutBrowserSession.status.in_(("starting", "running", "cleanup_failed", "reaping"))
             ).count()
             if active >= self.settings.max_concurrent_browser_sessions:
                 db.add(ScoutJobEvent(job_id=job_id, kind="browser_skipped", detail={"reason": "global_limit"}))
@@ -759,28 +790,24 @@ class ScoutRunner:
             return False
 
     def _discard_unstarted_browser_slot(self, session_id: uuid.UUID) -> None:
-        """Remove a reservation that never obtained a provider session ID."""
+        """Terminalize an ID-less reservation without consuming browser capacity."""
         with self.sessions() as db:
             session = db.get(ScoutBrowserSession, session_id)
             if session is not None and session.provider_session_id is None and session.status == "starting":
-                db.delete(session)
+                session.status = "abandoned"
+                session.error_class = "abandoned_before_provider_id"
+                session.released_at = datetime.now(timezone.utc)
                 db.commit()
 
     def _release_untracked_provider(self, provider_id: str) -> tuple[bool, str | None]:
         """One bounded cleanup retry for a provider ID whose callback failed."""
-        pool = ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(self.provider.release, provider_id)
         try:
-            replay = future.result(timeout=self.settings.browser_cleanup_seconds)
+            replay = _bounded_call(self.provider.release, provider_id, timeout=self.settings.browser_cleanup_seconds)
         except TimeoutError:
-            pool.shutdown(wait=False, cancel_futures=True)
             return False, None
         except Exception:
-            pool.shutdown(wait=True)
             return False, None
-        else:
-            pool.shutdown(wait=True)
-            return True, replay
+        return True, replay
 
     def _finalize_untracked_browser_slot(
         self,
@@ -834,15 +861,10 @@ class ScoutRunner:
                 self._mark_cleanup_failed(session_id, "missing_provider_id")
                 return
             replay = None
-            pool = ThreadPoolExecutor(max_workers=1)
-            future = pool.submit(self.provider.release, provider_id)
             try:
-                replay = future.result(timeout=self.settings.browser_cleanup_seconds)
+                replay = _bounded_call(self.provider.release, provider_id, timeout=self.settings.browser_cleanup_seconds)
             except TimeoutError:
-                pool.shutdown(wait=False, cancel_futures=True)
                 raise
-            else:
-                pool.shutdown(wait=True)
             with self.sessions() as db:
                 session = db.get(ScoutBrowserSession, session_id)
                 if session is not None:
@@ -862,17 +884,55 @@ class ScoutRunner:
             if session is not None:
                 session.status = "cleanup_failed"
                 session.error_class = error_class
+                session.cleanup_attempted_at = datetime.now(timezone.utc)
                 db.commit()
 
     def reap_sessions(self) -> int:
-        """Independent retry path for sessions left by process interruption/cleanup timeout."""
-        ids: list[tuple[uuid.UUID, str | None]] = []
+        """Claim eligible orphan cleanup atomically, then release outside DB I/O.
+
+        Fresh running sessions belong to their worker until that job is
+        canceled/terminal or its lease expires.  `reaping` is recoverable after
+        the cleanup timeout, so a killed reaper never permanently consumes cap.
+        """
+        ids: list[tuple[uuid.UUID, str]] = []
         replay_ids: list[tuple[uuid.UUID, str, int]] = []
         now = datetime.now(timezone.utc)
         with self.sessions() as db:
-            ids = [(row.id, row.provider_session_id) for row in db.execute(select(ScoutBrowserSession).where(or_(
-                ScoutBrowserSession.status.in_(("starting", "running", "cleanup_failed")),
-            ))).scalars()]
+            stale_reaping_before = now - timedelta(seconds=self.settings.browser_cleanup_seconds)
+            rows = db.execute(
+                select(ScoutBrowserSession, ScoutResearchJob)
+                .join(ScoutResearchJob, ScoutResearchJob.id == ScoutBrowserSession.job_id)
+                .where(ScoutBrowserSession.status.in_(("starting", "running", "cleanup_failed", "reaping")))
+                .with_for_update(skip_locked=True)
+            ).all()
+            for row, job in rows:
+                lease_expires_at = job.lease_expires_at
+                if lease_expires_at is not None and lease_expires_at.tzinfo is None:
+                    lease_expires_at = lease_expires_at.replace(tzinfo=timezone.utc)
+                cleanup_attempted_at = row.cleanup_attempted_at
+                if cleanup_attempted_at is not None and cleanup_attempted_at.tzinfo is None:
+                    cleanup_attempted_at = cleanup_attempted_at.replace(tzinfo=timezone.utc)
+                terminal_or_expired = job.status in {"completed", "partial", "failed", "canceled"} or (
+                    lease_expires_at is not None and lease_expires_at < now
+                )
+                stale_reaping = row.status == "reaping" and (
+                    cleanup_attempted_at is None or cleanup_attempted_at < stale_reaping_before
+                )
+                eligible = row.status == "cleanup_failed" or (row.status in {"starting", "running"} and terminal_or_expired) or stale_reaping
+                if not eligible:
+                    continue
+                if not row.provider_session_id:
+                    # No remote resource was ever identified. A stale/dead
+                    # reservation must stop consuming the global cap, but is
+                    # not falsely reported as released.
+                    row.status = "abandoned"
+                    row.error_class = "abandoned_without_provider_id"
+                    row.cleanup_attempted_at = now
+                    row.released_at = now
+                    continue
+                row.status = "reaping"
+                row.cleanup_attempted_at = now
+                ids.append((row.id, row.provider_session_id))
             for row in db.execute(select(ScoutBrowserSession).where(
                 ScoutBrowserSession.status == "released", ScoutBrowserSession.replay_url.is_(None)
             )).scalars():
@@ -887,13 +947,7 @@ class ScoutRunner:
                     row.error_class = "replay_unavailable"
             db.commit()
         for session_id, provider_id in ids:
-            if provider_id:
-                self._release_browser_session(session_id, provider_id)
-            else:
-                # A process died before the provider reported an ID.  There is
-                # nothing safe to release remotely, so preserve the truthful
-                # failure ledger instead of claiming a release occurred.
-                self._mark_cleanup_failed(session_id, "orphaned_start")
+            self._release_browser_session(session_id, provider_id)
         for session_id, provider_id, attempts in replay_ids:
             self._probe_replay(session_id, provider_id, attempts)
         return len(ids) + len(replay_ids)
@@ -909,15 +963,10 @@ class ScoutRunner:
 
     def _probe_replay(self, session_id: uuid.UUID, provider_id: str, attempts: int) -> None:
         try:
-            pool = ThreadPoolExecutor(max_workers=1)
-            future = pool.submit(self.provider.probe_replay, provider_id)
             try:
-                replay = future.result(timeout=self.settings.browser_cleanup_seconds)
+                replay = _bounded_call(self.provider.probe_replay, provider_id, timeout=self.settings.browser_cleanup_seconds)
             except TimeoutError:
-                pool.shutdown(wait=False, cancel_futures=True)
                 replay = None
-            else:
-                pool.shutdown(wait=True)
             with self.sessions() as db:
                 session = db.get(ScoutBrowserSession, session_id)
                 if session is not None and session.status == "released" and session.replay_url is None:
@@ -952,6 +1001,33 @@ class ScoutRunner:
                 db.commit()
                 return True
         return False
+
+    def rollback_reconcile(self) -> dict[str, int]:
+        """Safe rollback operator action, intentionally available while dark.
+
+        It only terminalizes queued jobs and running jobs whose lease is
+        already expired; a fresh claim retains ownership and is never killed.
+        """
+        reaped = self.reap_sessions()
+        now = datetime.now(timezone.utc)
+        terminalized = 0
+        with self.sessions() as db:
+            jobs = db.execute(
+                select(ScoutResearchJob)
+                .where(or_(ScoutResearchJob.status == "queued", and_(ScoutResearchJob.status == "running", ScoutResearchJob.lease_expires_at < now)))
+                .with_for_update(skip_locked=True)
+            ).scalars()
+            for job in jobs:
+                job.status = "failed"
+                job.error_class = "rolled_back"
+                job.completed_at = now
+                job.lease_expires_at = None
+                job.claim_owner = None
+                job.claim_token = None
+                db.add(ScoutJobEvent(job_id=job.id, kind="finished", detail={"status": "failed", "error_class": "rolled_back"}))
+                terminalized += 1
+            db.commit()
+        return {"reaped": reaped, "terminalized": terminalized}
 
     def _reserve_external_attempt(self, job_id: uuid.UUID, token: str) -> bool:
         """Reserve one source retrieval before issuing it; never exceed the persisted cap."""

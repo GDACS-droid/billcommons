@@ -65,6 +65,7 @@ class ScoutSettings:
     per_customer_active_jobs: int = 2
     per_customer_daily_jobs: int = 20
     per_customer_daily_browser_seconds: int = 600
+    max_browser_routed_requests: int = 40
 
     @classmethod
     def from_env(cls) -> "ScoutSettings":
@@ -95,6 +96,7 @@ class ScoutSettings:
             per_customer_active_jobs=positive("BILLCOMMONS_SCOUT_MAX_ACTIVE_JOBS", 2),
             per_customer_daily_jobs=positive("BILLCOMMONS_SCOUT_MAX_DAILY_JOBS", 20),
             per_customer_daily_browser_seconds=positive("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", 600),
+            max_browser_routed_requests=positive("BILLCOMMONS_SCOUT_MAX_BROWSER_ROUTED_REQUESTS", 40),
         )
 
 
@@ -304,6 +306,9 @@ class BrowserRequest:
     max_actions: int
     wall_seconds: int
     max_bytes: int
+    # Includes the document navigation and every admitted routed subrequest.
+    # Kept optional at the tail for third-party/mock provider compatibility.
+    max_routed_requests: int = 40
 
 
 @dataclass(frozen=True)
@@ -315,6 +320,7 @@ class BrowserCapture:
     pages: int
     actions: int
     replay_url: str | None = None
+    routed_requests: int = 0
 
 
 class ResearchBrowserProvider(Protocol):

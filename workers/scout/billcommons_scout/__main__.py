@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import os
 import re
+import signal
 import time
+import uuid
 
 from billcommons_shared.db import get_sessionmaker
 from billcommons_shared.rawstore import FilesystemRawStore
 from billcommons_shared.scout import BrowserRequest, ScoutSettings
+from sqlalchemy import text
 
 from billcommons_scout.providers import SolariProviderError, SolariResearchBrowserProvider, resolve_solari_api_key
 from billcommons_scout.runner import ScoutRunner
@@ -51,6 +55,68 @@ def _runner() -> ScoutRunner:
     return ScoutRunner(get_sessionmaker(), FilesystemRawStore(), SolariResearchBrowserProvider())
 
 
+def _check_readiness() -> int:
+    """Exercise required local dependencies without exposing their configuration."""
+    database_ok = rawstore_ok = False
+    try:
+        with get_sessionmaker()() as db:
+            db.execute(text("SELECT 1"))
+            db.execute(text("SELECT 1 FROM scout_research_jobs LIMIT 1"))
+        database_ok = True
+    except Exception:
+        pass
+    try:
+        store = FilesystemRawStore()
+        payload = f"scout-readiness-{uuid.uuid4().hex}".encode()
+        key = store.put(payload, {"kind": "scout_readiness"})
+        rawstore_ok = store.get(key) == payload
+        # FilesystemRawStore is deliberately content addressed and has no
+        # general delete API. Delete only this freshly random probe key.
+        data_path, meta_path = store._paths(key)
+        data_path.unlink(missing_ok=True)
+        meta_path.unlink(missing_ok=True)
+    except Exception:
+        rawstore_ok = False
+    configured = bool(resolve_solari_api_key())
+    provider_sdk = importlib.util.find_spec("solari_browser") is not None
+    print(
+        f"database={'ok' if database_ok else 'failed'} "
+        f"scout_tables={'ok' if database_ok else 'failed'} "
+        f"rawstore={'ok' if rawstore_ok else 'failed'} "
+        f"solari_configured={configured} "
+        f"solari_sdk={'available' if provider_sdk else 'missing'}"
+    )
+    return 0 if database_ok and rawstore_ok and (not configured or provider_sdk) else 2
+
+
+def _run_worker_loop(runner: ScoutRunner, *, once: bool, worker_id: str) -> int:
+    """Drain on TERM/INT: no new claims after signal, current run cleans up."""
+    draining = False
+
+    def request_drain(_signum, _frame) -> None:
+        nonlocal draining
+        draining = True
+
+    old_term = signal.signal(signal.SIGTERM, request_drain)
+    old_int = signal.signal(signal.SIGINT, request_drain)
+    try:
+        if once:
+            return 0 if runner.run_once(worker_id) else 1
+        next_reap = time.monotonic()
+        while not draining:
+            if time.monotonic() >= next_reap:
+                runner.reap_sessions()
+                next_reap = time.monotonic() + 60
+            # run_once is the drain boundary: a signal received during a run
+            # waits for process/finally cleanup, then stops before next claim.
+            if not runner.run_once(worker_id) and not draining:
+                time.sleep(1)
+        return 0
+    finally:
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGINT, old_int)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="billcommons-scout")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -58,17 +124,21 @@ def main() -> int:
     worker = sub.add_parser("worker", help="claim and process Scout jobs")
     worker.add_argument("--once", action="store_true")
     sub.add_parser("reap", help="retry durable cleanup_failed browser sessions")
+    sub.add_parser("rollback", help="reap eligible sessions and terminalize safely abandoned jobs")
     sub.add_parser("solari-check", help="EXPLICIT opt-in one-session Solari smoke check")
     args = parser.parse_args()
     settings = ScoutSettings.from_env()
     if args.command == "check":
-        print(f"enabled={settings.enabled} rawstore_configured={bool(os.environ.get('RAWSTORE_ROOT'))} solari_configured={bool(resolve_solari_api_key())}")
-        return 0 if settings.enabled and os.environ.get("RAWSTORE_ROOT") else 2
+        return _check_readiness()
     # Cleanup is deliberately available while the feature flag is off. A
     # rollback disables new jobs/claims first, then must still be able to reap
     # sessions that were already created by the previous revision.
     if args.command == "reap":
         print(f"reap_candidates={_runner().reap_sessions()}")
+        return 0
+    if args.command == "rollback":
+        result = _runner().rollback_reconcile()
+        print(f"reaped={result['reaped']} terminalized={result['terminalized']}")
         return 0
     if not settings.enabled:
         # Dark launch blocks both API creation and worker claims.
@@ -123,16 +193,7 @@ def main() -> int:
             f"element=robots_user_agent replay={'available' if replay else 'unavailable'} cleanup=confirmed"
         )
         return 0
-    runner = _runner()
-    if args.once:
-        return 0 if runner.run_once(f"scout-{os.getpid()}") else 1
-    next_reap = time.monotonic()
-    while True:
-        if time.monotonic() >= next_reap:
-            runner.reap_sessions()
-            next_reap = time.monotonic() + 60
-        if not runner.run_once(f"scout-{os.getpid()}"):
-            time.sleep(1)
+    return _run_worker_loop(_runner(), once=args.once, worker_id=f"scout-{os.getpid()}")
 
 
 if __name__ == "__main__":
