@@ -725,17 +725,37 @@ def _upsert_customer_by_email(db: OrmSession, email: str, stripe_customer_id: st
     attach when the local column is empty (unchanged, common case);
     otherwise only repoint when the OLD id is provably dead (404s at
     Stripe) or the INCOMING Customer is the one that actually holds a
-    plan-authority subscription *and the local customer has no incumbent
-    plan-authority subscription*.  The latter guard is important: an
-    active guest Checkout Customer necessarily holds its just-created
-    subscription too, but it must not replace the incumbent Customer id
-    before `_apply_subscription_event` cancels that duplicate. Otherwise
-    the Billing Portal would point at the canceled guest Customer. Keep the
-    existing id in that case; the incoming Customer is a guest duplicate or
-    snapshot-only purchase, not the subscriber's real one."""
+    plan-authority subscription and neither local nor remote evidence says
+    the incumbent does.  The latter guard matters because a guest Checkout
+    Customer necessarily holds its just-created subscription too, but it
+    must not replace the incumbent Customer id before
+    `_apply_subscription_event` cancels that duplicate. Otherwise the
+    Billing Portal would point at the canceled guest Customer.
+
+    The row lock covers the whole authority decision. Two checkout
+    deliveries for the same email therefore cannot both read the old mapping
+    and race to install different guest Customers. The second delivery
+    re-reads the committed local subscription under that lock, preserving
+    whichever subscription became authoritative first. If local evidence is
+    absent and Stripe says BOTH Customers have authority, automatic choice
+    would be unsafe: preserve the incumbent and emit a durable
+    operator-reconcilable permanent webhook error instead of silently
+    remapping the Portal to a likely-to-be-canceled guest Customer."""
     _configure_stripe()
     email = email.strip().lower()
-    customer = db.execute(select(ApiCustomer).where(ApiCustomer.email == email)).scalar_one_or_none()
+    # This is deliberately the first lookup of an existing row, rather than
+    # a lockless lookup followed by a lock. `populate_existing` matters for
+    # callers that already have an ApiCustomer in this session: after waiting
+    # on PostgreSQL's row lock, use the winner's committed mapping and local
+    # subscription state rather than an identity-map snapshot from before it
+    # acquired the lock. SQLite ignores FOR UPDATE but retains the identical
+    # deterministic decision path for unit tests.
+    customer = db.execute(
+        select(ApiCustomer)
+        .where(ApiCustomer.email == email)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
     if customer is None:
         customer = ApiCustomer(email=email, stripe_customer_id=stripe_customer_id)
         db.add(customer)
@@ -754,15 +774,32 @@ def _upsert_customer_by_email(db: OrmSession, email: str, stripe_customer_id: st
         if getattr(exc, "code", None) != "resource_missing":
             raise
         old_is_stale = True
+
     # Preserve recovery when the old Stripe Customer was deleted, even if a
-    # stale local subscription row still exists.  Otherwise the LOCAL
-    # authority is decisive before inspecting the incoming Customer: both
-    # sides of a duplicate guest Checkout can be active in Stripe, but only
-    # the incumbent is the portal/customer mapping we must retain.
-    if old_is_stale or (
-        _active_subscription(db, customer.id) is None
-        and _stripe_customer_holds_plan_authority(stripe_customer_id)
-    ):
+    # stale local subscription row still exists. This is the one safe
+    # automatic replacement because the incumbent cannot be used by Portal.
+    if old_is_stale:
+        customer.stripe_customer_id = stripe_customer_id
+        return customer
+
+    # The most recent locally committed authority wins without extra
+    # Subscription.list calls. This is both cheaper and essential to avoid a
+    # guest duplicate stealing Portal while its cancellation is still in
+    # flight. The row was re-read while locked above.
+    if _active_subscription(db, customer.id) is not None:
+        return customer
+
+    # No local authority means local data cannot safely distinguish an old
+    # out-of-order webhook from an actually inactive incumbent. Reconcile
+    # BOTH remote Customer histories before ever changing the mapping.
+    incumbent_has_authority = _stripe_customer_holds_plan_authority(customer.stripe_customer_id)
+    incoming_has_authority = _stripe_customer_holds_plan_authority(stripe_customer_id)
+    if incumbent_has_authority and incoming_has_authority:
+        raise _PermanentWebhookError(
+            "operator reconciliation required: both mapped and incoming Stripe Customers "
+            f"have plan-authority subscriptions for {email}"
+        )
+    if not incumbent_has_authority and incoming_has_authority:
         customer.stripe_customer_id = stripe_customer_id
     return customer
 
