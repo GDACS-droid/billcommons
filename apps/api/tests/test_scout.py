@@ -4,6 +4,7 @@ import uuid
 import inspect
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
@@ -250,9 +251,10 @@ def test_scout_daily_job_budget_is_durable_but_cached_work_remains_reusable(monk
 
 def test_scout_daily_browser_runtime_blocks_new_spend(monkeypatch):
     app, owner, _other, sessions = _app(monkeypatch)
-    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "5")
     monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
     monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_CLEANUP_SECONDS", "1")
     headers = {"x-test-customer": str(owner.id)}
     with TestClient(app) as client:
         created = client.post("/api/v1/scout/jobs", json={"query": "HB 12"}, headers=headers)
@@ -260,7 +262,10 @@ def test_scout_daily_browser_runtime_blocks_new_spend(monkeypatch):
         with sessions() as db:
             job = db.get(ScoutResearchJob, job_id)
             job.status = "completed"
-            db.add(ScoutBrowserSession(job_id=job_id, provider="mock", status="released", runtime_ms=1000))
+            db.add(ScoutBrowserSession(
+                job_id=job_id, provider="mock", provider_session_id="runtime-recorded",
+                status="released", runtime_ms=2000,
+            ))
             db.commit()
         limited = client.post("/api/v1/scout/jobs", json={"query": "HB 13"}, headers=headers)
         assert limited.status_code == 429
@@ -269,14 +274,146 @@ def test_scout_daily_browser_runtime_blocks_new_spend(monkeypatch):
 
 def test_scout_daily_browser_budget_reserves_queued_work(monkeypatch):
     app, owner, _other, _sessions = _app(monkeypatch)
-    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "3")
     monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
     monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_CLEANUP_SECONDS", "1")
     headers = {"x-test-customer": str(owner.id)}
     with TestClient(app) as client:
         created = client.post("/api/v1/scout/jobs", json={"query": "HB 12"}, headers=headers)
         assert created.status_code == 201
         limited = client.post("/api/v1/scout/jobs", json={"query": "HB 13"}, headers=headers)
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "scout_daily_browser_limit"
+
+
+def test_scout_daily_browser_budget_counts_yesterday_session_released_today(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "3")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_CLEANUP_SECONDS", "1")
+    now = datetime.now(timezone.utc)
+    with sessions() as db:
+        job = ScoutResearchJob(
+            customer_id=owner.id, original_query="yesterday", normalized_query="yesterday",
+            jurisdiction="FL", cache_key=uuid.uuid4().hex, status="completed", strategy={}, limits={}, usage={},
+            created_at=now - timedelta(days=1), completed_at=now,
+        )
+        db.add(job)
+        db.flush()
+        db.add(ScoutBrowserSession(
+            job_id=job.id, provider="mock", provider_session_id="midnight", status="released",
+            runtime_ms=3000, created_at=now - timedelta(seconds=1), released_at=now,
+        ))
+        db.commit()
+    with TestClient(app) as client:
+        limited = client.post(
+            "/api/v1/scout/jobs", json={"query": "HB 12"}, headers={"x-test-customer": str(owner.id)}
+        )
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "scout_daily_browser_limit"
+
+
+def test_scout_reconciles_malformed_active_browser_reservation(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "3")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_CLEANUP_SECONDS", "1")
+    headers = {"x-test-customer": str(owner.id)}
+    with TestClient(app) as client:
+        created = client.post("/api/v1/scout/jobs", json={"query": "HB 12"}, headers=headers)
+        assert created.status_code == 201
+        for malformed in (True, 0, "not-a-number"):
+            with sessions() as db:
+                job = db.get(ScoutResearchJob, uuid.UUID(created.json()["job"]["id"]))
+                job.limits = {
+                    "daily_browser_reservation_ms": malformed,
+                    "max_external_requests": 1,
+                    "browser_wall_seconds": 1,
+                    "browser_cleanup_seconds": 1,
+                }
+                db.commit()
+            limited = client.post(
+                "/api/v1/scout/jobs", json={"query": f"HB {13 + len(str(malformed))}"}, headers=headers
+            )
+            assert limited.status_code == 429
+
+
+def test_scout_charges_started_released_session_without_runtime_telemetry(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "3")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_CLEANUP_SECONDS", "1")
+    with sessions() as db:
+        job = ScoutResearchJob(
+            customer_id=owner.id, original_query="unknown runtime", normalized_query="unknown runtime",
+            jurisdiction="FL", cache_key=uuid.uuid4().hex, status="completed", strategy={},
+            limits={"browser_wall_seconds": 1, "browser_cleanup_seconds": 1}, usage={},
+        )
+        db.add(job)
+        db.flush()
+        db.add(ScoutBrowserSession(
+            job_id=job.id, provider="mock", provider_session_id="started-without-runtime",
+            status="released", runtime_ms=None, released_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+    with TestClient(app) as client:
+        limited = client.post(
+            "/api/v1/scout/jobs", json={"query": "HB 99"}, headers={"x-test-customer": str(owner.id)}
+        )
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "scout_daily_browser_limit"
+
+
+def test_scout_holds_full_daily_browser_cap_for_active_legacy_cleanup_limit(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "5")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_CLEANUP_SECONDS", "1")
+    with sessions() as db:
+        db.add(ScoutResearchJob(
+            customer_id=owner.id, original_query="legacy", normalized_query="legacy", jurisdiction="FL",
+            cache_key=uuid.uuid4().hex, status="running", strategy={},
+            # This is an old job's persisted wall setting, deliberately
+            # missing its cleanup limit while current settings have changed.
+            limits={"max_external_requests": 1, "browser_wall_seconds": 1}, usage={},
+        ))
+        db.commit()
+    with TestClient(app) as client:
+        limited = client.post(
+            "/api/v1/scout/jobs", json={"query": "HB 98"}, headers={"x-test-customer": str(owner.id)}
+        )
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "scout_daily_browser_limit"
+
+
+def test_scout_charges_full_daily_browser_cap_for_terminal_legacy_session(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "5")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_CLEANUP_SECONDS", "1")
+    with sessions() as db:
+        job = ScoutResearchJob(
+            customer_id=owner.id, original_query="legacy settled", normalized_query="legacy settled",
+            jurisdiction="FL", cache_key=uuid.uuid4().hex, status="completed", strategy={},
+            limits={"max_external_requests": 1, "browser_wall_seconds": 1}, usage={},
+        )
+        db.add(job)
+        db.flush()
+        db.add(ScoutBrowserSession(
+            job_id=job.id, provider="mock", provider_session_id="legacy-terminal", status="released",
+            runtime_ms=0, released_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+    with TestClient(app) as client:
+        limited = client.post(
+            "/api/v1/scout/jobs", json={"query": "HB 97"}, headers={"x-test-customer": str(owner.id)}
+        )
     assert limited.status_code == 429
     assert limited.json()["error"]["code"] == "scout_daily_browser_limit"
 
@@ -308,3 +445,13 @@ def test_scout_owner_payload_omits_unknown_browser_routed_requests(monkeypatch):
     with TestClient(app) as client:
         created = client.post("/api/v1/scout/jobs", json={"query": "HB 12"}, headers=headers)
     assert "browser_routed_requests" not in created.json()["job"]["usage"]
+
+
+def test_enabled_scout_rejects_infeasible_browser_budget_at_app_start(monkeypatch):
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "2")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_CLEANUP_SECONDS", "1")
+    with pytest.raises(ValueError, match="DAILY_BROWSER"):
+        create_app()

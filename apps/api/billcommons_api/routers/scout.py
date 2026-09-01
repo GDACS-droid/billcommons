@@ -6,11 +6,12 @@ Scout worker and provider modules are not present in the API container.
 from __future__ import annotations
 
 import uuid
+import inspect
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from urllib.parse import urlsplit
@@ -61,6 +62,28 @@ def _job_for_owner(db: Session, customer: ApiCustomer, job_id: uuid.UUID, *, loc
     return job
 
 
+def _browser_limit_seconds(job: ScoutResearchJob, name: str, fallback: int) -> int:
+    limits = job.limits or {}
+    value = limits.get(name, fallback)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else fallback
+
+
+def _has_persisted_browser_cleanup_limit(job: ScoutResearchJob) -> bool:
+    value = (job.limits or {}).get("browser_cleanup_seconds")
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _browser_session_reservation_ms(job: ScoutResearchJob, settings: ScoutSettings) -> int:
+    """Bound one provider session: drive plus provider and runner cleanup."""
+    wall_seconds = _browser_limit_seconds(job, "browser_wall_seconds", settings.browser_wall_seconds)
+    cleanup_seconds = _browser_limit_seconds(job, "browser_cleanup_seconds", settings.browser_cleanup_seconds)
+    return (wall_seconds + 2 * cleanup_seconds) * 1000
+
+
+def _browser_cleanup_reservation_ms(job: ScoutResearchJob, settings: ScoutSettings) -> int:
+    return _browser_limit_seconds(job, "browser_cleanup_seconds", settings.browser_cleanup_seconds) * 1000
+
+
 def _browser_reservation_ms(job: ScoutResearchJob, settings: ScoutSettings) -> int:
     """Return the browser capacity durably reserved for one nonterminal job.
 
@@ -69,17 +92,23 @@ def _browser_reservation_ms(job: ScoutResearchJob, settings: ScoutSettings) -> i
     later settings change cannot alter an already-admitted reservation.  The
     fallback keeps pre-reservation jobs conservative during a rolling deploy.
     """
+    if not _has_persisted_browser_cleanup_limit(job):
+        # Legacy rows were admitted before cleanup was persisted. The worker
+        # may use its local validated setting to finish them, but API admission
+        # must not assume a mutable rollout value: hold the entire daily cap so
+        # no new browser work can overlap that unbounded legacy cleanup.
+        return settings.per_customer_daily_browser_seconds * 1000
     limits = job.limits or {}
-    reservation = limits.get("daily_browser_reservation_ms")
-    if isinstance(reservation, int) and reservation >= 0:
-        return reservation
     max_requests = limits.get("max_external_requests", settings.max_external_requests)
-    wall_seconds = limits.get("browser_wall_seconds", settings.browser_wall_seconds)
-    if not isinstance(max_requests, int) or max_requests < 0:
+    if not isinstance(max_requests, int) or isinstance(max_requests, bool) or max_requests <= 0:
         max_requests = settings.max_external_requests
-    if not isinstance(wall_seconds, int) or wall_seconds < 0:
-        wall_seconds = settings.browser_wall_seconds
-    return max_requests * wall_seconds * 1000
+    reconciled = max_requests * _browser_session_reservation_ms(job, settings)
+    reservation = limits.get("daily_browser_reservation_ms")
+    if isinstance(reservation, int) and not isinstance(reservation, bool) and reservation > 0:
+        # Never let a stale/corrupt aggregate lower the execution bounds
+        # frozen alongside it; a larger historical reservation stays held.
+        return max(reservation, reconciled)
+    return reconciled
 
 
 def _job_payload(db: Session, job: ScoutResearchJob) -> dict:
@@ -276,23 +305,51 @@ def create_job(
             )
         ).all()
     )
-    daily_browser_ms = db.scalar(
-        select(func.coalesce(func.sum(ScoutBrowserSession.runtime_ms), 0))
+    terminal_sessions = db.execute(
+        select(ScoutBrowserSession, ScoutResearchJob)
         .join(ScoutResearchJob, ScoutResearchJob.id == ScoutBrowserSession.job_id)
         .where(
             ScoutResearchJob.customer_id == customer.id,
-            ScoutBrowserSession.created_at >= day_start,
+            # A session crossing UTC midnight is conservatively charged in
+            # both calendar days.  Otherwise a session created yesterday and
+            # released today would escape today's cap entirely.
+            or_(
+                ScoutBrowserSession.created_at >= day_start,
+                ScoutBrowserSession.released_at >= day_start,
+                # A durable started session without runtime telemetry cannot
+                # be assigned safely to a prior day; hold its full bound until
+                # telemetry is repaired rather than admitting unaccounted use.
+                and_(
+                    ScoutBrowserSession.provider_session_id.is_not(None),
+                    ScoutBrowserSession.runtime_ms.is_(None),
+                ),
+            ),
             ScoutResearchJob.id.not_in(reserved_job_ids),
         )
-    ) or 0
+    ).all()
+    daily_browser_ms = sum(
+        settings.per_customer_daily_browser_seconds * 1000
+        if session.provider_session_id and not _has_persisted_browser_cleanup_limit(job)
+        else session.runtime_ms + _browser_cleanup_reservation_ms(job, settings)
+        if session.runtime_ms is not None and session.provider_session_id
+        else _browser_session_reservation_ms(job, settings)
+        if session.provider_session_id
+        else 0
+        for session, job in terminal_sessions
+    )
     reserved_browser_ms = sum(
         _browser_reservation_ms(job, settings)
         for job in db.scalars(select(ScoutResearchJob).where(ScoutResearchJob.id.in_(reserved_job_ids))).all()
     )
     if daily_browser_ms + reserved_browser_ms + (
-        settings.max_external_requests * settings.browser_wall_seconds * 1000
+        settings.max_external_requests * (
+            settings.browser_wall_seconds + 2 * settings.browser_cleanup_seconds
+        ) * 1000
     ) > settings.per_customer_daily_browser_seconds * 1000:
         raise too_many_requests("scout_daily_browser_limit", "Daily Scout browser budget reached.", 3600)
+    # The daily browser budget can be intentionally tighter than the generic
+    # active-job count: direct-only work may co-exist, but browser-capable work
+    # is admitted only when its full durable reservation fits.
     if active_count >= settings.per_customer_active_jobs:
         raise too_many_requests("scout_active_job_limit", "Too many active Scout jobs.", 60)
 
@@ -303,7 +360,7 @@ def create_job(
         jurisdiction=jurisdiction,
         cache_key=key,
         strategy={"adapter": "florida_p0", "mode": "structured_first"},
-        limits={"max_pages": settings.max_pages, "max_actions": settings.max_actions, "max_external_requests": settings.max_external_requests, "max_routed_requests": settings.max_browser_routed_requests, "max_retries": settings.max_retries, "daily_jobs": settings.per_customer_daily_jobs, "daily_browser_seconds": settings.per_customer_daily_browser_seconds, "browser_wall_seconds": settings.browser_wall_seconds, "daily_browser_reservation_ms": settings.max_external_requests * settings.browser_wall_seconds * 1000},
+        limits={"max_pages": settings.max_pages, "max_actions": settings.max_actions, "max_external_requests": settings.max_external_requests, "max_routed_requests": settings.max_browser_routed_requests, "max_retries": settings.max_retries, "daily_jobs": settings.per_customer_daily_jobs, "daily_browser_seconds": settings.per_customer_daily_browser_seconds, "browser_wall_seconds": settings.browser_wall_seconds, "browser_cleanup_seconds": settings.browser_cleanup_seconds, "daily_browser_reservation_ms": settings.max_external_requests * (settings.browser_wall_seconds + 2 * settings.browser_cleanup_seconds) * 1000},
         usage={},
     )
     db.add(job)

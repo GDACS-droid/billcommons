@@ -392,7 +392,7 @@ def test_browser_mock_release_and_cleanup_failure_are_durable(tmp_path):
         assert db.execute(select(ScoutBrowserSession)).scalar_one().status == "released"
 
     class CleanupErrorProvider(MockResearchBrowserProvider):
-        def release(self, provider_session_id):
+        def release(self, provider_session_id, *, cleanup_seconds=None):
             raise RuntimeError("cleanup")
 
     broken = CleanupErrorProvider({url: capture})
@@ -401,6 +401,54 @@ def test_browser_mock_release_and_cleanup_failure_are_durable(tmp_path):
     runner.process(job_id)
     with sessions() as db:
         assert db.execute(select(ScoutBrowserSession)).scalar_one().status == "cleanup_failed"
+
+
+def test_internal_release_type_error_is_not_retried(tmp_path):
+    class InternalTypeErrorProvider(MockResearchBrowserProvider):
+        calls = 0
+
+        def release(self, provider_session_id, *, cleanup_seconds=None):
+            self.calls += 1
+            raise TypeError("provider implementation failure")
+
+    provider = InternalTypeErrorProvider()
+    runner, sessions, job_id = _runner(
+        tmp_path, provider, lambda _url: (200, "text/html", b"HB 12 Filed")
+    )
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.status = "canceled"
+        db.add(ScoutBrowserSession(
+            job_id=job_id, provider="fixture", provider_session_id="type-error", status="running"
+        ))
+        db.commit()
+        session_id = db.execute(select(ScoutBrowserSession.id)).scalar_one()
+    assert runner._release_browser_session(session_id, "type-error") is False
+    assert provider.calls == 1
+
+
+def test_old_signature_release_is_called_once_without_cleanup_keyword(tmp_path):
+    class OldSignatureProvider(MockResearchBrowserProvider):
+        calls = 0
+
+        def release(self, provider_session_id):
+            self.calls += 1
+            return None
+
+    provider = OldSignatureProvider()
+    runner, sessions, job_id = _runner(
+        tmp_path, provider, lambda _url: (200, "text/html", b"HB 12 Filed")
+    )
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.status = "canceled"
+        db.add(ScoutBrowserSession(
+            job_id=job_id, provider="fixture", provider_session_id="old-signature", status="running"
+        ))
+        db.commit()
+        session_id = db.execute(select(ScoutBrowserSession.id)).scalar_one()
+    assert runner._release_browser_session(session_id, "old-signature") is True
+    assert provider.calls == 1
 
 
 def test_browser_budget_denial_creates_no_slot_or_browser_usage(tmp_path):
@@ -471,11 +519,12 @@ def test_browser_capture_honors_request_time_wall_reservation(tmp_path):
     runner, _sessions, job_id = _runner(
         tmp_path, provider, lambda _url: (403, "text/html", b"javascript challenge"),
         settings=ScoutSettings(enabled=True, browser_wall_seconds=60),
-        limits={"browser_wall_seconds": 7},
+        limits={"browser_wall_seconds": 7, "browser_cleanup_seconds": 3},
     )
     runner._candidates = lambda _db, _job: [_candidate(url=url)]
     runner.process(job_id)
-    assert provider.request is not None and provider.request.wall_seconds == 7
+    assert provider.request is not None
+    assert (provider.request.wall_seconds, provider.request.cleanup_seconds) == (7, 3)
 
 
 def test_browser_precreate_failure_removes_slot_without_browser_usage(tmp_path):
@@ -589,7 +638,7 @@ def test_unrecoverable_callback_persistence_keeps_cleanup_failed_slot_when_relea
                 on_started("opaque-live-session")
             except Exception as exc:
                 raise ProviderSessionPersistenceError("opaque-live-session") from exc
-        def release(self, provider_session_id):
+        def release(self, provider_session_id, *, cleanup_seconds=None):
             self.released.append(provider_session_id)
             raise RuntimeError("cleanup unavailable")
 
@@ -1058,7 +1107,7 @@ def test_persisted_id_cancel_reaper_race_releases_only_once(tmp_path):
     release_finish = threading.Event()
 
     class BlockingReleaseProvider(MockResearchBrowserProvider):
-        def release(self, provider_session_id):
+        def release(self, provider_session_id, *, cleanup_seconds=None):
             self.released.append(provider_session_id)
             release_started.set()
             assert release_finish.wait(timeout=2)
@@ -1097,7 +1146,7 @@ def test_timed_out_release_keeps_claim_until_original_provider_call_settles(tmp_
     class BlockingReleaseProvider(MockResearchBrowserProvider):
         release_calls = 0
 
-        def release(self, provider_session_id):
+        def release(self, provider_session_id, *, cleanup_seconds=None):
             self.release_calls += 1
             release_started.set()
             assert release_finish.wait(timeout=3)
@@ -1116,6 +1165,9 @@ def test_timed_out_release_keeps_claim_until_original_provider_call_settles(tmp_
     assert release_started.wait(timeout=2)
     worker.join(timeout=2)
     assert not worker.is_alive()
+    with sessions() as db:
+        session = db.execute(select(ScoutBrowserSession)).scalar_one()
+        assert (session.status, session.error_class) == ("reaping", "cleanup_timeout_inflight")
     assert runner.reap_sessions() == 0
     assert provider.release_calls == 1
     release_finish.set()
@@ -1137,7 +1189,7 @@ def test_timed_out_release_registry_survives_cleanup_keepalive_db_failure(tmp_pa
     class BlockingReleaseProvider(MockResearchBrowserProvider):
         release_calls = 0
 
-        def release(self, provider_session_id):
+        def release(self, provider_session_id, *, cleanup_seconds=None):
             self.release_calls += 1
             release_started.set()
             assert release_finish.wait(timeout=4)
@@ -1281,7 +1333,7 @@ def test_solari_cli_failure_diagnostics_are_redacted_and_release_is_truthful(mon
                 1,
                 1,
             )
-        def release(self, _session_id):
+        def release(self, _session_id, *, cleanup_seconds=None):
             raise SensitiveFailure("secret replay URL")
     monkeypatch.setattr(scout_cli, "SolariResearchBrowserProvider", ReleaseFailureProvider)
     assert scout_cli.main() == 1
@@ -1300,7 +1352,7 @@ def test_solari_cli_failure_diagnostics_are_redacted_and_release_is_truthful(mon
                 1,
                 1,
             )
-        def release(self, _session_id): return None
+        def release(self, _session_id, *, cleanup_seconds=None): return None
     monkeypatch.setattr(scout_cli, "SolariResearchBrowserProvider", UnexpectedContentProvider)
     assert scout_cli.main() == 1
     assert capsys.readouterr().out == (
@@ -1328,7 +1380,7 @@ def test_solari_cli_confirms_cleanup_and_maps_only_fixed_navigation_reason(monke
                 "navigate",
                 RuntimeError("Page.goto: net::ERR_CONNECTION_RESET at https://secret.example/token"),
             )
-        def release(self, session_id): self.released.append(session_id)
+        def release(self, session_id, *, cleanup_seconds=None): self.released.append(session_id)
     monkeypatch.setattr(scout_cli, "SolariResearchBrowserProvider", NavigationFailureProvider)
     monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "1")
     monkeypatch.setenv("BILLCOMMONS_SCOUT_SOLARI_CHECK", "1")
@@ -1356,7 +1408,7 @@ def test_solari_cli_success_prints_fingerprint_not_signed_session(monkeypatch, c
                 1,
                 1,
             )
-        def release(self, _session_id): return "https://signed-replay-must-not-print"
+        def release(self, _session_id, *, cleanup_seconds=None): return "https://signed-replay-must-not-print"
     monkeypatch.setattr(scout_cli, "SolariResearchBrowserProvider", SuccessProvider)
     monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "1")
     monkeypatch.setenv("BILLCOMMONS_SCOUT_SOLARI_CHECK", "1")
@@ -1383,7 +1435,7 @@ def test_reaper_remains_available_when_feature_flag_is_disabled(monkeypatch, cap
 
 def test_reaper_never_touches_fresh_running_owner_but_claims_expired_once(tmp_path):
     class ReleaseCounter(MockResearchBrowserProvider):
-        def release(self, provider_session_id):
+        def release(self, provider_session_id, *, cleanup_seconds=None):
             self.released.append(provider_session_id)
             return None
 

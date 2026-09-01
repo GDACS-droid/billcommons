@@ -113,7 +113,7 @@ class MockResearchBrowserProvider:
         on_started(result.provider_session_id)
         return result
 
-    def release(self, provider_session_id: str) -> str | None:
+    def release(self, provider_session_id: str, *, cleanup_seconds: int | None = None) -> str | None:
         """Fixture release is idempotent; the call ledger remains test-only telemetry."""
         self.released.append(provider_session_id)
         return None
@@ -165,7 +165,9 @@ class SolariResearchBrowserProvider:
         except Exception as exc:
             raise SolariProviderError(str(state["phase"]), exc) from exc
         finally:
-            await self._cleanup_capture(state)
+            await self._cleanup_capture(
+                state, cleanup_seconds=request.cleanup_seconds or self._cleanup_seconds
+            )
 
     async def _capture(self, request: BrowserRequest, on_started, state: dict[str, Any]) -> BrowserCapture:
         canonical = canonicalize_url(request.url)
@@ -287,50 +289,52 @@ class SolariResearchBrowserProvider:
             routed_requests=int(state["routed_requests"]),
         )
 
-    async def _cleanup_capture(self, state: dict[str, Any]) -> None:
-        """Bound each cleanup action; never make replay availability fatal."""
-        context = state.get("context")
-        if context is not None:
+    async def _cleanup_capture(self, state: dict[str, Any], *, cleanup_seconds: int) -> None:
+        """Release the remote session inside one request-time cleanup budget."""
+        deadline = time.monotonic() + cleanup_seconds
+
+        async def bounded(awaitable) -> None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                close = getattr(awaitable, "close", None)
+                if close is not None:
+                    close()
+                return
             try:
-                await asyncio.wait_for(context.close(), timeout=self._cleanup_seconds)
+                await asyncio.wait_for(awaitable, timeout=remaining)
             except Exception:
                 pass
-        browser = state.get("browser")
-        if browser is not None:
-            try:
-                await asyncio.wait_for(browser.close(), timeout=self._cleanup_seconds)
-            except Exception:
-                pass
-        playwright = state.get("playwright")
-        if playwright is not None:
-            try:
-                await asyncio.wait_for(playwright.stop(), timeout=self._cleanup_seconds)
-            except Exception:
-                pass
+
         solari = state.get("solari")
         session_id = state.get("session_id")
+        # Remote release comes first: local browser teardown must not spend the
+        # bounded provider-session lifetime and defer the paid-session close.
         if solari is not None and session_id:
-            try:
-                # Release even when Patchright did not connect.  404 is defined
-                # by the SDK as success, which also makes the runner's later
-                # durable reaper release idempotent.
-                await asyncio.wait_for(solari.sessions.release_and_wait(session_id), timeout=self._cleanup_seconds)
-            except Exception:
-                pass
+            await bounded(solari.sessions.release_and_wait(session_id))
+        context = state.get("context")
+        if context is not None:
+            await bounded(context.close())
+        browser = state.get("browser")
+        if browser is not None:
+            await bounded(browser.close())
+        playwright = state.get("playwright")
+        if playwright is not None:
+            await bounded(playwright.stop())
+        if solari is not None and session_id:
             replay_url = None
             try:
-                replay = await asyncio.wait_for(solari.sessions.get_replay_url(session_id), timeout=min(1.0, self._cleanup_seconds))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                replay = await asyncio.wait_for(solari.sessions.get_replay_url(session_id), timeout=min(1.0, remaining))
                 replay_url = str(getattr(replay, "url", replay))
             except Exception:
                 pass
             self._closed_replays[session_id] = replay_url
         if solari is not None:
-            try:
-                await asyncio.wait_for(solari.close(), timeout=self._cleanup_seconds)
-            except Exception:
-                pass
+            await bounded(solari.close())
 
-    def release(self, provider_session_id: str) -> str | None:
+    def release(self, provider_session_id: str, *, cleanup_seconds: int | None = None) -> str | None:
         """Release an orphan from any worker process, then probe replay.
 
         A local replay cache is advisory only: reapers instantiate their own
@@ -338,7 +342,8 @@ class SolariResearchBrowserProvider:
         """
         if not self._api_key:
             raise RuntimeError("solari_not_configured")
-        return asyncio.run(asyncio.wait_for(self._release(provider_session_id), timeout=self._cleanup_seconds))
+        cleanup_seconds = cleanup_seconds or self._cleanup_seconds
+        return asyncio.run(asyncio.wait_for(self._release(provider_session_id, cleanup_seconds), timeout=cleanup_seconds))
 
     def probe_replay(self, provider_session_id: str) -> str | None:
         """Best-effort replay probe; unlike release, this never re-closes remotely."""
@@ -346,15 +351,15 @@ class SolariResearchBrowserProvider:
             raise RuntimeError("solari_not_configured")
         return asyncio.run(asyncio.wait_for(self._probe_replay(provider_session_id), timeout=self._cleanup_seconds))
 
-    async def _release(self, provider_session_id: str) -> str | None:
+    async def _release(self, provider_session_id: str, cleanup_seconds: int) -> str | None:
         try:
             from solari_browser import Solari
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("solari_sdk_unavailable") from exc
-        async with Solari(api_key=self._api_key, timeout_ms=self._cleanup_seconds * 1000) as solari:
+        async with Solari(api_key=self._api_key, timeout_ms=cleanup_seconds * 1000) as solari:
             await solari.sessions.release_and_wait(provider_session_id)
             replay_url = None
-            deadline = time.monotonic() + max(1.0, self._cleanup_seconds - 1.0)
+            deadline = time.monotonic() + max(0.0, cleanup_seconds - 1.0)
             while time.monotonic() < deadline:
                 try:
                     replay = await asyncio.wait_for(solari.sessions.get_replay_url(provider_session_id), timeout=1.0)

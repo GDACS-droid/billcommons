@@ -75,10 +75,26 @@ class ScoutSettings:
     replay_probe_window_seconds: int = 600
     replay_probe_attempts: int = 5
     max_concurrent_browser_sessions: int = 2
+    # This is a queue-concurrency ceiling, not a browser-spend promise. The
+    # daily browser reservation may safely admit fewer browser-capable jobs.
     per_customer_active_jobs: int = 2
     per_customer_daily_jobs: int = 20
     per_customer_daily_browser_seconds: int = 600
     max_browser_routed_requests: int = 40
+
+    def __post_init__(self) -> None:
+        # A browser-routed job may use every persisted external-request slot.
+        # Its provider session includes both capture and bounded release time;
+        # admitting a job whose worst case cannot fit the daily cap would make
+        # the API's budget promise impossible to honor.
+        reservation_seconds = self.max_external_requests * (
+            self.browser_wall_seconds + 2 * self.browser_cleanup_seconds
+        )
+        if self.per_customer_daily_browser_seconds < reservation_seconds:
+            raise ValueError(
+                "BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS must cover one "
+                "job's browser capture and cleanup reservation"
+            )
 
     @classmethod
     def from_env(cls) -> "ScoutSettings":
@@ -322,6 +338,9 @@ class BrowserRequest:
     # Includes the document navigation and every admitted routed subrequest.
     # Kept optional at the tail for third-party/mock provider compatibility.
     max_routed_requests: int = 40
+    # The provider must bound session release with this same request-time
+    # budget; it is part of the durable daily browser reservation.
+    cleanup_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -343,7 +362,7 @@ class ResearchBrowserProvider(Protocol):
         """Invoke ``on_started`` immediately after the remote session exists."""
         ...
 
-    def release(self, provider_session_id: str) -> str | None:
+    def release(self, provider_session_id: str, *, cleanup_seconds: int | None = None) -> str | None:
         """Idempotently release a session and optionally return its replay URL.
 
         Implementations must treat an already-released/not-found session as

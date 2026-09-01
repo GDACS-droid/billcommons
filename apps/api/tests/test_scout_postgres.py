@@ -562,6 +562,10 @@ def test_postgres_ten_distinct_submissions_cannot_bypass_owner_active_limit(
     monkeypatch, pg_scout: PostgresScoutHarness, scout_api
 ):
     customer = pg_scout.customer("quota")
+    # Keep this test about the owner active-job lock, not the stricter browser
+    # reservation: the default 600-second budget admits one 400-second worst
+    # case, while this fixture intentionally proves two active jobs serialize.
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "800")
     monkeypatch.setattr(scout, "_require_session", lambda _request, db: db.get(ApiCustomer, customer.id))
     barrier = threading.Barrier(10)
 
@@ -599,9 +603,10 @@ def test_postgres_simultaneous_distinct_submissions_reserve_daily_browser_budget
     monkeypatch, pg_scout: PostgresScoutHarness, scout_api
 ):
     customer = pg_scout.customer("daily-browser-reservation")
-    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "3")
     monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
     monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_CLEANUP_SECONDS", "1")
     monkeypatch.setattr(scout, "_require_session", lambda _request, db: db.get(ApiCustomer, customer.id))
     barrier = threading.Barrier(2)
 
@@ -664,7 +669,7 @@ def test_postgres_global_browser_cap_and_reaper_claim_are_cross_runner_atomic(tm
         db.commit()
 
     class CountingProvider(MockResearchBrowserProvider):
-        def release(self, provider_session_id):
+        def release(self, provider_session_id, *, cleanup_seconds=None):
             self.released.append(provider_session_id)
             time.sleep(0.05)
             return None

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import inspect
 import re
 import secrets
 import threading
@@ -624,6 +625,9 @@ class ScoutRunner:
             browser_wall_seconds = self._job_limit(
                 active_job, "browser_wall_seconds", self.settings.browser_wall_seconds
             )
+            browser_cleanup_seconds = self._job_limit(
+                active_job, "browser_cleanup_seconds", self.settings.browser_cleanup_seconds
+            )
         # The global slot and its external-request reservation are one locked
         # transaction. A full browser cap must not consume request budget, and
         # a consumed request must always have a durable zero-usage slot.
@@ -647,7 +651,7 @@ class ScoutRunner:
         try:
             started = time.monotonic()
             capture = self.provider.capture(
-                BrowserRequest(url=url, max_pages=max_pages, max_actions=max_actions, wall_seconds=browser_wall_seconds, max_bytes=self.settings.max_direct_bytes, max_routed_requests=self._job_limit(active_job, "max_routed_requests", self.settings.max_browser_routed_requests)),
+                BrowserRequest(url=url, max_pages=max_pages, max_actions=max_actions, wall_seconds=browser_wall_seconds, max_bytes=self.settings.max_direct_bytes, max_routed_requests=self._job_limit(active_job, "max_routed_requests", self.settings.max_browser_routed_requests), cleanup_seconds=browser_cleanup_seconds),
                 on_started=on_started,
             )
             # Provider implementations must call on_started immediately after
@@ -725,14 +729,16 @@ class ScoutRunner:
             if capture is not None:
                 provider_id = capture.provider_session_id
             if provider_id and durable_provider_id:
-                self._release_browser_session(session_id, provider_id)
+                self._release_browser_session(session_id, provider_id, cleanup_seconds=browser_cleanup_seconds)
             elif provider_id:
                 # Callback persistence may have failed because the DB was
                 # transiently unavailable. The provider ID means this slot is
                 # never safe to delete: attempt a second idempotent release,
                 # then finalize the pre-reserved slot without reusing the
                 # failing callback transaction.
-                released, replay = self._release_untracked_provider(provider_id)
+                released, replay = self._release_untracked_provider(
+                    provider_id, cleanup_seconds=browser_cleanup_seconds
+                )
                 self._finalize_untracked_browser_slot(session_id, job_id, provider_id, released, replay)
             else:
                 self._discard_unstarted_browser_slot(session_id)
@@ -853,10 +859,36 @@ class ScoutRunner:
             session = db.get(ScoutBrowserSession, session_id)
             return session is not None and session.status == "abandoned"
 
-    def _release_untracked_provider(self, provider_id: str) -> tuple[bool, str | None]:
+    def _provider_release(self, provider_id: str, cleanup_seconds: int) -> str | None:
+        """Call either provider release contract once, decided before I/O."""
+        release = self.provider.release
+        try:
+            parameters = inspect.signature(release).parameters.values()
+            supports_cleanup = any(
+                (
+                    parameter.name == "cleanup_seconds"
+                    and parameter.kind in {
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    }
+                )
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            supports_cleanup = False
+        if supports_cleanup:
+            return release(provider_id, cleanup_seconds=cleanup_seconds)
+        return release(provider_id)
+
+    def _release_untracked_provider(
+        self, provider_id: str, *, cleanup_seconds: int
+    ) -> tuple[bool, str | None]:
         """One bounded cleanup retry for a provider ID whose callback failed."""
         try:
-            replay = _bounded_call(self.provider.release, provider_id, timeout=self.settings.browser_cleanup_seconds)
+            replay = _bounded_call(
+                self._provider_release, provider_id, cleanup_seconds, timeout=cleanup_seconds
+            )
         except TimeoutError:
             return False, None
         except Exception:
@@ -910,7 +942,9 @@ class ScoutRunner:
         except Exception:
             return False
 
-    def _claim_browser_cleanup(self, session_id: uuid.UUID, provider_id: str | None) -> str | None:
+    def _claim_browser_cleanup(
+        self, session_id: uuid.UUID, provider_id: str | None, *, cleanup_seconds: int | None = None
+    ) -> str | None:
         """Claim one persisted provider ID for cleanup before external I/O.
 
         Both workers and reapers use this transition.  ``reaping`` is the
@@ -930,9 +964,10 @@ class ScoutRunner:
             attempted_at = session.cleanup_attempted_at
             if attempted_at is not None and attempted_at.tzinfo is None:
                 attempted_at = attempted_at.replace(tzinfo=timezone.utc)
+            cleanup_seconds = cleanup_seconds or self.settings.browser_cleanup_seconds
             stale_reaping = session.status == "reaping" and (
                 attempted_at is None
-                or attempted_at < now - timedelta(seconds=self.settings.browser_cleanup_seconds)
+                or attempted_at < now - timedelta(seconds=cleanup_seconds)
             )
             if session.status not in {"starting", "running", "cleanup_failed"} and not stale_reaping:
                 return None
@@ -950,7 +985,10 @@ class ScoutRunner:
             if session is None or session.status != "reaping" or session.provider_session_id != provider_id:
                 return False
             session.cleanup_attempted_at = datetime.now(timezone.utc)
-            session.error_class = "cleanup_outcome_unknown"
+            # Once the bounded release wait timed out, retain that explicit
+            # classification while its daemon call keeps the admission hold.
+            if session.error_class != "cleanup_timeout_inflight":
+                session.error_class = "cleanup_outcome_unknown"
             db.commit()
             return True
 
@@ -977,7 +1015,9 @@ class ScoutRunner:
             db.commit()
             return error_class is None
 
-    def _release_browser_session(self, session_id: uuid.UUID, provider_id: str | None) -> bool:
+    def _release_browser_session(
+        self, session_id: uuid.UUID, provider_id: str | None, *, cleanup_seconds: int | None = None
+    ) -> bool:
         """Release only after winning and continuously owning the durable claim.
 
         Python cannot kill a provider call safely. If the local wait expires,
@@ -993,8 +1033,11 @@ class ScoutRunner:
             if session_id in _INFLIGHT_CLEANUPS:
                 return False
             _INFLIGHT_CLEANUPS.add(session_id)
+        cleanup_seconds = cleanup_seconds or self.settings.browser_cleanup_seconds
         try:
-            provider_id = self._claim_browser_cleanup(session_id, provider_id)
+            provider_id = self._claim_browser_cleanup(
+                session_id, provider_id, cleanup_seconds=cleanup_seconds
+            )
         except Exception:
             with _INFLIGHT_CLEANUP_LOCK:
                 _INFLIGHT_CLEANUPS.discard(session_id)
@@ -1005,7 +1048,7 @@ class ScoutRunner:
             return False
         done = threading.Event()
         outcome = {"released": False}
-        interval = max(0.05, min(1.0, self.settings.browser_cleanup_seconds / 3))
+        interval = max(0.05, min(1.0, cleanup_seconds / 3))
 
         def keepalive() -> None:
             while not done.wait(interval):
@@ -1021,7 +1064,7 @@ class ScoutRunner:
 
         def release() -> None:
             try:
-                replay = self.provider.release(provider_id)
+                replay = self._provider_release(provider_id, cleanup_seconds)
             except BaseException:
                 self._complete_browser_cleanup(
                     session_id, provider_id, error_class="cleanup_failed"
@@ -1041,11 +1084,16 @@ class ScoutRunner:
         threading.Thread(
             target=release, name="scout-provider-release", daemon=True
         ).start()
-        if not done.wait(self.settings.browser_cleanup_seconds):
+        if not done.wait(cleanup_seconds):
             # Refresh after the boundary so an immediate reaper cannot call
             # the provider while this outcome-unknown call is still alive.
             try:
                 self._touch_browser_cleanup(session_id, provider_id)
+                with self.sessions() as db:
+                    session = db.get(ScoutBrowserSession, session_id)
+                    if session is not None and session.status == "reaping":
+                        session.error_class = "cleanup_timeout_inflight"
+                        db.commit()
             except Exception:
                 pass
             return False
@@ -1058,11 +1106,10 @@ class ScoutRunner:
         canceled/terminal or its lease expires.  `reaping` is recoverable after
         the cleanup timeout, so a killed reaper never permanently consumes cap.
         """
-        ids: list[tuple[uuid.UUID, str]] = []
+        ids: list[tuple[uuid.UUID, str, int]] = []
         replay_ids: list[tuple[uuid.UUID, str, int]] = []
         now = datetime.now(timezone.utc)
         with self.sessions() as db:
-            stale_reaping_before = now - timedelta(seconds=self.settings.browser_cleanup_seconds)
             rows = db.execute(
                 select(ScoutBrowserSession, ScoutResearchJob)
                 .join(ScoutResearchJob, ScoutResearchJob.id == ScoutBrowserSession.job_id)
@@ -1079,8 +1126,12 @@ class ScoutRunner:
                 terminal_or_expired = job.status in {"completed", "partial", "failed", "canceled"} or (
                     lease_expires_at is not None and lease_expires_at < now
                 )
+                cleanup_seconds = self._job_limit(
+                    job, "browser_cleanup_seconds", self.settings.browser_cleanup_seconds
+                )
                 stale_reaping = row.status == "reaping" and (
-                    cleanup_attempted_at is None or cleanup_attempted_at < stale_reaping_before
+                    cleanup_attempted_at is None
+                    or cleanup_attempted_at < now - timedelta(seconds=cleanup_seconds)
                 )
                 eligible = row.status == "cleanup_failed" or (row.status in {"starting", "running"} and terminal_or_expired) or stale_reaping
                 if not eligible:
@@ -1094,7 +1145,7 @@ class ScoutRunner:
                     row.cleanup_attempted_at = now
                     row.released_at = now
                     continue
-                ids.append((row.id, row.provider_session_id))
+                ids.append((row.id, row.provider_session_id, cleanup_seconds))
             for row in db.execute(select(ScoutBrowserSession).where(
                 ScoutBrowserSession.status == "released", ScoutBrowserSession.replay_url.is_(None)
             )).scalars():
@@ -1109,8 +1160,12 @@ class ScoutRunner:
                     row.error_class = "replay_unavailable"
             db.commit()
         released = 0
-        for session_id, provider_id in ids:
-            released += int(self._release_browser_session(session_id, provider_id))
+        for session_id, provider_id, cleanup_seconds in ids:
+            released += int(
+                self._release_browser_session(
+                    session_id, provider_id, cleanup_seconds=cleanup_seconds
+                )
+            )
         for session_id, provider_id, attempts in replay_ids:
             self._probe_replay(session_id, provider_id, attempts)
         return released + len(replay_ids)

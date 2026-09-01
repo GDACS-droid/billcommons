@@ -1,6 +1,7 @@
 import pytest
 
 from billcommons_shared.scout import (
+    ScoutSettings,
     ScoutPolicyError,
     browser_required,
     canonicalize_url,
@@ -12,6 +13,17 @@ from billcommons_shared.scout import (
     summarize_content_change,
     topical_search_terms,
 )
+
+
+def test_scout_settings_reject_daily_browser_cap_below_one_job_reservation():
+    with pytest.raises(ValueError, match="DAILY_BROWSER"):
+        ScoutSettings(
+            enabled=True,
+            max_external_requests=1,
+            browser_wall_seconds=2,
+            browser_cleanup_seconds=1,
+            per_customer_daily_browser_seconds=2,
+        )
 
 
 def test_scout_normalization_cache_and_hostile_text_are_data_only():
