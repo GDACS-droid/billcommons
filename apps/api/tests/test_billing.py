@@ -181,6 +181,29 @@ def test_checkout_guest_capable(client, monkeypatch):
     assert "customer" not in created and "customer_email" not in created
 
 
+def test_snapshot_checkout_restricts_p0_to_synchronous_card_payment(client, monkeypatch):
+    created = {}
+    # This test owns only the Checkout contract. Avoid consuming the module's
+    # shared anonymous-rate-limit bucket and changing later limiter tests.
+    monkeypatch.setattr(billing, "_enforce_checkout_rate_limit", lambda _request: None)
+
+    def _fake_create(**kwargs):
+        created.update(kwargs)
+        return {"url": "https://checkout.stripe.com/pay/cs_snapshot", "id": "cs_snapshot"}
+
+    monkeypatch.setattr(stripe.checkout.Session, "create", staticmethod(_fake_create))
+    res = client.post(
+        "/api/v1/billing/checkout/snapshot",
+        json={"scope": "full"},
+        headers={"Origin": ORIGIN},
+    )
+
+    assert res.status_code == 200
+    assert created["mode"] == "payment"
+    assert created["payment_method_types"] == ["card"]
+    assert created["metadata"] == {"app": "billcommons", "scope": "full"}
+
+
 def test_checkout_409_when_active_subscription_exists(client, app_and_db, monkeypatch):
     _, SessionLocal = app_and_db
     email = "already-paying@example.com"
@@ -243,6 +266,7 @@ def test_checkout_completed_mints_exactly_one_key(client, app_and_db, monkeypatc
     row = customer.execute(select(ApiCustomer).where(ApiCustomer.email == "new-buyer@example.com")).scalar_one()
     keys = customer.execute(select(ApiKey).where(ApiKey.customer_id == row.id)).scalars().all()
     customer.close()
+    assert row.stripe_customer_id == "cus_new"
     assert len(keys) == 1
     assert keys[0].plan == "builder"
     assert keys[0].reveal_ciphertext is not None  # B1: never revealed inline for the checkout path
@@ -547,6 +571,148 @@ def test_duplicate_subscription_canceled_at_stripe(client, app_and_db, monkeypat
     assert res2.status_code == 200
     assert res2.json()["outcome"] == "processed"
     assert canceled_ids == []
+
+
+@pytest.mark.parametrize("first_delivery", ["subscription", "checkout"])
+def test_guest_duplicate_keeps_incumbent_stripe_customer_for_portal_in_both_delivery_orders(
+    client, app_and_db, monkeypatch, first_delivery
+):
+    """An active guest Customer must not steal the local Portal mapping.
+
+    Stripe can deliver either the subscription event or Checkout completion
+    first.  In both cases the incoming Customer really does hold an active
+    remote subscription, but the local incumbent already has the one
+    authoritative subscription and paid key.  The duplicate must be
+    canceled once while the Portal continues to target the incumbent.
+    """
+    import billcommons_api.api_keys as api_keys_module
+
+    _, SessionLocal = app_and_db
+    email = "guest-duplicate@example.com"
+    incumbent_customer_id = "cus_incumbent_live"
+    guest_customer_id = "cus_guest_active"
+    incumbent_subscription_id = "sub_incumbent_live"
+    guest_subscription_id = "sub_guest_active"
+    customer_id = _make_customer(SessionLocal, email, incumbent_customer_id)
+    db = SessionLocal()
+    incumbent_subscription = ApiSubscription(
+        customer_id=customer_id,
+        stripe_subscription_id=incumbent_subscription_id,
+        plan="builder",
+        status="active",
+    )
+    db.add(incumbent_subscription)
+    db.flush()
+    incumbent_key, _ = api_keys_module.mint_key(db, customer_id, plan="builder")
+    incumbent_key.subscription_id = incumbent_subscription.id
+    db.commit()
+    db.close()
+
+    canceled_ids = []
+    portal_customers = []
+    monkeypatch.setattr(
+        stripe.Customer,
+        "retrieve",
+        staticmethod(
+            lambda stripe_customer_id: {
+                "id": stripe_customer_id,
+                "email": "Guest-Duplicate@Example.COM",
+                "metadata": {"app": "billcommons"},
+                "deleted": False,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "retrieve",
+        staticmethod(
+            lambda sub_id: {
+                "id": sub_id,
+                "customer": guest_customer_id,
+                "status": "active",
+                "metadata": {"app": "billcommons", "plan": "builder"},
+            }
+        ),
+    )
+    # The repair must decide from the incumbent local subscription before
+    # asking Stripe whether the guest Customer is active.  Raising here
+    # makes a future regression deterministic rather than fixture-dependent.
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "list",
+        staticmethod(lambda **kwargs: (_ for _ in ()).throw(AssertionError("guest authority lookup is unnecessary"))),
+    )
+    monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(lambda sub_id: canceled_ids.append(sub_id)))
+    monkeypatch.setattr(
+        stripe.billing_portal.Session,
+        "create",
+        staticmethod(lambda **kwargs: portal_customers.append(kwargs["customer"]) or {"url": "https://portal.example.test"}),
+    )
+
+    checkout = _stripe_event(
+        "checkout.session.completed",
+        {
+            "id": "cs_guest_duplicate",
+            "mode": "subscription",
+            "customer": guest_customer_id,
+            "subscription": guest_subscription_id,
+            "customer_details": {"email": "Guest-Duplicate@Example.COM"},
+            "metadata": {"app": "billcommons", "plan": "builder"},
+        },
+        created=100,
+    )
+    subscription_active = _stripe_event(
+        "customer.subscription.created",
+        {
+            "id": guest_subscription_id,
+            "customer": guest_customer_id,
+            "status": "active",
+            "metadata": {"app": "billcommons", "plan": "builder"},
+        },
+        created=100,
+    )
+    subscription_canceled = _stripe_event(
+        "customer.subscription.deleted",
+        {
+            "id": guest_subscription_id,
+            "customer": guest_customer_id,
+            "status": "canceled",
+            "metadata": {"app": "billcommons", "plan": "builder"},
+        },
+        created=101,
+    )
+
+    if first_delivery == "subscription":
+        first, second = subscription_active, checkout
+    else:
+        # Once Checkout's active remote subscription has been canceled, the
+        # follow-up Stripe subscription delivery is terminal.
+        first, second = checkout, subscription_canceled
+
+    assert _post_webhook(client, first).json()["outcome"] == "duplicate_subscription_canceled"
+    assert _post_webhook(client, second).status_code == 200
+
+    db = SessionLocal()
+    customer = db.execute(select(ApiCustomer).where(ApiCustomer.id == customer_id)).scalar_one()
+    keys = db.execute(select(ApiKey).where(ApiKey.customer_id == customer_id)).scalars().all()
+    incumbent = db.execute(
+        select(ApiSubscription).where(ApiSubscription.stripe_subscription_id == incumbent_subscription_id)
+    ).scalar_one()
+    duplicate = db.execute(
+        select(ApiSubscription).where(ApiSubscription.stripe_subscription_id == guest_subscription_id)
+    ).scalar_one()
+    db.close()
+    assert customer.stripe_customer_id == incumbent_customer_id
+    assert incumbent.status == "active"
+    assert duplicate.status == "canceled"
+    assert len(keys) == 1
+    assert keys[0].plan == "builder"
+    assert canceled_ids == [guest_subscription_id]
+
+    portal_headers = _log_in(client, SessionLocal, email)
+    portal = client.post("/api/v1/billing/portal", headers={"Origin": ORIGIN, **portal_headers})
+    assert portal.status_code == 200
+    assert portal_customers == [incumbent_customer_id]
 
 
 # ---------------------------------------------------------------------------
@@ -1622,6 +1788,17 @@ def test_r3_6_checkout_missing_subscription_is_permanent_error(client, app_and_d
 def test_r3_9_deleted_stripe_customer_is_stale(app_and_db, monkeypatch):
     _, SessionLocal = app_and_db
     customer_id = _make_customer(SessionLocal, email="r3-deleted@example.com", stripe_customer_id="cus_deleted")
+    db = SessionLocal()
+    db.add(
+        ApiSubscription(
+            customer_id=customer_id,
+            stripe_subscription_id="sub_deleted_customer_recovery",
+            plan="builder",
+            status="active",
+        )
+    )
+    db.commit()
+    db.close()
     monkeypatch.setattr(
         stripe.Customer, "retrieve", staticmethod(lambda stripe_customer_id: {"id": stripe_customer_id, "deleted": True})
     )

@@ -600,6 +600,10 @@ def create_snapshot_checkout(
 
     kwargs: dict = {
         "mode": "payment",
+        # P0 fulfillment consumes checkout.session.completed only. Restrict
+        # this Checkout Session to synchronous card payments so a delayed bank
+        # debit cannot settle later without an async-payment webhook handler.
+        "payment_method_types": ["card"],
         "line_items": [{"price": price_id, "quantity": 1}],
         "success_url": f"{_site_url()}/account/welcome",
         "cancel_url": f"{_site_url()}/docs/bulk",
@@ -721,9 +725,14 @@ def _upsert_customer_by_email(db: OrmSession, email: str, stripe_customer_id: st
     attach when the local column is empty (unchanged, common case);
     otherwise only repoint when the OLD id is provably dead (404s at
     Stripe) or the INCOMING Customer is the one that actually holds a
-    plan-authority subscription. Otherwise keep the existing id -- the
-    incoming Customer is a guest duplicate/snapshot-only purchase, not the
-    subscriber's real one."""
+    plan-authority subscription *and the local customer has no incumbent
+    plan-authority subscription*.  The latter guard is important: an
+    active guest Checkout Customer necessarily holds its just-created
+    subscription too, but it must not replace the incumbent Customer id
+    before `_apply_subscription_event` cancels that duplicate. Otherwise
+    the Billing Portal would point at the canceled guest Customer. Keep the
+    existing id in that case; the incoming Customer is a guest duplicate or
+    snapshot-only purchase, not the subscriber's real one."""
     _configure_stripe()
     email = email.strip().lower()
     customer = db.execute(select(ApiCustomer).where(ApiCustomer.email == email)).scalar_one_or_none()
@@ -745,7 +754,15 @@ def _upsert_customer_by_email(db: OrmSession, email: str, stripe_customer_id: st
         if getattr(exc, "code", None) != "resource_missing":
             raise
         old_is_stale = True
-    if old_is_stale or _stripe_customer_holds_plan_authority(stripe_customer_id):
+    # Preserve recovery when the old Stripe Customer was deleted, even if a
+    # stale local subscription row still exists.  Otherwise the LOCAL
+    # authority is decisive before inspecting the incoming Customer: both
+    # sides of a duplicate guest Checkout can be active in Stripe, but only
+    # the incumbent is the portal/customer mapping we must retain.
+    if old_is_stale or (
+        _active_subscription(db, customer.id) is None
+        and _stripe_customer_holds_plan_authority(stripe_customer_id)
+    ):
         customer.stripe_customer_id = stripe_customer_id
     return customer
 
