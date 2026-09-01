@@ -18,6 +18,7 @@ Most coverage uses deterministic fixtures and the mock browser. Live tests are e
 - Live direct official-source finding: passed against Florida Senate HB 625; one direct source and one finding whose excerpt supports both the identifier and action; mock browser unused.
 - Final live Solari smoke: passed; one page/action, 7,283 ms, recording/replay available, cleanup confirmed.
 - Chromium visual assertions/captures: passed at 1440x1100 and 390x844 with an explicitly labeled fixture.
+- Demo artifact probe: passed; H.264, 1440x900, 28.96 seconds, 2,967,055 bytes. Poster/contact-sheet inspection confirmed the deterministic/live-source/Solari boundary labels are legible. An independent reviewer sampled 100 transition frames at 10 fps, verified one-second keyframes and clean decoding, and returned **SHIP** after the audit-link and transition repairs.
 - Broad isolated shared/API gate: **617 passed, 30 skipped, 45 failed**. It is not green; failures are documented in `STATUS.md` and must not be presented as Scout-pass evidence.
 
 ## Reproducible commands

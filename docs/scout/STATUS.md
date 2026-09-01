@@ -18,6 +18,7 @@ Updated 2026-09-01. This records checks actually run; it is not production-deplo
 - Earlier product-path Solari check: real MyFloridaHouse `302` escalation; exactly one durable browser session; terminal state `released`; deliberately no unsupported bill finding.
 - Live direct product check: the official Florida Senate HB 625 page supported both `HB 625` and `Chapter No. 2026-141`; Scout retained one direct source and one exact evidence-backed finding without launching the mock browser.
 - Chromium visual assertions and full-page captures passed at 1440x1100 and 390x844 using an explicitly labeled result fixture. This is rendering proof, not a claimed live discovery.
+- A 28.96-second H.264 challenge demo was recorded at 1440x900 with backend-driven deterministic job states, the separately live-verified HB 625 evidence contract, and explicit on-screen boundaries between that direct result and the separately verified Solari run. It is a local product/demo artifact, not a production recording.
 
 ## Verification actually run
 
@@ -31,13 +32,13 @@ Updated 2026-09-01. This records checks actually run; it is not production-deplo
 
 ## Git / preservation
 
-- Public feature branch: `billcommons-scout`; hardened source/artifact head `7b593e8` (code repair `51e2588`). Remote head was independently confirmed after push.
+- Public feature branch: `billcommons-scout`; hardened code head `22a6376` (code repair `51e2588`). Remote head was independently confirmed after push. The replacement demo and sanitized verification record received an independent **SHIP** verdict and are ready to push.
 - Preserve unrelated modified ingest health/full-text files and untracked `.claude`, operations, outreach, rendered, monitoring, and data-request files.
 - Scout production schema migration, worker service creation, RawStore topology, monitoring/canary, backup/restore proof, feature enablement, and web deployment have not run.
 
 ## Remaining
 
 - The independent post-repair review's cancellation/finalization, duplicate cleanup, terminal-reason, usage-audit, daily-spend admission, expired-lease, bounded-polling, and outcome-unknown cleanup findings are repaired and locally green. The final adversarial reproduce-or-ship verdict is **SHIP**.
-- Record and publish a truthful demo, then tag `@harrychow_` and `@getsolari`. The public source artifact is ready; `https://billcommons.org/scout` is not deployed and must not be presented as a live product demo.
+- Publish the reviewed demo commit, then have a human send the prepared X or LinkedIn post tagging `@harrychow_` and `@getsolari`. The public source artifact and reviewed recording are ready; `https://billcommons.org/scout` is not deployed and must not be presented as a live product demo.
 - General production Scout rollout remains a separately authorized operation and is **not ready** until the deployment runbook's service, storage, migration, backup, monitoring, canary, and rollback gates are satisfied.
 - Stripe webhook state in the correct Bill Commons live Stripe account remains unknown; an authorized account operator must inspect/configure it and safely place the signing secret in Railway before paid provisioning can be called end-to-end verified.
