@@ -220,6 +220,56 @@ def content_changed(previous_hash: str | None, data: bytes) -> bool:
     return previous_hash != content_hash(data)
 
 
+@dataclass(frozen=True)
+class ContentChange:
+    """A bounded, deliberately non-semantic description of a source change.
+
+    The summary contains measurements, not upstream text.  That keeps hostile
+    fetched content out of progress/events while making a raw-hash change
+    auditable.  ``cosmetic`` is intentionally narrow: only decoded-text
+    whitespace normalization may erase a difference.  HTML tag/attribute,
+    encoding, and any visible-text differences remain ``material``.
+    """
+
+    kind: Literal["unchanged", "cosmetic", "material"]
+    summary: str
+
+
+def summarize_content_change(previous: bytes | None, current: bytes, *, maximum: int = 180) -> ContentChange:
+    """Classify a byte change without claiming semantic understanding.
+
+    This is a FETCH → NORMALIZE → HASH comparison primitive, not a legal or
+    semantic diff.  It is deterministic and bounded for API storage/display.
+    """
+    if previous is not None and content_hash(previous) == content_hash(current):
+        result = ContentChange("unchanged", "Exact content hash matches the prior source.")
+    elif previous is None:
+        result = ContentChange("material", "Prior source bytes are unavailable; raw content hashes differ.")
+    else:
+        prior_text = previous.decode("utf-8", "replace")
+        current_text = current.decode("utf-8", "replace")
+        prior_normalized = _SPACE_RE.sub(" ", prior_text).strip()
+        current_normalized = _SPACE_RE.sub(" ", current_text).strip()
+        if prior_normalized == current_normalized:
+            result = ContentChange("cosmetic", "Normalized decoded text is unchanged; raw payload differs.")
+        else:
+            first_difference = next(
+                (
+                    index
+                    for index, pair in enumerate(zip(prior_normalized, current_normalized))
+                    if pair[0] != pair[1]
+                ),
+                min(len(prior_normalized), len(current_normalized)),
+            )
+            result = ContentChange(
+                "material",
+                "Normalized text changed "
+                f"({len(prior_normalized)}→{len(current_normalized)} chars; "
+                f"first difference at {first_difference}).",
+            )
+    return ContentChange(result.kind, result.summary[:maximum])
+
+
 def classify_direct_response(
     status: int,
     mime_type: str | None,

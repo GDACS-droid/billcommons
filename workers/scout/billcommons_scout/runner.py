@@ -19,7 +19,8 @@ from billcommons_shared.safe_http import SafeHttpError, SsrfRejected, new_safe_h
 from billcommons_shared.scout import (
     BrowserCapture, BrowserRequest, ResearchBrowserProvider, ScoutPolicyError,
     ScoutSettings, browser_required, canonicalize_url, classify_direct_response,
-    content_hash, extract_florida_bill_identifier, topical_search_terms,
+    content_hash, extract_florida_bill_identifier, summarize_content_change,
+    topical_search_terms,
 )
 from billcommons_scout.providers import ProviderSessionPersistenceError
 
@@ -265,6 +266,17 @@ class ScoutRunner:
                 if len(body) > self.settings.max_direct_bytes:
                     raise RuntimeError("direct_body_too_large")
                 mode = classify_direct_response(status, mime, body)
+                # The response has crossed the direct-retrieval boundary.
+                # This is intentionally recorded before extraction; a malformed
+                # document is still a real retrieval, not a fake success.
+                with self.sessions() as db:
+                    if self._fenced(db, job_id, token) is None:
+                        return
+                    db.add(ScoutJobEvent(job_id=job_id, kind="direct_retrieval", detail={
+                        "status": status,
+                        "mime_type": (mime or "").split(";", 1)[0].lower(),
+                    }))
+                    db.commit()
             except (ScoutPolicyError, SafeHttpError):
                 failures += 1
                 self._record_failed_source(job_id, token, url, "direct", None, None)
@@ -308,9 +320,149 @@ class ScoutRunner:
             db.add(ScoutJobEvent(job_id=job_id, kind="source_failed", detail={"mechanism": mechanism, "status": status}))
             db.commit()
 
+    @staticmethod
+    def _copy_finding(*, job_id: uuid.UUID, source_id: uuid.UUID, prior: ScoutFinding) -> ScoutFinding:
+        """Copy only an already evidence-supported finding to a local job row."""
+        return ScoutFinding(
+            job_id=job_id,
+            source_id=source_id,
+            title=prior.title,
+            what_happened=prior.what_happened,
+            why_it_matters=prior.why_it_matters,
+            relevant_date=prior.relevant_date,
+            excerpt=prior.excerpt,
+            excerpt_hash=prior.excerpt_hash,
+            excerpt_start=prior.excerpt_start,
+            excerpt_end=prior.excerpt_end,
+            confidence=prior.confidence,
+            extractor_version=prior.extractor_version,
+            bill_id=prior.bill_id,
+        )
+
+    def _reuse_exact_capture(
+        self,
+        job_id: uuid.UUID,
+        token: str,
+        url: str,
+        mechanism: str,
+        status: int | None,
+        mime: str | None,
+        digest: str,
+    ) -> tuple[bool, uuid.UUID | None]:
+        """Reuse an immutable tenant-local source before parsing or storing bytes.
+
+        A matching source alone is insufficient: it must have durable raw bytes
+        that still hash to this exact response and an existing supported
+        finding.  The cloned source/finding stay job-local so job results never
+        reference another job's ownership/provenance row.
+        """
+        with self.sessions() as db:
+            job = self._fenced(db, job_id, token)
+            if job is None:
+                return True, None
+            existing = db.execute(
+                select(ScoutSource)
+                .join(ScoutFinding, ScoutFinding.source_id == ScoutSource.id)
+                .where(
+                    ScoutSource.job_id == job_id,
+                    ScoutSource.canonical_url == url,
+                    ScoutSource.content_hash == digest,
+                    ScoutSource.raw_ref.is_not(None),
+                )
+                .order_by(ScoutSource.retrieved_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if existing is not None:
+                try:
+                    if existing.raw_ref and self.rawstore.exists(existing.raw_ref) and content_hash(self.rawstore.get(existing.raw_ref)) == digest:
+                        return True, existing.id
+                except Exception:
+                    pass
+            match = db.execute(
+                select(ScoutSource, ScoutFinding)
+                .join(ScoutResearchJob, ScoutResearchJob.id == ScoutSource.job_id)
+                .join(ScoutFinding, ScoutFinding.source_id == ScoutSource.id)
+                .where(
+                    ScoutResearchJob.customer_id == job.customer_id,
+                    ScoutSource.canonical_url == url,
+                    ScoutSource.official.is_(True),
+                    ScoutSource.content_hash == digest,
+                    ScoutSource.raw_ref.is_not(None),
+                )
+                .order_by(ScoutSource.retrieved_at.desc(), ScoutFinding.created_at.desc())
+                .limit(1)
+            ).first()
+            if match is None:
+                return False, None
+            prior_source, prior_finding = match
+            raw_ref = prior_source.raw_ref
+            try:
+                if raw_ref is None or not self.rawstore.exists(raw_ref) or content_hash(self.rawstore.get(raw_ref)) != digest:
+                    return False, None
+            except Exception:
+                return False, None
+            # RawStore reads occur outside the cancellation transaction. Re-fence
+            # immediately before materializing the new job-local provenance.
+            if self._fenced(db, job_id, token) is None:
+                return True, None
+            source = ScoutSource(
+                job_id=job_id,
+                canonical_url=url,
+                title=prior_source.title,
+                official=True,
+                retrieval_mechanism="reused",
+                http_status=status,
+                mime_type=mime,
+                content_hash=digest,
+                document_hash=prior_source.document_hash or digest,
+                raw_ref=raw_ref,
+                prior_source_id=prior_source.id,
+                change_kind="unchanged",
+                change_summary="Exact content hash matches a prior supported source.",
+            )
+            db.add(source)
+            db.flush()
+            db.add(self._copy_finding(job_id=job_id, source_id=source.id, prior=prior_finding))
+            db.add(ScoutJobEvent(job_id=job_id, kind="source_persisted", detail={"mechanism": "reused", "change_kind": "unchanged"}))
+            db.add(ScoutJobEvent(job_id=job_id, kind="finding_persisted", detail={"mechanism": "reused"}))
+            db.commit()
+            return True, source.id
+
+    def _prior_change(self, db: Session, job: ScoutResearchJob, url: str, digest: str, body: bytes) -> tuple[uuid.UUID | None, str | None, str | None]:
+        """Return a tenant-local prior version and conservative bounded change data."""
+        prior = db.execute(
+            select(ScoutSource)
+            .join(ScoutResearchJob, ScoutResearchJob.id == ScoutSource.job_id)
+            .where(
+                ScoutResearchJob.customer_id == job.customer_id,
+                ScoutSource.canonical_url == url,
+                ScoutSource.official.is_(True),
+                ScoutSource.content_hash.is_not(None),
+                ScoutSource.content_hash != digest,
+            )
+            .order_by(ScoutSource.retrieved_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if prior is None:
+            return None, None, None
+        prior_id = prior.id
+        prior_bytes: bytes | None = None
+        if prior.raw_ref:
+            try:
+                prior_bytes = self.rawstore.get(prior.raw_ref)
+            except Exception:
+                # A missing historic blob must not be represented as an
+                # unchanged/cosmetic result merely because the hashes differ.
+                prior_bytes = None
+        change = summarize_content_change(prior_bytes, body)
+        return prior_id, change.kind, change.summary
+
     def _persist_capture(self, job_id: uuid.UUID, token: str, bill_id: uuid.UUID | None, bill_title: str, bill_status: str | None, metadata: dict, url: str, mechanism: str, status: int | None, mime: str | None, body: bytes) -> uuid.UUID | None:
         try:
             digest = content_hash(body)
+            reused, source_id = self._reuse_exact_capture(job_id, token, url, mechanism, status, mime, digest)
+            if reused:
+                return source_id
             mime_base = (mime or "").split(";", 1)[0].lower()
             if mime_base == "application/pdf":
                 from io import BytesIO
@@ -344,6 +496,12 @@ class ScoutRunner:
             with self.sessions() as db:
                 if self._fenced(db, job_id, token) is None:
                     return None
+                current_job = self._fenced(db, job_id, token)
+                if current_job is None:
+                    return None
+                prior_id, change_kind, change_summary = self._prior_change(db, current_job, url, digest, body)
+                if self._fenced(db, job_id, token) is None:
+                    return None
                 stage = ScoutSource(job_id=job_id, canonical_url=url, official=False, retrieval_mechanism="staged", http_status=status, mime_type=mime)
                 db.add(stage)
                 db.commit()
@@ -367,7 +525,7 @@ class ScoutRunner:
                         db.commit()
                     return None
                 # Same URL/hash within this job is idempotent. A changed
-                # version retains the immediately preceding version link.
+                # version retains the immediately preceding tenant-local version.
                 same = db.execute(select(ScoutSource.id).where(ScoutSource.job_id == job_id, ScoutSource.canonical_url == url, ScoutSource.content_hash == digest)).scalar_one_or_none()
                 if same is not None and same != stage_id:
                     db.delete(db.get(ScoutSource, stage_id))
@@ -376,18 +534,6 @@ class ScoutRunner:
                 current_job = self._fenced(db, job_id, token)
                 if current_job is None:
                     return None
-                prior = db.execute(
-                    select(ScoutSource)
-                    .join(ScoutResearchJob, ScoutResearchJob.id == ScoutSource.job_id)
-                    .where(
-                        ScoutResearchJob.customer_id == current_job.customer_id,
-                        ScoutSource.canonical_url == url,
-                        ScoutSource.content_hash.is_not(None),
-                        ScoutSource.content_hash != digest,
-                    )
-                    .order_by(ScoutSource.retrieved_at.desc())
-                    .limit(1)
-                ).scalar_one_or_none()
                 source = db.get(ScoutSource, stage_id)
                 if source is None:  # pragma: no cover - stage is committed above
                     return None
@@ -397,7 +543,9 @@ class ScoutRunner:
                 source.content_hash = digest
                 source.document_hash = digest
                 source.raw_ref = raw_ref
-                source.prior_source_id = prior.id if prior else None
+                source.prior_source_id = prior_id
+                source.change_kind = change_kind
+                source.change_summary = change_summary
                 identifier = str(metadata.get("identifier") or bill_title)
                 action = metadata.get("latest_action")
                 action_date = metadata.get("latest_action_date") or metadata.get("status_date")
@@ -405,7 +553,9 @@ class ScoutRunner:
                 # _evidence_excerpt refuses a finding unless this exact
                 # displayed window supports both the identifier and action.
                 db.add(ScoutFinding(job_id=job_id, source_id=source.id, title=f"{identifier}: {bill_title}", what_happened=development, why_it_matters="The structured development is paired with retained official source bytes.", relevant_date=action_date if isinstance(action_date, date) else None, excerpt=excerpt, excerpt_hash=content_hash(excerpt.encode()), excerpt_start=excerpt_start, excerpt_end=excerpt_end, confidence="high", extractor_version="scout-p0-1", bill_id=bill_id))
-                db.add(ScoutJobEvent(job_id=job_id, kind="source_persisted", detail={"mechanism": mechanism}))
+                db.add(ScoutJobEvent(job_id=job_id, kind="document_inspected", detail={"mechanism": mechanism, "mime_type": mime_base}))
+                db.add(ScoutJobEvent(job_id=job_id, kind="source_persisted", detail={"mechanism": mechanism, "change_kind": change_kind}))
+                db.add(ScoutJobEvent(job_id=job_id, kind="finding_persisted", detail={"mechanism": mechanism}))
                 db.commit()
                 return source.id
         except Exception:
@@ -418,7 +568,7 @@ class ScoutRunner:
         """Return one bounded displayed window supporting the claimed finding."""
         display_text = _SPACE_RE.sub(" ", text).strip()
         normalized = display_text.casefold()
-        if not normalized or any(marker in normalized for marker in _SHELL_MARKERS):
+        if not normalized:
             return None
         identifier = _SPACE_RE.sub(" ", str(metadata.get("identifier") or "")).strip().casefold()
         action = _SPACE_RE.sub(" ", str(metadata.get("latest_action") or bill_status or "")).strip().casefold()

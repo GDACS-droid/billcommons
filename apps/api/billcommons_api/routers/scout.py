@@ -104,6 +104,8 @@ def _job_payload(db: Session, job: ScoutResearchJob) -> dict:
         {"id": str(source.id), "url": source.canonical_url, "title": source.title, "domain": urlsplit(source.canonical_url).hostname, "official_domain": urlsplit(source.canonical_url).hostname, "official": source.official,
          "mechanism": source.retrieval_mechanism, "status": source.http_status,
          "type": source.mime_type, "mime_type": source.mime_type, "content_hash": source.content_hash,
+         "prior_source_id": str(source.prior_source_id) if source.prior_source_id else None,
+         "change_kind": source.change_kind, "change_summary": source.change_summary,
          "retrieved_at": source.retrieved_at.isoformat() if source.retrieved_at else None}
         for source in sources.values()
     ]

@@ -13,7 +13,7 @@ from billcommons_api.app import create_app
 from billcommons_api.deps import get_db
 from billcommons_api.routers import scout
 from billcommons_schema.base import Base
-from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutJobEvent, ScoutResearchJob
+from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutJobEvent, ScoutResearchJob, ScoutSource
 
 
 def _app(monkeypatch):
@@ -132,6 +132,35 @@ def test_scout_payload_marks_an_expired_cache_as_a_miss(monkeypatch):
             job.fresh_until = datetime.now(timezone.utc) + timedelta(minutes=1)
             db.commit()
         assert client.get(f"/api/v1/scout/jobs/{created['id']}", headers=headers).json()["cache_status"] == "fresh"
+
+
+def test_scout_payload_exposes_bounded_source_change_provenance(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    headers = {"x-test-customer": str(owner.id)}
+    with TestClient(app) as client:
+        created = client.post("/api/v1/scout/jobs", json={"query": "HB 12"}, headers=headers).json()["job"]
+        job_id = uuid.UUID(created["id"])
+        with sessions() as db:
+            prior = ScoutSource(job_id=job_id, canonical_url="https://www.flsenate.gov/prior", official=True, retrieval_mechanism="direct")
+            db.add(prior)
+            db.flush()
+            source = ScoutSource(
+                job_id=job_id,
+                canonical_url="https://www.flsenate.gov/current",
+                official=True,
+                retrieval_mechanism="direct",
+                prior_source_id=prior.id,
+                change_kind="material",
+                change_summary="Normalized text changed (12→20 chars; first difference at 8).",
+            )
+            db.add(source)
+            db.commit()
+            source_id = str(source.id)
+        payload = client.get(f"/api/v1/scout/jobs/{job_id}", headers=headers).json()
+    returned = next(source for source in payload["sources"] if source["id"] == source_id)
+    assert returned["prior_source_id"] == str(prior.id)
+    assert returned["change_kind"] == "material"
+    assert returned["change_summary"] == "Normalized text changed (12→20 chars; first difference at 8)."
 
 
 def test_scout_quota_decision_locks_the_customer_row_before_counting():

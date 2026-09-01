@@ -9,6 +9,7 @@ from billcommons_shared.scout import (
     content_hash,
     normalize_query,
     scout_cache_key,
+    summarize_content_change,
     topical_search_terms,
 )
 
@@ -85,6 +86,16 @@ def test_browser_is_not_general_fallback_and_hash_diff_is_deterministic():
     assert not browser_required(url, status=500, body=b"javascript")
     assert content_changed(None, b"one")
     assert not content_changed(content_hash(b"one"), b"one")
+
+
+def test_content_change_summary_is_deterministic_bounded_and_conservative():
+    assert summarize_content_change(b"same", b"same").kind == "unchanged"
+    cosmetic = summarize_content_change(b"HB 12\nFiled", b"HB 12   Filed")
+    assert cosmetic.kind == "cosmetic"
+    material = summarize_content_change(b"HB 12 Filed", b"HB 12 Vetoed")
+    assert material.kind == "material"
+    assert "first difference at" in material.summary
+    assert len(summarize_content_change(b"a", b"b" * 200, maximum=32).summary) <= 32
 
 
 def test_topical_florida_demo_terms_drop_request_framing_not_the_subject():

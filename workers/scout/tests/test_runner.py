@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import hashlib
 import sys
 import types
 import asyncio
@@ -13,7 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from billcommons_schema.base import Base
-from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutResearchJob, ScoutSource
+from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutResearchJob, ScoutSource
 from billcommons_shared.rawstore import FilesystemRawStore
 from billcommons_shared.safe_http import SsrfRejected
 from billcommons_shared.scout import BrowserCapture, BrowserRequest, ScoutSettings
@@ -124,6 +125,114 @@ def test_prior_source_is_scoped_to_the_current_customer(tmp_path):
     with sessions() as db:
         newest = db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalar_one()
         assert newest.prior_source_id == own_prior_id
+
+
+def test_exact_tenant_local_source_reuses_raw_and_supported_finding_without_reinspection(tmp_path, monkeypatch):
+    body = b"<h1>HB 12 Filed</h1>"
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", body))
+    url = "https://www.flsenate.gov/Session/Bill/2026/12"
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        prior_job = ScoutResearchJob(id=uuid.uuid4(), customer_id=job.customer_id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="completed", strategy={}, limits={}, usage={})
+        db.add(prior_job)
+        db.flush()
+        raw_ref = runner.rawstore.put(body, {"source_url": url})
+        digest = hashlib.sha256(body).hexdigest()
+        prior_source = ScoutSource(job_id=prior_job.id, canonical_url=url, title="HB 12", official=True, retrieval_mechanism="direct", content_hash=digest, document_hash=digest, raw_ref=raw_ref)
+        db.add(prior_source)
+        db.flush()
+        db.add(ScoutFinding(job_id=prior_job.id, source_id=prior_source.id, title="prior title", what_happened="prior happened", why_it_matters="prior why", excerpt="HB 12 Filed", excerpt_hash="excerpt", confidence="high", extractor_version="prior-v1"))
+        db.commit()
+        prior_source_id = prior_source.id
+    put_calls = {"count": 0}
+    original_put = runner.rawstore.put
+
+    def count_put(*args, **kwargs):
+        put_calls["count"] += 1
+        return original_put(*args, **kwargs)
+
+    monkeypatch.setattr(runner.rawstore, "put", count_put)
+    monkeypatch.setattr(runner, "_evidence_excerpt", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("reuse must happen before extraction")))
+    runner._candidates = lambda _db, _job: [_candidate(url=url)]
+    runner.process(job_id)
+    assert put_calls["count"] == 0
+    with sessions() as db:
+        source = db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalar_one()
+        finding = db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalar_one()
+        events = [event.kind for event in db.execute(select(ScoutJobEvent).where(ScoutJobEvent.job_id == job_id)).scalars()]
+        assert (source.retrieval_mechanism, source.raw_ref, source.prior_source_id, source.change_kind) == ("reused", raw_ref, prior_source_id, "unchanged")
+        assert (finding.title, finding.what_happened, finding.extractor_version) == ("prior title", "prior happened", "prior-v1")
+        assert "direct_retrieval" in events and "finding_persisted" in events and "document_inspected" not in events
+
+
+def test_identical_other_tenant_source_is_not_reused(tmp_path, monkeypatch):
+    body = b"HB 12 Filed"
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", body))
+    url = "https://www.flsenate.gov/Session/Bill/2026/12"
+    with sessions() as db:
+        other_customer = ApiCustomer(id=uuid.uuid4(), email="other-reuse@example.test")
+        other_job = ScoutResearchJob(id=uuid.uuid4(), customer_id=other_customer.id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="completed", strategy={}, limits={}, usage={})
+        db.add_all((other_customer, other_job))
+        db.flush()
+        raw_ref = runner.rawstore.put(body, {"source_url": url})
+        digest = hashlib.sha256(body).hexdigest()
+        other_source = ScoutSource(job_id=other_job.id, canonical_url=url, official=True, retrieval_mechanism="direct", content_hash=digest, document_hash=digest, raw_ref=raw_ref)
+        db.add(other_source)
+        db.flush()
+        db.add(ScoutFinding(job_id=other_job.id, source_id=other_source.id, title="other", what_happened="other", excerpt="HB 12 Filed", excerpt_hash="x", confidence="high", extractor_version="prior-v1"))
+        db.commit()
+    put_calls = {"count": 0}
+    original_put = runner.rawstore.put
+    monkeypatch.setattr(runner.rawstore, "put", lambda *args, **kwargs: (put_calls.__setitem__("count", put_calls["count"] + 1), original_put(*args, **kwargs))[1])
+    runner._candidates = lambda _db, _job: [_candidate(url=url)]
+    runner.process(job_id)
+    assert put_calls["count"] == 1
+    with sessions() as db:
+        source = db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalar_one()
+        assert source.retrieval_mechanism == "direct"
+        assert source.prior_source_id is None
+
+
+def test_changed_sources_record_cosmetic_then_material_bounded_summaries(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", b"HB 12 Filed"))
+    url = "https://www.flsenate.gov/Session/Bill/2026/12"
+    original = b"HB 12\nFiled"
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        prior_job = ScoutResearchJob(id=uuid.uuid4(), customer_id=job.customer_id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="completed", strategy={}, limits={}, usage={})
+        db.add(prior_job)
+        db.flush()
+        raw_ref = runner.rawstore.put(original, {"source_url": url})
+        digest = hashlib.sha256(original).hexdigest()
+        prior = ScoutSource(job_id=prior_job.id, canonical_url=url, official=True, retrieval_mechanism="direct", content_hash=digest, document_hash=digest, raw_ref=raw_ref)
+        db.add(prior)
+        db.commit()
+        prior_id = prior.id
+    cosmetic_id = runner._persist_capture(job_id, "initial-claim", None, "HB 12", "Filed", _candidate()[4], url, "direct", 200, "text/html", b"HB 12   Filed")
+    with sessions() as db:
+        cosmetic = db.get(ScoutSource, cosmetic_id)
+        assert (cosmetic.prior_source_id, cosmetic.change_kind) == (prior_id, "cosmetic")
+        assert len(cosmetic.change_summary) <= 180
+        job = db.get(ScoutResearchJob, job_id)
+        second = ScoutResearchJob(id=uuid.uuid4(), customer_id=job.customer_id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="second-claim", strategy={}, limits={}, usage={})
+        db.add(second)
+        db.commit()
+        second_id = second.id
+    material_id = runner._persist_capture(second_id, "second-claim", None, "HB 12", "Filed", _candidate()[4], url, "direct", 200, "text/html", b"HB 12 Filed with a material update")
+    with sessions() as db:
+        material = db.get(ScoutSource, material_id)
+        assert material.prior_source_id == cosmetic_id
+        assert material.change_kind == "material"
+        assert "first difference at" in material.change_summary
+
+
+def test_evidence_excerpt_allows_benign_navigation_login_when_exact_support_is_nearby(tmp_path):
+    runner, _sessions, _job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", b""))
+    text = "Home Login Committee HB 625 Chapter No. 2026-141 Official bill history"
+    metadata = {"identifier": "HB 625", "latest_action": "Chapter No. 2026-141"}
+    evidence = runner._evidence_excerpt(text, metadata, None)
+    assert evidence is not None
+    assert "login" in evidence[0].casefold() and "chapter no. 2026-141" in evidence[0].casefold()
 
 
 def test_solari_key_uses_explicit_environment_then_safe_local_file(tmp_path, monkeypatch):

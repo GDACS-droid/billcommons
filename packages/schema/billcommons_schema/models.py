@@ -1400,6 +1400,11 @@ class ScoutSource(UUIDPkMixin, Base):
     prior_source_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("scout_sources.id", ondelete="SET NULL"), nullable=True
     )
+    # A bounded, intentionally non-semantic comparison with prior_source_id.
+    # ``unchanged`` is used for safe cross-job reuse; ``cosmetic`` means only
+    # whitespace-normalized decoded text matched; ``material`` is conservative.
+    change_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    change_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         Index("ix_scout_sources_job", "job_id"),
