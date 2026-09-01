@@ -22,9 +22,12 @@ jurisdiction, not an arbitrary URL.
   page, action, routed-request, byte, concurrency, daily-runtime, and cleanup bounds.
 - Provider IDs and replay URLs are never public evidence. Replay resolution is
   owner-authorized operational context; safe logs contain normalized error classes.
-- Session creation, use, release uncertainty, replay, and usage are durable. Cleanup
-  runs on success/error/cancellation; leases, outcome-unknown heartbeats, an in-flight
-  registry, and the reaper cover timeout/process failure.
+- Sessions created through the Scout worker or durable lifecycle canary retain
+  creation, use, release uncertainty, replay, and usage state. Cleanup runs on
+  success/error/cancellation; leases, outcome-unknown heartbeats, an in-flight
+  registry, and the reaper cover timeout/process failure. The separate low-level
+  `solari-check` is an explicitly non-authoritative SDK smoke and is not lifecycle
+  or cleanup-recovery evidence.
 - Session creation is one-shot (`max_attempts=1`) because create has no idempotency
   key. If its outcome is unknown, Scout stops further browser escalation, charges a
   full session reservation, and holds a global slot from the outcome timestamp through
@@ -53,12 +56,16 @@ worst-case browser time before admission; terminal actual runtime replaces the
 reservation. Global live/cleanup-failed sessions consume durable slots. Request-
 budget exhaustion becomes a truthful partial result, never a false completion.
 
-There is no all-account queue byte ceiling in P0. Each raw blob is capped at 2 MiB by
-both application and database constraints; expired terminal staging rows and old
-unreferenced blobs are reaped behind a live-finalization barrier. The private cohort,
-per-owner quotas, serial worker, and global browser cap bound the canary. The explicit
-public flag must remain false until canary evidence supports a written global capacity
-and monitoring decision.
+Platform admission is serialized in PostgreSQL and caps active jobs, daily new jobs,
+and actual-plus-reserved browser runtime across all customers. Per-owner quotas still
+apply inside those ceilings. Admission also reserves every active job's worst-case
+remaining evidence bytes against the retained-store ceiling, so a job is rejected
+before retrieval or provider spend if the evidence contract cannot be met. Raw blobs
+are capped at 2 MiB each and the PostgreSQL store has a separate advisory-lock-protected
+retained-byte high-water mark; identical content is free, while a late concurrent
+capacity failure terminalizes truthfully as `rawstore_capacity_exceeded`. Expired
+terminal staging rows and old unreferenced blobs are reaped behind a live-finalization
+barrier; referenced evidence is never deleted merely to reclaim capacity.
 
 Scout evidence is immutable, SHA-256-addressed PostgreSQL data. Concurrent puts are
 idempotent; reads re-hash bytes before returning them. Fresh unresolved stages block
@@ -72,10 +79,14 @@ PDFs, XSS-safe rendering, CSRF/IDOR, duplicate/adversarial submissions, quotas,
 browser crash/cancel/timeout, cleanup failure/reaping, delayed replay, and related-
 document scope/dedupe/change. The guarded API/shared suite now refuses any database
 other than an explicitly acknowledged local `_test` Postgres target. The final
-isolated API/shared/Scout suites total 801 passing tests.
+backend/operations suites total 862 passing tests with 8 explicit skips; the web
+contract adds 10 passing tests plus lint, typecheck, and production build.
 
-Fresh independent review found no open critical/high Scout code issue. Production
-secret scope, service bindings, database revision, backup/restore, termination grace,
-and monitoring still require verification during an authorized dark-deploy window.
+Fresh independent review found no open critical/high Scout code issue. The authorized
+dark window verified the pinned API/worker artifacts, named-account/private-only
+bindings, additive `0025` revision, 300-second worker grace, service/read-path
+monitoring, a durable released Solari session, and feature-off rollback reconciliation.
+The dated production backup and disposable restore evidence is recorded in
+`PRODUCTION_CANARY.md`.
 The pre-existing local magic-link fallback logging behavior is outside Scout; Resend
 must be configured correctly before production account flows take traffic.

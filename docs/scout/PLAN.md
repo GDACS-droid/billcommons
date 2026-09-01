@@ -7,6 +7,9 @@ Locked goal: ship a native, evidence-first Scout vertical slice with existing-da
 3. M2–M10 additive schema, owner-scoped API, worker/router/providers, provenance, native UI, caching/change/security, and deterministic PostgreSQL E2E — done.
 4. M11 live Solari smoke — done; authentication, one-session browser lifecycle, recording/replay, cleanup, and the opt-in PostgreSQL/API browser escalation were verified. The final post-repair provider smoke also passed with one recorded session and confirmed cleanup.
 5. M12–M14 Florida smoke, analytics, production-mode visual proof, and external visual review — done; material visual feedback was repaired and screenshots recaptured.
-6. M15–M17 final adversarial review, public cookbook example, submission material, regression, and release preflight — done for the challenge artifact; the final race/cleanup adversary returned SHIP. Public demo/post remain human publishing actions. General production enablement remains NOT READY and is not authorized.
+6. M15–M17 final adversarial review, public cookbook example, submission material,
+   regression, release preflight, dark deploy, named production canary, and exact-image
+   rollback rehearsal — done. Public API/web/navigation enablement and the challenge
+   post remain explicit owner actions.
 
 P0 is Florida-focused and authenticated-only. P1 watches/notifications and P2 breadth cannot delay the vertical slice.

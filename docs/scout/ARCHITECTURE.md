@@ -45,7 +45,10 @@ authenticated request
 - `scout_browser_sessions`: provider/session ID, recording/replay fields, pages/actions/runtime, timestamps, terminal status, normalized error. Never secrets.
 - `scout_raw_blobs`: SHA-256-keyed immutable bytes plus bounded first-observation metadata. The primary key makes concurrent `put` idempotent; sources retain their own URL/tenant provenance separately.
 
-The first migration is additive and reversible by dropping only these new objects. Production migration/deploy is not authorized by this build request.
+The Scout migrations are additive and production is now at revision `0025`. Runtime
+rollback retains these objects and their evidence; it disables new work, drains and
+reaps the worker, and restores the prior compatible application artifact. Dropping
+Scout objects is destructive and is not part of the rollback procedure.
 
 ## Research router
 

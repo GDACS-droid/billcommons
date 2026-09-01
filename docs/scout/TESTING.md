@@ -7,13 +7,15 @@ and Solari checks are explicit opt-ins and never CI defaults.
 
 | Gate | Result |
 | --- | --- |
-| Guarded API suite | **563 passed, 8 skipped, 1 warning** in 21.66s |
-| Shared suite | **153 passed, 1 warning** in 15.74s |
-| Scout worker suite (including Postgres proofs) | **85 passed, 9 warnings** in 6.54s |
-| Native-suite total | **801 passed, 8 skipped, 11 warnings** |
+| Guarded API suite | **571 passed, 8 skipped, 1 warning** |
+| Shared suite | **165 passed, 1 warning** |
+| Scout worker suite (including Postgres proofs) | **96 passed, 9 warnings** |
+| Monitoring suite | **4 passed** |
+| Production operator scripts | **26 passed** |
+| Backend/operations total | **862 passed, 8 skipped, 11 warnings** |
 | Focused source/session repair | **28 passed** |
 | Public cookbook deterministic contracts | **12 passed** |
-| Web Scout contract | **8 passed** |
+| Web Scout contract | **10 passed** |
 | Targeted web ESLint | pass |
 | TypeScript `--noEmit` | pass |
 | Next production build | pass; `/scout` emitted |
@@ -25,6 +27,12 @@ and Solari checks are explicit opt-ins and never CI defaults.
 The broad suite's eight skips are explicitly optional integrations/live checks. Its
 warnings are Starlette/httpx, future cryptography certificate parsing, and Python
 3.12 SQLite fixture date/datetime adapter deprecations; no assertion failed.
+
+These counts were reacquired after the dark-route, durable Solari lifecycle,
+strict-limit, platform-capacity, migration-runner, monitoring, and drain hardening commits. The web
+lint, typecheck, and build gate was also rerun sequentially after the contract tests;
+running TypeScript and Next build concurrently is intentionally avoided because both
+mutate/read `.next` generated state.
 
 ## Covered behavior
 
@@ -64,7 +72,7 @@ PYTHONPATH=workers/scout:packages/schema:packages/shared \
 
 cd apps/web
 npm run test:scout
-npx eslint components/scout/ScoutExperience.tsx components/SiteHeader.tsx
+npx eslint components/scout/ScoutExperience.tsx components/SiteHeader.tsx lib/scoutAccess.ts middleware.ts
 npx tsc --noEmit
 npm run build
 ```

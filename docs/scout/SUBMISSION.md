@@ -72,8 +72,8 @@ python3 -m unittest discover -s tests -v
 python3 main.py
 ```
 
-The latest native isolated Bill Commons suites total **801 passed / 8 skipped**,
-with 8 passing web contracts plus passing targeted lint, TypeScript, production build,
+The latest backend/operations Bill Commons suites total **862 passed / 8 skipped**,
+with 10 passing web contracts plus passing targeted lint, TypeScript, production build,
 PostgreSQL concurrency/restart/vertical storage proof, live Florida discovery, and a
 post-repair live Solari product-path lifecycle. Exact commands are in
 [TESTING.md](TESTING.md).
@@ -119,8 +119,9 @@ usefulness metrics yet. Do not fabricate them.
   additional policy and tests.
 - Scout blobs in Postgres are appropriate for bounded P0 volume; object storage is a
   future scale step behind the existing interface.
-- Production enablement still requires authorized Railway inventory, one migration
-  runner, and a current backup/restore drill. Deployment is not authorized.
+- Scout is dark-deployed behind a one-account server allowlist. Production inventory,
+  additive migration, backup/restore, monitoring, and exact-image rollback are proven;
+  public API/web/navigation enablement still requires explicit owner authorization.
 - Stripe live-account webhook verification is separate and incomplete.
 
 ## Recommended X post — owner sends later

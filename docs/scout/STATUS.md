@@ -5,10 +5,10 @@ Updated 2026-09-01.
 ## Decision
 
 - Challenge artifact: **SHIP** once the owner authorizes the post.
-- Scout application code: **READY FOR DARK DEPLOY / PRIVATE CANARY**.
-- Public production enablement: **CONDITIONAL** on authorized Railway inventory,
-  one production migration runner, and a current backup/restore drill. No deployment
-  was attempted.
+- Scout application: **PRODUCTION-READY; DARK DEPLOYED**.
+- Named private production canary: **PASS**.
+- Rollback rehearsal: **VERIFIED** against the final backend artifact.
+- Public production enablement: **OFF; requires explicit owner authorization**.
 
 ## Completed milestones
 
@@ -33,7 +33,7 @@ Updated 2026-09-01.
 - Florida checks Bill Commons first, then admitted Senate sources. A bill page can
   discover same-session/same-bill official analyses and amendments; ordinary HTTP
   remains preferred.
-- Browser escalation is allowlisted and quota-bound. Every provider session has a
+- Browser escalation is allowlisted and quota-bound. Every Scout worker/durable-canary provider session has a
   durable row, recording state, usage, bounded cleanup, and reaper recovery.
 - Scout evidence uses PostgreSQL `scout_raw_blobs`, not a cross-service filesystem
   mount. Blobs are capped at 2 MiB in application and schema, and expired unverified
@@ -46,10 +46,10 @@ Updated 2026-09-01.
 
 ## Latest verification
 
-- Native isolated suites total **801 passed, 8 skipped, 11 dependency/fixture
-  deprecation warnings**: API 563 passed / 8 skipped, shared 153 passed, Scout
-  worker 85 passed.
-- Web: **8 passed**; targeted ESLint, TypeScript, and Next production build passed.
+- Backend/operations suites total **862 passed, 8 skipped, 11 dependency/fixture
+  deprecation warnings**: API 571/8, shared 165, Scout worker 96, monitoring 4,
+  operator scripts 26.
+- Web: **10 passed**; targeted ESLint, TypeScript, and Next production build passed.
 - PostgreSQL store: concurrent two-instance put, database size constraint, and an
   API-created job read by a fresh store instance passed.
 - Live Florida discovery: passed; HB 625 bill evidence and at least one official
@@ -58,18 +58,27 @@ Updated 2026-09-01.
   recording/replay available; cleanup confirmed.
 - Live Bill Commons provider path after lifecycle repair: passed in 7.86s with one
   real Solari session and a released terminal ledger state.
+- Production durable lifecycle canary: passed in 9.291s; 1 page, 1 action,
+  19 routed requests, source/raw/hash retained, no finding, replay available,
+  released terminal ledger, and zero cleanup exceptions.
+- Production direct canary: completed with 3 findings/3 official sources; duplicate
+  request reused the cached job without new retrieval or browser spend.
+- Migration: production `0021` → additive `0025`; controlled runner now fail-closed.
+- Backup/restore: pre-migration and post-canary full dumps restored to disposable
+  PostgreSQL 18; the reconciled recovery set matches all corpus/Scout counts, usage,
+  and five blob hashes.
+- Operations: final `8dc0ce36` API/Scout deployments are `SUCCESS`; service monitor
+  7/7 and read monitor 5/5 healthy; exact-image feature-off reconciliation/reaper
+  counters all zero.
 - Demo: H.264 1440×900, 20.16s, 504 frames, fully decoded and visually inspected.
 
-## Remaining human/external release evidence
+## Remaining human actions
 
-1. Confirm the real Railway Scout service, command, artifact, replicas, termination
-   grace, and dark environment variables.
-2. Name one authorized migration runner and record production pre/post revision.
-3. Create and restore a current production dump to a fresh disposable target; verify
-   a Scout blob hashes to its key.
-4. Before all-account expansion, record global queue/blob capacity and enable the
-   separate public/nav flags deliberately.
-5. Explicitly authorize deployment and later social publication.
+1. Explicitly authorize public API/web/navigation enablement. Platform admission now
+   caps active jobs, daily jobs, daily browser runtime, and retained evidence globally,
+   but the rollout flags remain deliberately false.
+2. Separately authorize the challenge social publication when ready.
 
 Stripe live-account webhook access is tracked separately and does not gate Scout.
-See [CLOSEOUT.md](CLOSEOUT.md) for every final disposition.
+See [PRODUCTION_CANARY.md](PRODUCTION_CANARY.md) for exact evidence and
+[CLOSEOUT.md](CLOSEOUT.md) for every final disposition.

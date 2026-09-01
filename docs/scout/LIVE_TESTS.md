@@ -84,8 +84,20 @@ connection through `ScoutRunner`, retains the official source and raw bytes, and
 uses the ordinary release/reaper path. It deliberately creates **no finding** and
 is one-shot once terminal for that account. The command's fixed output omits account,
 job, provider-session, source URL/body, cookies, replay, and capability details.
-This command has deterministic test coverage only at this point; no additional live
-provider call has been made by this change.
+The production named-account canary ran this durable path once. It completed in
+**9.291 seconds** with 1 page, 1 action, and 19 routed requests. The job and source
+were retained with official/raw/hash provenance; the browser ledger reached
+`released`, `released_at` was present, replay was available, and the canary created
+no finding. Global `cleanup_failed`, `reaping`, and `abandoned` counts were all zero.
+A repeat invocation returned `provider_call=skipped`, proving the terminal one-shot
+guard without spending another browser session. The ordinary reaper then reported
+zero eligible sessions and zero expired staging/blob work.
+
+At the current first-party rates above, that measured durable lifecycle costs about
+**$0.00039 Free**, **$0.00026 Starter**, or **$0.00018 Professional**. At the same
+runtime, $3 of Free credit is roughly 7,700 sessions and Starter's 200 browser-hours
+is roughly 77,000 sessions. These are arithmetic estimates, not billing guarantees;
+the actual product cache hit uses no browser runtime.
 
 After the final single-owner lifecycle repair, the opt-in real product-path test ran
 one Solari session through the Bill Commons runner in **7.86 seconds** and verified a

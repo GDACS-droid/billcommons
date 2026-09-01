@@ -20,18 +20,31 @@ local dev DB with production-shaped data).
 
 ## Manual `pg_dump` backup
 
+Use a `pg_dump` client with the same major version as production. The current
+production server is PostgreSQL 18, so the verified operator path uses
+`/usr/lib/postgresql/18/bin/pg_dump`. Run against the Postgres service's TCP
+proxy binding; an API/worker `DATABASE_URL` can name Railway's private DNS and
+is not necessarily reachable from the operator machine.
+
 ```bash
-# Never echo DATABASE_URL to a shell history file or log — pull it from
-# Railway directly into the command.
-railway run --service api pg_dump "$DATABASE_URL" \
-  --format=custom --no-owner --no-acl \
-  --file="billcommons-$(date +%Y%m%d).dump"
+umask 077
+railway run --service Postgres --no-local -- bash -lc '
+  export PGHOST="$RAILWAY_TCP_PROXY_DOMAIN"
+  export PGPORT="$RAILWAY_TCP_PROXY_PORT"
+  exec /usr/lib/postgresql/18/bin/pg_dump \
+    --format=custom --no-owner --no-acl \
+    --file="$1"
+' _ "$PWD/billcommons-YYYYMMDD.dump"
+
+# Do not hash or restore until pg_dump has actually exited successfully.
+/usr/lib/postgresql/18/bin/pg_restore \
+  --list "$PWD/billcommons-YYYYMMDD.dump" >/dev/null
+sha256sum "$PWD/billcommons-YYYYMMDD.dump"
 ```
 
-(Or, if you already have `DATABASE_URL` exported locally for a one-off
-task per the local-dev setup in the README: `pg_dump "$DATABASE_URL"
---format=custom --no-owner --no-acl --file=backup.dump` — same command,
-just without the `railway run` wrapper.)
+This keeps the password out of command arguments and output. The Railway
+subprocess receives `PGUSER`, `PGPASSWORD`, and `PGDATABASE` from the Postgres
+service binding; never print that environment.
 
 `--format=custom` produces a compressed, `pg_restore`-only file (not plain
 SQL) — smaller and supports selective/parallel restore. `--no-owner
@@ -40,30 +53,36 @@ SQL) — smaller and supports selective/parallel restore. `--no-owner
 
 ## Restore procedure (to a fresh DB)
 
-1. **Provision a fresh Postgres** (a new Railway Postgres plugin, or any
-   Postgres 16 instance with `pg_trgm`/`unaccent` extensions available —
-   see `packages/schema/alembic` migration `0001` which creates them).
+1. **Provision a fresh Postgres** with a server major version at least as new
+   as the dump source (currently PostgreSQL 18) and with `pg_trgm`/`unaccent`
+   extensions available — see migration `0001`.
 2. **Restore the dump**:
    ```bash
-   pg_restore --format=custom --no-owner --no-acl \
-     --dbname="$NEW_DATABASE_URL" \
-     billcommons-YYYYMMDD.dump
+   railway run --service <DISPOSABLE_POSTGRES> --no-local -- bash -lc '
+     export PGHOST="$RAILWAY_TCP_PROXY_DOMAIN"
+     export PGPORT="$RAILWAY_TCP_PROXY_PORT"
+     export PGDATABASE=<FRESH_DISPOSABLE_DATABASE>
+     exec /usr/lib/postgresql/18/bin/pg_restore \
+       --exit-on-error --format=custom --no-owner --no-acl \
+       --dbname="$PGDATABASE" "$1"
+   ' _ "$PWD/billcommons-YYYYMMDD.dump"
    ```
-3. **Stamp Alembic** so future migrations apply correctly against the
-   restored DB (a `pg_dump --format=custom` restore already includes the
-   `alembic_version` table's data, so this step is typically a no-op
-   verification, not a real stamp — confirm before assuming):
+   Wait for `pg_restore` itself to exit successfully before querying the
+   target; a yielded terminal session is not completion evidence.
+3. **Verify Alembic; do not stamp by default.** A full custom-format restore
+   includes the source `alembic_version` row. Check it against the dump's
+   recorded revision:
    ```bash
    cd packages/schema
    DATABASE_URL="$NEW_DATABASE_URL" ../../.venv/bin/alembic current
-   # if the table is somehow missing/empty (e.g. you restored a
-   # schema-only dump), stamp it explicitly at the version matching the
-   # dump's actual schema state:
-   DATABASE_URL="$NEW_DATABASE_URL" ../../.venv/bin/alembic stamp head
    ```
+   An absent revision is a failed full-restore drill. Only a separately
+   reviewed schema-only workflow may stamp a proven matching revision.
 4. **Point a service at it**: update `DATABASE_URL` (Railway variable or
    local `~/.config/billcommons/.env`) and restart the service.
-5. **Sanity-check**: `GET /api/v1/health` and `/api/v1/ready` against the
+5. **Sanity-check**: compare safe aggregate row counts with the source, verify
+   every retained `scout_raw_blobs.data` value hashes to its `sha256` key,
+   then run `GET /api/v1/health` and `/api/v1/ready` against the
    restored target, plus a spot search (`/api/v1/search?q=...`) to confirm
    the FTS/trigram indexes came through intact (they're part of the schema,
    not separately maintained — `pg_restore` recreates them from the dump's

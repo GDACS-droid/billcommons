@@ -78,9 +78,9 @@ npx -y @railway/cli deployment list -s <SCOUT_SERVICE> --json --limit 5
 
 If the Scout service is not present, stop the Scout rollout. Creating or
 naming it is a control-plane change and must be explicitly recorded. The
-service-state monitor currently has no Scout entry; add and validate Scout
-monitoring before enabling public traffic rather than assuming the existing
-monitor covers it.
+service-state monitor includes `scout-worker`; validate that its exact Railway
+service name still matches the live topology and require a healthy monitor run
+before enabling any cohort.
 
 Confirm the API remains one replica before public traffic. The current
 in-process API-key/quota counters do not remain globally authoritative across
@@ -415,9 +415,10 @@ done
 
 Run the documented MCP tool probe from [incident-runbook.md](incident-runbook.md#4-verify-recovery--five-endpoints-not-one).
 For background services, verify the latest deployment is `SUCCESS` and that
-the expected service list includes the new Scout service before calling the
-rollout healthy. Existing `service_state_monitor.py` does not currently list
-Scout; that is a blocking monitoring gap, not a green signal.
+the expected service list includes `scout-worker` before calling the rollout
+healthy. `service_state_monitor.py` monitors Scout alongside the existing
+workers; a missing or non-success Scout deployment is therefore a failing
+signal, not an omitted service.
 
 For a Scout-enabled cohort, also collect without leaking source text, replay
 URLs, session IDs, or customer identities:
@@ -476,16 +477,17 @@ Rollback actions/evidence, if any: <...>
 Follow-ups with owner/date: <...>
 ```
 
-## Preconditions that currently block a general production Scout launch
+## Conditions for public Scout enablement
 
-This runbook makes gaps visible; it does not make them disappear. Before a
-general public Scout launch, resolve and prove at least these conditions:
+The 2026-09-01 dark deploy closed the infrastructure gates for a controlled Scout
+rollout: the exact Railway API/worker artifacts and PostgreSQL RawStore binding are
+recorded, Scout participates in service-state monitoring, the named-account canary
+and exact-image rollback rehearsal passed, current backups restored in isolation,
+and the full deterministic regression gate is green. See
+`docs/scout/PRODUCTION_CANARY.md` for the immutable evidence.
 
-1. the real Railway Scout service, its pinned artifact mapping, and proof that it
-   uses the migrated PostgreSQL Scout RawStore backend;
-2. Scout inclusion in service-state/alerting and an agreed canary mechanism;
-3. a current production backup plus successful isolated restore drill;
-4. a green, isolated full regression gate or documented triage of unrelated
-   failures; and
-5. Stripe webhook and completed paid-provisioning proof for any billing
-   release in scope.
+Public enablement still requires an explicit release-owner decision and the staged
+flag procedure in this runbook. Stripe webhook and paid-provisioning proof are a
+separate prerequisite only when a billing or pricing release is in scope; they do
+not block the already-authorized Scout private canary or a separately authorized
+non-billing Scout rollout.
