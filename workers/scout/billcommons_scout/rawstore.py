@@ -10,18 +10,23 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
+from contextlib import contextmanager
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from billcommons_schema.models import ScoutRawBlob
+from billcommons_shared.scout import DEFAULT_MAX_RETAINED_RAWSTORE_BYTES
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_METADATA_BYTES = 4 * 1024
 MAX_SCOUT_RAW_BLOB_BYTES = 2 * 1024 * 1024
+_RAWSTORE_CAPACITY_LOCK_KEY = 81_420_903
+_sqlite_rawstore_capacity_lock = threading.RLock()
 
 
 class PostgresScoutRawStore:
@@ -32,8 +37,36 @@ class PostgresScoutRawStore:
     never rewrites the shared immutable blob record.
     """
 
-    def __init__(self, sessions: sessionmaker[Session]) -> None:
+    def __init__(
+        self,
+        sessions: sessionmaker[Session],
+        *,
+        max_retained_bytes: int = DEFAULT_MAX_RETAINED_RAWSTORE_BYTES,
+    ) -> None:
+        if (
+            isinstance(max_retained_bytes, bool)
+            or not isinstance(max_retained_bytes, int)
+            or max_retained_bytes <= 0
+        ):
+            raise ValueError("scout_rawstore_retained_capacity_invalid")
         self.sessions = sessions
+        self.max_retained_bytes = max_retained_bytes
+
+    @contextmanager
+    def _capacity_lock(self, db: Session):
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _RAWSTORE_CAPACITY_LOCK_KEY})
+            yield
+            return
+        with _sqlite_rawstore_capacity_lock:
+            yield
+
+    @staticmethod
+    def _retained_bytes(db: Session) -> int:
+        length = func.octet_length(ScoutRawBlob.data)
+        if db.bind is not None and db.bind.dialect.name != "postgresql":
+            length = func.length(ScoutRawBlob.data)
+        return int(db.scalar(select(func.coalesce(func.sum(length), 0))) or 0)
 
     @staticmethod
     def _key(data: bytes) -> str:
@@ -64,19 +97,26 @@ class PostgresScoutRawStore:
         key = self._key(payload)
         metadata = self._metadata(meta)
         with self.sessions() as db:
-            db.add(ScoutRawBlob(sha256=key, data=payload, metadata_json=metadata))
-            try:
-                db.commit()
-                return key
-            except IntegrityError:
-                # A concurrent identical put won the primary-key race. Roll
-                # back only this independent blob transaction, then verify the
-                # authoritative stored bytes before accepting its key.
-                db.rollback()
+            with self._capacity_lock(db):
                 existing = db.get(ScoutRawBlob, key)
-                if existing is None or self._key(bytes(existing.data)) != key:
-                    raise RuntimeError("scout_rawstore_hash_conflict")
-                return key
+                if existing is not None:
+                    if self._key(bytes(existing.data)) != key:
+                        raise RuntimeError("scout_rawstore_hash_conflict")
+                    return key
+                if self._retained_bytes(db) + len(payload) > self.max_retained_bytes:
+                    raise ValueError("scout_rawstore_capacity_exceeded")
+                db.add(ScoutRawBlob(sha256=key, data=payload, metadata_json=metadata))
+                try:
+                    db.commit()
+                    return key
+                except IntegrityError:
+                    # The advisory lock covers normal Scout writers. Preserve
+                    # idempotency if an external/legacy writer won the key.
+                    db.rollback()
+                    existing = db.get(ScoutRawBlob, key)
+                    if existing is None or self._key(bytes(existing.data)) != key:
+                        raise RuntimeError("scout_rawstore_hash_conflict")
+                    return key
 
     def get(self, key: str) -> bytes:
         if not self._valid_key(key):

@@ -48,6 +48,10 @@ def test_scout_settings_preserve_absent_defaults_and_parse_enabled_api_worker_li
     assert defaults.max_query_chars == 500
     assert defaults.max_direct_bytes == 2 * 1024 * 1024
     assert defaults.max_external_requests == 5
+    assert defaults.platform_max_active_jobs == 10
+    assert defaults.platform_max_daily_jobs == 100
+    assert defaults.platform_max_daily_browser_seconds == 3_600
+    assert defaults.max_retained_rawstore_bytes == 512 * 1024 * 1024
 
     monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "yes")
     monkeypatch.setenv("BILLCOMMONS_SCOUT_ALLOW_PUBLIC", "0")
@@ -62,6 +66,27 @@ def test_scout_settings_preserve_absent_defaults_and_parse_enabled_api_worker_li
     assert settings.max_query_chars == 480
     assert settings.max_external_requests == 3
     assert settings.browser_wall_seconds == 45
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "BILLCOMMONS_SCOUT_PLATFORM_MAX_ACTIVE_JOBS",
+        "BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_JOBS",
+        "BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_BROWSER_SECONDS",
+        "BILLCOMMONS_SCOUT_MAX_RETAINED_RAWSTORE_BYTES",
+    ),
+)
+def test_enabled_scout_rejects_invalid_platform_capacity_settings(monkeypatch, name):
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "1")
+    monkeypatch.setenv(name, "0")
+    with pytest.raises(ValueError, match=name):
+        ScoutSettings.from_env()
+
+
+def test_scout_settings_reject_direct_invalid_platform_capacity():
+    with pytest.raises(ValueError, match="platform_max_active_jobs"):
+        ScoutSettings(enabled=True, platform_max_active_jobs=0)
 
 
 @pytest.mark.parametrize(

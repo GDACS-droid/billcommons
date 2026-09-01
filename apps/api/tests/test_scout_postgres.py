@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from fastapi import HTTPException, Response
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, delete, select, text
+from sqlalchemy import create_engine, delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
@@ -246,6 +246,15 @@ def scout_api(monkeypatch, pg_scout: PostgresScoutHarness):
 
 def _direct_request() -> Request:
     return Request({"type": "http", "method": "POST", "path": "/api/v1/scout/jobs", "headers": []})
+
+
+def _direct_request_for(customer: ApiCustomer) -> Request:
+    return Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/api/v1/scout/jobs",
+        "headers": [(b"x-test-customer", str(customer.id).encode())],
+    })
 
 
 def test_postgres_vertical_slice_api_owner_runner_provenance_and_constraints(
@@ -683,6 +692,122 @@ def test_postgres_simultaneous_distinct_submissions_reserve_daily_browser_budget
 
     assert results.count("created") == 1
     assert results.count("limited") == 1
+
+
+def test_postgres_platform_active_capacity_is_atomic_across_customers(
+    monkeypatch, pg_scout: PostgresScoutHarness, scout_api
+):
+    customers = [pg_scout.customer(f"platform-active-{number}") for number in range(2)]
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_PLATFORM_MAX_ACTIVE_JOBS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_JOBS", "10")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_BROWSER_SECONDS", "800")
+    monkeypatch.setattr(
+        scout,
+        "_require_session",
+        lambda request, db: db.get(ApiCustomer, uuid.UUID(request.headers["x-test-customer"])),
+    )
+    barrier = threading.Barrier(2)
+
+    def submit(index: int) -> str:
+        with pg_scout.sessions() as db:
+            barrier.wait(timeout=10)
+            try:
+                result = scout.create_job(
+                    scout.CreateScoutJob(query=f"platform active topic {index}", jurisdiction="FL"),
+                    _direct_request_for(customers[index]), Response(), db,
+                )
+                return "created" if not result["coalesced"] else "coalesced"
+            except HTTPException as exc:
+                assert exc.status_code == 429
+                assert exc.detail["code"] == "scout_platform_active_job_limit"
+                return "limited"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(submit, range(2)))
+    assert sorted(outcomes) == ["created", "limited"]
+    with pg_scout.sessions() as db:
+        assert db.scalar(select(func.count()).select_from(ScoutResearchJob).where(
+            ScoutResearchJob.status.in_(("queued", "running"))
+        )) == 1
+
+
+def test_postgres_platform_daily_job_limit_refuses_without_partial_write(
+    monkeypatch, pg_scout: PostgresScoutHarness, scout_api
+):
+    first, second = pg_scout.customer("platform-daily-first"), pg_scout.customer("platform-daily-second")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_PLATFORM_MAX_ACTIVE_JOBS", "10")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_JOBS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_BROWSER_SECONDS", "800")
+    monkeypatch.setattr(
+        scout,
+        "_require_session",
+        lambda request, db: db.get(ApiCustomer, uuid.UUID(request.headers["x-test-customer"])),
+    )
+    with pg_scout.sessions() as db:
+        first_result = scout.create_job(
+            scout.CreateScoutJob(query="platform daily first", jurisdiction="FL"),
+            _direct_request_for(first), Response(), db,
+        )
+        assert first_result["coalesced"] is False
+    with pg_scout.sessions() as db:
+        with pytest.raises(HTTPException) as limited:
+            scout.create_job(
+                scout.CreateScoutJob(query="platform daily second", jurisdiction="FL"),
+                _direct_request_for(second), Response(), db,
+            )
+        assert limited.value.status_code == 429
+        assert limited.value.detail["code"] == "scout_platform_daily_job_limit"
+        assert db.scalar(select(func.count()).select_from(ScoutResearchJob)) == 1
+
+
+def test_postgres_platform_browser_reservation_and_terminal_release(
+    monkeypatch, pg_scout: PostgresScoutHarness, scout_api
+):
+    first, second = pg_scout.customer("platform-browser-first"), pg_scout.customer("platform-browser-second")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_PLATFORM_MAX_ACTIVE_JOBS", "2")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_JOBS", "10")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_BROWSER_SECONDS", "3")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_EXTERNAL_REQUESTS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_WALL_SECONDS", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_BROWSER_CLEANUP_SECONDS", "1")
+    monkeypatch.setattr(
+        scout,
+        "_require_session",
+        lambda request, db: db.get(ApiCustomer, uuid.UUID(request.headers["x-test-customer"])),
+    )
+    with pg_scout.sessions() as db:
+        created = scout.create_job(
+            scout.CreateScoutJob(query="platform browser first", jurisdiction="FL"),
+            _direct_request_for(first), Response(), db,
+        )
+        assert created["coalesced"] is False
+    with pg_scout.sessions() as db:
+        with pytest.raises(HTTPException) as limited:
+            scout.create_job(
+                scout.CreateScoutJob(query="platform browser second", jurisdiction="FL"),
+                _direct_request_for(second), Response(), db,
+            )
+        assert limited.value.status_code == 429
+        assert limited.value.detail["code"] == "scout_platform_daily_browser_limit"
+        assert db.scalar(select(func.count()).select_from(ScoutResearchJob)) == 1
+        job = db.get(ScoutResearchJob, uuid.UUID(created["job"]["id"]))
+        job.status = "completed"
+        job.completed_at = datetime.now(timezone.utc)
+        job.fresh_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        db.commit()
+    # Terminal jobs release active capacity; cache reuse remains free and
+    # creates no row before another customer consumes the freed slot.
+    with pg_scout.sessions() as db:
+        cached = scout.create_job(
+            scout.CreateScoutJob(query="platform browser first", jurisdiction="FL"),
+            _direct_request_for(first), Response(), db,
+        )
+        assert cached["coalesced"] is True and cached["cached"] is True
+        released = scout.create_job(
+            scout.CreateScoutJob(query="platform browser second", jurisdiction="FL"),
+            _direct_request_for(second), Response(), db,
+        )
+        assert released["coalesced"] is False
 
 
 def test_postgres_global_browser_cap_and_reaper_claim_are_cross_runner_atomic(tmp_path, pg_scout: PostgresScoutHarness):

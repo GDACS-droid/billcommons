@@ -60,11 +60,14 @@ def _safe_solari_diagnostic(exc: BaseException, *, fallback_phase: str) -> str:
     return " ".join(fields)
 
 
-def _rawstore():
+def _rawstore(settings: ScoutSettings | None = None):
     """Return Scout's service-independent store, with an explicit local escape hatch."""
     backend = os.environ.get("BILLCOMMONS_SCOUT_RAWSTORE_BACKEND", "postgres").strip().casefold()
     if backend == "postgres":
-        return PostgresScoutRawStore(get_sessionmaker())
+        configured = settings or ScoutSettings.from_env()
+        return PostgresScoutRawStore(
+            get_sessionmaker(), max_retained_bytes=configured.max_retained_rawstore_bytes
+        )
     if backend == "filesystem" and os.environ.get("BILLCOMMONS_SCOUT_ALLOW_FILESYSTEM_RAWSTORE") == "1":
         # Compatibility only for local tests/dev. Production must not silently
         # couple Scout to an ingest-service mounted volume.
@@ -73,7 +76,10 @@ def _rawstore():
 
 
 def _runner() -> ScoutRunner:
-    return ScoutRunner(get_sessionmaker(), _rawstore(), SolariResearchBrowserProvider())
+    settings = ScoutSettings.from_env()
+    return ScoutRunner(
+        get_sessionmaker(), _rawstore(settings), SolariResearchBrowserProvider(), settings=settings
+    )
 
 
 def _operator_canary_customer_id(email: str) -> uuid.UUID | None:

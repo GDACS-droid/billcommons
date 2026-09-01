@@ -2357,7 +2357,7 @@ def test_readiness_check_exercises_required_dependencies_without_echoing_configu
         def execute(self, _statement): return None
 
     class Store:
-        def __init__(self, _sessions): self.checked = False
+        def __init__(self, _sessions, **_kwargs): self.checked = False
         def healthcheck(self):
             self.checked = True
             return True
@@ -2379,7 +2379,7 @@ def test_readiness_rejects_configured_solari_without_sdk(monkeypatch, capsys):
         def execute(self, _statement): return None
 
     class Store:
-        def __init__(self, _sessions): pass
+        def __init__(self, _sessions, **_kwargs): pass
         def healthcheck(self): return True
 
     monkeypatch.setattr(scout_cli, "get_sessionmaker", lambda: lambda: Db())
@@ -2394,10 +2394,11 @@ def test_readiness_rejects_configured_solari_without_sdk(monkeypatch, capsys):
 
 
 def test_scout_rawstore_defaults_to_postgres_and_filesystem_needs_explicit_local_override(monkeypatch):
-    calls: list[str] = []
+    calls: list[object] = []
 
     class PostgresStore:
-        def __init__(self, _sessions): calls.append("postgres")
+        def __init__(self, _sessions, *, max_retained_bytes):
+            calls.append(("postgres", max_retained_bytes))
 
     class FilesystemStore:
         def __init__(self): calls.append("filesystem")
@@ -2407,13 +2408,14 @@ def test_scout_rawstore_defaults_to_postgres_and_filesystem_needs_explicit_local
     monkeypatch.setattr(scout_cli, "FilesystemRawStore", FilesystemStore)
     monkeypatch.delenv("BILLCOMMONS_SCOUT_RAWSTORE_BACKEND", raising=False)
     monkeypatch.delenv("BILLCOMMONS_SCOUT_ALLOW_FILESYSTEM_RAWSTORE", raising=False)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_RETAINED_RAWSTORE_BYTES", "4096")
     scout_cli._rawstore()
     monkeypatch.setenv("BILLCOMMONS_SCOUT_RAWSTORE_BACKEND", "filesystem")
     with pytest.raises(RuntimeError, match="invalid_scout_rawstore_backend"):
         scout_cli._rawstore()
     monkeypatch.setenv("BILLCOMMONS_SCOUT_ALLOW_FILESYSTEM_RAWSTORE", "1")
     scout_cli._rawstore()
-    assert calls == ["postgres", "filesystem"]
+    assert calls == [("postgres", 4096), "filesystem"]
 
 
 def test_rollback_reconcile_is_idempotent_and_preserves_fresh_claim(tmp_path):

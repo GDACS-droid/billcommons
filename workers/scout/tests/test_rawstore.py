@@ -62,6 +62,22 @@ def test_postgres_scout_rawstore_rejects_invalid_keys_and_oversized_metadata(tmp
         engine.dispose()
 
 
+def test_postgres_scout_rawstore_capacity_rejects_new_bytes_but_keeps_identical_put_free(tmp_path):
+    store, second, sessions, engine = _store(tmp_path)
+    limited = PostgresScoutRawStore(sessions, max_retained_bytes=6)
+    try:
+        key = limited.put(b"four")
+        assert limited.put(b"four", {"repeat": True}) == key
+        with pytest.raises(ValueError, match="capacity_exceeded"):
+            second_with_limit = PostgresScoutRawStore(sessions, max_retained_bytes=6)
+            second_with_limit.put(b"more")
+        with sessions() as db:
+            rows = db.execute(select(ScoutRawBlob)).scalars().all()
+            assert [row.sha256 for row in rows] == [key]
+    finally:
+        engine.dispose()
+
+
 def test_postgres_scout_rawstore_healthcheck_is_read_only(tmp_path):
     store, _second, sessions, engine = _store(tmp_path)
     try:
@@ -140,4 +156,63 @@ def test_postgres_scout_rawstore_two_instances_concurrent_put_and_restart():
             if row is not None:
                 db.delete(row)
                 db.commit()
+        engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("BILLCOMMONS_TEST_POSTGRES_URL"),
+    reason="set BILLCOMMONS_TEST_POSTGRES_URL to run PostgreSQL Scout RawStore capacity coverage",
+)
+def test_postgres_scout_rawstore_global_capacity_is_atomic_for_distinct_concurrent_blobs():
+    postgres_url = os.environ["BILLCOMMONS_TEST_POSTGRES_URL"]
+    parsed = urlsplit(postgres_url)
+    database = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    socket_host = query.get("host", [""])[0]
+    local = parsed.hostname in {"localhost", "127.0.0.1", "::1"} or (
+        not parsed.hostname and socket_host == "/var/run/postgresql"
+    )
+    if (
+        not local
+        or not re.fullmatch(r"billcommons_scout_(?:test|verify|closeout)_\d{8}_test", database)
+        or os.environ.get("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE") != "1"
+    ):
+        raise RuntimeError("refusing Scout RawStore capacity coverage outside an acknowledged local disposable database")
+    engine = create_engine(_use_psycopg3(postgres_url))
+    sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    payloads = [f"raw-cap-a-{uuid.uuid4().hex}".encode(), f"raw-cap-b-{uuid.uuid4().hex}".encode()]
+    keys = [hashlib.sha256(payload).hexdigest() for payload in payloads]
+    with sessions() as db:
+        baseline = PostgresScoutRawStore._retained_bytes(db)
+    stores = [
+        PostgresScoutRawStore(sessions, max_retained_bytes=baseline + len(payloads[0]))
+        for _ in payloads
+    ]
+    outcomes: list[str] = []
+    barrier = threading.Barrier(2)
+
+    def put(index: int) -> None:
+        try:
+            barrier.wait(timeout=5)
+            stores[index].put(payloads[index])
+            outcomes.append("stored")
+        except ValueError as exc:
+            assert str(exc) == "scout_rawstore_capacity_exceeded"
+            outcomes.append("limited")
+
+    try:
+        threads = [threading.Thread(target=put, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert all(not thread.is_alive() for thread in threads)
+        assert sorted(outcomes) == ["limited", "stored"]
+        with sessions() as db:
+            rows = db.execute(select(ScoutRawBlob).where(ScoutRawBlob.sha256.in_(keys))).scalars().all()
+            assert len(rows) == 1
+    finally:
+        with sessions() as db:
+            db.query(ScoutRawBlob).filter(ScoutRawBlob.sha256.in_(keys)).delete(synchronize_session=False)
+            db.commit()
         engine.dispose()

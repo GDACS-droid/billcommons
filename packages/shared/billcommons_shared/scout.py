@@ -18,6 +18,10 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from billcommons_shared.safe_http import SsrfRejected, admit_url
 
 FLORIDA = "FL"
+DEFAULT_PLATFORM_MAX_ACTIVE_JOBS = 10
+DEFAULT_PLATFORM_MAX_DAILY_JOBS = 100
+DEFAULT_PLATFORM_MAX_DAILY_BROWSER_SECONDS = 3_600
+DEFAULT_MAX_RETAINED_RAWSTORE_BYTES = 512 * 1024 * 1024
 OFFICIAL_FLORIDA_HOSTS = frozenset({
     "www.flsenate.gov", "flsenate.gov", "www.myfloridahouse.gov",
     "myfloridahouse.gov", "www.leg.state.fl.us", "leg.state.fl.us",
@@ -126,8 +130,24 @@ class ScoutSettings:
     per_customer_daily_jobs: int = 20
     per_customer_daily_browser_seconds: int = 600
     max_browser_routed_requests: int = 40
+    # Platform-wide ceilings are deliberately independent from per-customer
+    # quotas. They bound aggregate queueing, daily browser spend, and retained
+    # immutable evidence before a public rollout can multiply demand.
+    platform_max_active_jobs: int = DEFAULT_PLATFORM_MAX_ACTIVE_JOBS
+    platform_max_daily_jobs: int = DEFAULT_PLATFORM_MAX_DAILY_JOBS
+    platform_max_daily_browser_seconds: int = DEFAULT_PLATFORM_MAX_DAILY_BROWSER_SECONDS
+    max_retained_rawstore_bytes: int = DEFAULT_MAX_RETAINED_RAWSTORE_BYTES
 
     def __post_init__(self) -> None:
+        for name in (
+            "platform_max_active_jobs",
+            "platform_max_daily_jobs",
+            "platform_max_daily_browser_seconds",
+            "max_retained_rawstore_bytes",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         if any(
             not email
             or "@" not in email
@@ -240,6 +260,22 @@ class ScoutSettings:
             per_customer_daily_jobs=positive("BILLCOMMONS_SCOUT_MAX_DAILY_JOBS", 20),
             per_customer_daily_browser_seconds=positive("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", 600),
             max_browser_routed_requests=positive("BILLCOMMONS_SCOUT_MAX_BROWSER_ROUTED_REQUESTS", 40),
+            platform_max_active_jobs=positive(
+                "BILLCOMMONS_SCOUT_PLATFORM_MAX_ACTIVE_JOBS",
+                DEFAULT_PLATFORM_MAX_ACTIVE_JOBS,
+            ),
+            platform_max_daily_jobs=positive(
+                "BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_JOBS",
+                DEFAULT_PLATFORM_MAX_DAILY_JOBS,
+            ),
+            platform_max_daily_browser_seconds=positive(
+                "BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_BROWSER_SECONDS",
+                DEFAULT_PLATFORM_MAX_DAILY_BROWSER_SECONDS,
+            ),
+            max_retained_rawstore_bytes=positive(
+                "BILLCOMMONS_SCOUT_MAX_RETAINED_RAWSTORE_BYTES",
+                DEFAULT_MAX_RETAINED_RAWSTORE_BYTES,
+            ),
         )
 
 

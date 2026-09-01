@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import uuid
 import inspect
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from urllib.parse import urlsplit
@@ -30,6 +32,9 @@ from billcommons_schema.models import (
 from billcommons_shared.scout import ScoutPolicyError, ScoutSettings, normalize_jurisdiction, normalize_query, scout_cache_key
 
 router = APIRouter(prefix="/scout", tags=["scout"])
+
+_PLATFORM_ADMISSION_LOCK_KEY = 81_420_902
+_sqlite_platform_admission_lock = threading.RLock()
 
 
 class CreateScoutJob(BaseModel):
@@ -125,6 +130,89 @@ def _browser_reservation_ms(job: ScoutResearchJob, settings: ScoutSettings) -> i
         # frozen alongside it; a larger historical reservation stays held.
         return max(reservation, reconciled)
     return reconciled
+
+
+@contextmanager
+def _platform_admission_lock(db: Session):
+    """Serialize platform-wide check-and-create decisions.
+
+    PostgreSQL owns the production lock inside the caller's transaction. The
+    in-process lock only supplies equivalent deterministic behavior for the
+    SQLite unit-test path; it is never relied on between production replicas.
+    """
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _PLATFORM_ADMISSION_LOCK_KEY})
+        yield
+        return
+    with _sqlite_platform_admission_lock:
+        yield
+
+
+def _browser_budget_totals(
+    db: Session,
+    settings: ScoutSettings,
+    day_start: datetime,
+    *,
+    customer_id: uuid.UUID | None = None,
+) -> tuple[list[ScoutResearchJob], int, int]:
+    """Return active jobs plus actual and durably reserved browser milliseconds."""
+    job_scope = [] if customer_id is None else [ScoutResearchJob.customer_id == customer_id]
+    active_jobs = list(
+        db.scalars(
+            select(ScoutResearchJob).where(
+                *job_scope,
+                ScoutResearchJob.status.in_(("queued", "running")),
+            )
+        ).all()
+    )
+    reserved_job_ids = {job.id for job in active_jobs}
+    live_session_stmt = (
+        select(ScoutBrowserSession.job_id)
+        .join(ScoutResearchJob, ScoutResearchJob.id == ScoutBrowserSession.job_id)
+        .where(
+            *job_scope,
+            ScoutBrowserSession.status.in_(("starting", "running", "cleanup_failed", "reaping")),
+        )
+    )
+    reserved_job_ids.update(db.scalars(live_session_stmt).all())
+
+    terminal_stmt = (
+        select(ScoutBrowserSession, ScoutResearchJob)
+        .join(ScoutResearchJob, ScoutResearchJob.id == ScoutBrowserSession.job_id)
+        .where(
+            *job_scope,
+            or_(
+                ScoutBrowserSession.created_at >= day_start,
+                ScoutBrowserSession.released_at >= day_start,
+                and_(
+                    ScoutBrowserSession.provider_session_id.is_not(None),
+                    ScoutBrowserSession.runtime_ms.is_(None),
+                ),
+            ),
+        )
+    )
+    if reserved_job_ids:
+        terminal_stmt = terminal_stmt.where(ScoutResearchJob.id.not_in(reserved_job_ids))
+    terminal_sessions = db.execute(terminal_stmt).all()
+    daily_browser_ms = sum(
+        settings.per_customer_daily_browser_seconds * 1000
+        if session.provider_session_id and not _has_persisted_browser_cleanup_limit(job)
+        else session.runtime_ms + _browser_cleanup_reservation_ms(job, settings)
+        if session.runtime_ms is not None and session.provider_session_id
+        else _browser_session_reservation_ms(job, settings)
+        if session.provider_session_id
+        else _browser_session_reservation_ms(job, settings)
+        if (session.error_class or "").startswith("create_outcome_unknown")
+        else 0
+        for session, job in terminal_sessions
+    )
+    reserved_browser_ms = sum(
+        _browser_reservation_ms(job, settings)
+        for job in db.scalars(
+            select(ScoutResearchJob).where(ScoutResearchJob.id.in_(reserved_job_ids))
+        ).all()
+    ) if reserved_job_ids else 0
+    return active_jobs, daily_browser_ms, reserved_browser_ms
 
 
 def _job_payload(db: Session, job: ScoutResearchJob) -> dict:
@@ -261,13 +349,6 @@ def create_job(
     # The partial cache-key index remains the authority for equivalent jobs.
     db.execute(select(ApiCustomer.id).where(ApiCustomer.id == customer.id).with_for_update())
 
-    active_jobs = list(
-        db.execute(select(ScoutResearchJob).where(
-            ScoutResearchJob.customer_id == customer.id,
-            ScoutResearchJob.status.in_(("queued", "running")),
-        )).scalars()
-    )
-    active_count = len(active_jobs)
     # An equivalent request is allowed to coalesce even when the owner has
     # exhausted their unrelated active-job budget.
     existing = db.execute(
@@ -294,114 +375,97 @@ def create_job(
         response.headers["Cache-Control"] = "no-store"
         return {"coalesced": True, "cached": True, "cache_hit": True, "job": _job_payload(db, fresh)}
 
-    # Durable calendar-day budgets prevent a customer from serially draining
-    # browser credits as soon as each two-job active batch completes. Cached or
-    # coalesced research above remains free to reuse after the cap.
-    day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    daily_jobs = db.scalar(
-        select(func.count()).select_from(ScoutResearchJob).where(
-            ScoutResearchJob.customer_id == customer.id,
-            ScoutResearchJob.created_at >= day_start,
+    # The PostgreSQL advisory xact lock makes platform-wide aggregates a
+    # check-and-create decision rather than a best-effort observation. The
+    # customer row lock above keeps same-owner cache/coalescing race-safe
+    # without charging those free reads against the global lock.
+    with _platform_admission_lock(db):
+        day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        active_jobs, daily_browser_ms, reserved_browser_ms = _browser_budget_totals(
+            db, settings, day_start, customer_id=customer.id
         )
-    ) or 0
-    if daily_jobs >= settings.per_customer_daily_jobs:
-        raise too_many_requests("scout_daily_job_limit", "Daily Scout job limit reached.", 3600)
-    # Active jobs reserve their maximum possible browser spend before any
-    # provider session exists.  Without this durable reservation, serialized
-    # creates can each observe the same runtime ledger and over-admit work.
-    # A canceled/terminal job retains its reservation while a live provider
-    # slot exists, then its actual daily runtime replaces that reservation.
-    reserved_job_ids = {job.id for job in active_jobs}
-    reserved_job_ids.update(
-        db.scalars(
-            select(ScoutBrowserSession.job_id)
-            .join(ScoutResearchJob, ScoutResearchJob.id == ScoutBrowserSession.job_id)
-            .where(
+        active_count = len(active_jobs)
+        platform_active, platform_daily_browser_ms, platform_reserved_browser_ms = _browser_budget_totals(
+            db, settings, day_start
+        )
+        daily_jobs = db.scalar(
+            select(func.count()).select_from(ScoutResearchJob).where(
                 ScoutResearchJob.customer_id == customer.id,
-                ScoutBrowserSession.status.in_(("starting", "running", "cleanup_failed", "reaping")),
+                ScoutResearchJob.created_at >= day_start,
             )
-        ).all()
-    )
-    terminal_sessions = db.execute(
-        select(ScoutBrowserSession, ScoutResearchJob)
-        .join(ScoutResearchJob, ScoutResearchJob.id == ScoutBrowserSession.job_id)
-        .where(
-            ScoutResearchJob.customer_id == customer.id,
-            # A session crossing UTC midnight is conservatively charged in
-            # both calendar days.  Otherwise a session created yesterday and
-            # released today would escape today's cap entirely.
-            or_(
-                ScoutBrowserSession.created_at >= day_start,
-                ScoutBrowserSession.released_at >= day_start,
-                # A durable started session without runtime telemetry cannot
-                # be assigned safely to a prior day; hold its full bound until
-                # telemetry is repaired rather than admitting unaccounted use.
-                and_(
-                    ScoutBrowserSession.provider_session_id.is_not(None),
-                    ScoutBrowserSession.runtime_ms.is_(None),
-                ),
-            ),
-            ScoutResearchJob.id.not_in(reserved_job_ids),
-        )
-    ).all()
-    daily_browser_ms = sum(
-        settings.per_customer_daily_browser_seconds * 1000
-        if session.provider_session_id and not _has_persisted_browser_cleanup_limit(job)
-        else session.runtime_ms + _browser_cleanup_reservation_ms(job, settings)
-        if session.runtime_ms is not None and session.provider_session_id
-        else _browser_session_reservation_ms(job, settings)
-        if session.provider_session_id
-        else _browser_session_reservation_ms(job, settings)
-        if (session.error_class or "").startswith("create_outcome_unknown")
-        else 0
-        for session, job in terminal_sessions
-    )
-    reserved_browser_ms = sum(
-        _browser_reservation_ms(job, settings)
-        for job in db.scalars(select(ScoutResearchJob).where(ScoutResearchJob.id.in_(reserved_job_ids))).all()
-    )
-    if daily_browser_ms + reserved_browser_ms + (
-        settings.max_external_requests * (
+        ) or 0
+        platform_daily_jobs = db.scalar(
+            select(func.count()).select_from(ScoutResearchJob).where(
+                ScoutResearchJob.created_at >= day_start,
+            )
+        ) or 0
+        new_reservation_ms = settings.max_external_requests * (
             settings.browser_wall_seconds + 2 * settings.browser_cleanup_seconds
         ) * 1000
-    ) > settings.per_customer_daily_browser_seconds * 1000:
-        raise too_many_requests("scout_daily_browser_limit", "Daily Scout browser budget reached.", 3600)
-    # The daily browser budget can be intentionally tighter than the generic
-    # active-job count: direct-only work may co-exist, but browser-capable work
-    # is admitted only when its full durable reservation fits.
-    if active_count >= settings.per_customer_active_jobs:
-        raise too_many_requests("scout_active_job_limit", "Too many active Scout jobs.", 60)
+        if len(platform_active) >= settings.platform_max_active_jobs:
+            raise too_many_requests("scout_platform_active_job_limit", "Scout is at platform capacity.", 60)
+        if platform_daily_jobs >= settings.platform_max_daily_jobs:
+            raise too_many_requests("scout_platform_daily_job_limit", "Scout daily platform capacity reached.", 3600)
+        if (
+            platform_daily_browser_ms + platform_reserved_browser_ms + new_reservation_ms
+            > settings.platform_max_daily_browser_seconds * 1000
+        ):
+            raise too_many_requests("scout_platform_daily_browser_limit", "Scout browser capacity reached.", 3600)
+        if daily_jobs >= settings.per_customer_daily_jobs:
+            raise too_many_requests("scout_daily_job_limit", "Daily Scout job limit reached.", 3600)
+        if daily_browser_ms + reserved_browser_ms + new_reservation_ms > settings.per_customer_daily_browser_seconds * 1000:
+            raise too_many_requests("scout_daily_browser_limit", "Daily Scout browser budget reached.", 3600)
+        if active_count >= settings.per_customer_active_jobs:
+            raise too_many_requests("scout_active_job_limit", "Too many active Scout jobs.", 60)
 
-    job = ScoutResearchJob(
-        customer_id=customer.id,
-        original_query=body.query.strip(),
-        normalized_query=normalized,
-        jurisdiction=jurisdiction,
-        cache_key=key,
-        strategy={"adapter": "florida_p0", "mode": "structured_first"},
-        limits={"max_pages": settings.max_pages, "max_actions": settings.max_actions, "max_external_requests": settings.max_external_requests, "max_related_documents": settings.max_related_documents, "max_direct_bytes": settings.max_direct_bytes, "max_pdf_pages": settings.max_pdf_pages, "max_pdf_text_chars": settings.max_pdf_text_chars, "max_pdf_extract_seconds": settings.max_pdf_extract_seconds, "max_pdf_extract_memory_bytes": settings.max_pdf_extract_memory_bytes, "max_pdf_extract_cpu_seconds": settings.max_pdf_extract_cpu_seconds, "max_routed_requests": settings.max_browser_routed_requests, "max_retries": settings.max_retries, "daily_jobs": settings.per_customer_daily_jobs, "daily_browser_seconds": settings.per_customer_daily_browser_seconds, "browser_wall_seconds": settings.browser_wall_seconds, "browser_cleanup_seconds": settings.browser_cleanup_seconds, "daily_browser_reservation_ms": settings.max_external_requests * (settings.browser_wall_seconds + 2 * settings.browser_cleanup_seconds) * 1000},
-        usage={},
-    )
-    db.add(job)
-    try:
-        db.flush()
-    except IntegrityError:
-        # The partial unique index is the race-safe authority.  Query it only
-        # after rollback; do not try to solve concurrent submits in memory.
-        db.rollback()
-        existing = db.execute(
-            select(ScoutResearchJob).where(
-                ScoutResearchJob.customer_id == customer.id,
-                ScoutResearchJob.cache_key == key,
-                ScoutResearchJob.status.in_(("queued", "running")),
-            )
-        ).scalar_one_or_none()
-        if existing is None:
-            raise
-        response.status_code = 200
-        response.headers["Cache-Control"] = "no-store"
-        return {"coalesced": True, "job": _job_payload(db, existing)}
-    db.commit()
+        job = ScoutResearchJob(
+            customer_id=customer.id,
+            original_query=body.query.strip(),
+            normalized_query=normalized,
+            jurisdiction=jurisdiction,
+            cache_key=key,
+            strategy={"adapter": "florida_p0", "mode": "structured_first"},
+            limits={
+                "max_pages": settings.max_pages,
+                "max_actions": settings.max_actions,
+                "max_external_requests": settings.max_external_requests,
+                "max_related_documents": settings.max_related_documents,
+                "max_direct_bytes": settings.max_direct_bytes,
+                "max_pdf_pages": settings.max_pdf_pages,
+                "max_pdf_text_chars": settings.max_pdf_text_chars,
+                "max_pdf_extract_seconds": settings.max_pdf_extract_seconds,
+                "max_pdf_extract_memory_bytes": settings.max_pdf_extract_memory_bytes,
+                "max_pdf_extract_cpu_seconds": settings.max_pdf_extract_cpu_seconds,
+                "max_routed_requests": settings.max_browser_routed_requests,
+                "max_retries": settings.max_retries,
+                "daily_jobs": settings.per_customer_daily_jobs,
+                "daily_browser_seconds": settings.per_customer_daily_browser_seconds,
+                "browser_wall_seconds": settings.browser_wall_seconds,
+                "browser_cleanup_seconds": settings.browser_cleanup_seconds,
+                "daily_browser_reservation_ms": new_reservation_ms,
+            },
+            usage={},
+        )
+        db.add(job)
+        try:
+            db.flush()
+        except IntegrityError:
+            # The partial unique index is the race-safe authority. Query it
+            # only after rollback; do not solve concurrent submits in memory.
+            db.rollback()
+            existing = db.execute(
+                select(ScoutResearchJob).where(
+                    ScoutResearchJob.customer_id == customer.id,
+                    ScoutResearchJob.cache_key == key,
+                    ScoutResearchJob.status.in_(("queued", "running")),
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                raise
+            response.status_code = 200
+            response.headers["Cache-Control"] = "no-store"
+            return {"coalesced": True, "job": _job_payload(db, existing)}
+        db.commit()
     db.refresh(job)
     response.headers["Cache-Control"] = "no-store"
     return {"coalesced": False, "job": _job_payload(db, job)}
