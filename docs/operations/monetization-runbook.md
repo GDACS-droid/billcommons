@@ -279,6 +279,53 @@ events (R7 -- this list REPLACES anything broader):
 
 Copy the endpoint's signing secret into `STRIPE_WEBHOOK_SECRET`.
 
+#### Production configuration verification
+
+Do this in the **correct Bill Commons Stripe account in Live mode**. In
+Workbench -> Webhooks, identify the Bill Commons destination for the endpoint
+URL above. Do not create a second destination or change or delete an unrelated
+destination. If more than one destination already targets this URL, stop and
+reconcile the duplicate configuration before enabling or disabling anything.
+
+For the Bill Commons destination, confirm all of the following in Workbench:
+
+1. It receives **Events on your account**, not connected-account events.
+2. Its endpoint URL is exactly
+   `https://api.billcommons.org/api/v1/billing/webhook`.
+3. Its event-object API version is explicitly `2025-03-31.basil`.
+4. Its enabled event types are exactly the seven events listed above.
+5. The destination is enabled.
+
+The destination's event-object API version must match the parser's inbound
+payload contract. `billing.py` separately pins the SDK's outbound API version.
+
+Reveal that destination's signing secret only in Stripe, then place it directly
+in Railway's production `STRIPE_WEBHOOK_SECRET` variable. Never put the value
+in shell history, a URL, source control, SQL, screenshots, tickets, or logs.
+Restart or redeploy the API after changing the variable, then confirm startup
+logs contain no missing-monetization-variable error. The validation log names
+missing variables but never their values.
+
+Stripe's current documentation describes Workbench delivery inspection and
+retries, but does not document a generic no-object "send test delivery" action
+for a Live-mode destination. Do not claim signed-delivery proof from a Live
+endpoint unless Stripe's current UI and documentation explicitly provide such
+an action for that destination, or an authorized operator deliberately creates
+a reviewed real event.
+
+Before live activation, prove handler behavior in a sandbox or with Stripe CLI,
+using that environment's own endpoint signing secret. Treat this as code and
+test-environment proof only; it does not prove the Live destination's signing
+secret or routing.
+
+For Live configuration, retain a non-secret activation record containing the
+destination URL, mode, account scope, API version, enabled event list,
+destination enabled state, Railway deployment timestamp, and confirmation that
+startup validation reported no missing monetization variables. A production
+signed-event proof requires a separately authorized real Live event and
+read-only confirmation in `stripe_events`; do not create a Checkout Session or
+charge merely to obtain this proof.
+
 ### 4. Customer Portal configuration
 
 Dashboard → Settings → Billing → Customer portal:
