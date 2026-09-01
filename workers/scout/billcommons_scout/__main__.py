@@ -22,8 +22,15 @@ from billcommons_scout.runner import ScoutRunner
 
 _SAFE_EXCEPTION_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 _SAFE_HTTP_STATUSES = {400, 401, 403, 404, 408, 409, 413, 422, 429, 500, 502, 503, 504}
-_SOLARI_SMOKE_URL = "https://www.leg.state.fl.us/robots.txt"
-_SOLARI_SMOKE_MARKER = b"User-agent"
+# This is deliberately the final statute URL rather than a chapter-index click
+# path.  The infrastructure smoke needs one bounded official capture, not a
+# browser-interaction claim; following a link would spend an unnecessary action
+# and would add a second page/navigation surface to this check.
+_SOLARI_SMOKE_URL = (
+    "https://www.leg.state.fl.us/statutes/index.cfm?App_mode=Display_Statute&"
+    "Search_String=&URL=0000-0099/0043/Sections/0043.16.html"
+)
+_SOLARI_SMOKE_MARKERS = (b"43.16", b"Justice Administrative Commission")
 
 
 def _safe_solari_diagnostic(exc: BaseException, *, fallback_phase: str) -> str:
@@ -234,7 +241,7 @@ def main() -> int:
                 f"{_safe_solari_diagnostic(exc, fallback_phase='release')}"
             )
             return 1
-        if _SOLARI_SMOKE_MARKER not in capture.body:
+        if not all(marker in capture.body for marker in _SOLARI_SMOKE_MARKERS):
             # A successful navigation to an interstitial or provider error
             # page is not a successful government-source smoke test. Cleanup
             # has already been independently confirmed above.
@@ -243,7 +250,9 @@ def main() -> int:
         print(
             f"solari_check=ok session_ref={hashlib.sha256(capture.provider_session_id.encode()).hexdigest()[:12]} "
             f"actions={capture.actions} runtime_ms={int((time.monotonic() - started) * 1000)} "
-            f"element=robots_user_agent replay={'available' if replay else 'unavailable'} cleanup=confirmed"
+            f"capture=official_fl_statute_43_16 navigation=direct_no_click "
+            f"markers=43_16,justice_administrative_commission "
+            f"replay={'available' if replay else 'unavailable'} cleanup=confirmed"
         )
         return 0
     return _run_worker_loop(_runner(), once=args.once, worker_id=f"scout-{os.getpid()}")

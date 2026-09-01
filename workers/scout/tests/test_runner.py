@@ -1844,9 +1844,9 @@ def test_solari_cli_failure_diagnostics_are_redacted_and_release_is_truthful(mon
         def capture(self, *_args, **_kwargs):
             return BrowserCapture(
                 "interstitial-session",
-                "https://www.flsenate.gov/robots.txt",
+                "https://www.leg.state.fl.us/statutes/index.cfm?App_mode=Display_Statute&Search_String=&URL=0000-0099/0043/Sections/0043.16.html",
                 "text/html",
-                b"<h1>Access denied</h1>",
+                b"<h1>43.16</h1><p>Access denied</p>",
                 1,
                 1,
             )
@@ -1894,15 +1894,17 @@ def test_solari_cli_confirms_cleanup_and_maps_only_fixed_navigation_reason(monke
 
 def test_solari_cli_success_prints_fingerprint_not_signed_session(monkeypatch, capsys):
     signed_id = "signed-session-id-must-not-print"
+    captured_request = []
     class SuccessProvider:
         def __init__(self): pass
         def capture(self, *_args, **kwargs):
+            captured_request.append(_args[0])
             kwargs["on_started"](signed_id)
             return BrowserCapture(
                 signed_id,
-                "https://www.leg.state.fl.us/robots.txt",
+                "https://www.leg.state.fl.us/statutes/index.cfm?App_mode=Display_Statute&Search_String=&URL=0000-0099/0043/Sections/0043.16.html",
                 "text/html",
-                b"<pre>User-agent: *</pre>",
+                b"<h1>43.16</h1><p>Justice Administrative Commission</p>",
                 1,
                 1,
             )
@@ -1914,8 +1916,19 @@ def test_solari_cli_success_prints_fingerprint_not_signed_session(monkeypatch, c
     assert scout_cli.main() == 0
     output = capsys.readouterr().out
     assert "solari_check=ok session_ref=" in output
+    assert "capture=official_fl_statute_43_16 navigation=direct_no_click" in output
+    assert "markers=43_16,justice_administrative_commission" in output
     assert "replay=available cleanup=confirmed" in output
     assert signed_id not in output and "signed-replay" not in output
+    assert captured_request == [
+        BrowserRequest(
+            "https://www.leg.state.fl.us/statutes/index.cfm?App_mode=Display_Statute&Search_String=&URL=0000-0099/0043/Sections/0043.16.html",
+            max_pages=1,
+            max_actions=1,
+            wall_seconds=ScoutSettings.from_env().browser_wall_seconds,
+            max_bytes=ScoutSettings.from_env().max_direct_bytes,
+        )
+    ]
 
 
 def test_reaper_remains_available_when_feature_flag_is_disabled(monkeypatch, capsys):

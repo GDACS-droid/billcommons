@@ -69,7 +69,11 @@ zero until freshness expires or the source needs revisiting.
 The native Scout provider also has opt-in SDK/API product-path coverage for durable
 session creation, browser-required classification, release/replay, and reaping. The
 small `billcommons-scout solari-check` remains an infrastructure check; it is not the
-challenge showcase and makes no government-finding claim.
+challenge showcase and makes no government-finding claim. Its bounded provider smoke
+directly opens Online Sunshine §43.16 in one page/one navigation with no click,
+checks only the stable `43.16` and `Justice Administrative Commission` markers, then
+releases the session and probes replay. Its sanitized output labels that direct,
+no-click capture and withholds the provider session ID and replay capability URL.
 
 After the final single-owner lifecycle repair, the opt-in real product-path test ran
 one Solari session through the Bill Commons runner in **7.86 seconds** and verified a

@@ -259,7 +259,18 @@ alone can therefore never accidentally create an all-account rollout.
    source/finding provenance, RawStore retention, usage ceilings, owner
    isolation, and browser-session terminal state. A provider browser session
    is billable; run the separate `solari-check` only with its explicit opt-in
-   flag and log the safe fingerprint/output.
+   flag and log the safe fingerprint/output. It is an infrastructure/lifecycle
+   check, not a Scout finding: it directly captures the official Online
+   Sunshine §43.16 page in one page/one navigation (no click), verifies only
+   the `43.16` and `Justice Administrative Commission` markers, and confirms
+   release plus best-effort replay availability. It never prints the provider
+   session ID or replay capability URL:
+
+   ```bash
+   BILLCOMMONS_SCOUT_ENABLED=1 \
+   BILLCOMMONS_SCOUT_SOLARI_CHECK=1 \
+     python -m billcommons_scout solari-check
+   ```
 5. Observe a full browser ceiling/window plus the Scout lease and cleanup
    intervals. Review durable rows for `cleanup_failed`, `reaping`,
    `abandoned`, failed/partial jobs, and unexpected spend. Do not expand the
