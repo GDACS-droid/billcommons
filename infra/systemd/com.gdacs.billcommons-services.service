@@ -1,0 +1,15 @@
+[Unit]
+Description=Bill Commons Railway service-state monitor (deployment status per service)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/alberto/codingProjects/billcommons
+# Headless systemd PATH lacks ~/.local/bin -- set it explicitly so `npx`
+# (via @railway/cli) resolves the same way it does in an interactive shell.
+Environment=PATH=/home/alberto/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/alberto/codingProjects/billcommons/.venv/bin/python /home/alberto/codingProjects/billcommons/infra/monitoring/service_state_monitor.py
+# exit 1 = a service probe failed (alerting is handled inside, on a 2-run
+# confirmation). That is a reported state, not a unit failure.
+SuccessExitStatus=0 1
+TimeoutStartSec=180
