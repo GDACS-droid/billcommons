@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import uuid
 import hashlib
+import os
+import re
 import sys
+import threading
 import types
 import asyncio
 import time
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from sqlalchemy import create_engine, event, select, text
@@ -16,6 +20,7 @@ from sqlalchemy.pool import StaticPool
 from billcommons_schema.base import Base
 from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutResearchJob, ScoutSource
 from billcommons_shared.rawstore import FilesystemRawStore
+from billcommons_shared.db import _use_psycopg3
 from billcommons_shared.safe_http import SsrfRejected
 from billcommons_shared.scout import BrowserCapture, BrowserRequest, ScoutSettings, content_hash
 from billcommons_scout.providers import MockResearchBrowserProvider
@@ -412,6 +417,27 @@ def test_browser_budget_denial_creates_no_slot_or_browser_usage(tmp_path):
         assert job.usage == {"external_requests": 1}
         assert db.execute(select(ScoutBrowserSession)).scalars().all() == []
     assert provider.released == []
+
+
+def test_browser_capture_rejects_provider_routed_request_overrun(tmp_path):
+    url = "https://www.myfloridahouse.gov/Sections/Bills/billsdetail.aspx"
+    provider = MockResearchBrowserProvider({
+        url: BrowserCapture("overrun", url, "text/html", b"HB 12 Filed", 1, 1, routed_requests=2)
+    })
+    runner, sessions, job_id = _runner(
+        tmp_path, provider, lambda _url: (403, "text/html", b"javascript challenge"),
+        limits={"max_routed_requests": 1},
+    )
+    runner._candidates = lambda _db, _job: [_candidate(url=url)]
+    runner.process(job_id)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        session = db.execute(select(ScoutBrowserSession)).scalar_one()
+        assert job.status == "partial"
+        assert db.execute(select(ScoutSource).where(ScoutSource.official.is_(True))).scalars().all() == []
+        # Preserve the provider-reported overrun for audit even though its
+        # bytes were not admitted as a source.
+        assert session.routed_requests == 2
 
 
 def test_browser_precreate_failure_removes_slot_without_browser_usage(tmp_path):
@@ -853,6 +879,30 @@ def test_persisted_external_request_limit_counts_retries_before_fetch(tmp_path):
         assert job.status == "partial"
 
 
+def test_request_limit_after_first_success_finishes_partial_with_durable_reason(tmp_path):
+    first = "https://www.flsenate.gov/Session/Bill/2026/12"
+    second = "https://www.flsenate.gov/Session/Bill/2026/13"
+    runner, sessions, job_id = _runner(
+        tmp_path, MockResearchBrowserProvider(),
+        lambda _url: (200, "text/html", b"HB 12 Filed"),
+        limits={"max_external_requests": 1, "max_retries": 0},
+    )
+    runner._candidates = lambda _db, _job: [_candidate(url=first), _candidate(url=second)]
+    runner.process(job_id)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        events = db.execute(select(ScoutJobEvent).where(ScoutJobEvent.job_id == job_id)).scalars().all()
+        assert (job.status, job.error_class, job.partial_success, job.usage["external_requests"]) == (
+            "partial", "external_request_limit", True, 1,
+        )
+        assert any(event.kind == "external_request_limit_reached" for event in events)
+        assert any(
+            event.kind == "finished"
+            and event.detail == {"status": "partial", "error_class": "external_request_limit"}
+            for event in events
+        )
+
+
 def test_expired_claim_at_persisted_retry_limit_is_terminalized(tmp_path):
     runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", b"HB 12 Filed"), limits={"max_retries": 1})
     with sessions() as db:
@@ -1179,6 +1229,132 @@ def test_stale_idless_reservation_becomes_abandoned_and_no_longer_counts_against
         job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
         db.commit()
     assert runner._reserve_browser_slot(job_id, "next-claim") is not None
+
+
+def test_late_browser_started_callback_cannot_revive_reaped_idless_slot(tmp_path):
+    """A provider callback after reaping must fail into provider cleanup."""
+    url = "https://www.myfloridahouse.gov/Sections/Bills/billsdetail.aspx"
+    callback_ready = threading.Event()
+    allow_callback = threading.Event()
+
+    class DelayedProvider(MockResearchBrowserProvider):
+        def capture(self, _request, *, on_started):
+            callback_ready.set()
+            assert allow_callback.wait(timeout=2)
+            try:
+                on_started("late-provider-id")
+            except Exception as exc:
+                # Match the real provider contract: a rejected callback
+                # triggers provider-side cleanup before returning control.
+                self.release("late-provider-id")
+                raise ProviderSessionPersistenceError("late-provider-id") from exc
+            raise AssertionError("late callback unexpectedly persisted")
+
+    provider = DelayedProvider()
+    runner, sessions, job_id = _runner(
+        tmp_path, provider, lambda _url: (403, "text/html", b"javascript challenge"),
+    )
+    runner._candidates = lambda _db, _job: [_candidate(url=url)]
+    thread = threading.Thread(target=runner.process, args=(job_id, "initial-claim"))
+    thread.start()
+    assert callback_ready.wait(timeout=2)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+    assert runner.reap_sessions() == 0
+    allow_callback.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert provider.released == ["late-provider-id"]
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        session = db.execute(select(ScoutBrowserSession)).scalar_one()
+        assert (session.status, session.provider_session_id, job.usage.get("browser_sessions")) == (
+            "abandoned", None, None,
+        )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("BILLCOMMONS_TEST_POSTGRES_URL"),
+    reason="set BILLCOMMONS_TEST_POSTGRES_URL to run PostgreSQL source-history concurrency coverage",
+)
+def test_postgres_concurrent_source_finalization_forms_immediate_predecessor_chain(tmp_path):
+    """Exercise the advisory-lock revalidation with two synchronized writers."""
+    postgres_url = os.environ["BILLCOMMONS_TEST_POSTGRES_URL"]
+    parsed = urlsplit(postgres_url)
+    database = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+    socket_host = parse_qs(parsed.query).get("host", [""])[0]
+    local = parsed.hostname in {"localhost", "127.0.0.1", "::1"} or (
+        not parsed.hostname and socket_host == "/var/run/postgresql"
+    )
+    if (
+        not local
+        or not re.fullmatch(r"billcommons_scout_(?:test|verify)_\d{8}", database)
+        or os.environ.get("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE") != "1"
+    ):
+        raise RuntimeError("refusing Scout runner PostgreSQL DDL outside an acknowledged local disposable database")
+    engine = create_engine(_use_psycopg3(postgres_url))
+    sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    customer_id: uuid.UUID | None = None
+    try:
+        customer = ApiCustomer(id=uuid.uuid4(), email="pg-runner@example.test")
+        customer_id = customer.id
+        initial = ScoutResearchJob(id=uuid.uuid4(), customer_id=customer.id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="initial", strategy={}, limits={}, usage={})
+        second = ScoutResearchJob(id=uuid.uuid4(), customer_id=customer.id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="second", strategy={}, limits={}, usage={})
+        third = ScoutResearchJob(id=uuid.uuid4(), customer_id=customer.id, original_query="HB 12", normalized_query="hb 12", jurisdiction="FL", cache_key=uuid.uuid4().hex, status="running", claim_token="third", strategy={}, limits={}, usage={})
+        with sessions() as db:
+            db.add_all((customer, initial, second, third))
+            db.commit()
+        rawstore = FilesystemRawStore(tmp_path / "pg-raw")
+        runner = ScoutRunner(sessions, rawstore, MockResearchBrowserProvider(), settings=ScoutSettings(enabled=True))
+        url = "https://www.flsenate.gov/Session/Bill/2026/12"
+        metadata = _candidate()[4]
+        first_id = runner._persist_capture(initial.id, "initial", None, "HB 12", "Filed", metadata, url, "direct", 200, "text/html", b"HB 12 Filed initial")
+        assert first_id is not None
+        barrier = threading.Barrier(2)
+        local = threading.local()
+
+        def synchronized_latest(job_id, token, source_url):
+            original = ScoutRunner._latest_observation(runner, job_id, token, source_url)
+            if not getattr(local, "waited", False):
+                local.waited = True
+                barrier.wait(timeout=5)
+            return original
+
+        # Both writers deliberately observe the same initial predecessor;
+        # one must retry after the other commits under the advisory lock.
+        runner._latest_observation = synchronized_latest
+        results: list[uuid.UUID | None] = []
+        errors: list[BaseException] = []
+
+        def persist(job, token, body):
+            try:
+                results.append(runner._persist_capture(job.id, token, None, "HB 12", "Filed", metadata, url, "direct", 200, "text/html", body))
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=persist, args=(second, "second", b"HB 12 Filed second")),
+            threading.Thread(target=persist, args=(third, "third", b"HB 12 Filed third")),
+        ]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(timeout=10)
+        assert all(not thread.is_alive() for thread in threads)
+        assert not errors and all(results)
+        with sessions() as db:
+            sources = db.execute(select(ScoutSource).where(ScoutSource.id.in_(results))).scalars().all()
+            predecessors = {source.id: source.prior_source_id for source in sources}
+            assert set(predecessors.values()) & {first_id}
+            assert any(prior in predecessors for prior in predecessors.values())
+    finally:
+        if customer_id is not None:
+            with sessions() as db:
+                customer = db.get(ApiCustomer, customer_id)
+                if customer is not None:
+                    db.delete(customer)
+                    db.commit()
+        engine.dispose()
 
 
 def test_bounded_provider_call_timeout_does_not_wait_for_hung_non_daemon_executor():

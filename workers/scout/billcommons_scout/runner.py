@@ -334,7 +334,13 @@ class ScoutRunner:
             job = self._fenced(db, job_id, token)
             if job is None:
                 return
-            if successes and failures:
+            if request_limit_reached:
+                # A persisted request-budget denial means there may be
+                # unexamined candidates.  Even when earlier candidates
+                # succeeded, that is a truthful partial result, never a
+                # completed search.
+                self._finish(db, job, token, "partial", "external_request_limit", successes > 0)
+            elif successes and failures:
                 self._finish(db, job, token, "partial", None, True)
             elif successes:
                 self._finish(db, job, token, "completed", None, False)
@@ -374,6 +380,36 @@ class ScoutRunner:
             ).scalar_one_or_none()
             return exact
 
+    @staticmethod
+    def _latest_observation_for_customer(
+        db: Session, customer_id: uuid.UUID, url: str,
+    ) -> tuple[uuid.UUID, str | None, str | None] | None:
+        """Read the newest official observation for one tenant and URL."""
+        prior = db.execute(
+            select(ScoutSource.id, ScoutSource.content_hash, ScoutSource.raw_ref)
+            .join(ScoutResearchJob, ScoutResearchJob.id == ScoutSource.job_id)
+            .where(
+                ScoutResearchJob.customer_id == customer_id,
+                ScoutSource.canonical_url == url,
+                ScoutSource.official.is_(True),
+                ScoutSource.content_hash.is_not(None),
+            )
+            .order_by(ScoutSource.retrieved_at.desc(), ScoutSource.id.desc())
+            .limit(1)
+        ).one_or_none()
+        return tuple(prior) if prior is not None else None
+
+    @staticmethod
+    def _lock_source_history(db: Session, customer_id: uuid.UUID, url: str) -> None:
+        """Serialize PostgreSQL finalization for a tenant-local canonical URL."""
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            # A transaction-scoped lock avoids a new durable lock table and is
+            # released before any RawStore operation.  The tenant is part of
+            # the key so identical public URLs never cross customer bounds.
+            db.execute(text(
+                "SELECT pg_advisory_xact_lock(hashtextextended(:scope, 0))"
+            ), {"scope": f"scout-source:{customer_id}:{url}"})
+
     def _latest_observation(
         self, job_id: uuid.UUID, token: str, url: str
     ) -> tuple[uuid.UUID, str | None, str | None] | None:
@@ -386,19 +422,7 @@ class ScoutRunner:
             job = self._fenced(db, job_id, token)
             if job is None:
                 return None
-            prior = db.execute(
-                select(ScoutSource.id, ScoutSource.content_hash, ScoutSource.raw_ref)
-                .join(ScoutResearchJob, ScoutResearchJob.id == ScoutSource.job_id)
-                .where(
-                    ScoutResearchJob.customer_id == job.customer_id,
-                    ScoutSource.canonical_url == url,
-                    ScoutSource.official.is_(True),
-                    ScoutSource.content_hash.is_not(None),
-                )
-                .order_by(ScoutSource.retrieved_at.desc(), ScoutSource.id.desc())
-                .limit(1)
-            ).one_or_none()
-            return tuple(prior) if prior is not None else None
+            return self._latest_observation_for_customer(db, job.customer_id, url)
 
     def _persist_capture(self, job_id: uuid.UUID, token: str, bill_id: uuid.UUID | None, bill_title: str, bill_status: str | None, metadata: dict, url: str, mechanism: str, status: int | None, mime: str | None, body: bytes) -> uuid.UUID | None:
         try:
@@ -410,21 +434,6 @@ class ScoutRunner:
                         exact_raw_ref = None
                 except Exception:
                     exact_raw_ref = None
-            prior = self._latest_observation(job_id, token, url)
-            prior_id: uuid.UUID | None = None
-            prior_bytes: bytes | None = None
-            if prior is not None:
-                prior_id, prior_digest, prior_raw_ref = prior
-                if prior_digest == digest:
-                    prior_bytes = body
-                elif prior_raw_ref:
-                    try:
-                        prior_bytes = self.rawstore.get(prior_raw_ref)
-                    except Exception:
-                        # A missing historic blob must not be represented as
-                        # unchanged/cosmetic merely because hashes differ.
-                        prior_bytes = None
-            change = summarize_content_change(prior_bytes, body) if prior_id is not None else None
             mime_base = (mime or "").split(";", 1)[0].lower()
             if mime_base == "application/pdf":
                 from io import BytesIO
@@ -473,55 +482,79 @@ class ScoutRunner:
                         db.delete(stage)
                         db.commit()
                 raise
-            with self.sessions() as db:
-                if self._fenced(db, job_id, token) is None:
-                    stage = db.get(ScoutSource, stage_id)
-                    if stage is not None:
-                        stage.raw_ref = raw_ref
-                        stage.content_hash = digest
-                        stage.document_hash = digest
+            # RawStore reads must remain outside transactions.  A concurrent
+            # finalizer can advance the URL history between this read and the
+            # final write, so the PostgreSQL finalization lock below rechecks
+            # the predecessor and retries with the new immediate predecessor.
+            while True:
+                prior = self._latest_observation(job_id, token, url)
+                prior_id: uuid.UUID | None = None
+                prior_bytes: bytes | None = None
+                if prior is not None:
+                    prior_id, prior_digest, prior_raw_ref = prior
+                    if prior_digest == digest:
+                        prior_bytes = body
+                    elif prior_raw_ref:
+                        try:
+                            prior_bytes = self.rawstore.get(prior_raw_ref)
+                        except Exception:
+                            # A missing historic blob must not be represented as
+                            # unchanged/cosmetic merely because hashes differ.
+                            prior_bytes = None
+                change = summarize_content_change(prior_bytes, body) if prior_id is not None else None
+                with self.sessions() as db:
+                    current_job = self._fenced(db, job_id, token)
+                    if current_job is None:
+                        stage = db.get(ScoutSource, stage_id)
+                        if stage is not None:
+                            stage.raw_ref = raw_ref
+                            stage.content_hash = digest
+                            stage.document_hash = digest
+                            db.commit()
+                        return None
+                    self._lock_source_history(db, current_job.customer_id, url)
+                    if self._latest_observation_for_customer(db, current_job.customer_id, url) != prior:
+                        # The lock-holder committed a newer observation while
+                        # RawStore was read.  Recompute its comparison outside
+                        # this transaction, then revalidate again.
+                        continue
+                    # Same URL/hash within this job is idempotent. A changed
+                    # version retains the immediately preceding tenant-local version.
+                    same = db.execute(select(ScoutSource.id).where(ScoutSource.job_id == job_id, ScoutSource.canonical_url == url, ScoutSource.content_hash == digest)).scalar_one_or_none()
+                    if same is not None and same != stage_id:
+                        db.delete(db.get(ScoutSource, stage_id))
                         db.commit()
-                    return None
-                # Same URL/hash within this job is idempotent. A changed
-                # version retains the immediately preceding tenant-local version.
-                same = db.execute(select(ScoutSource.id).where(ScoutSource.job_id == job_id, ScoutSource.canonical_url == url, ScoutSource.content_hash == digest)).scalar_one_or_none()
-                if same is not None and same != stage_id:
-                    db.delete(db.get(ScoutSource, stage_id))
+                        return same
+                    source = db.get(ScoutSource, stage_id)
+                    if source is None:  # pragma: no cover - stage is committed above
+                        return None
+                    source.title = bill_title
+                    source.official = True
+                    source.retrieval_mechanism = "reused" if exact_raw_ref else mechanism
+                    source.content_hash = digest
+                    source.document_hash = digest
+                    source.raw_ref = raw_ref
+                    source.prior_source_id = prior_id
+                    source.change_kind = change.kind if change else None
+                    source.change_summary = change.summary if change else None
+                    # Server defaults on older SQLite/PostgreSQL configurations can
+                    # collapse multiple observations into one second. Persist the
+                    # actual finalization instant so URL history has a stable newest
+                    # observation for A→B→A comparisons.
+                    source.retrieved_at = datetime.now(timezone.utc)
+                    identifier = str(metadata.get("identifier") or bill_title)
+                    action = metadata.get("latest_action")
+                    action_date = metadata.get("latest_action_date") or metadata.get("status_date")
+                    development = f"Latest structured action{f' ({action_date.isoformat()})' if isinstance(action_date, date) else ''}: {action}" if action else f"Structured Florida status: {bill_status or 'unreported'}"
+                    # _evidence_excerpt refuses a finding unless this exact
+                    # displayed window supports both the identifier and action.
+                    db.add(ScoutFinding(job_id=job_id, source_id=source.id, title=f"{identifier}: {bill_title}", what_happened=development, why_it_matters="The structured development is paired with retained official source bytes.", relevant_date=action_date if isinstance(action_date, date) else None, excerpt=excerpt, excerpt_hash=content_hash(excerpt.encode()), excerpt_start=excerpt_start, excerpt_end=excerpt_end, confidence="high", extractor_version="scout-p0-1", bill_id=bill_id))
+                    persisted_mechanism = "reused" if exact_raw_ref else mechanism
+                    db.add(ScoutJobEvent(job_id=job_id, kind="document_inspected", detail={"mechanism": persisted_mechanism, "mime_type": mime_base}))
+                    db.add(ScoutJobEvent(job_id=job_id, kind="source_persisted", detail={"mechanism": persisted_mechanism, "change_kind": change.kind if change else None}))
+                    db.add(ScoutJobEvent(job_id=job_id, kind="finding_persisted", detail={"mechanism": persisted_mechanism}))
                     db.commit()
-                    return same
-                current_job = self._fenced(db, job_id, token)
-                if current_job is None:
-                    return None
-                source = db.get(ScoutSource, stage_id)
-                if source is None:  # pragma: no cover - stage is committed above
-                    return None
-                source.title = bill_title
-                source.official = True
-                source.retrieval_mechanism = "reused" if exact_raw_ref else mechanism
-                source.content_hash = digest
-                source.document_hash = digest
-                source.raw_ref = raw_ref
-                source.prior_source_id = prior_id
-                source.change_kind = change.kind if change else None
-                source.change_summary = change.summary if change else None
-                # Server defaults on older SQLite/PostgreSQL configurations can
-                # collapse multiple observations into one second. Persist the
-                # actual finalization instant so URL history has a stable newest
-                # observation for A→B→A comparisons.
-                source.retrieved_at = datetime.now(timezone.utc)
-                identifier = str(metadata.get("identifier") or bill_title)
-                action = metadata.get("latest_action")
-                action_date = metadata.get("latest_action_date") or metadata.get("status_date")
-                development = f"Latest structured action{f' ({action_date.isoformat()})' if isinstance(action_date, date) else ''}: {action}" if action else f"Structured Florida status: {bill_status or 'unreported'}"
-                # _evidence_excerpt refuses a finding unless this exact
-                # displayed window supports both the identifier and action.
-                db.add(ScoutFinding(job_id=job_id, source_id=source.id, title=f"{identifier}: {bill_title}", what_happened=development, why_it_matters="The structured development is paired with retained official source bytes.", relevant_date=action_date if isinstance(action_date, date) else None, excerpt=excerpt, excerpt_hash=content_hash(excerpt.encode()), excerpt_start=excerpt_start, excerpt_end=excerpt_end, confidence="high", extractor_version="scout-p0-1", bill_id=bill_id))
-                persisted_mechanism = "reused" if exact_raw_ref else mechanism
-                db.add(ScoutJobEvent(job_id=job_id, kind="document_inspected", detail={"mechanism": persisted_mechanism, "mime_type": mime_base}))
-                db.add(ScoutJobEvent(job_id=job_id, kind="source_persisted", detail={"mechanism": persisted_mechanism, "change_kind": change.kind if change else None}))
-                db.add(ScoutJobEvent(job_id=job_id, kind="finding_persisted", detail={"mechanism": persisted_mechanism}))
-                db.commit()
-                return source.id
+                    return source.id
         except Exception:
             # A database/provenance failure is isolated to this source; the
             # outer loop can still publish a truthful partial outcome.
@@ -600,7 +633,14 @@ class ScoutRunner:
                 durable_provider_id = True
             if not self._heartbeat(job_id, token):
                 return False
-            if capture.pages > max_pages or capture.actions > max_actions:
+            max_routed_requests = self._job_limit(
+                active_job, "max_routed_requests", self.settings.max_browser_routed_requests
+            )
+            if (
+                capture.pages > max_pages
+                or capture.actions > max_actions
+                or capture.routed_requests > max_routed_requests
+            ):
                 raise RuntimeError("browser_limit_exceeded")
             final_url = canonicalize_url(capture.url)
             source_id = self._persist_capture(job_id, token, bill_id, bill_title, bill_status, metadata, final_url, "browser", 200, capture.mime_type, capture.body)
@@ -625,6 +665,12 @@ class ScoutRunner:
             # release the true provider ID. Never log the opaque value.
             provider_id = exc.provider_session_id
             durable_provider_id = self._recover_browser_session(session_id, job_id, token, provider_id)
+            if not durable_provider_id and self._browser_slot_abandoned(session_id):
+                # The reaper already declared this ID-less slot terminal. The
+                # callback was rejected and the provider has performed its
+                # own cleanup, so a second release must not recreate/alter
+                # the abandoned ledger row.
+                provider_id = None
             return False
         except Exception:
             return False
@@ -705,6 +751,20 @@ class ScoutRunner:
             if session is None or session.job_id != job_id:
                 raise RuntimeError("browser_slot_not_found")
             if session.provider_session_id is None:
+                # A reaper can terminalize an ID-less reservation once its
+                # owner is no longer live.  A delayed provider callback must
+                # fail back into the provider's cleanup path, never turn that
+                # abandoned capacity back into a live session.
+                lease_expires_at = job.lease_expires_at
+                if (
+                    session.status != "starting"
+                    or (
+                        lease_expires_at is not None
+                        and (lease_expires_at.replace(tzinfo=timezone.utc) if lease_expires_at.tzinfo is None else lease_expires_at)
+                        <= datetime.now(timezone.utc)
+                    )
+                ):
+                    raise RuntimeError("browser_slot_no_longer_startable")
                 session.provider_session_id = provider_id
                 session.status = "running"
                 usage = dict(job.usage or {})
@@ -734,6 +794,11 @@ class ScoutRunner:
                 session.error_class = "abandoned_before_provider_id"
                 session.released_at = datetime.now(timezone.utc)
                 db.commit()
+
+    def _browser_slot_abandoned(self, session_id: uuid.UUID) -> bool:
+        with self.sessions() as db:
+            session = db.get(ScoutBrowserSession, session_id)
+            return session is not None and session.status == "abandoned"
 
     def _release_untracked_provider(self, provider_id: str) -> tuple[bool, str | None]:
         """One bounded cleanup retry for a provider ID whose callback failed."""
@@ -768,6 +833,11 @@ class ScoutRunner:
                 if session is None or job is None or session.job_id != job_id:
                     return False
                 if session.provider_session_id is None:
+                    # A late callback for a reaped ID-less slot has already
+                    # gone through provider cleanup. Do not recreate ledger
+                    # usage or consume global capacity after abandonment.
+                    if session.status != "starting":
+                        return False
                     session.provider_session_id = provider_id
                     usage = dict(job.usage or {})
                     usage["browser_sessions"] = int(usage.get("browser_sessions", 0)) + 1
@@ -973,6 +1043,10 @@ class ScoutRunner:
                 return False
             usage = dict(job.usage or {})
             if int(usage.get("external_requests", 0)) >= self._job_limit(job, "max_external_requests", self.settings.max_external_requests):
+                db.add(ScoutJobEvent(job_id=job_id, kind="external_request_limit_reached", detail={
+                    "limit": self._job_limit(job, "max_external_requests", self.settings.max_external_requests),
+                }))
+                db.commit()
                 return False
             usage["external_requests"] = int(usage.get("external_requests", 0)) + 1
             job.usage = usage
