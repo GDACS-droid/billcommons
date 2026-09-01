@@ -34,7 +34,7 @@ Updated 2026-09-01. This records checks actually run; it is not production-deplo
 
 ## Git / preservation
 
-- Public feature branch: `billcommons-scout`; hardened code head `22a6376` (code repair `51e2588`), with the original reviewed demo in artifact commit `5e1e769`. The strengthened live-proof replacement has completed independent and external-model review and is pending its public branch push at this checkpoint.
+- Public feature branch: `billcommons-scout`; hardened code head `22a6376` (code repair `51e2588`), with the strengthened live-proof demo published in artifact commit `9423090`. Independent and external-model reviews returned **SHIP**, the remote head matched after push, and immutable raw demo/proof URLs returned HTTP 200 at their documented byte sizes.
 - Preserve unrelated modified ingest health/full-text files and untracked `.claude`, operations, outreach, rendered, monitoring, and data-request files.
 - Scout production schema migration, worker service creation, RawStore topology, monitoring/canary, backup/restore proof, feature enablement, and web deployment have not run.
 
