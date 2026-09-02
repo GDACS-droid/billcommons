@@ -1156,7 +1156,9 @@ def test_admin_key_sharing_flag_is_per_day_not_window_total(client, app_and_db):
     db = SessionLocal()
     from billcommons_schema.models import ApiKeyUsageSubnet
 
-    today = date.today()
+    # The admin query anchors its calendar window to UTC; use the same clock
+    # in the fixture so the test remains deterministic around local midnight.
+    today = datetime.now(timezone.utc).date()
     for day_offset in range(7):  # 7 days, 4 distinct subnets EACH day
         for subnet_n in range(4):
             db.add(
