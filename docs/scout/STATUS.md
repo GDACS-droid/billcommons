@@ -1,14 +1,14 @@
 # Bill Commons Scout status
 
-Updated 2026-09-01.
+Updated 2026-09-02.
 
 ## Decision
 
 - Challenge artifact: **SHIP** once the owner authorizes the post.
-- Scout application: **PRODUCTION-READY; DARK DEPLOYED**.
+- Scout application: **PRODUCTION-READY; LIMITED PUBLIC BETA ENABLED**.
 - Named private production canary: **PASS**.
-- Rollback rehearsal: **VERIFIED** against the final backend artifact.
-- Public production enablement: **OFF; requires explicit owner authorization**.
+- Rollback: **VERIFIED IN USE** after a provenance-label defect was found during staged rollout.
+- Public production enablement: **ON; authentication, quotas, cache namespace, and kill switches retained**.
 
 ## Completed milestones
 
@@ -46,10 +46,9 @@ Updated 2026-09-01.
 
 ## Latest verification
 
-- Backend/operations suites total **862 passed, 8 skipped, 11 dependency/fixture
-  deprecation warnings**: API 571/8, shared 165, Scout worker 96, monitoring 4,
-  operator scripts 26.
-- Web: **10 passed**; targeted ESLint, TypeScript, and Next production build passed.
+- Final broad rerun: API **572 passed, 8 skipped**; shared **166 passed**; Scout
+  worker **96 passed, 3 skipped**. Web Scout **13 passed**; ESLint, TypeScript,
+  and Next production build passed.
 - PostgreSQL store: concurrent two-instance put, database size constraint, and an
   API-created job read by a fresh store instance passed.
 - Live Florida discovery: passed; HB 625 bill evidence and at least one official
@@ -67,16 +66,24 @@ Updated 2026-09-01.
 - Backup/restore: pre-migration and post-canary full dumps restored to disposable
   PostgreSQL 18; the reconciled recovery set matches all corpus/Scout counts, usage,
   and five blob hashes.
-- Operations: final `8dc0ce36` API/Scout deployments are `SUCCESS`; service monitor
-  7/7 and read monitor 5/5 healthy; exact-image feature-off reconciliation/reaper
-  counters all zero.
+- Operations: deployed source `8d5dbec3`; API `5828ea8b-6a85-4ca6-b453-f76e604ad374`,
+  Scout worker `e71aa668-4dc1-4d57-9045-3dd51f3a568d`, and Vercel
+  `dpl_2ajAm7J2TBkdnZjQsqsp1PMC3wfj` are healthy. Service monitor 7/7 and read
+  monitor 5/5 pass; reaper counters and unreleased sessions are zero.
+- Staged rollout found and repaired a material trust defect: House analyses
+  discovered through a Senate host were mislabeled as Senate documents. Public
+  admission was disabled and the prior dark web artifact restored before repair.
+  Evidence-derived chamber/type/date labels, non-fabricated significance, cache
+  namespace invalidation, and mobile Beta disclosure were then verified in a new
+  private canary and actual deployed desktop/mobile renders.
+- Second multi-family review: eight independent legs returned **SHIP**. The ninth
+  configured image leg was unavailable because its endpoint does not accept images;
+  it returned no product verdict.
 - Demo: H.264 1440×900, 20.16s, 504 frames, fully decoded and visually inspected.
 
 ## Remaining human actions
 
-1. Explicitly authorize public API/web/navigation enablement. Platform admission now
-   caps active jobs, daily jobs, daily browser runtime, and retained evidence globally,
-   but the rollout flags remain deliberately false.
+1. Review the final challenge screenshots/video and proposed post.
 2. Separately authorize the challenge social publication when ready.
 
 Stripe live-account webhook access is tracked separately and does not gate Scout.

@@ -1,14 +1,14 @@
 # Scout closeout ledger
 
-Updated 2026-09-01. This is the authoritative final-hardening ledger. The authorized
-dark deploy/private canary is complete; public enablement and social publication remain
-outside this work's authority.
+Updated 2026-09-02. This is the authoritative final-hardening ledger. Staged limited
+public enablement is complete; social publication remains outside this work's authority.
 
 | Issue | Severity | Classification | Owner / module | Evidence and action | Test / proof | Final disposition |
 | --- | --- | --- | --- | --- | --- | --- |
 | Public example used `robots.txt` | High | FIX NOW | public cookbook | Replaced with chapter 43 → §43.16 browser navigation on Online Sunshine; retained free fixture path | Live 10.137s run, 1 page, 2 actions, 38 routed requests, replay available, cleanup confirmed; 12 deterministic tests; public commit `1233dd2` | FIXED |
 | Demo separated product and browser proof | High | FIX NOW | `docs/scout/demo` | Rebuilt one HB 625 case narrative with an explicit deterministic product segment and two actual same-session Solari frames | 20.16s H.264 fully decoded; 504 frames; screenshots and hashes inspected | FIXED |
-| Generic AI-SaaS visual language | Medium | FIX NOW | web Scout/header/tokens | Replaced card/pill hierarchy with compact query controls, separators, evidence columns, durable events, and plain operational metadata | Desktop/mobile production screenshots; 8 web tests; ESLint, TypeScript, and Next build pass; two independent visual passes | FIXED |
+| Generic AI-SaaS visual language | Medium | FIX NOW | web Scout/header/tokens | Replaced card/pill hierarchy with compact query controls, separators, evidence columns, durable events, and plain operational metadata | Final deployed desktop/mobile screenshots; 13 web tests; ESLint, TypeScript, and Next build pass; two independent visual passes | FIXED |
+| House analyses mislabeled as Senate / duplicate-looking findings | High | FIX NOW | worker/shared/web | Public rollout review found discovery-host attribution overriding document evidence. Admission was disabled and the dark web artifact restored. Issuer/type/date/token now come conservatively from retained headers; unsupported significance is omitted; extraction cache namespace bumped so bad fresh jobs cannot be reused | Private production recomputation, exact 2/3/2026 and 6/16/2026 assertions, deployed UI screenshots, second review with 8 SHIP verdicts | FIXED AFTER VERIFIED ROLLBACK |
 | Demo fixture strategy/evidence mismatch | High | FIX NOW | demo fixtures | Completed fixture now has two linked findings and two official sources: Senate bill action plus current statute | Runtime assertions and final frame review | FIXED |
 | Florida P0 revisited only known URLs | High | FIX NOW | shared/worker | Added bill-scoped discovery for official Senate analyses/amendments, dedupe, PDF signature/MIME enforcement, and provenance/change handling | Deterministic source-discovery/change/partial tests plus opt-in live HB 625 run that retained an official analysis | FIXED |
 | 256 KiB ceiling rejected ordinary analyses | High | FIX NOW | shared settings | Raised bounded payload cap to 2 MiB; PDF page/text caps remain independent | Live official analyses were 419–455 KiB; opt-in workflow passed after repair | FIXED |
@@ -30,11 +30,11 @@ outside this work's authority.
 | Production backup/restore drill | High | TEST/PROVE | Railway Postgres | Full pre-migration and post-canary PG18 custom dumps retained mode 0600 with recorded checksums; current Scout-only archive reconciles the final canary delta | Clean disposable restores; exact corpus/Scout/usage parity; 5/5 blob hashes; restored worker readiness | CLOSED |
 | Stripe account/webhook mismatch | Medium | EXTERNAL BLOCKER | monetization, separate | Code/tests/runbook remain preserved on `stripe-webhook-hotfix-20260901` at `81c5459`; current credentials do not prove control of the correct Bill Commons live account | In the correct account's Live Workbench, verify exact endpoint/scope/API version/seven events, copy its signing secret directly to Railway, redeploy, then inspect one separately authorized real event; do not create a charge merely for proof | EXTERNAL; NOT A SCOUT BLOCKER |
 | Social submission | Low | INTENTIONAL P1 | owner | Draft and public artifacts prepared; user explicitly said not to submit | Human review/authorization | DEFERRED BY USER |
-| Production deployment | High | TEST/PROVE | owner/release operator | User authorized dark deploy/private canary only; final API/worker artifacts deployed with public/nav flags off | Named direct + durable Solari canaries, logs/monitoring, backup/restore, rollback rehearsal | DARK DEPLOY COMPLETE; PUBLIC OFF |
+| Production deployment | High | TEST/PROVE | owner/release operator | User authorized staged public beta. API/worker/web were enabled with auth, quotas, cache versioning, canary controls, and independent kill switches intact | Named canary, public UI E2E, real Solari lifecycle, live IDOR/origin/size probes, actual rollback/repair/re-enable, logs/DB/reaper, second visual review | LIMITED PUBLIC BETA ENABLED |
 
 ## Remaining boundary
 
-There are no known critical/high Scout implementation or private-canary defects in
-the reviewed final artifact. Public API/web/navigation flags and the social post remain
-deliberate owner actions. Stripe account access remains separate and does not gate
-Scout. Exact production evidence is in `PRODUCTION_CANARY.md`.
+There are no known critical/high Scout implementation or public-beta defects in the
+reviewed final artifact. The social post remains a deliberate owner action. Stripe
+account access remains separate and does not gate Scout. Exact dark-canary evidence is
+in `PRODUCTION_CANARY.md`; staged public evidence is in `PUBLIC_BETA.md`.
