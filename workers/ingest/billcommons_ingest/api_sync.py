@@ -763,13 +763,24 @@ def _upsert_actions(
             # preserve the conflicting rows and insert one authoritative
             # representation; the explicit cleanup pass can then collapse
             # exact content duplicates deterministically.
-            same_classification = [
-                action for action in exact_matches if action.classification == classification
+            official_matches = [
+                action for action in exact_matches if _is_ca_official_action(action)
             ]
-            if same_classification:
-                same_order = [action for action in same_classification if action.order == order]
-                current = same_order[0] if same_order else same_classification[0]
-                order_is_safe_to_reconcile = bool(same_order)
+            if official_matches:
+                # Multiple CA ledger rows can legitimately share normalized
+                # text/date. The API has no immutable action ID to choose a
+                # copy, so consume one without mutation rather than adding a
+                # third fact solely because its classification differs.
+                current = official_matches[0]
+                order_is_safe_to_reconcile = False
+            else:
+                same_classification = [
+                    action for action in exact_matches if action.classification == classification
+                ]
+                if same_classification:
+                    same_order = [action for action in same_classification if action.order == order]
+                    current = same_order[0] if same_order else same_classification[0]
+                    order_is_safe_to_reconcile = bool(same_order)
         if current is None:
             description_matches = [
                 action

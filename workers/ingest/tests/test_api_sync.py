@@ -256,6 +256,56 @@ def test_ca_official_action_whitespace_match_preserves_order_and_provenance(db_s
     assert official.upstream_id == "ca-history:1546"
 
 
+def test_ca_duplicate_official_exact_match_does_not_insert_third_api_row(db_session):
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="AB 1546",
+        identifier_norm="AB1546",
+        title="A California bill",
+        openstates_id="ocd-bill/ca-official-duplicate",
+    )
+    db_session.add(bill)
+    db_session.flush()
+    officials = [
+        BillAction(
+            bill_id=bill.id,
+            action_date=date(2026, 8, 31),
+            description="Read first time.",
+            classification=None,
+            order=sequence,
+            source_name="ca_official_action_sweep/2026-09-02",
+            upstream_id=f"ca-history:1546-{sequence}",
+        )
+        for sequence in (41, 42)
+    ]
+    db_session.add_all(officials)
+    db_session.flush()
+
+    payload = _v3_bill_payload(
+        openstates_id=bill.openstates_id,
+        identifier=bill.identifier,
+        title=bill.title,
+        session=session_row.identifier,
+        actions=[{
+            "description": "Read  first time.",
+            "date": "2026-08-31",
+            "classification": ["reading-1"],
+            "order": 1,
+        }],
+    )
+    sync_state(db_session, jurisdiction, client=_client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}}))
+    db_session.flush()
+
+    actions = db_session.execute(select(BillAction).where(BillAction.bill_id == bill.id)).scalars().all()
+    assert {action.id for action in actions} == {action.id for action in officials}
+    assert {(action.order, action.source_name, action.upstream_id) for action in actions} == {
+        (41, "ca_official_action_sweep/2026-09-02", "ca-history:1546-41"),
+        (42, "ca_official_action_sweep/2026-09-02", "ca-history:1546-42"),
+    }
+
+
 def test_ca_same_day_api_failure_cannot_override_official_status_sequence(db_session):
     jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
     bill = Bill(

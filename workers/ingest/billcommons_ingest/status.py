@@ -131,7 +131,8 @@ CA_OFFICIAL_ACTION_SOURCE_PREFIX = "ca_official_action_sweep/"
 # thing ("motion to withdraw failed"), and a wrong terminal status is far
 # costlier than a missing one.
 _CA_FINAL_CONCURRENCE_RE = re.compile(
-    r"^(?:senate|assembly)\s+amendments\s+concurred\s+in\."
+    r"^(?:urgency\s+clause\s+adopted\.\s+)?"
+    r"(?:senate|assembly)\s+amendments\s+concurred\s+in\."
     r"[\s\S]*?\b(?:to|ordered\s+to)\s+engrossing\s+and\s+enrolling\b",
     re.I,
 )

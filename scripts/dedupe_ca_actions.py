@@ -185,8 +185,7 @@ def _load_planned_actions_for_update(db, action_ids: Sequence[object]) -> list[B
     """
     return list(
         db.execute(
-            select(BillAction)
-            .where(BillAction.id.in_(action_ids))
+            select(BillAction).where(BillAction.id.in_(action_ids)).order_by(BillAction.id)
             .with_for_update()
         ).scalars().all()
     )
@@ -205,7 +204,7 @@ def _lock_affected_bills_and_actions(db, bill_ids: Sequence[object]) -> list[Bil
         return []
     locked_bill_ids = list(
         db.execute(
-            select(Bill.id).where(Bill.id.in_(bill_ids)).with_for_update()
+            select(Bill.id).where(Bill.id.in_(bill_ids)).order_by(Bill.id).with_for_update()
         ).scalars().all()
     )
     if set(locked_bill_ids) != set(bill_ids):
@@ -214,6 +213,7 @@ def _lock_affected_bills_and_actions(db, bill_ids: Sequence[object]) -> list[Bil
         db.execute(
             select(BillAction)
             .where(BillAction.bill_id.in_(bill_ids))
+            .order_by(BillAction.bill_id, BillAction.id)
             .with_for_update()
         ).scalars().all()
     )

@@ -329,17 +329,25 @@ def build_plan(
     for key, official_rows in official_by_key.items():
         local_rows = sorted(local_by_key.get(key, []), key=_retention_key, reverse=True)
         ordered_official_rows = sorted(official_rows, key=_official_sort_key)
+        retained_local_rows = local_rows[:len(ordered_official_rows)]
+        pairs = _pair_local_to_official(retained_local_rows, ordered_official_rows)
         if len(local_rows) < len(official_rows):
-            additions.extend(ordered_official_rows[len(local_rows):])
+            # Provenance can establish that the existing local occurrence is
+            # the *later* official duplicate. Positional slicing would add
+            # that same history row again and leave the earlier one absent.
+            paired_history_ids = {official.history_id for _local, official in pairs}
+            additions.extend(
+                official
+                for official in ordered_official_rows
+                if official.history_id not in paired_history_ids
+            )
         elif len(local_rows) > len(official_rows):
             deletions.extend(local_rows[len(official_rows):])
         # The retention ordering selects which local duplicates survive; the
         # official history sequence orders the corresponding factual copies.
         # That creates an exact pairing even for repeated same-day text such
         # as AB 1546, rather than leaving arbitrary old orders in place.
-        for local, official in _pair_local_to_official(
-            local_rows[:len(ordered_official_rows)], ordered_official_rows
-        ):
+        for local, official in pairs:
             if local.order != official.sequence:
                 order_updates.append(OrderUpdate(local.id, official))
 
@@ -486,7 +494,24 @@ def _action_update_mappings(
             candidate["id"] = local.id
             updates[local.id] = candidate
 
+    for local, official in _paired_local_official_rows(plan):
+        consider(local, official)
+    return [updates[action_id] for action_id in sorted(updates, key=str)]
+
+
+def _paired_local_official_rows(
+    plan: ActionPlan,
+) -> list[tuple[LocalAction, OfficialAction]]:
+    """Return the durable survivor-to-ledger pairing used by every apply step.
+
+    Reconciliation of duplicate normalized facts cannot fall back to row load
+    order after planning: a local row may already identify one exact official
+    history occurrence through ``upstream_id``.  Both provenance updates and
+    status reconstruction must use this same pairing or a classification can
+    migrate to a different occurrence of otherwise identical text.
+    """
     deleted_ids = {item.id for item in plan.deletions}
+    pairs: list[tuple[LocalAction, OfficialAction]] = []
     for local_rows in plan.local_by_bill.values():
         by_key: dict[tuple[str, str, str], list[LocalAction]] = defaultdict(list)
         for local in local_rows:
@@ -497,9 +522,8 @@ def _action_update_mappings(
                 (row for row in plan.official_by_bill.get(key[0], ()) if row.key == key),
                 key=_official_sort_key,
             )
-            for local, official in _pair_local_to_official(rows, official_rows):
-                consider(local, official)
-    return [updates[action_id] for action_id in sorted(updates, key=str)]
+            pairs.extend(_pair_local_to_official(rows, official_rows))
+    return pairs
 
 
 def _execute_action_updates(db: OrmSession, mappings: Sequence[dict[str, Any]]) -> int:
@@ -543,14 +567,8 @@ def _apply_plan(
 ) -> tuple[int, int]:
     """Apply a precomputed plan; caller owns transaction/lock and commits."""
     by_id = {item.id: item for rows in plan.local_by_bill.values() for item in rows}
-    deleted_ids = {item.id for item in plan.deletions}
     touched: set[object] = set()
     updates = 0
-    current_rows_by_bill: dict[object, list[BillAction]] = defaultdict(list)
-    for rows in plan.local_by_bill.values():
-        for local in rows:
-            if local.row is not None and local.id not in deleted_ids:
-                current_rows_by_bill[local.bill_id].append(local.row)
     if plan.deletions:
         deletion_ids = [local.id for local in plan.deletions]
         # The serializable advisory-locked plan names every exact primary key.
@@ -588,12 +606,20 @@ def _apply_plan(
             classification=None, order=official.sequence, **_action_provenance(official, zip_sha256, now),
         )
         db.add(new_row)
-        current_rows_by_bill[bill.id].append(new_row)
         touched.add(bill.id)
     db.flush()
 
     # Latest scalar and status deliberately use the official ledger, while
-    # retaining any structured classification available on a paired local row.
+    # retaining any structured classification available on the exact paired
+    # local history occurrence. Do not use DB load/FIFO order here: CA can
+    # legitimately publish the same normalized text more than once per day.
+    metadata_by_history = {
+        (official.official_bill_id, official.history_id): (
+            local.classification,
+            getattr(local.row, "organization_id", None),
+        )
+        for local, official in _paired_local_official_rows(plan)
+    }
     for official_bill_id, official_rows in plan.official_by_bill.items():
         bill = bill_by_official.get(official_bill_id)
         if bill is None:
@@ -604,17 +630,11 @@ def _apply_plan(
         old_latest = (bill.latest_action_date, bill.latest_action_text)
         bill.latest_action_date = latest.action_date
         bill.latest_action_text = latest.description
-        current_rows = current_rows_by_bill[bill.id]
-        classifications: dict[
-            tuple[str, str, str], list[tuple[str | None, object | None]]
-        ] = defaultdict(list)
-        for row in current_rows:
-            key = (official_bill_id, row.action_date.isoformat() if row.action_date else "", _normal_description(row.description))
-            classifications[key].append((row.classification, row.organization_id))
         action_rows: list[status.ActionRow] = []
         for official in official_rows:
-            matches = classifications[official.key]
-            classification, organization_id = matches.pop(0) if matches else (None, None)
+            classification, organization_id = metadata_by_history.get(
+                (official_bill_id, official.history_id), (None, None)
+            )
             action_rows.append(
                 status.ActionRow(
                     official.action_date,

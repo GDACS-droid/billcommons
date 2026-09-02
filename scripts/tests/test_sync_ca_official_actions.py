@@ -140,6 +140,147 @@ def test_reloaded_duplicate_provenance_keeps_exact_official_sequence_pairing():
     ) == []
 
 
+def test_duplicate_addition_uses_unpaired_history_then_second_plan_is_zero():
+    first = _official("1546-1", 41, "Read first time.")
+    second = _official("1546-2", 42, "Read first time.")
+
+    def local(identity: str, official: sweep.OfficialAction):
+        provenance = sweep._action_provenance(
+            official, "a" * 64, datetime(2026, 9, 2, tzinfo=timezone.utc)
+        )
+        return sweep.LocalAction(
+            identity,
+            "bill-1",
+            first.official_bill_id,
+            first.action_date,
+            first.description,
+            None,
+            official.sequence,
+            SimpleNamespace(classification=None, order=official.sequence, **provenance),
+        )
+
+    # The one existing copy was already proven to be history row 42. The
+    # missing row is 41, not the positional tail 42.
+    plan = sweep.build_plan({first.official_bill_id: (first, second)}, [local("second", second)])
+    assert [item.history_id for item in plan.additions] == ["1546-1"]
+
+    second_plan = sweep.build_plan(
+        {first.official_bill_id: (first, second)},
+        [local("second", second), local("first", first)],
+    )
+    assert second_plan.additions == ()
+    assert second_plan.deletions == ()
+    assert second_plan.order_updates == ()
+    assert sweep._action_update_mappings(
+        second_plan, zip_sha256="a" * 64, now=datetime(2026, 9, 3, tzinfo=timezone.utc)
+    ) == []
+
+
+def test_apply_plan_keeps_duplicate_history_classification_on_its_provenance_pair(monkeypatch):
+    """A status repair must not FIFO-swap AB 1546-style duplicate rows.
+
+    The pre-existing local copy is explicitly CA history 42 and carries a
+    failure classification.  Applying the missing history 41 row must retain
+    that classification on sequence 42; assigning it to the new row instead
+    would falsely derive the wrong official chronology.
+    """
+    first = _official("1546-1", 41, "Read first time.")
+    second = _official("1546-2", 42, "Read first time.")
+    now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    second_provenance = sweep._action_provenance(second, "a" * 64, now)
+    existing_row = SimpleNamespace(
+        classification="failure",
+        organization_id="committee-2",
+        order=42,
+        **second_provenance,
+    )
+    existing = sweep.LocalAction(
+        "local-second",
+        "bill-1",
+        first.official_bill_id,
+        first.action_date,
+        first.description,
+        "failure",
+        42,
+        existing_row,
+    )
+    plan = sweep.build_plan({first.official_bill_id: (first, second)}, [existing])
+    assert [action.history_id for action in plan.additions] == ["1546-1"]
+
+    class Db:
+        def __init__(self):
+            self.added: list[object] = []
+            self.flushed = False
+
+        def add(self, row):
+            self.added.append(row)
+
+        def flush(self):
+            self.flushed = True
+
+    db = Db()
+    bill = SimpleNamespace(
+        id="bill-1",
+        identifier="AB 1",
+        latest_action_date=None,
+        latest_action_text=None,
+        status=None,
+        status_date=None,
+        updated_at=None,
+    )
+    session = SimpleNamespace(
+        identifier=sweep.REGULAR_SESSION_IDENTIFIER,
+        classification="regular",
+        end_date=date(2026, 12, 31),
+        active=True,
+    )
+    captured: list[sweep.status.ActionRow] = []
+    derive_status = sweep.status.derive_status
+
+    def capture_then_derive(rows):
+        captured.extend(rows)
+        return derive_status(rows)
+
+    monkeypatch.setattr(sweep.status, "derive_status", capture_then_derive)
+    monkeypatch.setattr(sweep.events, "record_event", lambda *_args, **_kwargs: None)
+
+    updates, touched = sweep._apply_plan(
+        db,
+        plan=plan,
+        bill_by_id={bill.id: bill},
+        session_by_bill_id={bill.id: session},
+        zip_sha256="a" * 64,
+        now=now,
+    )
+
+    assert updates == 0
+    assert touched == 1
+    assert db.flushed is True
+    assert [(row.order, row.classification, row.organization_id) for row in captured] == [
+        (41, None, None),
+        (42, "failure", "committee-2"),
+    ]
+    assert bill.status == sweep.status.DEAD
+
+    added = next(row for row in db.added if getattr(row, "upstream_id", None) == "ca-history:1546-1")
+    first_local = sweep.LocalAction(
+        "local-first",
+        bill.id,
+        first.official_bill_id,
+        first.action_date,
+        first.description,
+        added.classification,
+        added.order,
+        added,
+    )
+    second_plan = sweep.build_plan(
+        {first.official_bill_id: (first, second)}, [first_local, existing]
+    )
+    assert second_plan.additions == ()
+    assert second_plan.deletions == ()
+    assert second_plan.order_updates == ()
+
+
 def test_plan_deletes_only_excess_copy_of_officially_proven_fact_and_preserves_unsupported():
     official = _official("10", 1, "Introduced.")
     plan = sweep.build_plan(

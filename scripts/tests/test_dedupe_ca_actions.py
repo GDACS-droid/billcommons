@@ -98,6 +98,7 @@ def test_planned_deletion_loader_acquires_row_locks_before_validation():
     db = Db()
     assert dedupe._load_planned_actions_for_update(db, ["action-1"]) == []
     assert db.statement._for_update_arg is not None  # noqa: SLF001 - SQLAlchemy contract inspection
+    assert db.statement._order_by_clauses  # noqa: SLF001 - deterministic lock order
 
 
 def test_affected_set_loader_locks_parent_bills_before_every_action_row():
@@ -126,6 +127,8 @@ def test_affected_set_loader_locks_parent_bills_before_every_action_row():
     assert len(db.statements) == 2
     assert db.statements[0]._for_update_arg is not None  # noqa: SLF001
     assert db.statements[1]._for_update_arg is not None  # noqa: SLF001
+    assert db.statements[0]._order_by_clauses  # noqa: SLF001
+    assert db.statements[1]._order_by_clauses  # noqa: SLF001
     assert "FROM bills" in str(db.statements[0])
     assert "FROM bill_actions" in str(db.statements[1])
 

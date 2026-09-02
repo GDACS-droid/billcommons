@@ -200,6 +200,28 @@ def test_california_final_concurrence_is_passed_both_not_enrolled():
     assert derive_status(actions) == PASSED_BOTH
 
 
+def test_california_urgency_clause_prefix_is_recognized_for_exact_final_concurrence():
+    # Exact official 2025-26 forms from AB 2539, AB 2329, AB 2555, AB 2765,
+    # and AB 2173. The prefix is allowed only as the fixed initial clause.
+    for wording in (
+        "Urgency clause adopted. Senate amendments concurred in. To Engrossing and Enrolling. (Ayes 77. Noes 0.).",
+        "Urgency clause adopted. Senate amendments concurred in. To Engrossing and Enrolling.",
+        "Urgency clause adopted. Senate amendments concurred in. To Engrossing and Enrolling. (Ayes 77. Noes 0.).",
+        "Urgency clause adopted. Senate amendments concurred in. To Engrossing and Enrolling. (Ayes 63. Noes 9.).",
+        "Urgency clause adopted. Senate amendments concurred in. To Engrossing and Enrolling. (Ayes 77. Noes 0.).",
+    ):
+        assert derive_status([A(date(2026, 8, 30), None, wording)]) == PASSED_BOTH
+
+
+def test_california_final_concurrence_rejects_untrusted_or_unrelated_prefixes():
+    for wording in (
+        "Urgency clause proposed. Senate amendments concurred in. To Engrossing and Enrolling.",
+        "Untrusted preface. Urgency clause adopted. Senate amendments concurred in. To Engrossing and Enrolling.",
+        "Urgency clause adopted. Committee report says Senate amendments concurred in. To Engrossing and Enrolling.",
+    ):
+        assert derive_status([A(date(2026, 8, 30), None, wording)]) is None
+
+
 def test_california_generic_passage_classification_keeps_concurrence_detail():
     actions = [
         A(
