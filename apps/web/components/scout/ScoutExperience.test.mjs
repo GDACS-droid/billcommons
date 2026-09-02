@@ -11,3 +11,9 @@ test("Scout leaves unsupported significance absent, marks bounded excerpts, and 
   assert.match(source, /finding\.whyItMatters \? \(/);
   assert.match(source, /event\.message \? <p className="mt-0\.5 break-words text-slate-700">/);
 });
+
+test("every visible evidence-source control records a privacy-safe open event", () => {
+  assert.match(source, /track\("scout_evidence_opened", \{ control: "finding" \}\)/);
+  assert.match(source, /track\("scout_evidence_opened", \{ control: "source_metadata" \}\)/);
+  assert.match(source, /track\("scout_evidence_opened", \{ control: "prior_source_metadata" \}\)/);
+});

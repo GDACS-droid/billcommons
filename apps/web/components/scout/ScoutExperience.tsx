@@ -350,7 +350,7 @@ function JobDetails({ job, refreshError, onCancel, canceling }: { job: ScoutJob;
                         Prior evidence: {time(source.priorSource.retrievedAt) || "time not recorded"}
                         {shortHash(source.priorSource.contentHash) ? ` · ${shortHash(source.priorSource.contentHash)}` : ""}
                         {source.priorSource.canonicalUrl ? (
-                          <>{" · "}<a className="underline underline-offset-2 hover:text-slate-700" href={source.priorSource.canonicalUrl} target="_blank" rel="noreferrer noopener">source ↗</a></>
+                          <>{" · "}<a className="underline underline-offset-2 hover:text-slate-700" href={source.priorSource.canonicalUrl} target="_blank" rel="noreferrer noopener" onClick={() => track("scout_evidence_opened", { control: "prior_source_metadata" })}>source ↗</a></>
                         ) : null}
                       </p>
                     ) : null}
