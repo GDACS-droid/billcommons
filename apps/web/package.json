@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test:scout": "node --test lib/scout.test.mjs lib/scout-access.test.mjs",
+    "test:scout": "node --test lib/scout.test.mjs lib/scout-access.test.mjs components/SiteHeader.test.mjs",
     "lint": "eslint"
   },
   "dependencies": {

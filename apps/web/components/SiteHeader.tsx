@@ -4,14 +4,20 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import SearchBox from "./SearchBox";
 
-const PRIMARY_NAV = [
+type NavigationItem = {
+  href: string;
+  label: string;
+  beta?: boolean;
+};
+
+const PRIMARY_NAV: NavigationItem[] = [
   { href: "/states", label: "States" },
   { href: "/topics", label: "Topics" },
   { href: "/reports/2026-bill-mortality", label: "Reports" },
   { href: "/coverage", label: "Coverage" },
 ];
 
-const RESOURCE_NAV = [
+const RESOURCE_NAV: NavigationItem[] = [
   { href: "/docs/api", label: "API" },
   { href: "/docs/agents", label: "AI Agents" },
   { href: "/pricing", label: "Pricing" },
@@ -24,12 +30,25 @@ const RESOURCE_NAV = [
 // it in global navigation. Public launch deliberately flips a second flag.
 const SCOUT_ENABLED = process.env.NEXT_PUBLIC_SCOUT_NAV_ENABLED === "true";
 
+function NavigationLabel({ label, beta = false }: { label: string; beta?: boolean }) {
+  return (
+    <>
+      {label}
+      {beta ? (
+        <span className="ml-1 border-l border-blue-700/70 pl-1 text-[0.625rem] font-semibold uppercase tracking-[0.1em] text-blue-800">
+          Beta
+        </span>
+      ) : null}
+    </>
+  );
+}
+
 export default function SiteHeader() {
   const pathname = usePathname();
   const active = (href: string) => pathname === href || pathname.startsWith(`${href}/`);
   const moreActive = RESOURCE_NAV.some((item) => active(item.href));
   const navigation = SCOUT_ENABLED
-    ? [{ href: "/scout", label: "Scout" }, ...PRIMARY_NAV]
+    ? [{ href: "/scout", label: "Scout", beta: true }, ...PRIMARY_NAV]
     : PRIMARY_NAV;
 
   return (
@@ -56,7 +75,7 @@ export default function SiteHeader() {
                 return (
                   <li key={item.href}>
                     <Link href={item.href} aria-current={isActive ? "page" : undefined} className={`block border-l-2 px-3 py-2 hover:bg-slate-50 hover:text-slate-950 ${isActive ? "border-blue-700 bg-slate-50 font-semibold text-slate-950" : "border-transparent"}`}>
-                      {item.label}
+                      <NavigationLabel label={item.label} beta={item.beta} />
                     </Link>
                   </li>
                 );
@@ -75,7 +94,7 @@ export default function SiteHeader() {
                       isActive ? "bg-slate-100 text-slate-950" : ""
                     }`}
                   >
-                    {item.label}
+                    <NavigationLabel label={item.label} beta={item.beta} />
                   </Link>
                 </li>
               );
