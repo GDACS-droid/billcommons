@@ -136,6 +136,11 @@ def _official_counts(zip_path: Path) -> tuple[Counter, set[str]]:
                 for row in csv.reader(stream, delimiter="\t", quotechar="`"):
                     if len(row) != 13:
                         raise DedupeError("malformed BILL_HISTORY_TBL.dat row")
+                    # pubinfo archives can retain history-only orphan rows.
+                    # Only a bill admitted by BILL_TBL belongs to this pinned
+                    # 2025--26 ledger, matching the companion action sweep.
+                    if row[0] not in bill_ids:
+                        continue
                     counts[(row[0], row[2][:10], _normal_description(row[3]))] += 1
     except (KeyError, zipfile.BadZipFile) as exc:
         raise DedupeError("official ZIP is missing a required readable table") from exc
@@ -158,6 +163,76 @@ def choose_excess(actions: Iterable[LocalAction], official_count: int) -> list[L
     if official_count < 1 or len(rows) <= official_count:
         return []
     return rows[official_count:]
+
+
+def _matches_planned_deletion(action: BillAction, planned: PlannedDeletion) -> bool:
+    """Reject a concurrent identity change before deleting a planned UUID."""
+    return (
+        action.id == planned.action_id
+        and action.bill_id == planned.bill_id
+        and (action.action_date.isoformat() if action.action_date else "") == planned.action_date
+        and _normal_description(action.description) == planned.description
+    )
+
+
+def _load_planned_actions_for_update(db, action_ids: Sequence[object]) -> list[BillAction]:
+    """Lock planned rows before identity revalidation and deletion.
+
+    The advisory lock coordinates this repair command with itself, but row
+    locks also close the race with unrelated action writers that do not know
+    this command's advisory-lock name. The caller keeps this transaction open
+    through validation, delete, re-plan, and commit/rollback.
+    """
+    return list(
+        db.execute(
+            select(BillAction)
+            .where(BillAction.id.in_(action_ids))
+            .with_for_update()
+        ).scalars().all()
+    )
+
+
+def _lock_affected_bills_and_actions(db, bill_ids: Sequence[object]) -> list[BillAction]:
+    """Lock complete action sets for every bill this repair may change.
+
+    Locking only planned deletion UUIDs leaves a gap: a concurrent source
+    writer can add or alter a *retained* duplicate after planning.  Taking
+    ``FOR UPDATE`` on the parent bills first blocks FK-backed inserts, then
+    locking every extant action blocks updates/deletes.  The caller must
+    re-plan after this function and keep the transaction open through commit.
+    """
+    if not bill_ids:
+        return []
+    locked_bill_ids = list(
+        db.execute(
+            select(Bill.id).where(Bill.id.in_(bill_ids)).with_for_update()
+        ).scalars().all()
+    )
+    if set(locked_bill_ids) != set(bill_ids):
+        raise DedupeError("affected bill set changed before lock-protected deletion")
+    return list(
+        db.execute(
+            select(BillAction)
+            .where(BillAction.bill_id.in_(bill_ids))
+            .with_for_update()
+        ).scalars().all()
+    )
+
+
+def _missing_official_multiplicity(official: Counter, local: Counter) -> int:
+    """Count ledger facts missing locally without conflating them with excesses."""
+    return sum(max(0, expected - local[key]) for key, expected in official.items())
+
+
+def _assert_deletions_within_locked_bills(
+    deletions: Iterable[PlannedDeletion], locked_bill_ids: set[object]
+) -> None:
+    """Fail closed rather than delete a row introduced outside our lock scope."""
+    expanded = {item.bill_id for item in deletions} - locked_bill_ids
+    if expanded:
+        raise DedupeError(
+            "replanned deletion scope expanded beyond locked California bill set"
+        )
 
 
 def plan(db, zip_path: Path) -> tuple[list[PlannedDeletion], dict]:
@@ -200,6 +275,7 @@ def plan(db, zip_path: Path) -> tuple[list[PlannedDeletion], dict]:
         select(*ACTION_READ_COLUMNS).where(BillAction.bill_id.in_(bill_by_id))
     ).all()
     local: dict[tuple, list[LocalAction]] = defaultdict(list)
+    local_counts: Counter = Counter()
     bill_for_key: dict[tuple, LocalBill] = {}
     local_bill_ids: set[str] = set()
     for row in action_rows:
@@ -215,6 +291,7 @@ def plan(db, zip_path: Path) -> tuple[list[PlannedDeletion], dict]:
             _normal_description(action.description),
         )
         local[key].append(action)
+        local_counts[key] += 1
         bill_for_key[key] = bill
 
     deletions: list[PlannedDeletion] = []
@@ -252,6 +329,9 @@ def plan(db, zip_path: Path) -> tuple[list[PlannedDeletion], dict]:
         "unsupported_duplicate_groups": unsupported_duplicate_groups,
         "planned_deletions": len(deletions),
         "touched_bills": len({item.bill_id for item in deletions}),
+        "missing_official_action_multiplicity": _missing_official_multiplicity(
+            official, local_counts
+        ),
     }
     return deletions, report
 
@@ -272,13 +352,27 @@ def run(*, zip_path: Path, expected_sha256: str, apply: bool) -> dict:
             db.rollback()
             return report
 
+        if deletions:
+            # Lock the full affected bill/action sets, then derive the delete
+            # plan from that stable view.  This closes the retained-row race
+            # that UUID-only deletion locks could not see.
+            locked_bill_ids = {item.bill_id for item in deletions}
+            _lock_affected_bills_and_actions(db, list(locked_bill_ids))
+            deletions, report = plan(db, zip_path)
+            _assert_deletions_within_locked_bills(deletions, locked_bill_ids)
+            report.update({"official_zip_sha256": actual_sha256, "applied": apply})
+
         by_bill: dict[object, int] = Counter(item.bill_id for item in deletions)
         action_ids = [item.action_id for item in deletions]
         if action_ids:
-            actions = db.execute(select(BillAction).where(BillAction.id.in_(action_ids))).scalars().all()
+            actions = _load_planned_actions_for_update(db, action_ids)
             if len(actions) != len(action_ids):
                 raise DedupeError("planned action set changed before lock-protected deletion")
+            planned_by_id = {item.action_id: item for item in deletions}
             for action in actions:
+                planned = planned_by_id.get(action.id)
+                if planned is None or not _matches_planned_deletion(action, planned):
+                    raise DedupeError("planned action identity changed before lock-protected deletion")
                 db.delete(action)
             now = datetime.now(timezone.utc)
             for bill_id, count in by_bill.items():
@@ -297,6 +391,10 @@ def run(*, zip_path: Path, expected_sha256: str, apply: bool) -> dict:
         remaining, after = plan(db, zip_path)
         if remaining:
             raise DedupeError(f"{len(remaining)} officially-proven excess action rows remain")
+        if after["missing_official_action_multiplicity"]:
+            raise DedupeError(
+                "official action multiplicity is missing locally after lock-protected deletion"
+            )
         report["post_duplicate_groups"] = after["duplicate_groups"]
         report["post_legitimate_duplicate_groups"] = after["legitimate_duplicate_groups"]
         report["post_unsupported_duplicate_groups"] = after["unsupported_duplicate_groups"]

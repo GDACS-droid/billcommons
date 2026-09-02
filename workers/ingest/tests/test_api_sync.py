@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy import select, text
 
 from billcommons_ingest import cli as cli_mod
+from billcommons_ingest.status import ActionRow, PASSED_BOTH, derive_status
 from billcommons_ingest.api_sync import (
     ApiSyncResult,
     _bill_checksum,
@@ -206,6 +207,110 @@ def test_same_day_ca_official_action_keeps_latest_scalar_over_unsupported_api_ro
 
     assert bill.latest_action_date == date(2026, 8, 26)
     assert bill.latest_action_text == "Official final re-referral."
+
+
+def test_ca_official_action_whitespace_match_preserves_order_and_provenance(db_session):
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="AB 1546",
+        identifier_norm="AB1546",
+        title="A California bill",
+        openstates_id="ocd-bill/ca-official-whitespace",
+    )
+    db_session.add(bill)
+    db_session.flush()
+    official = BillAction(
+        bill_id=bill.id,
+        action_date=date(2026, 8, 31),
+        description="Senate amendments concurred in. To Engrossing and Enrolling.",
+        classification=None,
+        order=30,
+        source_name="ca_official_action_sweep/2026-09-02",
+        upstream_id="ca-history:1546",
+    )
+    db_session.add(official)
+    db_session.flush()
+
+    payload = _v3_bill_payload(
+        openstates_id=bill.openstates_id,
+        identifier=bill.identifier,
+        title=bill.title,
+        session=session_row.identifier,
+        actions=[{
+            "description": "Senate  amendments concurred in. To Engrossing and Enrolling.",
+            "date": "2026-08-31",
+            "classification": ["referral-committee"],
+            "order": 1,
+        }],
+    )
+    sync_state(db_session, jurisdiction, client=_client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}}))
+    db_session.flush()
+
+    actions = db_session.execute(select(BillAction).where(BillAction.bill_id == bill.id)).scalars().all()
+    assert actions == [official]
+    assert official.order == 30
+    assert official.classification is None
+    assert official.source_name == "ca_official_action_sweep/2026-09-02"
+    assert official.upstream_id == "ca-history:1546"
+
+
+def test_ca_same_day_api_failure_cannot_override_official_status_sequence(db_session):
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="AB 1128",
+        identifier_norm="AB1128",
+        title="A California bill",
+        openstates_id="ocd-bill/ca-same-day-order",
+    )
+    db_session.add(bill)
+    db_session.flush()
+    official = BillAction(
+        bill_id=bill.id,
+        action_date=date(2026, 8, 31),
+        description="Senate amendments concurred in. To Engrossing and Enrolling.",
+        order=30,
+        source_name="ca_official_action_sweep/2026-09-02",
+    )
+    api_action = BillAction(
+        bill_id=bill.id,
+        action_date=date(2026, 8, 31),
+        description="Failed passage in committee.",
+        classification="failure",
+        order=999,
+        source_name="openstates_api_sync",
+    )
+    db_session.add_all((official, api_action))
+    db_session.flush()
+    payload = _v3_bill_payload(
+        openstates_id=bill.openstates_id,
+        identifier=bill.identifier,
+        title=bill.title,
+        session=session_row.identifier,
+        actions=[{
+            "description": api_action.description,
+            "date": "2026-08-31",
+            "classification": ["failure"],
+            "order": 999,
+        }],
+    )
+    sync_state(db_session, jurisdiction, client=_client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}}))
+    db_session.flush()
+
+    assert api_action.order is None
+    assert derive_status([
+        ActionRow(
+            official.action_date, official.classification, official.description,
+            order=official.order, source_name=official.source_name,
+        ),
+        ActionRow(
+            api_action.action_date, api_action.classification, api_action.description,
+            order=api_action.order, source_name=api_action.source_name,
+        ),
+    ]) == PASSED_BOTH
 
 
 def test_sync_state_updates_changed_bill_title(db_session):

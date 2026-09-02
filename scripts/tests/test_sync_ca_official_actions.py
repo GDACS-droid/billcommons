@@ -61,6 +61,85 @@ def test_plan_preserves_official_duplicate_multiplicity():
     assert [item.history_id for item in missing.additions] == ["11"]
 
 
+def test_duplicate_official_actions_reconstruct_each_sequence_and_provenance():
+    """AB 1546 shape: repeated normalized text is not an ambiguous order."""
+    first = _official("1546-1", 41, "Read first time.")
+    second = _official("1546-2", 42, "Read  first time.")
+
+    def local(identity: str, order: int):
+        return sweep.LocalAction(
+            identity,
+            "bill-1",
+            first.official_bill_id,
+            first.action_date,
+            "Read first time.",
+            None,
+            order,
+            SimpleNamespace(
+                classification=None,
+                order=order,
+                source_name=None,
+                source_url=None,
+                upstream_id=None,
+                retrieved_at=None,
+                raw_ref=None,
+                checksum=None,
+                parser_version=None,
+            ),
+        )
+
+    plan = sweep.build_plan({first.official_bill_id: (first, second)}, [local("a", 900), local("b", 901)])
+    assert {(item.action_id, item.official.sequence) for item in plan.order_updates} == {("a", 42), ("b", 41)}
+
+    mappings = sweep._action_update_mappings(
+        plan, zip_sha256="a" * 64, now=datetime(2026, 9, 2, tzinfo=timezone.utc)
+    )
+    assert {(item["id"], item["order"], item["upstream_id"]) for item in mappings} == {
+        ("a", 42, "ca-history:1546-2"),
+        ("b", 41, "ca-history:1546-1"),
+    }
+
+
+def test_reloaded_duplicate_provenance_keeps_exact_official_sequence_pairing():
+    """A second sweep must not swap AB 1546-style duplicate text rows."""
+    first = _official("1546-1", 41, "Read first time.")
+    second = _official("1546-2", 42, "Read first time.")
+
+    def local(identity: str, official: sweep.OfficialAction, retrieved_at: datetime):
+        provenance = sweep._action_provenance(official, "a" * 64, retrieved_at)
+        row = SimpleNamespace(
+            classification=None,
+            order=official.sequence,
+            **provenance,
+        )
+        return sweep.LocalAction(
+            identity,
+            "bill-1",
+            first.official_bill_id,
+            first.action_date,
+            first.description,
+            None,
+            official.sequence,
+            row,
+        )
+
+    # Deliberately reverse the retrieval ordering that chose the initial
+    # first-pass survivors. Existing official history IDs, not that mutable
+    # ordering, must determine the second-pass pairing.
+    locals_after_first_apply = [
+        local("a", first, datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        local("b", second, datetime(2026, 9, 2, tzinfo=timezone.utc)),
+    ]
+    plan = sweep.build_plan(
+        {first.official_bill_id: (first, second)}, locals_after_first_apply
+    )
+
+    assert plan.order_updates == ()
+    assert sweep._action_update_mappings(
+        plan, zip_sha256="a" * 64, now=datetime(2026, 9, 3, tzinfo=timezone.utc)
+    ) == []
+
+
 def test_plan_deletes_only_excess_copy_of_officially_proven_fact_and_preserves_unsupported():
     official = _official("10", 1, "Introduced.")
     plan = sweep.build_plan(

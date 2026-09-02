@@ -91,6 +91,11 @@ _SPECIAL_INDEX_PATTERNS = (
     re.compile(r"(?:^|[^a-z])s{1,2}(\d{1,2})$", re.IGNORECASE),
     re.compile(r"(?:^|[^0-9])(\d{1,2})e$", re.IGNORECASE),
 )
+_EXPLICIT_SPECIAL_SESSION_INDEX_RE = re.compile(
+    r"\b(?:special|extraordinary)\s+session\s*\d{1,2}\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:called|special|extraordinary)\s+session\b",
+    re.IGNORECASE,
+)
 
 
 def _extract_special_session_index(text: str) -> str | None:
@@ -103,6 +108,17 @@ def _extract_special_session_index(text: str) -> str | None:
         if match:
             return str(int(match.group(1)))
     return None
+
+
+def _has_explicit_special_session_index(text: str) -> bool:
+    """Whether the source spells out a numbered special session in prose.
+
+    Compact archive slugs such as ``2026S1`` are a real Arkansas convention
+    and historically map to the one seeded special session even where the
+    registry has no number.  A literal ``Special Session 1`` carries stronger
+    identity evidence and must instead fail closed against an unnumbered row.
+    """
+    return _EXPLICIT_SPECIAL_SESSION_INDEX_RE.search(text) is not None
 
 
 def _extract_ordinal_numbers(text: str) -> set[str]:
@@ -215,10 +231,20 @@ def resolve_session(
             if cand_classification == "special"
             else None
         )
+        # A spelled-out upstream sequence is positive identity evidence. It
+        # must not fuzzily bind to an unnumbered special session merely
+        # because the year/classification happen to agree. Compact bulk slugs
+        # retain the established candidate-index behavior above.
         if (
             slug_special_index is not None
             and candidate_special_index is not None
-            and slug_special_index != candidate_special_index
+            and candidate_special_index != slug_special_index
+        ):
+            continue
+        if (
+            slug_special_index is not None
+            and _has_explicit_special_session_index(slug)
+            and candidate_special_index is None
         ):
             continue
 

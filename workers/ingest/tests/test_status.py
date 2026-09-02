@@ -97,6 +97,15 @@ def test_california_reconsideration_refines_a_stale_failure_classification():
     )
 
 
+def test_failure_classification_is_not_revived_by_generic_committee_prose():
+    """A same-action referral is not evidence that a failed bill survived."""
+    for description in (
+        "Failed. Referred to the Committee on Rules.",
+        "Motion failed. Held in committee.",
+    ):
+        assert derive_status([A(date(2026, 3, 18), "failure", description)]) == DEAD
+
+
 def test_later_official_committee_status_revives_a_prior_failed_passage():
     actions = [
         A(date(2026, 3, 18), None, "Failed passage in committee. (Ayes 1. Noes 3.)"),
@@ -211,6 +220,27 @@ def test_california_final_concurrence_beats_stale_committee_classification():
             "Ordered to engrossing and enrolling.",
         )
     ]
+    assert derive_status(actions) == PASSED_BOTH
+
+
+def test_california_official_same_day_action_outweighs_secondary_terminal_action():
+    actions = [
+        ActionRow(
+            date(2026, 8, 31),
+            None,
+            "Senate amendments concurred in. To Engrossing and Enrolling.",
+            order=30,
+            source_name="ca_official_action_sweep/2026-09-02",
+        ),
+        ActionRow(
+            date(2026, 8, 31),
+            "failure",
+            "Failed passage in committee.",
+            order=None,
+            source_name="openstates_api_sync",
+        ),
+    ]
+
     assert derive_status(actions) == PASSED_BOTH
 
 

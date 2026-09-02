@@ -85,6 +85,17 @@ def test_explicit_special_session_number_mismatch_fails_closed():
         assert result.path == MatchPath.NONE, slug
 
 
+def test_explicit_special_session_number_does_not_match_unnumbered_special():
+    candidates = [
+        SessionCandidate(identifier="2025-2026 Regular Session", classification="regular"),
+        SessionCandidate(identifier="California special: redistricting (2025-11-01)", classification="special"),
+    ]
+
+    result = resolve_session("20252026 Special Session 1", candidates)
+
+    assert result.path == MatchPath.NONE
+
+
 def test_nc_2025_matches_2025_2026_regular_session():
     # NC_2025.zip -- registry uses a biennium identifier "2025-2026 Regular
     # Session"; slug only carries the first year.

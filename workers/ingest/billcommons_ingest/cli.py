@@ -1594,6 +1594,7 @@ def recompute_status_for_bills(
             BillAction.description,
             BillAction.organization_id,
             BillAction.order,
+            BillAction.source_name,
         )
         .where(BillAction.bill_id.in_(bill_ids))
         # Deterministic order (round-4 panel): the substitution-target scan
@@ -1616,6 +1617,7 @@ def recompute_status_for_bills(
                 description=a.description,
                 organization_id=a.organization_id,
                 order=a.order,
+                source_name=a.source_name,
             )
         )
 

@@ -68,6 +68,15 @@ MAX_PAGES_PER_RUN = 10
 INCLUDE = ["sponsorships", "actions", "sources", "versions", "documents", "abstracts"]
 
 
+def _normalize_action_description(value: str | None) -> str:
+    """Whitespace-stable action identity shared with the CA official sweep."""
+    return " ".join((value or "").split())
+
+
+def _is_ca_official_action(action: BillAction) -> bool:
+    return (getattr(action, "source_name", None) or "").startswith(CA_OFFICIAL_ACTION_SOURCE_PREFIX)
+
+
 @dataclass
 class ApiSyncResult:
     state: str
@@ -706,8 +715,9 @@ def _upsert_actions(
     local_by_content: dict[tuple[str, date | None], list[BillAction]] = {}
     local_by_description: dict[str, list[BillAction]] = {}
     for action in local_actions:
-        local_by_content.setdefault((action.description, action.action_date), []).append(action)
-        local_by_description.setdefault(action.description, []).append(action)
+        description_key = _normalize_action_description(action.description)
+        local_by_content.setdefault((description_key, action.action_date), []).append(action)
+        local_by_description.setdefault(description_key, []).append(action)
     consumed_action_ids: set[object] = set()
 
     def _action_token(action: BillAction) -> object:
@@ -723,9 +733,16 @@ def _upsert_actions(
     revised = 0
     for i, action_payload in enumerate(action_payloads):
         description = action_payload.get("description") or ""
+        description_key = _normalize_action_description(description)
         order_raw = action_payload.get("order")
         order = order_raw if isinstance(order_raw, int) and not isinstance(order_raw, bool) else i
         action_date = _parse_date(action_payload.get("date"))
+        # A same-day Open States list position is not comparable to the
+        # official CA history sequence.  Preserve an official sequence as the
+        # only source-backed ordering evidence for that day; this also keeps a
+        # later generic API row from demoting the official status elsewhere.
+        if any(_is_ca_official_action(action) and action.action_date == action_date for action in local_actions):
+            order = None
         raw_classification = action_payload.get("classification")
         if isinstance(raw_classification, str):
             classification = raw_classification.strip() or None
@@ -735,7 +752,7 @@ def _upsert_actions(
             ) or None
         else:
             classification = None
-        exact_matches = _unconsumed(local_by_content.get((description, action_date), []))
+        exact_matches = _unconsumed(local_by_content.get((description_key, action_date), []))
         current = exact_matches[0] if len(exact_matches) == 1 else None
         order_is_safe_to_reconcile = len(exact_matches) <= 1
         if current is None and len(exact_matches) > 1:
@@ -754,7 +771,11 @@ def _upsert_actions(
                 current = same_order[0] if same_order else same_classification[0]
                 order_is_safe_to_reconcile = bool(same_order)
         if current is None:
-            description_matches = _unconsumed(local_by_description.get(description, []))
+            description_matches = [
+                action
+                for action in _unconsumed(local_by_description.get(description_key, []))
+                if not _is_ca_official_action(action)
+            ]
             # A unique description is enough to identify a date correction;
             # multiple same-description actions are genuinely ambiguous, so
             # preserve them and insert rather than silently revising one.
@@ -762,6 +783,14 @@ def _upsert_actions(
                 current = description_matches[0]
         if current is not None:
             consumed_action_ids.add(_action_token(current))
+            authoritative_ca_same_day = (
+                _is_ca_official_action(current) and current.action_date == action_date
+            )
+            if authoritative_ca_same_day:
+                # Do not let a secondary API refresh alter the official
+                # sequence, classification, or retrieval provenance of the
+                # exact primary-source fact it matched.
+                continue
             # Reconcile the upstream order as well as the two status fields.
             # Same-day actions use `order` as their deterministic tiebreaker;
             # leaving a bulk-era/list-position value stale can report the
@@ -791,8 +820,8 @@ def _upsert_actions(
             )
             db.add(new_action)
             local_actions.append(new_action)
-            local_by_content.setdefault((description, action_date), []).append(new_action)
-            local_by_description.setdefault(description, []).append(new_action)
+            local_by_content.setdefault((description_key, action_date), []).append(new_action)
+            local_by_description.setdefault(description_key, []).append(new_action)
             consumed_action_ids.add(_action_token(new_action))
             result.actions += 1
             added += 1
@@ -811,7 +840,7 @@ def _upsert_actions(
             action
             for action in local_actions
             if action.action_date == latest_date
-            and (action.source_name or "").startswith(CA_OFFICIAL_ACTION_SOURCE_PREFIX)
+            and _is_ca_official_action(action)
         ]
         if latest_date is not None
         else []

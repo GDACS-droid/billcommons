@@ -262,6 +262,49 @@ def _retention_key(action: LocalAction) -> tuple:
     )
 
 
+def _official_upstream_id(action: OfficialAction) -> str:
+    return f"ca-history:{action.history_id}"
+
+
+def _pair_local_to_official(
+    local_rows: Iterable[LocalAction], official_rows: Iterable[OfficialAction]
+) -> list[tuple[LocalAction, OfficialAction]]:
+    """Pair duplicate facts stably across a reload.
+
+    A human-text/date key can legitimately occur more than once in the CA
+    ledger.  On the first repair, retention ordering chooses a local survivor
+    and associates it with an official history row.  On later repairs that
+    association is durable in ``upstream_id``; reusing it prevents a changed
+    retrieval timestamp or UUID ordering from swapping two otherwise equal
+    copies and producing perpetual order updates.
+    """
+    remaining_local = list(local_rows)
+    remaining_official = sorted(official_rows, key=_official_sort_key)
+    pairs: list[tuple[LocalAction, OfficialAction]] = []
+
+    for official in tuple(remaining_official):
+        matching = [
+            local
+            for local in remaining_local
+            if getattr(local.row, "upstream_id", None) == _official_upstream_id(official)
+        ]
+        if not matching:
+            continue
+        local = max(matching, key=_retention_key)
+        pairs.append((local, official))
+        remaining_local.remove(local)
+        remaining_official.remove(official)
+
+    pairs.extend(
+        zip(
+            sorted(remaining_local, key=_retention_key, reverse=True),
+            remaining_official,
+            strict=False,
+        )
+    )
+    return pairs
+
+
 def build_plan(
     official_by_bill: dict[str, tuple[OfficialAction, ...]], local_actions: Iterable[LocalAction]
 ) -> ActionPlan:
@@ -285,16 +328,20 @@ def build_plan(
     unsupported = 0
     for key, official_rows in official_by_key.items():
         local_rows = sorted(local_by_key.get(key, []), key=_retention_key, reverse=True)
+        ordered_official_rows = sorted(official_rows, key=_official_sort_key)
         if len(local_rows) < len(official_rows):
-            additions.extend(sorted(official_rows, key=_official_sort_key)[len(local_rows):])
+            additions.extend(ordered_official_rows[len(local_rows):])
         elif len(local_rows) > len(official_rows):
             deletions.extend(local_rows[len(official_rows):])
-        # A one-to-one fact is the only case where a history sequence can be
-        # paired without guessing which identical duplicate it belongs to.
-        if len(local_rows) == len(official_rows) == 1:
-            official = official_rows[0]
-            if local_rows[0].order != official.sequence:
-                order_updates.append(OrderUpdate(local_rows[0].id, official))
+        # The retention ordering selects which local duplicates survive; the
+        # official history sequence orders the corresponding factual copies.
+        # That creates an exact pairing even for repeated same-day text such
+        # as AB 1546, rather than leaving arbitrary old orders in place.
+        for local, official in _pair_local_to_official(
+            local_rows[:len(ordered_official_rows)], ordered_official_rows
+        ):
+            if local.order != official.sequence:
+                order_updates.append(OrderUpdate(local.id, official))
 
     for key, local_rows in local_by_key.items():
         if key not in official_by_key:
@@ -414,7 +461,6 @@ def _action_update_mappings(
     operation.  Caller still computes statuses from the already-loaded rows;
     classification and organization are intentionally not changed here.
     """
-    order_by_action_id = {change.action_id: change.official for change in plan.order_updates}
     updates: dict[object, dict[str, Any]] = {}
 
     def consider(local: LocalAction, official: OfficialAction) -> None:
@@ -430,8 +476,10 @@ def _action_update_mappings(
         if all(getattr(local.row, field) == provenance[field] for field in immutable_fields):
             provenance["retrieved_at"] = local.row.retrieved_at
         candidate = dict(provenance)
-        order_official = order_by_action_id.get(local.id)
-        candidate["order"] = order_official.sequence if order_official is not None else local.order
+        # ``build_plan`` selects a deterministic surviving local copy for
+        # every official duplicate. Always carry the paired sequence through
+        # to the mutation mapping, not only the formerly one-to-one case.
+        candidate["order"] = official.sequence
         if any(getattr(local.row, field) != value for field, value in candidate.items()):
             # SQLAlchemy ORM bulk UPDATE identifies a row using this primary
             # key; it is not an application field update.
@@ -449,9 +497,7 @@ def _action_update_mappings(
                 (row for row in plan.official_by_bill.get(key[0], ()) if row.key == key),
                 key=_official_sort_key,
             )
-            for local, official in zip(
-                sorted(rows, key=_retention_key, reverse=True), official_rows, strict=False
-            ):
+            for local, official in _pair_local_to_official(rows, official_rows):
                 consider(local, official)
     return [updates[action_id] for action_id in sorted(updates, key=str)]
 
@@ -576,6 +622,7 @@ def _apply_plan(
                     official.description,
                     organization_id,
                     official.sequence,
+                    SOURCE_NAME,
                 )
             )
         session = session_by_bill_id[bill.id]
@@ -638,9 +685,13 @@ def run(
                 )
             report = _report(plan, zip_sha256=actual_sha256, apply=True, updates=updates, touched_bills=touched)
             report.update({
-                "post_missing_official_actions": 0,
-                "post_excess_official_actions": 0,
-                "post_unsupported_local_actions_preserved": plan.unsupported_local_singletons,
+                # This is a locked cardinality proof, not a second full
+                # identity/multiplicity reconciliation. Operators must run
+                # the documented dry command after commit before claiming an
+                # exact post-sweep match.
+                "post_scoped_action_count": actual_action_count,
+                "post_scoped_action_count_expected": expected_action_count,
+                "post_exact_reconciliation": "required_dry_run",
             })
             db.commit()
             return report
@@ -655,7 +706,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zip", required=True, type=Path)
     parser.add_argument("--expected-sha256", required=True)
-    parser.add_argument("--apply", action="store_true", help="perform the locked transaction (default: report only)")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="perform the locked transaction; rerun without --apply afterward for exact post-commit reconciliation",
+    )
     return parser
 
 

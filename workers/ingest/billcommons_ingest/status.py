@@ -121,6 +121,8 @@ _CLASSIFICATION_STATUS = {
     "reading-3": INTRODUCED,
 }
 
+CA_OFFICIAL_ACTION_SOURCE_PREFIX = "ca_official_action_sweep/"
+
 # Text fallback, applied ONLY when an action has no classification.
 #
 # Every pattern here is anchored on wording that states actually use and that
@@ -131,6 +133,14 @@ _CLASSIFICATION_STATUS = {
 _CA_FINAL_CONCURRENCE_RE = re.compile(
     r"^(?:senate|assembly)\s+amendments\s+concurred\s+in\."
     r"[\s\S]*?\b(?:to|ordered\s+to)\s+engrossing\s+and\s+enrolling\b",
+    re.I,
+)
+
+# This is the only same-action exception that can refine a structured
+# ``failure`` into a live committee state.  Broad referral/hold prose can
+# appear in a failed action's narrative, but does not establish revival.
+_FAILED_PASSAGE_RECONSIDERATION_RE = re.compile(
+    r"\bfailed\s+passage\s+in\s+committee\b[\s\S]*?\breconsideration\s+granted\b",
     re.I,
 )
 
@@ -187,13 +197,7 @@ _TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # A failed committee vote with reconsideration granted is specifically
     # not an outcome.  California's official ledger records both facts in
     # one action, then continues the measure through committee.
-    (
-        re.compile(
-            r"\bfailed\s+passage\s+in\s+committee\b[\s\S]*?\breconsideration\s+granted\b",
-            re.I,
-        ),
-        IN_COMMITTEE,
-    ),
+    (_FAILED_PASSAGE_RECONSIDERATION_RE, IN_COMMITTEE),
     (re.compile(r"\bfailed\s+to\s+pass\b", re.I), DEAD),
     (re.compile(r"\bfailed\s+passage\s+in\s+committee\b", re.I), DEAD),
     (re.compile(r"\b(indefinitely\s+postponed|postponed\s+indefinitely)\b", re.I), DEAD),
@@ -402,6 +406,10 @@ class ActionRow:
     # procedural step (for example a CA re-referral) superseded a floor vote.
     # Callers without that evidence keep the long-standing rank tie-break.
     order: int | None = None
+    # Primary-source precedence is intentionally restricted to the CA
+    # one-off official ledger; all ordinary jurisdictions retain their
+    # existing cross-source derivation behavior.
+    source_name: str | None = None
 
 
 # Classification tokens that represent forward motion on a bill, used only to
@@ -475,7 +483,11 @@ def status_for_action(action: ActionRow) -> str | None:
         and _CA_FINAL_CONCURRENCE_RE.search(action.description)
     ):
         return PASSED_BOTH
-    if from_class == DEAD and from_text == IN_COMMITTEE:
+    if (
+        from_class == DEAD
+        and action.description
+        and _FAILED_PASSAGE_RECONSIDERATION_RE.search(action.description)
+    ):
         return IN_COMMITTEE
     return from_class
 
@@ -510,8 +522,24 @@ def derive_status(actions: list[ActionRow]) -> str | None:
     action filed the same day without that evidence is noise, not proof of
     survival.
     """
+    official_ca_dates = {
+        action.action_date
+        for action in actions
+        if action.action_date is not None
+        and (getattr(action, "source_name", None) or "").startswith(CA_OFFICIAL_ACTION_SOURCE_PREFIX)
+    }
+    # A secondary source's same-day timestamp cannot prove where it sits in
+    # California's official history sequence.  Retain that action in storage,
+    # but do not let it overturn primary-source chronology/status derivation.
+    effective_actions = [
+        action
+        for action in actions
+        if action.action_date not in official_ca_dates
+        or (getattr(action, "source_name", None) or "").startswith(CA_OFFICIAL_ACTION_SOURCE_PREFIX)
+    ]
+
     derived: list[tuple[ActionRow, str]] = []
-    for action in actions:
+    for action in effective_actions:
         action_status = status_for_action(action)
         if action_status is not None:
             derived.append((action, action_status))
@@ -542,7 +570,7 @@ def derive_status(actions: list[ActionRow]) -> str | None:
 
     forward_actions = [
         action
-        for action in actions
+        for action in effective_actions
         if (
             _is_progress_classification(action.classification)
             or status_for_action(action) in (IN_COMMITTEE, PASSED_ONE_CHAMBER, PASSED_BOTH)
@@ -573,7 +601,7 @@ def derive_status(actions: list[ActionRow]) -> str | None:
     if result == PASSED_ONE_CHAMBER:
         chambers = {
             action.organization_id
-            for action in actions
+            for action in effective_actions
             if action.organization_id is not None
             and action.classification
             and "passage" in {tok.strip() for tok in action.classification.split(",")}
