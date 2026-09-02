@@ -24,3 +24,8 @@ test("Scout open waits briefly for the root analytics queue instead of dropping 
   assert.match(source, /track\("scout_opened", \{ availability: enabled \? "enabled" : "disabled" \}\)/);
   assert.match(source, /window\.clearTimeout\(timer\)/);
 });
+
+test("Scout intro does not show a signed-out prompt over an authenticated result", () => {
+  assert.match(source, /Research jobs are owner-scoped\. <Link href="\/account\/login"[^>]*>Account access<\/Link>/);
+  assert.doesNotMatch(source, /Sign in<\/Link> to create and view research jobs/);
+});

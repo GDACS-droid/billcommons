@@ -5,7 +5,7 @@ provider session ID, WebSocket/CDP endpoint, cookie, or replay URL is retained.
 
 ## Headline public Solari workflow
 
-The public cookbook example authenticated through `solari-browser==0.1.3`, created
+The final public-cookbook rerun authenticated through `solari-browser==0.1.3`, created
 one recorded cloud-browser session, opened the Florida Legislature's chapter 43
 contents, followed the exact `43.16` link, extracted the current-law judge paragraph
 and `s. 1, ch. 2026-141` history, then released the session.
@@ -14,7 +14,7 @@ and `s. 1, ch. 2026-141` history, then released the session.
 | --- | --- |
 | Result | pass |
 | Official host | `www.leg.state.fl.us` |
-| Runtime | 10.137 seconds |
+| Runtime | 11.689 seconds |
 | Pages / actions | 1 / 2 |
 | Routed requests | 38 of 48 maximum |
 | Recording | enabled |
@@ -51,15 +51,15 @@ emitting an evidence-free finding. The live test passed again after those repair
 
 Current first-party pricing checked at `https://docs.getsolari.com/pricing` on
 2026-09-01 lists browser runtime at $0.15/hour Free, $0.10/hour Starter, and
-$0.07/hour Professional. Applying those rates to the measured 10.137-second session:
+$0.07/hour Professional. Applying those rates to the measured 11.689-second session:
 
-- Free: approximately **$0.00042** per uncached run;
-- Starter: approximately **$0.00028**;
-- Professional: approximately **$0.00020**.
+- Free: approximately **$0.00049** per uncached run;
+- Starter: approximately **$0.00032**;
+- Professional: approximately **$0.00023**.
 
-At identical runtime, the included $3 Free credit is roughly 7,100 runs; Starter's
-200 included browser-hours are roughly 71,000 runs; Professional's approximately
-2,850 included browser-hours are roughly 1.01 million runs. These are arithmetic
+At identical runtime, the included $3 Free credit is roughly 6,100 runs; Starter's
+200 included browser-hours are roughly 61,500 runs; Professional's approximately
+2,850 included browser-hours are roughly 878,000 runs. These are arithmetic
 estimates, not billing guarantees, and exclude proxy/CAPTCHA usage (neither was used).
 A fresh equivalent Scout cache hit creates no browser session, so browser cost is
 zero until freshness expires or the source needs revisiting.

@@ -561,7 +561,7 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
         </div>
         <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-600">
           Bill Commons is checked first. Scout then uses admitted official sources and keeps the record needed to assess each finding.
-          <span className="ml-1"><Link href="/account/login" className="font-medium text-blue-800 underline underline-offset-2">Sign in</Link> to create and view research jobs.</span>
+          <span className="ml-1">Research jobs are owner-scoped. <Link href="/account/login" className="font-medium text-blue-800 underline underline-offset-2">Account access</Link>.</span>
         </p>
       </div>
 

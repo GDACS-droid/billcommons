@@ -7,22 +7,22 @@ and Solari checks are explicit opt-ins and never CI defaults.
 
 | Gate | Result |
 | --- | --- |
-| Guarded API suite | **571 passed, 8 skipped, 1 warning** |
-| Shared suite | **165 passed, 1 warning** |
-| Scout worker suite (including Postgres proofs) | **96 passed, 9 warnings** |
+| Guarded API suite | **572 passed, 8 skipped** |
+| Shared suite | **166 passed** |
+| Scout worker suite (including Postgres proofs) | **96 passed, 3 skipped** |
 | Monitoring suite | **4 passed** |
 | Production operator scripts | **26 passed** |
-| Backend/operations total | **862 passed, 8 skipped, 11 warnings** |
+| Backend/operations passed assertions | **864 passed** across the five rows above |
 | Focused source/session repair | **28 passed** |
 | Public cookbook deterministic contracts | **12 passed** |
-| Web Scout contract | **10 passed** |
+| Web Scout contract | **16 passed** |
 | Targeted web ESLint | pass |
 | TypeScript `--noEmit` | pass |
 | Next production build | pass; `/scout` emitted |
 | PostgreSQL RawStore concurrent/restart proof | **1 passed** |
 | Live Florida HB 625 bill → analysis workflow | **1 passed** |
 | Live Bill Commons Solari product path | **1 passed** in 7.86s; released terminal state |
-| Demo decode / metadata | pass; 20.16s, 504 frames |
+| Final demo decode / metadata | pass; 17.80s, H.264, 1440×900 |
 
 The broad suite's eight skips are explicitly optional integrations/live checks. Its
 warnings are Starlette/httpx, future cryptography certificate parsing, and Python

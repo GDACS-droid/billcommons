@@ -20,7 +20,7 @@ Updated 2026-09-02.
 - M9–M10: SSRF/redirect/MIME/size/injection/IDOR/cost/cleanup tests and deterministic E2E.
 - M11–M12: real Solari Online Sunshine navigation and live Florida Senate HB 625
   bill-page → analysis discovery.
-- M13–M14: existing Vercel Analytics events and desktop/mobile production renders.
+- M13–M14: provider-verified Vercel Analytics events and desktop/mobile production renders.
 - M15–M17: guarded broad regression, independent adversarial/visual reviews,
   sanitized 20.16-second demo, and production release runbook.
 
@@ -47,7 +47,7 @@ Updated 2026-09-02.
 ## Latest verification
 
 - Final broad rerun: API **572 passed, 8 skipped**; shared **166 passed**; Scout
-  worker **96 passed, 3 skipped**. Web Scout **13 passed**; ESLint, TypeScript,
+  worker **96 passed, 3 skipped**. Web Scout **16 passed**; ESLint, TypeScript,
   and Next production build passed.
 - PostgreSQL store: concurrent two-instance put, database size constraint, and an
   API-created job read by a fresh store instance passed.
@@ -66,9 +66,9 @@ Updated 2026-09-02.
 - Backup/restore: pre-migration and post-canary full dumps restored to disposable
   PostgreSQL 18; the reconciled recovery set matches all corpus/Scout counts, usage,
   and five blob hashes.
-- Operations: deployed source `8d5dbec3`; API `5828ea8b-6a85-4ca6-b453-f76e604ad374`,
+- Operations: deployed web source `5921d802`; API `5828ea8b-6a85-4ca6-b453-f76e604ad374`,
   Scout worker `e71aa668-4dc1-4d57-9045-3dd51f3a568d`, and Vercel
-  `dpl_2ajAm7J2TBkdnZjQsqsp1PMC3wfj` are healthy. Service monitor 7/7 and read
+  `dpl_CQFDoxFWuZYvacaLEqiEKex5YnRG` are healthy. Service monitor 7/7 and read
   monitor 5/5 pass; reaper counters and unreleased sessions are zero.
 - Staged rollout found and repaired a material trust defect: House analyses
   discovered through a Senate host were mislabeled as Senate documents. Public
@@ -79,7 +79,8 @@ Updated 2026-09-02.
 - Second multi-family review: eight independent legs returned **SHIP**. The ninth
   configured image leg was unavailable because its endpoint does not accept images;
   it returned no product verdict.
-- Demo: H.264 1440×900, 20.16s, 504 frames, fully decoded and visually inspected.
+- Final demo: deployed public product plus actual Solari run; H.264 1440×900,
+  17.80s, fully decoded and visually inspected.
 
 ## Remaining human actions
 
