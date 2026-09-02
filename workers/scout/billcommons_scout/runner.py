@@ -40,7 +40,7 @@ _RELATED_ANALYSIS_RE = re.compile(r"\b(?:COMMITTEE\s+|STAFF\s+)?BILL\s+ANALYSIS\
 _RELATED_STORAGE_NAME_RE = re.compile(r"\bSTORAGE\s+NAME\s*:\s*([A-Za-z0-9._-]+)", re.I)
 _RELATED_DATE_RE = re.compile(
     r"\b(?:DATE|REVISED|ANALYSIS\s+DATE|PREPARED)\s*:?\s*"
-    r"((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+20\d{2})\b",
+    r"((?:(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+20\d{2})|(?:\d{1,2}/\d{1,2}/20\d{2}))\b",
     re.I,
 )
 _SHELL_MARKERS = (
@@ -125,10 +125,12 @@ def describe_related_document(
     relevant_date: date | None = None
     date_match = _RELATED_DATE_RE.search(display_text)
     if date_match:
-        try:
-            relevant_date = datetime.strptime(date_match.group(1), "%B %d, %Y").date()
-        except ValueError:
-            pass
+        for date_format in ("%B %d, %Y", "%m/%d/%Y"):
+            try:
+                relevant_date = datetime.strptime(date_match.group(1), date_format).date()
+                break
+            except ValueError:
+                continue
 
     return RelatedDocumentDescription(
         title=title,

@@ -591,7 +591,7 @@ def test_house_analyses_discovered_from_senate_are_labeled_from_retained_evidenc
         "application/pdf",
         _pdf_with_text(
             "STORAGE NAME: h0625c.JDC FLORIDA HOUSE OF REPRESENTATIVES BILL ANALYSIS "
-            "DATE: February 3, 2026 HB 625"
+            "DATE: 2/3/2026 HB 625"
         ),
     )
     final = runner._persist_capture(
@@ -607,7 +607,7 @@ def test_house_analyses_discovered_from_senate_are_labeled_from_retained_evidenc
         "application/pdf",
         _pdf_with_text(
             "STORAGE NAME: h0625z1.JDC FLORIDA HOUSE OF REPRESENTATIVES FINAL BILL ANALYSIS "
-            "DATE: June 16, 2026 HB 625"
+            "DATE: 6/16/2026 HB 625"
         ),
     )
     assert committee is not None and final is not None
