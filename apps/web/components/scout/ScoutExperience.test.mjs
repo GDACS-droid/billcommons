@@ -17,3 +17,10 @@ test("every visible evidence-source control records a privacy-safe open event", 
   assert.match(source, /track\("scout_evidence_opened", \{ control: "source_metadata" \}\)/);
   assert.match(source, /track\("scout_evidence_opened", \{ control: "prior_source_metadata" \}\)/);
 });
+
+test("Scout open waits briefly for the root analytics queue instead of dropping the event", () => {
+  assert.match(source, /typeof analyticsWindow\.va === "function"/);
+  assert.match(source, /attempts < 20/);
+  assert.match(source, /track\("scout_opened", \{ availability: enabled \? "enabled" : "disabled" \}\)/);
+  assert.match(source, /window\.clearTimeout\(timer\)/);
+});

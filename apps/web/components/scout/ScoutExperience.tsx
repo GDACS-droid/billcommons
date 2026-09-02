@@ -415,7 +415,24 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
   const pollJobStatus = job?.status;
 
   useEffect(() => {
-    track("scout_opened", { availability: enabled ? "enabled" : "disabled" });
+    // Child passive effects can run before the root <Analytics /> effect has
+    // installed Vercel's queue. Retry this one page-entry fact briefly rather
+    // than silently dropping it; all later Scout events are user-driven.
+    let attempts = 0;
+    let timer: number | undefined;
+    const emit = () => {
+      const analyticsWindow = window as Window & { va?: unknown };
+      if (typeof analyticsWindow.va === "function") {
+        track("scout_opened", { availability: enabled ? "enabled" : "disabled" });
+        return;
+      }
+      attempts += 1;
+      if (attempts < 20) timer = window.setTimeout(emit, 50);
+    };
+    emit();
+    return () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, [enabled]);
 
   useEffect(() => {
