@@ -14,8 +14,10 @@ no classification at all. Deriving from classification alone would read MS
 SB 2693's earlier `referral-committee` and report it IN_COMMITTEE -- calling a
 dead bill alive, which is the one error a legislative source must not make.
 
-So: classification is the primary signal, a deliberately narrow text fallback
-covers unclassified actions, and anything neither recognizes yields **None**.
+So: classification is the primary signal, while deliberately narrow text
+patterns may refine a generic classification to a later/stronger stage (for
+example California classifies final concurrence only as ``passage``). Anything
+neither recognizes yields **None**.
 "Not determined" is an honest answer; a confident wrong one is not.
 """
 from __future__ import annotations
@@ -126,6 +128,13 @@ _CLASSIFICATION_STATUS = {
 # "reported", "amended" -- too easy to match a motion that FAILED to do the
 # thing ("motion to withdraw failed"), and a wrong terminal status is far
 # costlier than a missing one.
+_CA_FINAL_CONCURRENCE_RE = re.compile(
+    r"^(?:senate|assembly)\s+amendments\s+concurred\s+in\."
+    r"[\s\S]*?\b(?:to|ordered\s+to)\s+engrossing\s+and\s+enrolling\b",
+    re.I,
+)
+
+
 _TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # Checked before ENACTED: NJ's companion-bill bookkeeping reads "Withdrawn
     # Because Approved P.L.2025, c.34." -- this bill was pulled because the
@@ -175,11 +184,28 @@ _TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bvetoed\s+by\s+(the\s+)?governor\b", re.I), VETOED),
     (re.compile(r"^vetoed\b", re.I), VETOED),
     (re.compile(r"\bdied\s+(in|on|pursuant)\b", re.I), DEAD),
+    # A failed committee vote with reconsideration granted is specifically
+    # not an outcome.  California's official ledger records both facts in
+    # one action, then continues the measure through committee.
+    (
+        re.compile(
+            r"\bfailed\s+passage\s+in\s+committee\b[\s\S]*?\breconsideration\s+granted\b",
+            re.I,
+        ),
+        IN_COMMITTEE,
+    ),
     (re.compile(r"\bfailed\s+to\s+pass\b", re.I), DEAD),
+    (re.compile(r"\bfailed\s+passage\s+in\s+committee\b", re.I), DEAD),
     (re.compile(r"\b(indefinitely\s+postponed|postponed\s+indefinitely)\b", re.I), DEAD),
     (re.compile(r"\bsession\s+sine\s+die\b", re.I), DEAD),
     (re.compile(r"\bwithdrawn\s+by\s+(the\s+)?(author|sponsor|patron)\b", re.I), WITHDRAWN),
-    (re.compile(r"^withdrawn\b", re.I), WITHDRAWN),
+    # Do not treat a procedural withdrawal from committee or Engrossing and
+    # Enrolling as withdrawal of the measure. California routinely follows
+    # "Withdrawn from committee" with a same-day re-referral, then passage.
+    # A generic clause-start "Withdrawn" rule caused CA SB 1217 and AB 1338
+    # to remain terminally withdrawn despite later official progress.
+    (re.compile(r"^withdrawn\s*\.?$", re.I), WITHDRAWN),
+    (re.compile(r"^withdrawn\s+from\s+(?:further\s+)?consideration\b", re.I), WITHDRAWN),
     # Direction matters: "substituted BY X" means X replaced this bill (this
     # print moves to a new identifier and stays LIVE under it); "substituted
     # FOR X" means THIS bill is the survivor, so it implies nothing about this
@@ -200,6 +226,17 @@ _TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (re.compile(r"\bsent\s+to\s+(the\s+)?governor\b", re.I), ENROLLED),
     (re.compile(r"\benrolled\b", re.I), ENROLLED),
+    # California records the second chamber's amendments returning to the
+    # house of origin as a concurrence action.  Once those amendments are
+    # concurred in and the measure is ordered to engrossing/enrolling, both
+    # chambers have agreed to the same text.  This is passage by both houses,
+    # not yet enrollment: the Clerk records enrollment as a later action.
+    # Keep this CA wording exact and clause-initial so committee/amendment
+    # narrative cannot promote a bill accidentally.
+    (
+        _CA_FINAL_CONCURRENCE_RE,
+        PASSED_BOTH,
+    ),
     # NJ's unclassified passage actions read "Passed by the Senate (40-0)"
     # (one chamber) or "Passed Assembly (Passed Both Houses) (75-0-0)" (the
     # second chamber's vote, naming that both have now passed it). The
@@ -326,7 +363,21 @@ _TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         PASSED_ONE_CHAMBER,
     ),
+    # California's official history uses a two-sentence floor-passage form
+    # rather than OpenStates' normalized ``passage`` classification.
+    # Requiring all three clauses prevents a third-reading or motion record
+    # from being mistaken for passage.
+    (
+        re.compile(
+            r"^read\s+third\s+time\.\s*passed\.\s*ordered\s+to\s+the\s+"
+            r"(?:assembly|senate)\b",
+            re.I,
+        ),
+        PASSED_ONE_CHAMBER,
+    ),
     (re.compile(r"\breferred\s+to\b", re.I), IN_COMMITTEE),
+    (re.compile(r"\bheld\s+in\s+committee\b", re.I), IN_COMMITTEE),
+    (re.compile(r"\bplaced\s+on\b[\s\S]*?\bsuspense\s+file\b", re.I), IN_COMMITTEE),
     (re.compile(r"\bintroduced\b", re.I), INTRODUCED),
 )
 
@@ -346,6 +397,11 @@ class ActionRow:
     classification: str | None
     description: str | None
     organization_id: object | None = None
+    # Upstream sequence/order is optional.  When two actions share a calendar
+    # date, a source-supplied order is the only reliable evidence that a later
+    # procedural step (for example a CA re-referral) superseded a floor vote.
+    # Callers without that evidence keep the long-standing rank tie-break.
+    order: int | None = None
 
 
 # Classification tokens that represent forward motion on a bill, used only to
@@ -398,14 +454,30 @@ def _status_from_text(description: str | None) -> str | None:
 def status_for_action(action: ActionRow) -> str | None:
     """Status implied by one action, or None if it implies nothing.
 
-    Classification wins outright when present -- it is structured upstream data
-    and beats guessing from prose. The text fallback exists only for the 42% of
-    actions that arrive unclassified.
+    Classification wins except for three bounded refinements: generic
+    ``passage`` can be upgraded by exact bicameral-passage prose, and a
+    committee ``failure`` is not terminal when the same official action says
+    reconsideration was granted. California's exact final-concurrence form
+    also beats a stale ``referral-committee`` classification on that same
+    action. Allowing arbitrary text to outrank arbitrary classifications makes
+    phrases such as "committee on veto override" look enacted.
     """
     from_class = _status_from_classification(action.classification)
-    if from_class is not None:
-        return from_class
-    return _status_from_text(action.description)
+    from_text = _status_from_text(action.description)
+    if from_class is None:
+        return from_text
+    if from_class == PASSED_ONE_CHAMBER and from_text == PASSED_BOTH:
+        return PASSED_BOTH
+    if (
+        from_class == IN_COMMITTEE
+        and from_text == PASSED_BOTH
+        and action.description
+        and _CA_FINAL_CONCURRENCE_RE.search(action.description)
+    ):
+        return PASSED_BOTH
+    if from_class == DEAD and from_text == IN_COMMITTEE:
+        return IN_COMMITTEE
+    return from_class
 
 
 def derive_status(actions: list[ActionRow]) -> str | None:
@@ -413,10 +485,12 @@ def derive_status(actions: list[ActionRow]) -> str | None:
 
     An OUTCOME (enacted/vetoed/dead/withdrawn), once reached, is what the bill
     is -- later procedural filings cannot demote it back to "in committee". So
-    terminal statuses are considered first, and among them the latest-dated one
-    wins, which is what makes "died, then revived and enacted" and "vetoed,
-    then overridden" both come out right. Only if nothing terminal was ever
-    recorded does the newest procedural stage stand.
+    terminal statuses are considered first, and among them the latest-dated
+    source event wins, which is what makes "died, then revived and enacted"
+    and "vetoed, then overridden" both come out right. A source-provided
+    within-day order takes precedence over a static status rank; without it,
+    the rank remains the conservative tie-break. Only if nothing terminal was
+    ever recorded does the newest procedural stage stand.
 
     Undated actions sort oldest: an action with no date cannot be shown to
     supersede one that has a date, so it must not win by accident.
@@ -431,31 +505,49 @@ def derive_status(actions: list[ActionRow]) -> str | None:
     are real, deliberate acts, not clerical carryover noise) and the record
     also contains unambiguous forward motion dated strictly AFTER it, the
     stale DEAD is dropped and the bill is re-derived as if that entry had
-    never been recorded. Same-date "progress" does not count -- an action
-    filed the same day as the death is noise, not proof of survival.
+    never been recorded. Same-date "progress" does not count unless BOTH
+    events carry a source sequence which proves the progress came later; an
+    action filed the same day without that evidence is noise, not proof of
+    survival.
     """
-    derived: list[tuple[date | None, str]] = []
+    derived: list[tuple[ActionRow, str]] = []
     for action in actions:
-        status = status_for_action(action)
-        if status is not None:
-            derived.append((action.action_date, status))
+        action_status = status_for_action(action)
+        if action_status is not None:
+            derived.append((action, action_status))
 
     if not derived:
         return None
 
-    progress_dates = [
-        action.action_date
+    def sort_key(entry: tuple[ActionRow, str]) -> tuple[date, int, int, float]:
+        action, action_status = entry
+        # A source order only beats rank when it exists. Rows with no order
+        # deliberately remain tied by status rank rather than being treated
+        # as later than a known source sequence.
+        if action.order is None:
+            return (action.action_date or date.min, 0, 0, _RANK[action_status])
+        return (action.action_date or date.min, 1, action.order, _RANK[action_status])
+
+    def proven_after(candidate: ActionRow, baseline: ActionRow) -> bool:
+        """Whether source chronology proves candidate followed baseline."""
+        if candidate.action_date is None or baseline.action_date is None:
+            return False
+        if candidate.action_date != baseline.action_date:
+            return candidate.action_date > baseline.action_date
+        return (
+            candidate.order is not None
+            and baseline.order is not None
+            and candidate.order > baseline.order
+        )
+
+    forward_actions = [
+        action
         for action in actions
-        if action.action_date is not None
-        and (
+        if (
             _is_progress_classification(action.classification)
-            or status_for_action(action) in (PASSED_ONE_CHAMBER, PASSED_BOTH)
+            or status_for_action(action) in (IN_COMMITTEE, PASSED_ONE_CHAMBER, PASSED_BOTH)
         )
     ]
-
-    def sort_key(entry: tuple[date | None, str]) -> tuple[date, int]:
-        action_date, status = entry
-        return (action_date or date.min, _RANK[status])
 
     remaining = list(derived)
     result: str | None = None
@@ -464,8 +556,7 @@ def derive_status(actions: list[ActionRow]) -> str | None:
         pool = terminal or remaining
         winner = max(pool, key=sort_key)
         if winner[1] == DEAD:
-            winner_date = winner[0] or date.min
-            if any(pd > winner_date for pd in progress_dates):
+            if any(proven_after(action, winner[0]) for action in forward_actions):
                 # Stale carryover DEAD: drop this one entry and re-resolve
                 # from what remains, so an earlier real terminal outcome (or
                 # the non-terminal pool, if nothing else concluded the bill)

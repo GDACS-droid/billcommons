@@ -18,7 +18,13 @@ import pytest
 from sqlalchemy import select, text
 
 from billcommons_ingest import cli as cli_mod
-from billcommons_ingest.api_sync import ApiSyncResult, _bill_checksum, run_api_sync_job, sync_state
+from billcommons_ingest.api_sync import (
+    ApiSyncResult,
+    _bill_checksum,
+    _resolve_session_row,
+    run_api_sync_job,
+    sync_state,
+)
 from billcommons_ingest.fulltext import FETCH_TEXT_KIND, enqueue_fulltext_jobs
 from billcommons_ingest.openstates_api import OpenStatesClient
 from billcommons_shared.db import get_session as real_get_session
@@ -58,6 +64,8 @@ def _v3_bill_payload(
     session=None,
     versions=None,
     documents=None,
+    actions=None,
+    abstracts=None,
 ):
     payload = {
         "id": openstates_id,
@@ -65,9 +73,9 @@ def _v3_bill_payload(
         "title": title,
         "chamber": "lower",
         "classification": ["bill"],
-        "actions": [
-            {"description": action_description, "date": action_date, "classification": ["introduction"]}
-        ],
+        "actions": actions
+        if actions is not None
+        else [{"description": action_description, "date": action_date, "classification": ["introduction"]}],
         "sponsorships": [{"name": "Jane Doe", "classification": "primary", "primary": True}],
         "sources": [{"url": "https://example-legislature.gov/bill/1"}],
     }
@@ -77,6 +85,8 @@ def _v3_bill_payload(
         payload["versions"] = versions
     if documents is not None:
         payload["documents"] = documents
+    if abstracts is not None:
+        payload["abstracts"] = abstracts
     return payload
 
 
@@ -140,6 +150,64 @@ def test_sync_state_is_idempotent_on_unchanged_bill(db_session):
     assert len(sponsorships) == 1
 
 
+def test_same_day_ca_official_action_keeps_latest_scalar_over_unsupported_api_row(db_session):
+    """A later list-position from a non-authoritative same-day row must not
+    undo the official CA ledger's latest-action proof on a future API sync."""
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="AB 568",
+        identifier_norm="AB568",
+        title="A California bill",
+        openstates_id="ocd-bill/ca-source-precedence",
+    )
+    db_session.add(bill)
+    db_session.flush()
+    db_session.add_all(
+        [
+            BillAction(
+                bill_id=bill.id,
+                action_date=date(2026, 8, 26),
+                description="Official final re-referral.",
+                order=12,
+                source_name="ca_official_action_sweep/2026-09-02",
+            ),
+            BillAction(
+                bill_id=bill.id,
+                action_date=date(2026, 8, 26),
+                description="Unsupported legacy same-day action.",
+                order=999,
+                source_name="openstates_api_sync",
+            ),
+        ]
+    )
+    db_session.flush()
+    payload = _v3_bill_payload(
+        openstates_id=bill.openstates_id,
+        identifier=bill.identifier,
+        title=bill.title,
+        session=session_row.identifier,
+        actions=[
+            {
+                "description": "Unsupported legacy same-day action.",
+                "date": "2026-08-26",
+                "classification": [],
+                "order": 999,
+            }
+        ],
+    )
+
+    sync_state(
+        db_session,
+        jurisdiction,
+        client=_client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}}),
+    )
+
+    assert bill.latest_action_date == date(2026, 8, 26)
+    assert bill.latest_action_text == "Official final re-referral."
+
+
 def test_sync_state_updates_changed_bill_title(db_session):
     jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
     payload_v1 = _v3_bill_payload(openstates_id="ocd-bill/3", identifier="HB 3", title="Original title")
@@ -156,6 +224,39 @@ def test_sync_state_updates_changed_bill_title(db_session):
 
     bill = db_session.execute(select(Bill).where(Bill.jurisdiction_id == jurisdiction.id)).scalar_one()
     assert bill.title == "Amended title"
+
+
+def test_sync_state_updates_description_from_current_abstract(db_session):
+    """A changed v3 abstract is a bill-core change, not an ignorable child.
+
+    This is the incremental repair path for gut-and-amend summaries: the API
+    include must be requested, its non-empty summary must replace the stale
+    local description, and the checksum must make that write observable on a
+    later otherwise-identical payload.
+    """
+    jurisdiction, _ = _make_jurisdiction_with_active_session(db_session)
+    old = _v3_bill_payload(
+        openstates_id="ocd-bill/abstract-1",
+        identifier="HB 42",
+        title="An act",
+        abstracts=[{"abstract": "Original summary"}],
+    )
+    sync_state(db_session, jurisdiction, client=_client_with_pages({1: {"results": [old], "pagination": {"max_page": 1}}}))
+    db_session.flush()
+
+    current = _v3_bill_payload(
+        openstates_id="ocd-bill/abstract-1",
+        identifier="HB 42",
+        title="An act",
+        abstracts=[{"abstract": "Current gut-and-amend summary"}],
+    )
+    result = sync_state(
+        db_session, jurisdiction, client=_client_with_pages({1: {"results": [current], "pagination": {"max_page": 1}}})
+    )
+    bill = db_session.execute(select(Bill).where(Bill.openstates_id == "ocd-bill/abstract-1")).scalar_one()
+
+    assert result.bills_updated == 1
+    assert bill.description == "Current gut-and-amend summary"
 
 
 def test_sync_state_does_not_conflate_same_bill_number_across_sessions(db_session):
@@ -230,14 +331,9 @@ def test_sync_state_does_not_conflate_same_bill_number_across_sessions(db_sessio
     )
 
 
-def test_sync_state_warns_when_payload_session_does_not_match_any_known_session(db_session):
-    """Regression for Finding 6(b): falling back to the active session when
-    a payload's session string doesn't match any known session row used to
-    be completely silent -- a real misassignment risk (the bill may
-    actually belong to a different, not-yet-seeded session) with no
-    operator-visible trace. Must now emit a warning through the same
-    `result.warnings` channel the "no session row resolved" skip path
-    already uses."""
+def test_sync_state_skips_nonempty_payload_session_that_does_not_match_known_session(db_session):
+    """An unknown nonempty upstream session must fail closed: using the
+    active session would create a cross-session bill misassignment."""
     jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
 
     payload = _v3_bill_payload(
@@ -250,10 +346,83 @@ def test_sync_state_warns_when_payload_session_does_not_match_any_known_session(
 
     result = sync_state(db_session, jurisdiction, client=client)
 
-    assert result.bills_created == 1, "the bill must still be created (falls back to active session)"
+    assert result.bills_created == 0
     assert any(
-        "did not match any known" in w and "2099 Nonexistent Session" in w for w in result.warnings
-    ), "a session string that matches no known session row must produce a visible warning"
+        "did not match a unique known" in w and "2099 Nonexistent Session" in w for w in result.warnings
+    ), "an unknown session string must produce a visible warning before it is skipped"
+
+
+def test_sync_state_unknown_payload_session_cannot_overwrite_existing_openstates_bill(db_session):
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+    existing = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 60",
+        identifier_norm="HB 60",
+        title="Trusted existing title",
+        openstates_id="ocd-bill/mismatch-existing",
+    )
+    db_session.add(existing)
+    db_session.flush()
+
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/mismatch-existing",
+        identifier="HB 60",
+        title="Must not overwrite trusted title",
+        session="2099 Nonexistent Session",
+    )
+    result = sync_state(
+        db_session,
+        jurisdiction,
+        client=_client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}}),
+    )
+
+    assert result.bills_updated == 0
+    assert existing.title == "Trusted existing title"
+
+
+def test_resolve_session_row_maps_ca_compact_regular_and_special_aliases_and_fails_closed():
+    """Pure regression coverage for CA API session slugs; deliberately does
+    not need the integration fixture or a database connection."""
+    # Some legacy/bootstrap rows retain ``primary`` here; the explicit
+    # "Regular Session" identifier must still classify this as regular.
+    regular = SessionModel(identifier="2025-2026 Regular Session", classification="primary", active=True)
+    special = SessionModel(
+        identifier="California 2025-2026, Special Session 1", classification="special", active=False
+    )
+    sessions_by_identifier = {regular.identifier: regular, special.identifier: special}
+    result = ApiSyncResult(state="CA")
+
+    assert _resolve_session_row(
+        {"session": "20252026"}, sessions_by_identifier, {}, regular, result
+    ) is regular
+    assert _resolve_session_row(
+        {"session": "20252026 Special Session 1"}, sessions_by_identifier, {}, regular, result
+    ) is special
+    assert _resolve_session_row(
+        {"session": "2099 Unknown Session"}, sessions_by_identifier, {}, regular, result
+    ) is None
+    assert _resolve_session_row(
+        {"session": "20252026 Special Session 2"}, sessions_by_identifier, {}, regular, result
+    ) is None
+    assert _resolve_session_row({"session": "  "}, sessions_by_identifier, {}, regular, result) is regular
+    assert any("2099 Unknown Session" in warning and "skipped rather than" in warning for warning in result.warnings)
+
+
+def test_resolve_session_row_gives_exact_local_name_precedence_over_alias_matching():
+    regular = SessionModel(identifier="2025-2026 Regular Session", classification="regular", active=True)
+    local_name_alias = SessionModel(identifier="custom-special", classification="special", active=False)
+    result = ApiSyncResult(state="CA")
+
+    resolved = _resolve_session_row(
+        {"session": "20252026"},
+        {regular.identifier: regular, local_name_alias.identifier: local_name_alias},
+        {"20252026": [local_name_alias]},
+        regular,
+        result,
+    )
+
+    assert resolved is local_name_alias
 
 
 def test_sync_state_does_not_warn_when_payload_session_matches(db_session):
@@ -270,6 +439,44 @@ def test_sync_state_does_not_warn_when_payload_session_matches(db_session):
 
     assert result.bills_created == 1
     assert not any("did not match any known" in w for w in result.warnings)
+
+
+def test_sync_state_forwards_optional_session_and_identifier_filters(db_session):
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+    captured = {}
+
+    def handler(request):
+        captured["params"] = request.url.params
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    _v3_bill_payload(
+                        openstates_id="ocd-bill/bounded-filter",
+                        identifier="HB 62",
+                        title="A bounded repair",
+                        session=session_row.identifier,
+                    )
+                ],
+                "pagination": {"max_page": 1},
+            },
+        )
+
+    client = OpenStatesClient(
+        client=httpx.Client(transport=httpx.MockTransport(handler), base_url="https://v3.openstates.org"),
+        api_key="test-key",
+    )
+    result = sync_state(
+        db_session,
+        jurisdiction,
+        client=client,
+        session=session_row.identifier,
+        identifier="HB 62",
+    )
+
+    assert result.bills_created == 1
+    assert captured["params"]["session"] == session_row.identifier
+    assert captured["params"]["identifier"] == "HB 62"
 
 
 def test_sync_state_skips_new_bill_without_active_session(db_session):
@@ -327,9 +534,249 @@ def test_run_api_sync_job_records_ingestion_run(db_session):
     assert run.source_name == "openstates_api_sync"
 
 
+def test_truncated_run_is_not_a_success_or_next_watermark(db_session):
+    """A page-budget stop may commit its bounded writes, but it cannot claim
+    completion or move `updated_since` past bills it never fetched."""
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+    last_real_success = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    db_session.add(
+        IngestionRun(
+            jurisdiction_id=jurisdiction.id,
+            session_id=session_row.id,
+            source_name="openstates_api_sync",
+            started_at=last_real_success,
+            finished_at=last_real_success,
+            status="success",
+        )
+    )
+    db_session.flush()
+
+    pages = {
+        page: {
+            "results": [
+                _v3_bill_payload(
+                    openstates_id=f"ocd-bill/truncated-{page}",
+                    identifier=f"HB {700 + page}",
+                    title=f"Page {page}",
+                )
+            ],
+            "pagination": {"max_page": 11},
+        }
+        for page in range(1, 12)
+    }
+    result = run_api_sync_job(db_session, jurisdiction.abbreviation, client=_client_with_pages(pages))
+    db_session.flush()
+
+    assert result.next_page == 11
+    truncated_run = db_session.execute(
+        select(IngestionRun)
+        .where(IngestionRun.jurisdiction_id == jurisdiction.id, IngestionRun.status == "failed")
+        .order_by(IngestionRun.started_at.desc())
+    ).scalar_one()
+    assert truncated_run.bills_created == 10
+    assert "next_page=11" in (truncated_run.error or "")
+
+    seen_updated_since: list = []
+    sync_state(
+        db_session,
+        jurisdiction,
+        client=_client_recording_updated_since(
+            {1: {"results": [], "pagination": {"max_page": 1}}}, seen_updated_since
+        ),
+    )
+    assert seen_updated_since == [last_real_success.isoformat()]
+
+
+def test_run_api_sync_job_can_resume_from_reported_page(db_session):
+    jurisdiction, _session_row = _make_jurisdiction_with_active_session(db_session)
+    pages = {
+        11: {
+            "results": [
+                _v3_bill_payload(
+                    openstates_id="ocd-bill/resumed-11",
+                    identifier="HB 711",
+                    title="Resumed page",
+                )
+            ],
+            "pagination": {"max_page": 11},
+        }
+    }
+
+    result = run_api_sync_job(
+        db_session,
+        jurisdiction.abbreviation,
+        client=_client_with_pages(pages),
+        start_page=11,
+    )
+
+    assert result.pages_fetched == 1
+    assert result.next_page is None
+    assert result.bills_created == 1
+
+
+def test_truncated_worker_result_enqueues_exact_continuation(monkeypatch):
+    enqueued = []
+    monkeypatch.setattr(
+        cli_mod.queue_mod,
+        "enqueue",
+        lambda db, kind, payload: enqueued.append((db, kind, payload)),
+    )
+    result = ApiSyncResult(state="CA")
+    result.next_page = 11
+    result.updated_since_used = "2026-08-01T00:00:00+00:00"
+    result.cycle_started_at = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+    sentinel_db = object()
+
+    assert cli_mod.enqueue_api_sync_continuation(sentinel_db, result) is True
+    assert enqueued == [
+        (
+            sentinel_db,
+            cli_mod.scheduler_mod.API_SYNC_KIND,
+            {
+                "state": "CA",
+                "start_page": 11,
+                "updated_since": "2026-08-01T00:00:00+00:00",
+                "cycle_started_at": "2026-09-02T12:00:00+00:00",
+            },
+        )
+    ]
+
+    result.next_page = None
+    assert cli_mod.enqueue_api_sync_continuation(sentinel_db, result) is False
+    assert len(enqueued) == 1
+
+
+def test_api_sync_continuation_reuses_exact_window():
+    kwargs = cli_mod.api_sync_continuation_kwargs(
+        {
+            "state": "CA",
+            "start_page": 11,
+            "updated_since": "2026-08-01T00:00:00+00:00",
+            "cycle_started_at": "2026-09-02T12:00:00Z",
+        }
+    )
+    assert kwargs == {
+        "start_page": 11,
+        "updated_since_override": "2026-08-01T00:00:00+00:00",
+        "cycle_started_at": datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc),
+    }
+
+
+def test_api_sync_continuation_without_cycle_fails_closed():
+    with pytest.raises(ValueError, match="missing cycle_started_at"):
+        cli_mod.api_sync_continuation_kwargs({"state": "CA", "start_page": 11})
+
+
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        ({"state": "CA", "start_page": True}, "positive integer"),
+        ({"state": "CA", "start_page": 0}, "positive integer"),
+        ({"state": "CA", "start_page": "11"}, "positive integer"),
+        ({"state": "CA", "start_page": 1, "updated_since": "2026-08-01T00:00:00+00:00"}, "initial API sync"),
+        ({"state": "CA", "start_page": 1, "cycle_started_at": "2026-09-02T12:00:00+00:00"}, "greater than 1"),
+        ({"state": "CA", "start_page": 11, "cycle_started_at": "not-a-time"}, "ISO timestamp"),
+        ({"state": "CA", "start_page": 11, "cycle_started_at": "2026-09-02T12:00:00"}, "timezone-aware"),
+        ({"state": "CA", "start_page": 11, "cycle_started_at": "2026-09-02T12:00:00+00:00", "updated_since": "2026-09-03T12:00:00+00:00"}, "cannot be after"),
+    ],
+)
+def test_api_sync_continuation_payload_validation_fails_closed(payload, message):
+    with pytest.raises(ValueError, match=message):
+        cli_mod.api_sync_continuation_kwargs(payload)
+
+
+def test_completed_continuation_keeps_first_chunk_watermark(db_session):
+    """An update arriving on page 1 while page 11 runs must be in the next window."""
+    jurisdiction, _ = _make_jurisdiction_with_active_session(db_session)
+    prior = "2026-08-01T00:00:00+00:00"
+    first_chunk_started = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    pages = {
+        n: {
+            "results": [
+                _v3_bill_payload(
+                    openstates_id=f"ocd-bill/window-{n}",
+                    identifier=f"HB {800 + n}",
+                    title=f"Page {n}",
+                )
+            ],
+            "pagination": {"max_page": 11},
+        }
+        for n in range(1, 12)
+    }
+
+    first = run_api_sync_job(
+        db_session,
+        jurisdiction.abbreviation,
+        client=_client_with_pages(pages),
+        updated_since_override=prior,
+        cycle_started_at=first_chunk_started,
+    )
+    assert first.next_page == 11
+    final = run_api_sync_job(
+        db_session,
+        jurisdiction.abbreviation,
+        client=_client_with_pages(pages),
+        start_page=first.next_page,
+        updated_since_override=first.updated_since_used,
+        cycle_started_at=first.cycle_started_at,
+    )
+    assert final.next_page is None
+
+    seen: list[str | None] = []
+    sync_state(
+        db_session,
+        jurisdiction,
+        client=_client_recording_updated_since(
+            {1: {"results": [], "pagination": {"max_page": 1}}}, seen
+        ),
+    )
+    assert seen == [first_chunk_started.isoformat()]
+
+
 def test_run_api_sync_job_raises_for_unknown_state(db_session):
     with pytest.raises(ValueError):
         run_api_sync_job(db_session, "ZZ_NOT_A_REAL_STATE")
+
+
+def test_matching_openstates_id_cannot_cross_session_boundary(db_session):
+    jurisdiction, regular = _make_jurisdiction_with_active_session(db_session)
+    special = SessionModel(
+        jurisdiction_id=jurisdiction.id,
+        identifier="2025-2026 Special Session 1",
+        name="2025-2026 Special Session 1",
+        classification="special",
+        active=False,
+    )
+    db_session.add(special)
+    db_session.flush()
+    existing = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=regular.id,
+        identifier="AB 2",
+        identifier_norm="AB2",
+        title="Regular bill must not be overwritten",
+        openstates_id="ocd-bill/shared-stale-id",
+    )
+    db_session.add(existing)
+    db_session.flush()
+
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/shared-stale-id",
+        identifier="AB 2",
+        title="Special bill payload",
+    )
+    payload["session"] = special.identifier
+    result = sync_state(
+        db_session,
+        jurisdiction,
+        client=_client_with_pages(
+            {1: {"results": [payload], "pagination": {"max_page": 1}}}
+        ),
+    )
+
+    assert existing.title == "Regular bill must not be overwritten"
+    assert result.bills_updated == 0
+    assert any("skipped pending identity repair" in warning for warning in result.warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +836,7 @@ def test_sync_state_requests_and_persists_versions_documents(db_session):
     includes = seen_params[0].get_list("include")
     assert "versions" in includes
     assert "documents" in includes
+    assert "abstracts" in includes
     assert "sponsorships" in includes
     assert "actions" in includes
     assert "sources" in includes

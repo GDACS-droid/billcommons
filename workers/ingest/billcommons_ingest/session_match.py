@@ -81,6 +81,29 @@ def _extract_years(text: str) -> set[str]:
 
 _TX_CALLED_SESSION_RE = re.compile(r"^(\d{2})([12])$")
 
+# An explicit special/called-session sequence is stronger identity evidence
+# than the shared calendar year.  Without comparing it, a payload for
+# "Special Session 2" can be fuzzily assigned to the only seeded "Special
+# Session 1" row merely because both mention 2025--26.
+_SPECIAL_INDEX_PATTERNS = (
+    re.compile(r"\b(?:special|extraordinary)\s+session\s*(\d{1,2})\b", re.IGNORECASE),
+    re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:called|special|extraordinary)\s+session\b", re.IGNORECASE),
+    re.compile(r"(?:^|[^a-z])s{1,2}(\d{1,2})$", re.IGNORECASE),
+    re.compile(r"(?:^|[^0-9])(\d{1,2})e$", re.IGNORECASE),
+)
+
+
+def _extract_special_session_index(text: str) -> str | None:
+    """Return an explicit special-session sequence number, if present."""
+    tx_called = _TX_CALLED_SESSION_RE.fullmatch(text.strip())
+    if tx_called:
+        return str(int(tx_called.group(2)))
+    for pattern in _SPECIAL_INDEX_PATTERNS:
+        match = pattern.search(text.strip())
+        if match:
+            return str(int(match.group(1)))
+    return None
+
 
 def _extract_ordinal_numbers(text: str) -> set[str]:
     """Extract bare 1-3 digit "ordinal legislature/session/period number"
@@ -173,6 +196,11 @@ def resolve_session(
     slug_years = _extract_years(slug)
     slug_classification = _classify_slug(slug_norm)
     slug_ordinals = _extract_ordinal_numbers(slug)
+    slug_special_index = (
+        _extract_special_session_index(slug)
+        if slug_classification == "special"
+        else None
+    )
 
     survivors: list[SessionCandidate] = []
     for cand in candidates:
@@ -180,6 +208,18 @@ def resolve_session(
         cand_classification = _classify_identifier(cand.identifier, cand.classification)
 
         if slug_classification != cand_classification:
+            continue
+
+        candidate_special_index = (
+            _extract_special_session_index(cand.identifier)
+            if cand_classification == "special"
+            else None
+        )
+        if (
+            slug_special_index is not None
+            and candidate_special_index is not None
+            and slug_special_index != candidate_special_index
+        ):
             continue
 
         year_overlap = bool(slug_years & cand_years) if slug_years and cand_years else False

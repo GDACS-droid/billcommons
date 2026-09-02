@@ -77,11 +77,13 @@ def test_search_bills_builds_query_params():
     client.search_bills(
         jurisdiction="nc",
         session="2025-2026",
+        identifier="HB 42",
         include=["sponsorships", "actions", "sources", "versions", "documents"],
     )
 
     assert "jurisdiction=nc" in captured["url"]
     assert "session=2025-2026" in captured["url"]
+    assert "identifier=HB+42" in captured["url"]
     assert "include=sponsorships" in captured["url"]
     assert "include=actions" in captured["url"]
     # `include` is v3's repeated query param, not a comma-joined single value
@@ -98,6 +100,20 @@ def test_search_bills_builds_query_params():
         "versions",
         "documents",
     ]
+
+
+def test_search_bills_omits_optional_filters_by_default():
+    captured = {}
+
+    def handler(request):
+        captured["params"] = request.url.params
+        return httpx.Response(200, json={"results": [], "pagination": {"max_page": 1}})
+
+    client = _client_with_handler(handler)
+    client.search_bills()
+
+    assert "session" not in captured["params"]
+    assert "identifier" not in captured["params"]
 
 
 def test_iter_bills_paginates_across_pages():

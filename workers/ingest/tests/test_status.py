@@ -25,12 +25,13 @@ from billcommons_ingest.status import (
 )
 
 
-def A(d, classification=None, description=None, organization_id=None):
+def A(d, classification=None, description=None, organization_id=None, order=None):
     return ActionRow(
         action_date=d,
         classification=classification,
         description=description,
         organization_id=organization_id,
+        order=order,
     )
 
 
@@ -47,6 +48,69 @@ def test_unclassified_died_in_committee_is_dead_not_in_committee():
         A(date(2026, 2, 3), None, "Died In Committee"),
     ]
     assert derive_status(actions) == DEAD
+
+
+def test_california_failed_passage_in_committee_is_dead():
+    assert (
+        derive_status(
+            [
+                A(
+                    date(2026, 7, 1),
+                    None,
+                    "July 1 hearing: Failed passage in committee. (Ayes 1. Noes 3. Page 5165.)",
+                )
+            ]
+        )
+        == DEAD
+    )
+
+
+def test_california_failed_passage_with_reconsideration_is_not_a_terminal_death():
+    actions = [
+        A(
+            date(2026, 3, 18),
+            None,
+            "March 18 set for first hearing. Failed passage in committee. "
+            "(Ayes 3. Noes 1.) Reconsideration granted.",
+        ),
+        A(
+            date(2026, 4, 22),
+            None,
+            "From committee: Do pass and re-refer to Com. on APPR. Re-referred to Com. on APPR.",
+        ),
+    ]
+    assert derive_status(actions) == IN_COMMITTEE
+
+
+def test_california_reconsideration_refines_a_stale_failure_classification():
+    assert (
+        derive_status(
+            [
+                A(
+                    date(2026, 3, 18),
+                    "failure",
+                    "Failed passage in committee. Reconsideration granted.",
+                )
+            ]
+        )
+        == IN_COMMITTEE
+    )
+
+
+def test_later_official_committee_status_revives_a_prior_failed_passage():
+    actions = [
+        A(date(2026, 3, 18), None, "Failed passage in committee. (Ayes 1. Noes 3.)"),
+        A(date(2026, 4, 22), None, "Re-referred to Com. on APPR."),
+    ]
+    assert derive_status(actions) == IN_COMMITTEE
+
+
+def test_later_ca_suspense_file_is_forward_committee_motion():
+    actions = [
+        A(date(2026, 3, 18), None, "Failed passage in committee."),
+        A(date(2026, 5, 4), None, "May 4 hearing: Placed on APPR. suspense file."),
+    ]
+    assert derive_status(actions) == IN_COMMITTEE
 
 
 def test_classified_failure_is_dead():
@@ -116,12 +180,121 @@ def test_sent_to_governor_is_enrolled():
     assert derive_status(actions) == ENROLLED
 
 
+def test_california_final_concurrence_is_passed_both_not_enrolled():
+    actions = [
+        A(
+            date(2026, 8, 31),
+            None,
+            "Senate amendments concurred in. To Engrossing and Enrolling.",
+        )
+    ]
+    assert derive_status(actions) == PASSED_BOTH
+
+
+def test_california_generic_passage_classification_keeps_concurrence_detail():
+    actions = [
+        A(
+            date(2026, 8, 31),
+            "passage",
+            "Senate amendments concurred in. To Engrossing and Enrolling.",
+        )
+    ]
+    assert derive_status(actions) == PASSED_BOTH
+
+
+def test_california_final_concurrence_beats_stale_committee_classification():
+    actions = [
+        A(
+            date(2026, 8, 30),
+            "referral-committee",
+            "Assembly amendments concurred in. (Ayes 29. Noes 10.) "
+            "Ordered to engrossing and enrolling.",
+        )
+    ]
+    assert derive_status(actions) == PASSED_BOTH
+
+
+def test_california_final_concurrence_never_overrides_executive_classification():
+    """The CA refinement is only for stale procedural classifications."""
+    actions = [
+        A(
+            date(2026, 8, 30),
+            "executive-veto",
+            "Assembly amendments concurred in. Ordered to engrossing and enrolling.",
+        )
+    ]
+    assert derive_status(actions) == VETOED
+
+
+def test_california_assembly_concurrence_variant_is_passed_both():
+    actions = [
+        A(
+            date(2026, 8, 30),
+            None,
+            "Assembly amendments concurred in. Ayes 62; Noes 10. "
+            "Ordered to engrossing and enrolling.",
+        )
+    ]
+    assert derive_status(actions) == PASSED_BOTH
+
+
+def test_california_third_reading_passage_is_one_chamber():
+    actions = [
+        A(
+            date(2026, 8, 28),
+            None,
+            "Read third time. Passed. Ordered to the Assembly.",
+        )
+    ]
+    assert derive_status(actions) == PASSED_ONE_CHAMBER
+
+
+def test_california_amendment_narrative_does_not_imply_passage():
+    actions = [
+        A(
+            date(2026, 8, 28),
+            None,
+            "Committee report discusses Senate amendments concurred in by a prior bill.",
+        )
+    ]
+    assert derive_status(actions) is None
+
+
 def test_withdrawal_is_reported():
     actions = [
         A(date(2026, 1, 5), "introduction", "Introduced"),
         A(date(2026, 2, 1), "withdrawal", "Withdrawn by author"),
     ]
     assert derive_status(actions) == WITHDRAWN
+
+
+def test_unclassified_bare_measure_withdrawal_is_reported():
+    assert derive_status([A(date(2026, 2, 1), None, "Withdrawn.")]) == WITHDRAWN
+    assert (
+        derive_status([A(date(2026, 2, 1), None, "Withdrawn from consideration.")])
+        == WITHDRAWN
+    )
+
+
+def test_california_withdrawn_from_committee_is_procedural():
+    actions = [
+        A(date(2026, 4, 8), None, "Withdrawn from committee."),
+        A(date(2026, 4, 8), None, "Re-referred to Com. on JUD."),
+        A(date(2026, 4, 23), "committee-passage", "From committee: Do pass."),
+    ]
+    assert derive_status(actions) == IN_COMMITTEE
+
+
+def test_california_procedural_withdrawal_does_not_override_later_concurrence():
+    actions = [
+        A(date(2026, 6, 11), None, "Withdrawn from committee."),
+        A(
+            date(2026, 8, 26),
+            "passage",
+            "Senate amendments concurred in. To Engrossing and Enrolling.",
+        ),
+    ]
+    assert derive_status(actions) == PASSED_BOTH
 
 
 def test_veto_is_reported_when_not_overridden():
@@ -229,6 +402,30 @@ def test_dead_with_same_date_progress_stays_dead():
         A(date(2026, 3, 1), "referral-committee", "Referred to committee"),
     ]
     assert derive_status(actions) == DEAD
+
+
+def test_dead_with_later_same_day_ordered_progress_is_revived():
+    actions = [
+        A(date(2026, 3, 1), None, "Failed passage in committee.", order=6),
+        A(date(2026, 3, 1), None, "Re-referred to Com. on JUD.", order=7),
+    ]
+    assert derive_status(actions) == IN_COMMITTEE
+
+
+def test_same_day_source_order_beats_static_status_rank_for_later_referral():
+    actions = [
+        A(date(2026, 8, 26), "passage", "Read third time. Passed. Ordered to the Senate.", order=21),
+        A(date(2026, 8, 26), None, "Re-referred to Com. on RLS.", order=22),
+    ]
+    assert derive_status(actions) == IN_COMMITTEE
+
+
+def test_same_day_without_source_order_retains_conservative_status_rank_tie_break():
+    actions = [
+        A(date(2026, 8, 26), "passage", "Read third time. Passed. Ordered to the Senate."),
+        A(date(2026, 8, 26), None, "Re-referred to Com. on RLS."),
+    ]
+    assert derive_status(actions) == PASSED_ONE_CHAMBER
 
 
 def test_real_second_death_after_progress_still_wins():

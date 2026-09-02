@@ -40,13 +40,14 @@ from __future__ import annotations
 import hashlib
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest.openstates_api import OpenStatesClient
 from billcommons_ingest.openstates_bulk import _parse_date_field
+from billcommons_ingest.session_match import MatchPath, SessionCandidate, resolve_session
 from billcommons_schema.models import (
     Bill,
     BillAction,
@@ -61,14 +62,23 @@ from billcommons_ingest import events
 from billcommons_shared.normalize import normalize_bill_number
 
 SOURCE_NAME = "openstates_api_sync"
+CA_OFFICIAL_ACTION_SOURCE_PREFIX = "ca_official_action_sweep/"
 DEFAULT_PER_PAGE = 20
 MAX_PAGES_PER_RUN = 10
-INCLUDE = ["sponsorships", "actions", "sources", "versions", "documents"]
+INCLUDE = ["sponsorships", "actions", "sources", "versions", "documents", "abstracts"]
 
 
 @dataclass
 class ApiSyncResult:
     state: str
+    # Exact lower bound used for every page in this scan.  Continuation jobs
+    # must carry it verbatim; recomputing it between chunks can change the
+    # result set under offset pagination.
+    updated_since_used: str | None = None
+    # The first chunk's start time is the safe next watermark once every page
+    # completes.  A later continuation's own wall-clock start would skip
+    # updates that arrived while the multi-job scan was running.
+    cycle_started_at: datetime | None = None
     bills_created: int = 0
     bills_updated: int = 0
     bills_unchanged: int = 0
@@ -108,6 +118,7 @@ def _bill_checksum(payload: dict) -> str:
         ",".join(payload.get("classification") or []),
         payload.get("latest_action_description") or "",
         str(payload.get("latest_action_date") or ""),
+        _resolve_abstract(payload) or "",
     )
     return hashlib.sha256("|".join(key_fields).encode("utf-8")).hexdigest()
 
@@ -129,46 +140,98 @@ def _resolve_source_url(payload: dict) -> str | None:
     return None
 
 
+def _resolve_abstract(payload: dict) -> str | None:
+    """Return the first non-empty current v3 abstract without fabricating one.
+
+    Open States supplies abstracts as included child objects rather than as a
+    bill scalar.  The API has no durable local abstract model, so the current
+    summary belongs in ``Bill.description`` (the same representation the bulk
+    importer uses).  Empty/whitespace-only entries are not a replacement for a
+    useful existing description.
+    """
+    for abstract in payload.get("abstracts") or []:
+        if not isinstance(abstract, dict):
+            continue
+        text = abstract.get("abstract")
+        if isinstance(text, str) and text.strip():
+            return text
+    return None
+
+
 def _resolve_session_row(
     bill_payload: dict,
     sessions_by_identifier: dict[str, SessionModel],
+    sessions_by_name: dict[str, list[SessionModel]],
     active_session: SessionModel | None,
     result: ApiSyncResult,
 ) -> SessionModel | None:
-    """Resolve a v3 bill payload's `session` string to OUR local session
-    row. v3's `session` field is a string session identifier (the same kind
-    of value stored in `Session.identifier`), so an exact match against this
-    jurisdiction's known sessions is the correct, non-guessing resolution --
-    falling back to the jurisdiction's active session only when the
-    payload's session string doesn't (yet) match any session row we know
-    about (e.g. a brand-new session the registry/bootstrap hasn't seeded
-    yet). This is what actually prevents a same-numbered bill in a
-    DIFFERENT session from being conflated with the current session's bill
-    of the same number (see `bill_by_session_and_identifier_norm`'s key).
+    """Resolve a v3 bill payload's session without cross-session guessing.
 
-    Falling back silently used to be a real misassignment risk with no
-    operator-visible trace: a payload session string that doesn't match any
-    known session row gets silently attributed to whatever session happens
-    to be `active` right now, which is WRONG whenever that's a different
-    session than the one the bill is actually in. This logs a warning to
-    `result.warnings` (the same operator-visible channel the "no session row
-    resolved" skip path a few lines up in `sync_state` already uses) any
-    time this fallback fires with a NON-empty session_identifier that
-    genuinely didn't match -- i.e. every case where we can't prove the
-    fallback is even correct, not merely every case where session is
-    entirely absent from the payload."""
-    session_identifier = bill_payload.get("session")
-    if session_identifier:
-        matched = sessions_by_identifier.get(session_identifier)
-        if matched is not None:
-            return matched
+    A missing/blank payload session is the one case where active-session
+    fallback remains legitimate.  A nonempty unknown value is evidence that
+    this bill belongs somewhere specific, so assigning it to the current
+    session would silently corrupt session-scoped bill identity; it therefore
+    fails closed and the caller skips the bill.
+
+    Open States' API uses compact session slugs for some jurisdictions (CA's
+    ``20252026`` and ``20252026 Special Session 1`` are the important cases),
+    while registry/bootstrap rows use human identifiers.  After exact local
+    identifier/name lookup, reuse the shared bulk-import matcher.  It accepts
+    only a unique year-and-classification-compatible candidate, so regular
+    and special sessions cannot be conflated and ambiguity still fails closed.
+    """
+    raw_session = bill_payload.get("session")
+    if raw_session is None or (isinstance(raw_session, str) and not raw_session.strip()):
+        return active_session
+    if not isinstance(raw_session, str):
         result.warnings.append(
-            f"bill payload session={session_identifier!r} did not match any known "
-            f"session row for this jurisdiction; falling back to the active session "
-            f"({active_session.identifier if active_session else 'none'}) -- this bill "
-            f"may be misassigned if it actually belongs to a different, not-yet-seeded session"
+            f"bill payload has non-string session={raw_session!r}; skipped rather than "
+            "falling back to the active session"
         )
-    return active_session
+        return None
+
+    session_identifier = raw_session.strip()
+    matched = sessions_by_identifier.get(session_identifier)
+    if matched is not None:
+        return matched
+
+    name_matches = sessions_by_name.get(session_identifier, [])
+    if len(name_matches) == 1:
+        return name_matches[0]
+    if len(name_matches) > 1:
+        result.warnings.append(
+            f"bill payload session={raw_session!r} exactly matches {len(name_matches)} local "
+            "session names; skipped rather than guessing"
+        )
+        return None
+
+    candidates = [
+        SessionCandidate(identifier=session.identifier, classification=session.classification)
+        for session in sessions_by_identifier.values()
+    ]
+    match = resolve_session(session_identifier, candidates)
+    if match.path == MatchPath.FUZZY and match.candidate is not None:
+        return sessions_by_identifier[match.candidate.identifier]
+
+    # A local session name is normally the legislature name, but supporting a
+    # human session alias here costs little and covers older/manual seed rows.
+    named_candidates = [
+        SessionCandidate(identifier=name, classification=session.classification)
+        for name, rows in sessions_by_name.items()
+        for session in rows
+    ]
+    name_match = resolve_session(session_identifier, named_candidates)
+    if name_match.path == MatchPath.FUZZY and name_match.candidate is not None:
+        alias_rows = sessions_by_name[name_match.candidate.identifier]
+        if len(alias_rows) == 1:
+            return alias_rows[0]
+
+    result.warnings.append(
+        f"bill payload session={raw_session!r} did not match a unique known session row "
+        f"for this jurisdiction ({match.reason}); skipped rather than falling back to "
+        f"the active session ({active_session.identifier if active_session else 'none'})"
+    )
+    return None
 
 
 def sync_state(
@@ -180,6 +243,8 @@ def sync_state(
     max_pages: int = MAX_PAGES_PER_RUN,
     updated_since_override: str | None = None,
     start_page: int = 1,
+    session: str | None = None,
+    identifier: str | None = None,
 ) -> ApiSyncResult:
     """Incrementally sync one jurisdiction via the v3 API. Caller commits.
 
@@ -201,6 +266,10 @@ def sync_state(
 
     `start_page`, similarly, only matters to that same replay path -- ordinary
     calls always start at page 1 (the default).
+
+    `session` and `identifier` optionally narrow the upstream search for a
+    bounded repair/replay.  Omitting both preserves the ordinary statewide
+    incremental query exactly.
 
     Absent an override, `updated_since` is THIS sync pipeline's own watermark: the `started_at`
     (NOT `finished_at`) of the jurisdiction's most recent SUCCESSFUL
@@ -255,19 +324,19 @@ def sync_state(
         updated_since = (
             last_successful_run_started_at.isoformat() if last_successful_run_started_at is not None else None
         )
+    result.updated_since_used = updated_since
 
-    # Every session row for this jurisdiction, keyed by its own `identifier`
-    # -- v3's bill `session` field is a string session identifier, and this
-    # is how a bill payload's session is resolved to OUR session row (see
-    # `_resolve_session_row` below). `active_session` remains the fallback
-    # for the (should-be-rare) case where a bill's session string doesn't
-    # match any session row we know about yet.
-    sessions_by_identifier: dict[str, SessionModel] = {
-        s.identifier: s
-        for s in db.execute(
-            select(SessionModel).where(SessionModel.jurisdiction_id == jurisdiction.id)
-        ).scalars()
-    }
+    # Exact local identifiers take precedence.  Names are a secondary exact
+    # alias (only when unique); compact upstream slugs then get a shared,
+    # ambiguity-safe fuzzy match in `_resolve_session_row`.
+    session_rows = db.execute(
+        select(SessionModel).where(SessionModel.jurisdiction_id == jurisdiction.id)
+    ).scalars().all()
+    sessions_by_identifier: dict[str, SessionModel] = {s.identifier: s for s in session_rows}
+    sessions_by_name: dict[str, list[SessionModel]] = {}
+    for session_row in session_rows:
+        if session_row.name and session_row.name.strip():
+            sessions_by_name.setdefault(session_row.name.strip(), []).append(session_row)
     active_session = db.execute(
         select(SessionModel)
         .where(SessionModel.jurisdiction_id == jurisdiction.id, SessionModel.active.is_(True))
@@ -309,13 +378,18 @@ def sync_state(
     page = start_page
     pages_fetched_this_call = 0
     while pages_fetched_this_call < max_pages:
-        payload = client.search_bills(
+        search_kwargs = dict(
             jurisdiction=jurisdiction.abbreviation.lower(),
             updated_since=updated_since,
             include=INCLUDE,
             page=page,
             per_page=per_page,
         )
+        if session is not None:
+            search_kwargs["session"] = session
+        if identifier is not None:
+            search_kwargs["identifier"] = identifier
+        payload = client.search_bills(**search_kwargs)
         result.pages_fetched += 1
         pages_fetched_this_call += 1
         pagination = payload.get("pagination", {})
@@ -349,24 +423,44 @@ def sync_state(
             # unambiguous regardless of session. Only falls back to the
             # (session_id, identifier_norm) key for bills that don't have an
             # openstates_id recorded yet (e.g. bulk-CSV-bootstrapped rows).
-            session_row = _resolve_session_row(bill_payload, sessions_by_identifier, active_session, result)
+            session_row = _resolve_session_row(
+                bill_payload, sessions_by_identifier, sessions_by_name, active_session, result
+            )
+            if session_row is None:
+                # Do this before openstates_id matching too: an existing row
+                # is not permission to apply a payload we cannot safely place
+                # in a local session.  Otherwise an unknown nonempty session
+                # could still overwrite an already-ingested bill.
+                result.warnings.append(
+                    f"no session row resolved for {jurisdiction.abbreviation} bill "
+                    f"{identifier_raw!r} (session={bill_payload.get('session')!r}); skipped"
+                )
+                continue
             bill = bill_by_openstates_id.get(openstates_id) if openstates_id else None
+            if bill is not None and bill.session_id != session_row.id:
+                # An Open States id is supposed to identify one bill in one
+                # session.  A payload/local-session disagreement therefore
+                # proves stale or corrupted identity data; it is never safe
+                # to update the row merely because the external id matches.
+                # This is the exact shape that previously merged California
+                # regular and special-session measures sharing a number.
+                result.warnings.append(
+                    f"Open States id {openstates_id!r} for {identifier_raw!r} resolves to "
+                    f"session {session_row.identifier!r}, but the existing Bill Commons row "
+                    f"is in session_id={bill.session_id}; skipped pending identity repair"
+                )
+                continue
             if bill is None and session_row is not None:
                 bill = bill_by_session_and_identifier_norm.get((session_row.id, identifier_norm))
 
             if bill is None:
-                if session_row is None:
-                    result.warnings.append(
-                        f"no session row resolved for {jurisdiction.abbreviation} bill "
-                        f"{identifier_raw!r} (session={bill_payload.get('session')!r}); skipped"
-                    )
-                    continue
                 bill = Bill(
                     jurisdiction_id=jurisdiction.id,
                     session_id=session_row.id,
                     identifier=identifier_raw,
                     identifier_norm=identifier_norm,
                     title=bill_payload.get("title") or "(untitled)",
+                    description=_resolve_abstract(bill_payload),
                     chamber=bill_payload.get("chamber"),
                     bill_type=",".join(bill_payload.get("classification") or []) or None,
                     openstates_id=openstates_id,
@@ -408,6 +502,9 @@ def sync_state(
                     bill_by_openstates_id[openstates_id] = bill
             else:
                 bill.title = bill_payload.get("title") or bill.title
+                abstract = _resolve_abstract(bill_payload)
+                if abstract is not None:
+                    bill.description = abstract
                 bill.chamber = bill_payload.get("chamber") or bill.chamber
                 classifications = bill_payload.get("classification") or []
                 bill.bill_type = ",".join(classifications) if classifications else bill.bill_type
@@ -597,34 +694,78 @@ def _upsert_versions_and_documents(
 def _upsert_actions(
     db: OrmSession, bill: Bill, action_payloads: list[dict], result: ApiSyncResult, retrieved_at: datetime
 ) -> None:
-    if not action_payloads:
-        return
-    # Keyed to the ROW, not just its identity, so a corrected action can be
-    # detected. Upstream routinely revises actions in place: 42% arrive with
-    # no classification at all and get one later, which is precisely the event
-    # that moves a bill's derived status. Matching on existence alone meant an
-    # action reclassified to `executive-signature` was never written, never
-    # re-derived, and never announced -- the bill kept reporting `introduced`
-    # after it had been signed, permanently, with nothing logged anywhere.
-    existing = {
-        (a.description, a.order): a
-        for a in db.execute(select(BillAction).where(BillAction.bill_id == bill.id)).scalars()
-    }
-    latest_date = None
-    latest_text = None
+    # The v3 include has no immutable action id.  Its list position is not a
+    # natural key: it can differ from a bulk CSV's `order`, and an inserted
+    # historical action shifts every later position.  Reconcile one-to-one by
+    # stable content first, then permit a unique-description fallback for an
+    # upstream date correction.  Classification deliberately remains outside
+    # either key because reclassification is a revision of the same action.
+    local_actions = list(
+        db.execute(select(BillAction).where(BillAction.bill_id == bill.id)).scalars()
+    )
+    local_by_content: dict[tuple[str, date | None], list[BillAction]] = {}
+    local_by_description: dict[str, list[BillAction]] = {}
+    for action in local_actions:
+        local_by_content.setdefault((action.description, action.action_date), []).append(action)
+        local_by_description.setdefault(action.description, []).append(action)
+    consumed_action_ids: set[object] = set()
+
+    def _action_token(action: BillAction) -> object:
+        # UUID defaults are normally present before flush, but object identity
+        # keeps reconciliation one-to-one for a newly constructed row too.
+        action_id = getattr(action, "id", None)
+        return action_id if action_id is not None else id(action)
+
+    def _unconsumed(candidates: list[BillAction]) -> list[BillAction]:
+        return [action for action in candidates if _action_token(action) not in consumed_action_ids]
+
     added = 0
     revised = 0
     for i, action_payload in enumerate(action_payloads):
         description = action_payload.get("description") or ""
-        order = i
-        key = (description, order)
+        order_raw = action_payload.get("order")
+        order = order_raw if isinstance(order_raw, int) and not isinstance(order_raw, bool) else i
         action_date = _parse_date(action_payload.get("date"))
-        classification = ",".join(action_payload.get("classification") or []) or None
-        current = existing.get(key)
+        raw_classification = action_payload.get("classification")
+        if isinstance(raw_classification, str):
+            classification = raw_classification.strip() or None
+        elif isinstance(raw_classification, list):
+            classification = ",".join(
+                item.strip() for item in raw_classification if isinstance(item, str) and item.strip()
+            ) or None
+        else:
+            classification = None
+        exact_matches = _unconsumed(local_by_content.get((description, action_date), []))
+        current = exact_matches[0] if len(exact_matches) == 1 else None
+        order_is_safe_to_reconcile = len(exact_matches) <= 1
+        if current is None and len(exact_matches) > 1:
+            # Existing duplicate rows are ambiguous only when this payload
+            # would mutate one of them.  If at least one already represents
+            # the complete incoming fact, consume it without a write so a
+            # nightly sync cannot add a fresh duplicate forever.  Otherwise
+            # preserve the conflicting rows and insert one authoritative
+            # representation; the explicit cleanup pass can then collapse
+            # exact content duplicates deterministically.
+            same_classification = [
+                action for action in exact_matches if action.classification == classification
+            ]
+            if same_classification:
+                same_order = [action for action in same_classification if action.order == order]
+                current = same_order[0] if same_order else same_classification[0]
+                order_is_safe_to_reconcile = bool(same_order)
+        if current is None:
+            description_matches = _unconsumed(local_by_description.get(description, []))
+            # A unique description is enough to identify a date correction;
+            # multiple same-description actions are genuinely ambiguous, so
+            # preserve them and insert rather than silently revising one.
+            if len(description_matches) == 1:
+                current = description_matches[0]
         if current is not None:
-            # Only the two fields the status derivation actually reads. A
-            # no-op assignment would still leave the row clean, so this cannot
-            # churn updated_at on an unchanged sync.
+            consumed_action_ids.add(_action_token(current))
+            # Reconcile the upstream order as well as the two status fields.
+            # Same-day actions use `order` as their deterministic tiebreaker;
+            # leaving a bulk-era/list-position value stale can report the
+            # wrong latest action even when all action facts are present.
             changed_fields = []
             if current.action_date != action_date:
                 current.action_date = action_date
@@ -632,6 +773,9 @@ def _upsert_actions(
             if current.classification != classification:
                 current.classification = classification
                 changed_fields.append("classification")
+            if order_is_safe_to_reconcile and current.order != order:
+                current.order = order
+                changed_fields.append("order")
             if changed_fields:
                 current.retrieved_at = retrieved_at
                 revised += 1
@@ -646,16 +790,46 @@ def _upsert_actions(
                 retrieved_at=retrieved_at,
             )
             db.add(new_action)
-            existing[key] = new_action
+            local_actions.append(new_action)
+            local_by_content.setdefault((description, action_date), []).append(new_action)
+            local_by_description.setdefault(description, []).append(new_action)
+            consumed_action_ids.add(_action_token(new_action))
             result.actions += 1
             added += 1
-        if action_date is not None:
-            latest_date = action_date
-            latest_text = description
-    if latest_date is not None:
-        bill.latest_action_date = latest_date
-        bill.latest_action_text = latest_text
-    if added or revised:
+
+    # Derive from the complete local history, never the arrival order of one
+    # API response.  This both mirrors the bulk importer's invariant and
+    # repairs a previously-regressed scalar when a bill is next encountered.
+    # The CA official ledger is authoritative when it has an action on the
+    # latest calendar date.  Preserve a genuinely newer API action (the
+    # official snapshot can lag), but do not let an unsupported same-day API
+    # row with an arbitrary legacy/list-position ``order`` displace the
+    # ledger's final source sequence after the CA sweep.
+    latest_date = max((action.action_date for action in local_actions if action.action_date is not None), default=None)
+    latest_candidates = (
+        [
+            action
+            for action in local_actions
+            if action.action_date == latest_date
+            and (action.source_name or "").startswith(CA_OFFICIAL_ACTION_SOURCE_PREFIX)
+        ]
+        if latest_date is not None
+        else []
+    )
+    latest = max(
+        latest_candidates or local_actions,
+        key=lambda action: (action.action_date or date.min, action.order if action.order is not None else 0),
+        default=None,
+    )
+    latest_changed = False
+    if latest is not None and latest.action_date is not None:
+        latest_changed = (
+            bill.latest_action_date != latest.action_date
+            or bill.latest_action_text != latest.description
+        )
+        bill.latest_action_date = latest.action_date
+        bill.latest_action_text = latest.description
+    if added or revised or latest_changed:
         # A REVISED action counts as a change to the bill for exactly the same
         # reason a new one does: it can move the derived status. An action
         # gaining a `failure` or `executive-signature` classification is the
@@ -673,6 +847,7 @@ def _upsert_actions(
             for part in (
                 f"{added} action(s) added" if added else "",
                 f"{revised} action(s) revised" if revised else "",
+                "latest action recalculated" if latest_changed and not (added or revised) else "",
             )
             if part
         )
@@ -718,7 +893,15 @@ def _upsert_sponsorships(
     db.flush()
 
 
-def run_api_sync_job(db: OrmSession, state: str, *, client: OpenStatesClient | None = None) -> ApiSyncResult:
+def run_api_sync_job(
+    db: OrmSession,
+    state: str,
+    *,
+    client: OpenStatesClient | None = None,
+    start_page: int = 1,
+    updated_since_override: str | None = None,
+    cycle_started_at: datetime | None = None,
+) -> ApiSyncResult:
     """Entry point for the worker dispatch: resolve the jurisdiction, run
     the sync, and record an `ingestion_runs` row. Caller commits."""
     jurisdiction = db.execute(
@@ -727,18 +910,47 @@ def run_api_sync_job(db: OrmSession, state: str, *, client: OpenStatesClient | N
     if jurisdiction is None:
         raise ValueError(f"no jurisdiction row for state {state!r}; run seed-registry first")
 
+    now = datetime.now(timezone.utc)
+    if cycle_started_at is not None:
+        if cycle_started_at.tzinfo is None:
+            raise ValueError("cycle_started_at must be timezone-aware")
+        cycle_started_at = cycle_started_at.astimezone(timezone.utc)
+        if cycle_started_at > now:
+            raise ValueError("cycle_started_at cannot be in the future")
+    else:
+        cycle_started_at = now
+
     run = IngestionRun(
         jurisdiction_id=jurisdiction.id,
         source_name=SOURCE_NAME,
-        started_at=datetime.now(timezone.utc),
+        # All chunks share the first chunk's start time.  Only the final chunk
+        # becomes successful, making this the conservative next watermark.
+        started_at=cycle_started_at,
         status="running",
     )
     db.add(run)
     db.flush()
 
     try:
-        result = sync_state(db, jurisdiction, client=client)
-        run.status = "success"
+        result = sync_state(
+            db,
+            jurisdiction,
+            client=client,
+            start_page=start_page,
+            updated_since_override=updated_since_override,
+        )
+        result.cycle_started_at = cycle_started_at
+        if result.next_page is None:
+            run.status = "success"
+        else:
+            # Persist bounded, idempotent page writes, but never let an
+            # incomplete offset-pagination scan become the normal watermark.
+            # The next normal scan safely overlaps from the last real success.
+            run.status = "failed"
+            run.error = (
+                f"pagination truncated before upstream completion: next_page={result.next_page}, "
+                f"max_page_seen={result.max_page_seen}"
+            )
         run.finished_at = datetime.now(timezone.utc)
         run.bills_created = result.bills_created
         run.bills_updated = result.bills_updated

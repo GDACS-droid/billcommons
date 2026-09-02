@@ -1107,7 +1107,13 @@ def cmd_worker(args: argparse.Namespace) -> int:
                             f"status={result.status} chars={result.extracted_chars}"
                         )
                     elif job.kind == scheduler_mod.API_SYNC_KIND:
-                        result = api_sync_mod.run_api_sync_job(db, job.payload.get("state"))
+                        continuation = api_sync_continuation_kwargs(job.payload)
+                        result = api_sync_mod.run_api_sync_job(
+                            db,
+                            job.payload.get("state"),
+                            **continuation,
+                        )
+                        enqueue_api_sync_continuation(db, result)
                         print(
                             f"worker {worker_id}: api_sync {result.state} "
                             f"created={result.bills_created} updated={result.bills_updated} "
@@ -1245,6 +1251,68 @@ def classify_job_failure(
         status = getattr(exc, "status", None) or fulltext_mod.STATUS_FETCH_ERROR
         return (status, True)
     return (fulltext_mod.STATUS_WORKER_ERROR, False)
+
+
+def enqueue_api_sync_continuation(db, result) -> bool:
+    """Durably continue a page-bounded API scan in the caller's transaction."""
+    if result.next_page is None:
+        return False
+    if result.cycle_started_at is None:
+        raise ValueError("truncated API sync result is missing cycle_started_at")
+    queue_mod.enqueue(
+        db,
+        scheduler_mod.API_SYNC_KIND,
+        {
+            "state": result.state,
+            "start_page": result.next_page,
+            "updated_since": result.updated_since_used,
+            "cycle_started_at": result.cycle_started_at.isoformat(),
+        },
+    )
+    return True
+
+
+def api_sync_continuation_kwargs(payload: dict) -> dict:
+    """Validate the immutable scan window carried by a continuation job."""
+    if not isinstance(payload, dict):
+        raise ValueError("API sync payload must be an object")
+    raw_page = payload.get("start_page", 1)
+    if isinstance(raw_page, bool) or not isinstance(raw_page, int) or raw_page < 1:
+        raise ValueError("API sync start_page must be a positive integer")
+    raw_cycle = payload.get("cycle_started_at")
+    raw_since = payload.get("updated_since")
+    if raw_cycle is None:
+        if raw_page != 1:
+            raise ValueError("API sync continuation is missing cycle_started_at")
+        if raw_since is not None:
+            raise ValueError("initial API sync job must not carry updated_since")
+        return {"start_page": 1}
+    if raw_page == 1:
+        raise ValueError("API sync continuation start_page must be greater than 1")
+    if not isinstance(raw_cycle, str):
+        raise ValueError("API sync cycle_started_at must be an ISO timestamp")
+    try:
+        cycle_started_at = datetime.fromisoformat(raw_cycle.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("API sync cycle_started_at must be an ISO timestamp") from exc
+    if cycle_started_at.tzinfo is None:
+        raise ValueError("API sync cycle_started_at must be timezone-aware")
+    if raw_since is not None:
+        if not isinstance(raw_since, str) or not raw_since.strip():
+            raise ValueError("API sync updated_since must be a nonempty ISO timestamp or null")
+        try:
+            updated_since = datetime.fromisoformat(raw_since.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("API sync updated_since must be an ISO timestamp or null") from exc
+        if updated_since.tzinfo is None:
+            raise ValueError("API sync updated_since must be timezone-aware")
+        if updated_since > cycle_started_at:
+            raise ValueError("API sync updated_since cannot be after cycle_started_at")
+    return {
+        "start_page": raw_page,
+        "updated_since_override": raw_since,
+        "cycle_started_at": cycle_started_at,
+    }
 
 
 def _fetch_text_document_id(job) -> str | None:
@@ -1525,6 +1593,7 @@ def recompute_status_for_bills(
             BillAction.classification,
             BillAction.description,
             BillAction.organization_id,
+            BillAction.order,
         )
         .where(BillAction.bill_id.in_(bill_ids))
         # Deterministic order (round-4 panel): the substitution-target scan
@@ -1546,6 +1615,7 @@ def recompute_status_for_bills(
                 classification=a.classification,
                 description=a.description,
                 organization_id=a.organization_id,
+                order=a.order,
             )
         )
 
@@ -2292,7 +2362,13 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                     job_id = job.id
                     state = job.payload.get("state")
                     try:
-                        result = api_sync_mod.run_api_sync_job(db, state)
+                        continuation = api_sync_continuation_kwargs(job.payload)
+                        result = api_sync_mod.run_api_sync_job(
+                            db,
+                            state,
+                            **continuation,
+                        )
+                        enqueue_api_sync_continuation(db, result)
                         queue_mod.complete_job(db, job)
                         db.commit()
                         # Collected only after the commit succeeds: a rolled-back
@@ -3017,6 +3093,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ca.add_argument("--dry-run", action="store_true", help="report match counts without writing")
     p_ca.set_defaults(func=cmd_ca_fulltext)
 
+    _add_ca_session_collision_repair_parser(sub)
+
     return parser
 
 
@@ -3031,6 +3109,58 @@ def cmd_ca_fulltext(args: argparse.Namespace) -> int:
     )
     print(f"ca-fulltext: {result}")
     return 0
+
+
+def cmd_ca_session_collision_repair(args: argparse.Namespace) -> int:
+    """Run the tightly scoped CA session-collision repair (dry-run by default)."""
+    from billcommons_ingest import ca_session_collision_repair as repair_mod
+    from billcommons_ingest.openstates_api import OpenStatesClient
+
+    try:
+        scope = repair_mod.derive_scope(zip_path=Path(args.zip), manifest_path=Path(args.manifest))
+        if args.staged_input:
+            plan = repair_mod.load_repair_plan(Path(args.staged_input), scope)
+        else:
+            plan = repair_mod.stage_repair(OpenStatesClient(), scope)
+            if args.stage_output:
+                digest = repair_mod.save_repair_plan(plan, Path(args.stage_output))
+                print(f"ca-session-collision-repair: staged payload bundle sha256={digest}")
+        db = get_session()
+        try:
+            reset = repair_mod.preflight_database(db, plan)
+            if not args.apply:
+                print(f"ca-session-collision-repair: PREFLIGHT PASS staged={len(plan.bills)} extracted_text_reset={reset}; rerun with --apply")
+                return 0
+            if reset and not args.allow_fulltext_reset:
+                print(f"ca-session-collision-repair: REFUSED would reset extracted text on {reset} documents; add --allow-fulltext-reset after recording a recovery plan")
+                return 1
+            # `preflight_database` deliberately used this same session for
+            # read-only proof.  End that implicit read transaction before the
+            # repair opens its own advisory-locked write transaction.
+            db.rollback()
+            result = repair_mod.apply_repair(db, plan, allow_fulltext_reset=args.allow_fulltext_reset)
+            print(f"ca-session-collision-repair: APPLIED {result}")
+            return 0
+        finally:
+            db.close()
+    except repair_mod.CollisionRepairError as exc:
+        print(f"ca-session-collision-repair: REFUSED: {exc}")
+        return 1
+
+
+def _add_ca_session_collision_repair_parser(sub) -> None:
+    p = sub.add_parser(
+        "ca-session-collision-repair",
+        help="one-off fail-closed repair for California regular/special session bill collision",
+    )
+    p.add_argument("--zip", required=True, help="pinned official CA daily pubinfo ZIP")
+    p.add_argument("--manifest", required=True, help="frozen pre-sweep CA production manifest TSV")
+    staged = p.add_mutually_exclusive_group()
+    staged.add_argument("--staged-input", help="load an immutable staged Open States payload bundle")
+    staged.add_argument("--stage-output", help="save newly fetched payloads once for restore + production reuse")
+    p.add_argument("--apply", action="store_true", help="apply after complete staging and read-only preflight (default is dry-run)")
+    p.add_argument("--allow-fulltext-reset", action="store_true", help="explicitly allow reset of extracted text on affected replaced documents")
+    p.set_defaults(func=cmd_ca_session_collision_repair)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -215,6 +215,7 @@ class OpenStatesClient:
         *,
         jurisdiction: str | None = None,
         session: str | None = None,
+        identifier: str | None = None,
         updated_since: str | None = None,
         include: list[str] | None = None,
         page: int = 1,
@@ -228,6 +229,8 @@ class OpenStatesClient:
             params["jurisdiction"] = jurisdiction
         if session:
             params["session"] = session
+        if identifier:
+            params["identifier"] = identifier
         if updated_since:
             params["updated_since"] = updated_since
         if include:
