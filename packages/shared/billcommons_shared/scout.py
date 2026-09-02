@@ -22,6 +22,10 @@ DEFAULT_PLATFORM_MAX_ACTIVE_JOBS = 10
 DEFAULT_PLATFORM_MAX_DAILY_JOBS = 100
 DEFAULT_PLATFORM_MAX_DAILY_BROWSER_SECONDS = 3_600
 DEFAULT_MAX_RETAINED_RAWSTORE_BYTES = 512 * 1024 * 1024
+# Bump whenever extraction changes user-visible evidence semantics. Jobs from
+# earlier namespaces remain auditable records, but must not be returned as a
+# fresh result under a corrected presentation contract.
+SCOUT_CACHE_NAMESPACE = "scout-p0-3-provenance"
 OFFICIAL_FLORIDA_HOSTS = frozenset({
     "www.flsenate.gov", "flsenate.gov", "www.myfloridahouse.gov",
     "myfloridahouse.gov", "www.leg.state.fl.us", "leg.state.fl.us",
@@ -300,7 +304,12 @@ def normalize_jurisdiction(jurisdiction: str) -> str:
     return value
 
 
-def scout_cache_key(query: str, jurisdiction: str, *, freshness_bucket: str = "p0") -> str:
+def scout_cache_key(
+    query: str,
+    jurisdiction: str,
+    *,
+    freshness_bucket: str = SCOUT_CACHE_NAMESPACE,
+) -> str:
     normalized_jurisdiction = normalize_jurisdiction(jurisdiction)
     normalized_query = normalize_query(query)
     return hashlib.sha256(

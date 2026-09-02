@@ -23,6 +23,9 @@ const EXAMPLES = [
   "What changed recently for Florida SB 1344?",
   "Investigate Florida activity involving social media.",
 ];
+// Scout evidence windows are bounded in the worker.  Preserve the original
+// retained excerpt while making a potentially bounded display unmistakable.
+const EXCERPT_CHARACTER_LIMIT = 500;
 function label(value?: string | null): string {
   return value ? value.replaceAll("_", " ") : "Not recorded";
 }
@@ -94,6 +97,7 @@ function StatusLine({ job }: { job: ScoutJob }) {
 function FindingCard({ finding, source }: { finding: ScoutFinding; source?: ScoutJob["sources"][number] }) {
   const sourceUrl = source?.canonicalUrl ?? finding.sourceUrl;
   const sourceType = source?.sourceType?.toLowerCase() ?? "";
+  const excerptMayBeTruncated = (finding.evidenceExcerpt?.length ?? 0) >= EXCERPT_CHARACTER_LIMIT;
   const evidenceLinkLabel = sourceType.includes("pdf")
     ? "Open official document"
     : "Open official record";
@@ -117,18 +121,25 @@ function FindingCard({ finding, source }: { finding: ScoutFinding; source?: Scou
       <dl className="mt-4 grid gap-3 text-sm leading-6 sm:grid-cols-[8.5rem_minmax(0,1fr)]">
         <dt className="font-semibold text-slate-900">What happened</dt>
         <dd className="whitespace-pre-wrap break-words text-slate-700">{finding.whatHappened}</dd>
-        <dt className="font-semibold text-slate-900">Why it matters</dt>
-        <dd className="whitespace-pre-wrap break-words text-slate-700">{finding.whyItMatters}</dd>
+        {finding.whyItMatters ? (
+          <>
+            <dt className="font-semibold text-slate-900">Why it matters</dt>
+            <dd className="whitespace-pre-wrap break-words text-slate-700">{finding.whyItMatters}</dd>
+          </>
+        ) : null}
       </dl>
       <div className="mt-4 border-l-2 border-slate-300 pl-3">
         <p className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Attached official evidence</p>
         {finding.evidenceExcerpt ? (
           <blockquote className="mt-2 border-l-2 border-blue-200 pl-3 text-sm leading-6 text-slate-700">
-            {finding.evidenceExcerpt}
+            {finding.evidenceExcerpt}{excerptMayBeTruncated ? <span aria-label="Excerpt may continue">…</span> : null}
           </blockquote>
         ) : (
           <p className="mt-2 text-sm text-slate-500">No excerpt was retained for this finding.</p>
         )}
+        {excerptMayBeTruncated ? (
+          <p className="mt-2 text-xs leading-5 text-slate-500">Excerpt is limited to 500 characters. Open the official document for the complete record.</p>
+        ) : null}
         {sourceUrl ? (
           <a
             href={sourceUrl}
@@ -366,7 +377,7 @@ function JobDetails({ job, refreshError, onCancel, canceling }: { job: ScoutJob;
               {job.events.map((event) => (
                 <li key={event.id} className="text-sm">
                   <p className="font-medium text-slate-900">{eventLabel(event.stage)}</p>
-                  <p className="mt-0.5 break-words text-slate-700">{event.message}</p>
+                  {event.message ? <p className="mt-0.5 break-words text-slate-700">{event.message}</p> : null}
                   {time(event.createdAt) ? <p className="mt-1 text-xs text-slate-500">{time(event.createdAt)}</p> : null}
                 </li>
               ))}

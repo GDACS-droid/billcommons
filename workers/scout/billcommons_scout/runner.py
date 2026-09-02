@@ -33,6 +33,16 @@ _INFLIGHT_CLEANUP_LOCK = threading.Lock()
 _INFLIGHT_CLEANUPS: set[uuid.UUID] = set()
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
+_RELATED_HOUSE_RE = re.compile(r"\bFLORIDA\s+HOUSE\s+OF\s+REPRESENTATIVES\b", re.I)
+_RELATED_SENATE_RE = re.compile(r"\bFLORIDA\s+SENATE\b", re.I)
+_RELATED_FINAL_ANALYSIS_RE = re.compile(r"\bFINAL\s+BILL\s+ANALYSIS\b", re.I)
+_RELATED_ANALYSIS_RE = re.compile(r"\b(?:COMMITTEE\s+|STAFF\s+)?BILL\s+ANALYSIS\b", re.I)
+_RELATED_STORAGE_NAME_RE = re.compile(r"\bSTORAGE\s+NAME\s*:\s*([A-Za-z0-9._-]+)", re.I)
+_RELATED_DATE_RE = re.compile(
+    r"\b(?:DATE|REVISED|ANALYSIS\s+DATE|PREPARED)\s*:?\s*"
+    r"((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+20\d{2})\b",
+    re.I,
+)
 _SHELL_MARKERS = (
     "sign in", "log in", "login", "maintenance", "temporarily unavailable",
     "enable javascript", "javascript is required", "please enable javascript",
@@ -49,6 +59,85 @@ _OPERATOR_CANARY_QUERY = "operator solari lifecycle validation"
 class Claim:
     job_id: uuid.UUID
     token: str
+
+
+@dataclass(frozen=True)
+class RelatedDocumentDescription:
+    """A conservative, evidence-derived label for a discovered attachment."""
+
+    title: str
+    what_happened: str
+    relevant_date: date | None
+    confidence: str
+
+
+def describe_related_document(
+    text: str,
+    *,
+    identifier: str,
+    artifact_type: str,
+    url: str,
+) -> RelatedDocumentDescription:
+    """Describe a related Florida attachment only from evidence it contains.
+
+    Senate bill pages can link to House-created analyses.  The host is proof of
+    where Scout discovered the attachment, not proof of its chamber.  This
+    function deliberately leaves the chamber generic unless the retained text
+    identifies it, and uses the document token only to distinguish otherwise
+    similarly named official attachments.
+    """
+    display_text = _SPACE_RE.sub(" ", text).strip()
+    # A chamber name mentioned deep in the document can be a quotation or a
+    # cross-reference. Restrict attribution to the document header area.
+    header_text = display_text[:1_000]
+    if _RELATED_HOUSE_RE.search(header_text):
+        issuer = "Florida House"
+    elif _RELATED_SENATE_RE.search(header_text):
+        issuer = "Florida Senate"
+    else:
+        issuer = "Official Florida"
+
+    if _RELATED_FINAL_ANALYSIS_RE.search(display_text):
+        label = "final bill analysis"
+        label_verified = True
+    elif _RELATED_ANALYSIS_RE.search(display_text):
+        label = "committee bill analysis"
+        label_verified = True
+    else:
+        # The URL route admits only these attachment categories, but do not
+        # turn that routing fact into a stronger document-title claim.
+        label = artifact_type
+        label_verified = False
+
+    storage = _RELATED_STORAGE_NAME_RE.search(display_text)
+    token = storage.group(1) if storage else None
+    if token is None:
+        filename = url.rsplit("/", 1)[-1]
+        if filename.casefold().endswith(".pdf"):
+            filename = filename[:-4]
+        if re.fullmatch(r"[A-Za-z0-9._-]+", filename):
+            token = filename
+
+    title = f"{identifier}: {issuer} {label}"
+    if token:
+        title += f" ({token})"
+
+    relevant_date: date | None = None
+    date_match = _RELATED_DATE_RE.search(display_text)
+    if date_match:
+        try:
+            relevant_date = datetime.strptime(date_match.group(1), "%B %d, %Y").date()
+        except ValueError:
+            pass
+
+    return RelatedDocumentDescription(
+        title=title,
+        what_happened=f"{issuer} {label} retrieved for {identifier}.",
+        relevant_date=relevant_date,
+        # A primary-source host still matters, but a high label is reserved
+        # for an attachment that identifies both issuer and document type.
+        confidence="high" if issuer != "Official Florida" and label_verified else "medium",
+    )
 
 
 def _bounded_call(fn, *args, timeout: float):
@@ -840,6 +929,7 @@ class ScoutRunner:
             if related_artifact_type not in {"committee analysis", "amendment"}:
                 related_artifact_type = None
             evidence: tuple[str, int, int] | None = None
+            related_description: RelatedDocumentDescription | None = None
             if create_finding:
                 if mime_base == "application/pdf":
                     text = extract_pdf_text(
@@ -860,6 +950,13 @@ class ScoutRunner:
                 if evidence is None:
                     self._record_failed_source(job_id, token, url, mechanism, status, mime)
                     return None
+                if related_artifact_type:
+                    related_description = describe_related_document(
+                        text,
+                        identifier=str(metadata.get("identifier") or bill_title),
+                        artifact_type=related_artifact_type,
+                        url=url,
+                    )
         except Exception:
             self._record_failed_source(job_id, token, url, mechanism, status, mime)
             return None
@@ -947,8 +1044,8 @@ class ScoutRunner:
                         return None
                     identifier = str(metadata.get("identifier") or bill_title)
                     source.title = (
-                        f"{identifier}: Official Florida Senate {related_artifact_type}"
-                        if create_finding and related_artifact_type else bill_title
+                        related_description.title
+                        if related_description is not None else bill_title
                     )
                     source.official = True
                     source.retrieval_mechanism = "reused" if exact_raw_ref else mechanism
@@ -967,25 +1064,23 @@ class ScoutRunner:
                     action_date = metadata.get("latest_action_date") or metadata.get("status_date")
                     if create_finding and related_artifact_type:
                         assert evidence is not None
+                        assert related_description is not None
                         excerpt, excerpt_start, excerpt_end = evidence
                         finding = ScoutFinding(
                             job_id=job_id,
                             source_id=source.id,
-                            title=f"{identifier}: Official Florida Senate {related_artifact_type}",
-                            what_happened=(
-                                f"Official Florida Senate {related_artifact_type} retrieved for {identifier}."
-                            ),
-                            why_it_matters=(
-                                "This bill-scoped primary document was discovered from the official Senate bill page "
-                                "and retained as evidence."
-                            ),
-                            relevant_date=None,
+                            title=related_description.title,
+                            what_happened=related_description.what_happened,
+                            # Do not manufacture legislative significance.
+                            # The primary record and its title are the claim.
+                            why_it_matters=None,
+                            relevant_date=related_description.relevant_date,
                             excerpt=excerpt,
                             excerpt_hash=content_hash(excerpt.encode()),
                             excerpt_start=excerpt_start,
                             excerpt_end=excerpt_end,
-                            confidence="high",
-                            extractor_version="scout-p0-2-related",
+                            confidence=related_description.confidence,
+                            extractor_version="scout-p0-3-related-provenance",
                             bill_id=bill_id,
                         )
                     elif create_finding:
@@ -994,7 +1089,7 @@ class ScoutRunner:
                         development = f"Latest structured action{f' ({action_date.isoformat()})' if isinstance(action_date, date) else ''}: {action}" if action else f"Structured Florida status: {bill_status or 'unreported'}"
                         # _evidence_excerpt refuses a finding unless this exact
                         # displayed window supports both the identifier and action.
-                        finding = ScoutFinding(job_id=job_id, source_id=source.id, title=f"{identifier}: {bill_title}", what_happened=development, why_it_matters="The structured development is paired with retained official source bytes.", relevant_date=action_date if isinstance(action_date, date) else None, excerpt=excerpt, excerpt_hash=content_hash(excerpt.encode()), excerpt_start=excerpt_start, excerpt_end=excerpt_end, confidence="high", extractor_version="scout-p0-1", bill_id=bill_id)
+                        finding = ScoutFinding(job_id=job_id, source_id=source.id, title=f"{identifier}: {bill_title}", what_happened=development, why_it_matters=None, relevant_date=action_date if isinstance(action_date, date) else None, excerpt=excerpt, excerpt_hash=content_hash(excerpt.encode()), excerpt_start=excerpt_start, excerpt_end=excerpt_end, confidence="high", extractor_version="scout-p0-3", bill_id=bill_id)
                     if create_finding:
                         db.add(finding)
                     persisted_mechanism = "reused" if exact_raw_ref else mechanism

@@ -29,7 +29,7 @@ from billcommons_scout.providers import ProviderSessionPersistenceError
 from billcommons_scout.providers import SolariProviderError
 from billcommons_scout.providers import SolariResearchBrowserProvider
 from billcommons_scout.providers import resolve_solari_api_key
-from billcommons_scout.runner import ScoutRunner, _bounded_call, safe_direct_fetch
+from billcommons_scout.runner import ScoutRunner, _bounded_call, describe_related_document, safe_direct_fetch
 import billcommons_scout.__main__ as scout_cli
 
 
@@ -356,7 +356,7 @@ def test_exact_tenant_local_source_reuses_raw_but_regenerates_current_finding(tm
         finding = db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalar_one()
         events = [event.kind for event in db.execute(select(ScoutJobEvent).where(ScoutJobEvent.job_id == job_id)).scalars()]
         assert (source.retrieval_mechanism, source.raw_ref, source.prior_source_id, source.change_kind) == ("reused", raw_ref, prior_source_id, "unchanged")
-        assert (finding.title, finding.what_happened, finding.extractor_version) == ("HB 12: HB 12", "Structured Florida status: Filed", "scout-p0-1")
+        assert (finding.title, finding.what_happened, finding.extractor_version) == ("HB 12: HB 12", "Structured Florida status: Filed", "scout-p0-3")
         assert "direct_retrieval" in events and "finding_persisted" in events and "document_inspected" in events
 
 
@@ -387,7 +387,7 @@ def test_exact_raw_reuse_regenerates_finding_when_structured_context_changes(tmp
         finding = db.execute(select(ScoutFinding).where(ScoutFinding.source_id == source_id)).scalar_one()
         assert (source.retrieval_mechanism, source.title, source.raw_ref) == ("reused", "Current title", raw_ref)
         assert (finding.title, finding.what_happened, finding.bill_id, finding.extractor_version) == (
-            "HB 12: Current title", "Latest structured action (2026-06-01): Vetoed", current_bill_id, "scout-p0-1",
+            "HB 12: Current title", "Latest structured action (2026-06-01): Vetoed", current_bill_id, "scout-p0-3",
         )
 
 
@@ -538,7 +538,7 @@ def test_florida_bill_page_discovers_dedupes_and_persists_related_primary_docume
         if url == bill_url:
             return 200, "text/html", bill_page
         if url == analysis_url:
-            return 200, "application/pdf", _pdf_with_text("Florida Senate committee analysis for HB 625.")
+            return 200, "application/pdf", _pdf_with_text("Florida Senate committee bill analysis for HB 625.")
         if url == amendment_url:
             return 200, "text/html", b"<html><title>Document unavailable</title>HB 625</html>"
         raise AssertionError(f"unexpected fetch {url}")
@@ -556,10 +556,11 @@ def test_florida_bill_page_discovers_dedupes_and_persists_related_primary_docume
         finding = db.scalar(select(ScoutFinding).where(ScoutFinding.source_id == related.id))
         assert (job.status, job.partial_success) == ("partial", True)
         assert (related.official, related.retrieval_mechanism, related.title) == (
-            True, "direct", "HB 625: Official Florida Senate committee analysis",
+            True, "direct", "HB 625: Florida Senate committee bill analysis (h0625c.JDC)",
         )
         assert finding is not None
-        assert finding.what_happened == "Official Florida Senate committee analysis retrieved for HB 625."
+        assert finding.what_happened == "Florida Senate committee bill analysis retrieved for HB 625."
+        assert finding.why_it_matters is None
         assert finding.bill_id is None and "HB 625" in finding.excerpt
         assert finding.relevant_date is None
         assert any(not source.official and source.canonical_url == amendment_url for source in sources)
@@ -571,6 +572,77 @@ def test_florida_bill_page_discovers_dedupes_and_persists_related_primary_docume
             if event.kind == "direct_retrieval" and event.detail.get("related_document") == "committee analysis"
         ]
         assert len(related_events) == 1
+
+
+def test_house_analyses_discovered_from_senate_are_labeled_from_retained_evidence(tmp_path):
+    """A Senate attachment host is never a chamber attribution by itself."""
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (200, "text/html", b""))
+    metadata = {"identifier": "HB 625", "related_artifact_type": "committee analysis"}
+    committee = runner._persist_capture(
+        job_id,
+        "initial-claim",
+        None,
+        "HB 625",
+        "Filed",
+        metadata,
+        "https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF",
+        "direct",
+        200,
+        "application/pdf",
+        _pdf_with_text(
+            "STORAGE NAME: h0625c.JDC FLORIDA HOUSE OF REPRESENTATIVES BILL ANALYSIS "
+            "DATE: February 3, 2026 HB 625"
+        ),
+    )
+    final = runner._persist_capture(
+        job_id,
+        "initial-claim",
+        None,
+        "HB 625",
+        "Filed",
+        metadata,
+        "https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625z1.JDC.PDF",
+        "direct",
+        200,
+        "application/pdf",
+        _pdf_with_text(
+            "STORAGE NAME: h0625z1.JDC FLORIDA HOUSE OF REPRESENTATIVES FINAL BILL ANALYSIS "
+            "DATE: June 16, 2026 HB 625"
+        ),
+    )
+    assert committee is not None and final is not None
+    with sessions() as db:
+        findings = db.execute(
+            select(ScoutFinding).where(ScoutFinding.job_id == job_id).order_by(ScoutFinding.relevant_date)
+        ).scalars().all()
+        assert [(finding.title, finding.relevant_date, finding.confidence) for finding in findings] == [
+            ("HB 625: Florida House committee bill analysis (h0625c.JDC)", date(2026, 2, 3), "high"),
+            ("HB 625: Florida House final bill analysis (h0625z1.JDC)", date(2026, 6, 16), "high"),
+        ]
+        assert len({finding.what_happened for finding in findings}) == 2
+        assert all(finding.why_it_matters is None for finding in findings)
+
+
+def test_related_document_without_chamber_evidence_is_not_high_confidence():
+    description = describe_related_document(
+        "HB 625 official analysis",
+        identifier="HB 625",
+        artifact_type="committee analysis",
+        url="https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF",
+    )
+    assert description.title == "HB 625: Official Florida committee analysis (h0625c.JDC)"
+    assert description.confidence == "medium"
+
+
+def test_related_document_does_not_attribute_a_chamber_from_a_late_cross_reference():
+    description = describe_related_document(
+        ("Official analysis header. " * 60) + "Florida Senate BILL ANALYSIS HB 625",
+        identifier="HB 625",
+        artifact_type="committee analysis",
+        url="https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF",
+    )
+    assert description.title == "HB 625: Official Florida committee bill analysis (h0625c.JDC)"
+    assert description.confidence == "medium"
 
 
 def test_florida_related_documents_obey_the_shared_request_budget(tmp_path):

@@ -15,6 +15,7 @@ from billcommons_api.deps import get_db
 from billcommons_api.routers import scout
 from billcommons_schema.base import Base
 from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutJobEvent, ScoutResearchJob, ScoutSource
+from billcommons_shared.scout import scout_cache_key
 
 
 def _app(monkeypatch):
@@ -209,6 +210,30 @@ def test_scout_reuses_only_fresh_terminal_cache(monkeypatch):
             db.commit()
         stale = client.post("/api/v1/scout/jobs", json={"query": "HB 12"}, headers=headers)
         assert stale.status_code == 201
+
+
+def test_scout_does_not_reuse_a_fresh_pre_provenance_cache_namespace(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    with sessions() as db:
+        db.add(ScoutResearchJob(
+            customer_id=owner.id,
+            original_query="HB 625",
+            normalized_query="hb 625",
+            jurisdiction="FL",
+            cache_key=scout_cache_key("HB 625", "FL", freshness_bucket="p0"),
+            status="completed",
+            strategy={},
+            limits={},
+            usage={},
+            fresh_until=datetime.now(timezone.utc) + timedelta(minutes=5),
+        ))
+        db.commit()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/scout/jobs", json={"query": "HB 625"}, headers={"x-test-customer": str(owner.id)}
+        )
+    assert response.status_code == 201
+    assert response.json()["coalesced"] is False
 
 
 def test_scout_payload_marks_an_expired_cache_as_a_miss(monkeypatch):

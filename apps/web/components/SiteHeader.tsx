@@ -50,6 +50,7 @@ export default function SiteHeader() {
   const navigation = SCOUT_ENABLED
     ? [{ href: "/scout", label: "Scout", beta: true }, ...PRIMARY_NAV]
     : PRIMARY_NAV;
+  const hasBetaNavigation = navigation.some((item) => item.beta);
 
   return (
     <header className="border-b border-slate-200 bg-white">
@@ -67,7 +68,13 @@ export default function SiteHeader() {
         >
           <details className="group relative sm:hidden">
             <summary className={`site-nav-summary cursor-pointer list-none rounded-sm border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 ${navigation.some((item) => active(item.href)) || moreActive ? "text-slate-950" : ""}`}>
-              Menu <span aria-hidden="true" className="ml-1 text-slate-400 group-open:hidden">+</span><span aria-hidden="true" className="ml-1 hidden text-slate-400 group-open:inline">−</span>
+              Menu
+              {hasBetaNavigation ? (
+                <span className="ml-1 border-l border-blue-700/70 pl-1 text-[0.625rem] font-semibold uppercase tracking-[0.1em] text-blue-800">
+                  Beta
+                </span>
+              ) : null}
+              <span aria-hidden="true" className="ml-1 text-slate-400 group-open:hidden">+</span><span aria-hidden="true" className="ml-1 hidden text-slate-400 group-open:inline">−</span>
             </summary>
             <ul className="absolute right-0 z-20 mt-1 w-52 border border-slate-200 bg-white py-1 text-sm font-medium text-slate-700 shadow-sm">
               {[...navigation, ...RESOURCE_NAV].map((item) => {

@@ -10,7 +10,7 @@ export type ScoutStatus = ScoutTerminalStatus | "queued" | "running" | "unknown"
 export interface ScoutEvent {
   id: string;
   stage: string;
-  message: string;
+  message?: string;
   createdAt?: string;
 }
 
@@ -40,7 +40,7 @@ export interface ScoutFinding {
   id: string;
   title: string;
   whatHappened: string;
-  whyItMatters: string;
+  whyItMatters?: string;
   relevantDate?: string;
   evidenceExcerpt?: string;
   confidence?: string;
@@ -164,17 +164,40 @@ function status(value: unknown): ScoutStatus {
   }
 }
 
+function eventDetail(stage: string, value: unknown): string | undefined {
+  const detail = record(value);
+  if (!detail) return typeof value === "string" ? optionalString(value) : undefined;
+  const explicit = optionalString(detail.message) ?? optionalString(detail.detail);
+  if (explicit) return explicit;
+  const count = number(detail.count);
+  if (count !== undefined) {
+    if (stage === "structured_candidates") return `${count} structured ${count === 1 ? "candidate" : "candidates"} identified.`;
+    if (stage === "related_sources_discovered") return `${count} related official ${count === 1 ? "document" : "documents"} discovered.`;
+    return `${count} ${count === 1 ? "item" : "items"} recorded.`;
+  }
+  const status = optionalString(detail.status);
+  if (status) return `Status: ${status.replaceAll("_", " ")}.`;
+  const mechanism = optionalString(detail.mechanism);
+  const mimeType = optionalString(detail.mime_type);
+  const fragments = [
+    mechanism ? `via ${mechanism.replaceAll("_", " ")}` : undefined,
+    mimeType ? mimeType.toUpperCase() : undefined,
+  ].filter(Boolean);
+  return fragments.length ? fragments.join(" · ") : undefined;
+}
+
 function normalizeEvent(value: unknown, index: number): ScoutEvent {
   const item = record(value) ?? {};
-  const detail = record(item.detail);
+  const stage = optionalString(item.stage) ?? optionalString(item.kind) ?? "update";
+  const message = optionalString(item.message);
+  const genericMessage = stage.replaceAll("_", " ");
   return {
     id: optionalString(item.id) ?? `event-${index}`,
-    stage: optionalString(item.stage) ?? optionalString(item.kind) ?? "update",
-    message:
-      optionalString(item.message) ??
-      optionalString(detail?.message) ??
-      optionalString(detail?.detail) ??
-      (typeof item.detail === "string" ? item.detail : "Scout recorded an update."),
+    stage,
+    // The API's legacy fallback message is the normalized machine kind. It
+    // adds no information under a human stage label, so prefer durable detail
+    // and otherwise render no redundant subtitle.
+    message: message && message !== genericMessage ? message : eventDetail(stage, item.detail),
     createdAt: optionalString(item.created_at),
   };
 }
@@ -213,7 +236,7 @@ function normalizeFinding(value: unknown, index: number): ScoutFinding {
     id: optionalString(item.id) ?? `finding-${index}`,
     title: optionalString(item.title) ?? "Untitled finding",
     whatHappened: optionalString(item.what_happened) ?? "No summary was returned.",
-    whyItMatters: optionalString(item.why_it_matters) ?? "No significance statement was returned.",
+    whyItMatters: optionalString(item.why_it_matters),
     relevantDate: optionalString(item.relevant_date),
     evidenceExcerpt: optionalString(item.evidence_excerpt) ?? optionalString(item.excerpt),
     confidence: optionalString(item.confidence),

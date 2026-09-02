@@ -125,6 +125,26 @@ test("accepts the compact P0 API aliases without losing source evidence", () => 
   assert.equal(job.usage.browserActions, 3);
 });
 
+test("turns durable event detail into useful text and omits unsupported significance", () => {
+  const job = normalizeScoutJob({
+    id: "job-event-detail",
+    status: "completed",
+    events: [
+      { id: "candidates", kind: "structured_candidates", message: "structured candidates", detail: { count: 3 } },
+      { id: "source", kind: "source_persisted", message: "source persisted", detail: { mechanism: "direct", mime_type: "application/pdf" } },
+      { id: "empty", kind: "finding_persisted", message: "finding persisted", detail: {} },
+    ],
+    findings: [{ id: "unsupported-significance", title: "Finding", what_happened: "Recorded", why_it_matters: "" }],
+  });
+
+  assert.deepEqual(job.events.map((event) => event.message), [
+    "3 structured candidates identified.",
+    "via direct · APPLICATION/PDF",
+    undefined,
+  ]);
+  assert.equal(job.findings[0].whyItMatters, undefined);
+});
+
 test("derives aggregate analytics without exposing research or provider data", () => {
   const job = normalizeScoutJob({
     id: "job-private-id",
