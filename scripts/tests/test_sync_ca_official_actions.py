@@ -5,7 +5,10 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
+import pytest
+from sqlalchemy.dialects import postgresql
 
 scripts_directory = str(Path(__file__).resolve().parents[1])
 if scripts_directory not in sys.path:
@@ -188,7 +191,32 @@ def test_apply_plan_keeps_duplicate_history_classification_on_its_provenance_pai
     second = _official("1546-2", 42, "Read first time.")
     now = datetime(2026, 9, 2, tzinfo=timezone.utc)
     second_provenance = sweep._action_provenance(second, "a" * 64, now)
-    existing_row = SimpleNamespace(
+    # Source URL deliberately differs so reconciliation invokes the bulk
+    # update. The fake row then raises on any action attribute access after
+    # that update, modeling SQLAlchemy expiration/lazy-load behavior.
+    second_provenance["source_url"] = None
+
+    class ExpiringRow:
+        _EXPIRED_ATTRIBUTES = frozenset({
+            "classification", "organization_id", "order", "source_name",
+            "source_url", "upstream_id", "retrieved_at", "raw_ref",
+            "checksum", "parser_version",
+        })
+
+        def __init__(self, **values):
+            self.expired = False
+            for name, value in values.items():
+                setattr(self, name, value)
+
+        def __getattribute__(self, name):
+            if (
+                name in object.__getattribute__(self, "_EXPIRED_ATTRIBUTES")
+                and object.__getattribute__(self, "expired")
+            ):
+                raise AssertionError(f"unexpected post-update ORM access: {name}")
+            return object.__getattribute__(self, name)
+
+    existing_row = ExpiringRow(
         classification="failure",
         organization_id="committee-2",
         order=42,
@@ -244,6 +272,13 @@ def test_apply_plan_keeps_duplicate_history_classification_on_its_provenance_pai
     monkeypatch.setattr(sweep.status, "derive_status", capture_then_derive)
     monkeypatch.setattr(sweep.events, "record_event", lambda *_args, **_kwargs: None)
 
+    def expire_after_bulk_update(_db, mappings):
+        assert len(mappings) == 1
+        existing_row.expired = True
+        return len(mappings)
+
+    monkeypatch.setattr(sweep, "_execute_action_updates", expire_after_bulk_update)
+
     updates, touched = sweep._apply_plan(
         db,
         plan=plan,
@@ -261,6 +296,7 @@ def test_apply_plan_keeps_duplicate_history_classification_on_its_provenance_pai
         (42, "failure", "committee-2"),
     ]
     assert bill.status == sweep.status.DEAD
+    assert existing_row.expired is True
 
     added = next(row for row in db.added if getattr(row, "upstream_id", None) == "ca-history:1546-1")
     first_local = sweep.LocalAction(
@@ -273,12 +309,136 @@ def test_apply_plan_keeps_duplicate_history_classification_on_its_provenance_pai
         added.order,
         added,
     )
+    existing_row.expired = False
     second_plan = sweep.build_plan(
         {first.official_bill_id: (first, second)}, [first_local, existing]
     )
     assert second_plan.additions == ()
     assert second_plan.deletions == ()
     assert second_plan.order_updates == ()
+
+
+def test_apply_plan_snapshots_retained_metadata_and_mappings_before_delete_expires_rows(monkeypatch):
+    """An excess delete cannot force a retained sibling's lazy ORM reload."""
+    official = _official("h1", 1, "Read first time.")
+    now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    retained_provenance = sweep._action_provenance(official, "a" * 64, now)
+    retained_provenance["source_url"] = None  # force one provenance mapping
+
+    class ExpiringRow:
+        _EXPIRED_ATTRIBUTES = frozenset({
+            "classification", "organization_id", "order", "source_name",
+            "source_url", "upstream_id", "retrieved_at", "raw_ref",
+            "checksum", "parser_version",
+        })
+
+        def __init__(self, **values):
+            self.expired = False
+            for name, value in values.items():
+                setattr(self, name, value)
+
+        def __getattribute__(self, name):
+            if (
+                name in object.__getattribute__(self, "_EXPIRED_ATTRIBUTES")
+                and object.__getattribute__(self, "expired")
+            ):
+                raise AssertionError(f"unexpected post-delete ORM access: {name}")
+            return object.__getattribute__(self, name)
+
+    retained_row = ExpiringRow(
+        classification="failure",
+        organization_id="committee-1",
+        order=1,
+        **retained_provenance,
+    )
+    retained = sweep.LocalAction(
+        "retained",
+        "bill-1",
+        official.official_bill_id,
+        official.action_date,
+        official.description,
+        "failure",
+        1,
+        retained_row,
+    )
+    excess = sweep.LocalAction(
+        "excess",
+        "bill-1",
+        official.official_bill_id,
+        official.action_date,
+        official.description,
+        None,
+        None,
+        SimpleNamespace(classification=None, organization_id=None),
+    )
+    plan = sweep.build_plan({official.official_bill_id: (official,)}, [retained, excess])
+    assert [local.id for local in plan.deletions] == ["excess"]
+
+    class Db:
+        def __init__(self):
+            self.flushed = False
+
+        def execute(self, _statement):
+            retained_row.expired = True
+            return SimpleNamespace(rowcount=1)
+
+        def add(self, _row):
+            raise AssertionError("no official action should be added")
+
+        def flush(self):
+            self.flushed = True
+
+    db = Db()
+    bill = SimpleNamespace(
+        id="bill-1",
+        identifier="AB 1",
+        latest_action_date=None,
+        latest_action_text=None,
+        status=None,
+        status_date=None,
+        updated_at=None,
+    )
+    session = SimpleNamespace(
+        identifier=sweep.REGULAR_SESSION_IDENTIFIER,
+        classification="regular",
+        end_date=date(2026, 12, 31),
+        active=True,
+    )
+    captured: list[sweep.status.ActionRow] = []
+    derive_status = sweep.status.derive_status
+
+    def capture_then_derive(rows):
+        captured.extend(rows)
+        return derive_status(rows)
+
+    mapped_ids: list[object] = []
+
+    def apply_snapshot_mappings(_db, mappings):
+        mapped_ids.extend(mapping["id"] for mapping in mappings)
+        return len(mappings)
+
+    monkeypatch.setattr(sweep.status, "derive_status", capture_then_derive)
+    monkeypatch.setattr(sweep.events, "record_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(sweep, "_execute_action_updates", apply_snapshot_mappings)
+
+    updates, touched = sweep._apply_plan(
+        db,
+        plan=plan,
+        bill_by_id={bill.id: bill},
+        session_by_bill_id={bill.id: session},
+        zip_sha256="a" * 64,
+        now=now,
+    )
+
+    assert updates == 0
+    assert touched == 1
+    assert db.flushed is True
+    assert retained_row.expired is True
+    assert mapped_ids == ["retained"]
+    assert [(row.order, row.classification, row.organization_id) for row in captured] == [
+        (1, "failure", "committee-1"),
+    ]
+    assert bill.status == sweep.status.DEAD
 
 
 def test_plan_deletes_only_excess_copy_of_officially_proven_fact_and_preserves_unsupported():
@@ -345,11 +505,86 @@ def test_bulk_action_mappings_preserve_pairing_and_only_change_needed_fields():
 
 
 def test_action_update_chunks_are_parameter_bounded_and_keep_the_full_update_contract():
-    assert sweep.ACTION_UPDATE_CHUNK_SIZE == 500
+    assert sweep.ACTION_UPDATE_CHUNK_SIZE == 5_000
     assert sweep._ACTION_UPDATE_FIELDS == (
         "order", "source_name", "source_url", "upstream_id", "retrieved_at",
         "raw_ref", "checksum", "parser_version",
     )
+    assert sweep._ACTION_UPDATE_BIND_PARAMETERS_PER_ROW == 1 + len(sweep._ACTION_UPDATE_FIELDS)
+    assert (
+        sweep.ACTION_UPDATE_CHUNK_SIZE * sweep._ACTION_UPDATE_BIND_PARAMETERS_PER_ROW
+        < sweep.POSTGRES_BIND_PARAMETER_LIMIT
+    )
+
+
+def test_sixty_thousand_and_one_updates_dispatch_once_each_in_parameter_safe_chunks(monkeypatch):
+    """A first CA provenance pass must not make 120 proxy round trips."""
+    mappings = [{"id": index} for index in range(60_001)]
+    dispatched: list[list[int]] = []
+
+    def execute_chunk(_db, chunk):
+        dispatched.append([mapping["id"] for mapping in chunk])
+        return len(chunk)
+
+    monkeypatch.setattr(sweep, "_execute_action_update_chunk", execute_chunk)
+
+    assert sweep._execute_action_updates(object(), mappings) == 60_001
+    assert [len(chunk) for chunk in dispatched] == [5_000] * 12 + [1]
+    assert [mapping_id for chunk in dispatched for mapping_id in chunk] == list(range(60_001))
+
+
+def test_exact_five_thousand_row_values_update_compiles_below_postgres_bind_limit():
+    now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    mappings = [
+        {
+            "id": uuid4(),
+            "order": index,
+            "source_name": sweep.SOURCE_NAME,
+            "source_url": sweep.OFFICIAL_SOURCE_URL,
+            "upstream_id": f"ca-history:{index}",
+            "retrieved_at": now,
+            "raw_ref": f"raw:{index}",
+            "checksum": f"{index:064x}",
+            "parser_version": sweep.PARSER_VERSION,
+        }
+        for index in range(sweep.ACTION_UPDATE_CHUNK_SIZE)
+    ]
+
+    class Db:
+        statement = None
+
+        def execute(self, statement):
+            self.statement = statement
+            return SimpleNamespace(rowcount=len(mappings))
+
+    db = Db()
+    assert sweep._execute_action_update_chunk(db, mappings) == len(mappings)
+    compiled = db.statement.compile(dialect=postgresql.dialect())
+    assert "UPDATE bill_actions SET" in str(compiled)
+    assert "FROM (VALUES" in str(compiled)
+    assert len(compiled.params) == 45_000
+    assert len(compiled.params) < sweep.POSTGRES_BIND_PARAMETER_LIMIT
+
+
+def test_action_update_chunk_rejects_a_partial_database_rowcount():
+    mapping = {
+        "id": uuid4(),
+        "order": 1,
+        "source_name": sweep.SOURCE_NAME,
+        "source_url": sweep.OFFICIAL_SOURCE_URL,
+        "upstream_id": "ca-history:1",
+        "retrieved_at": datetime(2026, 9, 2, tzinfo=timezone.utc),
+        "raw_ref": "raw:1",
+        "checksum": "a" * 64,
+        "parser_version": sweep.PARSER_VERSION,
+    }
+
+    class Db:
+        def execute(self, _statement):
+            return SimpleNamespace(rowcount=0)
+
+    with pytest.raises(sweep.OfficialActionSweepError, match="expected 1"):
+        sweep._execute_action_update_chunk(Db(), [mapping])
 
 
 def test_bulk_action_update_requires_every_target_row_to_match():
@@ -422,6 +657,13 @@ def test_run_is_dry_by_default_and_rolls_back_without_mutating(monkeypatch, tmp_
     )
 
     assert result["applied"] is False
+    assert set(result["timing_seconds"]) == {
+        "lock_acquisition",
+        "load_local_actions",
+        "build_plan",
+        "total_transaction",
+    }
+    assert all(value >= 0 for value in result["timing_seconds"].values())
     assert db.rolled_back is True
     assert db.committed is False
     assert db.writes == []
@@ -443,3 +685,48 @@ def test_run_rejects_a_nonmatching_zip_hash_before_opening_database(monkeypatch,
         assert "SHA-256" in str(exc)
     else:  # pragma: no cover - assertion reads better than pytest.raises here.
         raise AssertionError("mismatched pinned archive was accepted")
+
+
+def test_run_apply_failure_rolls_back_the_outer_transaction(monkeypatch, tmp_path: Path):
+    zip_path = tmp_path / "pinned.zip"
+    zip_path.write_bytes(b"pinned bytes")
+    official = _official("10", 1, "Introduced.")
+    plan_local = [_local("a", official.description, order=1)]
+
+    class Db:
+        rolled_back = False
+        committed = False
+        closed = False
+
+        def execute(self, *_args, **_kwargs):
+            return None
+
+        def rollback(self):
+            self.rolled_back = True
+
+        def commit(self):
+            self.committed = True
+
+        def close(self):
+            self.closed = True
+
+    db = Db()
+    monkeypatch.setattr(sweep, "get_session", lambda: db)
+    monkeypatch.setattr(sweep, "load_official_actions", lambda _path: {official.official_bill_id: (official,)})
+    monkeypatch.setattr(sweep, "_load_local_actions", lambda *_args: ({}, plan_local, {}))
+
+    def fail_apply(*_args, **_kwargs):
+        raise sweep.OfficialActionSweepError("simulated bulk update failure")
+
+    monkeypatch.setattr(sweep, "_apply_plan", fail_apply)
+
+    with pytest.raises(sweep.OfficialActionSweepError, match="simulated bulk update failure"):
+        sweep.run(
+            zip_path=zip_path,
+            expected_sha256=hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+            apply=True,
+        )
+
+    assert db.rolled_back is True
+    assert db.committed is False
+    assert db.closed is True

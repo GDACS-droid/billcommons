@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
+from time import monotonic
 from typing import Any, Iterable, Sequence
 
 from sqlalchemy import column, delete, func, select, text, update, values
@@ -45,7 +46,12 @@ SOURCE_NAME = "ca_official_action_sweep/2026-09-02"
 PARSER_VERSION = "ca-pubinfo-history-v1"
 LOCK_NAME = "billcommons:ca:official-action-sweep:20252026"
 TOTAL_TRANSACTION_TIMEOUT_SECONDS = 600
-ACTION_UPDATE_CHUNK_SIZE = 500
+# A 5,000-row VALUES relation uses 45,000 bind parameters (one primary key
+# plus eight changed fields per row), safely below PostgreSQL's 65,535
+# protocol limit while avoiding 120+ Railway proxy round trips for a 60k
+# first reconciliation.
+ACTION_UPDATE_CHUNK_SIZE = 5_000
+POSTGRES_BIND_PARAMETER_LIMIT = 65_535
 _ACTION_UPDATE_FIELDS = (
     "order",
     "source_name",
@@ -56,6 +62,13 @@ _ACTION_UPDATE_FIELDS = (
     "checksum",
     "parser_version",
 )
+_ACTION_UPDATE_BIND_PARAMETERS_PER_ROW = 1 + len(_ACTION_UPDATE_FIELDS)
+
+if (
+    ACTION_UPDATE_CHUNK_SIZE * _ACTION_UPDATE_BIND_PARAMETERS_PER_ROW
+    >= POSTGRES_BIND_PARAMETER_LIMIT
+):
+    raise RuntimeError("CA action update chunk exceeds PostgreSQL bind parameter limit")
 
 
 class OfficialActionSweepError(RuntimeError):
@@ -526,33 +539,65 @@ def _paired_local_official_rows(
     return pairs
 
 
+def _status_metadata_by_history(
+    plan: ActionPlan,
+) -> dict[tuple[str, str], tuple[str | None, object | None]]:
+    """Snapshot status inputs before a Core bulk update can expire ORM rows."""
+    metadata: dict[tuple[str, str], tuple[str | None, object | None]] = {}
+    for local, official in _paired_local_official_rows(plan):
+        organization_id = (
+            getattr(local.row, "organization_id", None)
+            if local.row is not None
+            else None
+        )
+        metadata[(official.official_bill_id, official.history_id)] = (
+            local.classification,
+            organization_id,
+        )
+    return metadata
+
+
+def _action_update_chunks(
+    mappings: Sequence[dict[str, Any]],
+) -> Iterable[Sequence[dict[str, Any]]]:
+    """Yield parameter-safe update chunks without copying the mapping list."""
+    for offset in range(0, len(mappings), ACTION_UPDATE_CHUNK_SIZE):
+        yield mappings[offset : offset + ACTION_UPDATE_CHUNK_SIZE]
+
+
+def _execute_action_update_chunk(db: OrmSession, chunk: Sequence[dict[str, Any]]) -> int:
+    """Apply one parameter-safe primary-key-targeted update relation."""
+    if not chunk:
+        return 0
+    table = BillAction.__table__
+    names = ("id", *_ACTION_UPDATE_FIELDS)
+    typed_columns = [column(name, table.c[name].type) for name in names]
+    source = values(*typed_columns, name="action_updates").data(
+        [tuple(mapping[name] for name in names) for mapping in chunk]
+    ).alias("action_updates")
+    statement = (
+        update(BillAction)
+        .where(BillAction.id == source.c.id)
+        .values({name: getattr(source.c, name) for name in _ACTION_UPDATE_FIELDS})
+    )
+    result = db.execute(statement)
+    _require_exact_rowcount(result.rowcount, len(chunk), operation="bulk action update")
+    return result.rowcount
+
+
 def _execute_action_updates(db: OrmSession, mappings: Sequence[dict[str, Any]]) -> int:
     """Apply action provenance/order with bounded set-based UPDATE statements.
 
     ORM ``executemany`` still sent one UPDATE message per action through the
-    Railway TCP proxy.  A VALUES relation turns each 500-row chunk into one
+    Railway TCP proxy.  A VALUES relation turns each 5,000-row chunk into one
     server-side ``UPDATE ... FROM`` statement while retaining bound values and
     exact primary-key targeting.
     """
     if not mappings:
         return 0
-    table = BillAction.__table__
-    names = ("id", *_ACTION_UPDATE_FIELDS)
-    typed_columns = [column(name, table.c[name].type) for name in names]
     updated = 0
-    for offset in range(0, len(mappings), ACTION_UPDATE_CHUNK_SIZE):
-        chunk = mappings[offset : offset + ACTION_UPDATE_CHUNK_SIZE]
-        source = values(*typed_columns, name="action_updates").data(
-            [tuple(mapping[name] for name in names) for mapping in chunk]
-        ).alias("action_updates")
-        statement = (
-            update(BillAction)
-            .where(BillAction.id == source.c.id)
-            .values({name: getattr(source.c, name) for name in _ACTION_UPDATE_FIELDS})
-        )
-        result = db.execute(statement)
-        _require_exact_rowcount(result.rowcount, len(chunk), operation="bulk action update")
-        updated += result.rowcount
+    for chunk in _action_update_chunks(mappings):
+        updated += _execute_action_update_chunk(db, chunk)
     return updated
 
 
@@ -567,6 +612,13 @@ def _apply_plan(
 ) -> tuple[int, int]:
     """Apply a precomputed plan; caller owns transaction/lock and commits."""
     by_id = {item.id: item for rows in plan.local_by_bill.values() for item in rows}
+    # Core UPDATE execution may expire matched ORM instances. Every value the
+    # later status pass needs from local rows must be a plain value before any
+    # update/delete/flush so a 60k reconciliation cannot trigger lazy reloads.
+    metadata_by_history = _status_metadata_by_history(plan)
+    # Provenance reconciliation reads the same local ORM rows. Calculate it
+    # before a preceding excess-row DELETE can expire retained siblings.
+    action_updates = _action_update_mappings(plan, zip_sha256=zip_sha256, now=now)
     touched: set[object] = set()
     updates = 0
     if plan.deletions:
@@ -577,7 +629,6 @@ def _apply_plan(
         deleted = db.execute(delete(BillAction).where(BillAction.id.in_(deletion_ids)))
         _require_exact_rowcount(deleted.rowcount, len(deletion_ids), operation="bulk action delete")
         touched.update(local.bill_id for local in plan.deletions)
-    action_updates = _action_update_mappings(plan, zip_sha256=zip_sha256, now=now)
     if action_updates:
         # Bounded server-side set updates, rather than one ORM/driver UPDATE
         # per action. Below we need only the immutable classification and
@@ -610,16 +661,9 @@ def _apply_plan(
     db.flush()
 
     # Latest scalar and status deliberately use the official ledger, while
-    # retaining any structured classification available on the exact paired
-    # local history occurrence. Do not use DB load/FIFO order here: CA can
-    # legitimately publish the same normalized text more than once per day.
-    metadata_by_history = {
-        (official.official_bill_id, official.history_id): (
-            local.classification,
-            getattr(local.row, "organization_id", None),
-        )
-        for local, official in _paired_local_official_rows(plan)
-    }
+    # retaining status metadata captured from the exact paired local history
+    # occurrence. Do not use DB load/FIFO order here: CA can legitimately
+    # publish the same normalized text more than once per day.
     for official_bill_id, official_rows in plan.official_by_bill.items():
         bill = bill_by_official.get(official_bill_id)
         if bill is None:
@@ -674,21 +718,33 @@ def run(
     db = get_session()
     try:
         with _total_transaction_timeout(total_timeout_seconds):
+            transaction_started = monotonic()
+            timing_seconds: dict[str, float] = {}
             # Must be first: an action reconciliation cannot observe a moving
             # local ledger and then write a conclusion from that mixed snapshot.
+            phase_started = monotonic()
             db.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
             db.execute(text("SELECT set_config('lock_timeout', '5s', true)"))
             db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:name))"), {"name": LOCK_NAME})
+            timing_seconds["lock_acquisition"] = round(monotonic() - phase_started, 3)
+            phase_started = monotonic()
             bill_by_id, local_actions, session_by_bill_id = _load_local_actions(db, official)
+            timing_seconds["load_local_actions"] = round(monotonic() - phase_started, 3)
+            phase_started = monotonic()
             plan = build_plan(official, local_actions)
+            timing_seconds["build_plan"] = round(monotonic() - phase_started, 3)
             if not apply:
                 report = _report(plan, zip_sha256=actual_sha256, apply=False)
+                timing_seconds["total_transaction"] = round(monotonic() - transaction_started, 3)
+                report["timing_seconds"] = timing_seconds
                 db.rollback()
                 return report
+            phase_started = monotonic()
             updates, touched = _apply_plan(
                 db, plan=plan, bill_by_id=bill_by_id, session_by_bill_id=session_by_bill_id,
                 zip_sha256=actual_sha256, now=datetime.now(timezone.utc),
             )
+            timing_seconds["apply_plan"] = round(monotonic() - phase_started, 3)
             # Exact rowcount checks above plus the locked, serializable plan
             # establish that this transaction applied every intended mutation.
             # Rehydrating every action a second time through the Railway proxy
@@ -696,9 +752,11 @@ def run(
             # its 10-minute lifetime. Independently rerun this command in dry
             # mode after commit for the authoritative database reconciliation.
             expected_action_count = len(local_actions) - plan.excess_count + plan.missing_count
+            phase_started = monotonic()
             actual_action_count = db.execute(
                 select(func.count(BillAction.id)).where(BillAction.bill_id.in_(list(bill_by_id)))
             ).scalar_one()
+            timing_seconds["post_apply_cardinality"] = round(monotonic() - phase_started, 3)
             if actual_action_count != expected_action_count:
                 raise OfficialActionSweepError(
                     f"post-apply CA action count is {actual_action_count}; expected {expected_action_count}"
@@ -713,7 +771,11 @@ def run(
                 "post_scoped_action_count_expected": expected_action_count,
                 "post_exact_reconciliation": "required_dry_run",
             })
+            phase_started = monotonic()
             db.commit()
+            timing_seconds["commit"] = round(monotonic() - phase_started, 3)
+            timing_seconds["total_transaction"] = round(monotonic() - transaction_started, 3)
+            report["timing_seconds"] = timing_seconds
             return report
     except Exception:
         db.rollback()
