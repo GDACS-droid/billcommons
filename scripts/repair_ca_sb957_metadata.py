@@ -35,7 +35,7 @@ from billcommons_shared.db import get_session
 TARGET_OFFICIAL_BILL_ID = "202520260SB957"
 TARGET_IDENTIFIER_NORM = "SB 957"
 REGULAR_SESSION = "2025-2026 Regular Session"
-EXPECTED_GENERAL_SUBJECT = "Civil detention facilities"
+EXPECTED_GENERAL_SUBJECT = "Civil detention facilities."
 LOCK_NAME = "billcommons:ca:sb957:metadata-repair:20252026"
 
 _BILL_COLUMN_COUNT = 19
@@ -93,6 +93,18 @@ def _sha256(path: Path) -> str:
 
 def _normal_text(value: str | None) -> str:
     return " ".join((value or "").split())
+
+
+def _title_matches_official_subject(title: str | None, subject: str) -> bool:
+    """Accept CA's known title display omission of one terminal period only.
+
+    The official ZIP's version subject and XML general subject remain exact and
+    become the retained tag.  This narrow comparison exists solely because
+    Bill Commons' already-correct scalar title may render the same phrase
+    without CA's terminal punctuation.
+    """
+
+    return _normal_text(title).removesuffix(".") == _normal_text(subject).removesuffix(".")
 
 
 def _read_rows(archive: zipfile.ZipFile, name: str, expected_columns: int) -> list[list[str]]:
@@ -204,7 +216,7 @@ def _load_locked_plan(db, official: OfficialMetadata) -> RepairPlan:
     if len(rows) != 1:
         raise MetadataRepairError("local target must be exactly one CA regular-session SB 957 bill")
     bill, _session, _jurisdiction = rows[0]
-    if _normal_text(bill.title) != official.subject:
+    if not _title_matches_official_subject(bill.title, official.subject):
         raise MetadataRepairError("local SB 957 title does not match the pinned official current subject")
     subjects = tuple(
         sorted(
@@ -247,7 +259,11 @@ def _apply_locked_plan(db, plan: RepairPlan) -> None:
     """Write only the target description and exact target subject rows."""
 
     bill = db.execute(select(Bill).where(Bill.id == plan.local.bill_id).with_for_update()).scalar_one_or_none()
-    if bill is None or bill.description != plan.local.description or _normal_text(bill.title) != plan.official.subject:
+    if (
+        bill is None
+        or bill.description != plan.local.description
+        or not _title_matches_official_subject(bill.title, plan.official.subject)
+    ):
         raise MetadataRepairError("local SB 957 changed after the lock-protected plan")
     current_subjects = tuple(
         sorted(

@@ -159,6 +159,18 @@ def test_plan_is_idempotent_only_for_exact_digest_and_subject_set():
     assert stale.changed is True
 
 
+def test_local_title_guard_allows_only_the_known_terminal_period_difference():
+    assert repair._title_matches_official_subject(
+        "Civil detention facilities", repair.EXPECTED_GENERAL_SUBJECT
+    )
+    assert repair._title_matches_official_subject(
+        "Civil detention facilities.", repair.EXPECTED_GENERAL_SUBJECT
+    )
+    assert not repair._title_matches_official_subject(
+        "Social media administrative subpoenas", repair.EXPECTED_GENERAL_SUBJECT
+    )
+
+
 class _Result:
     def __init__(self, *, rows=None, scalar=None, scalars=None, rowcount=None):
         self._rows = rows or []
