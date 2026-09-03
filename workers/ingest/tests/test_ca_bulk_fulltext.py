@@ -17,19 +17,28 @@ synthetic, pubinfo-shaped zip built in-memory by `_build_synthetic_pubinfo_zip`.
 from __future__ import annotations
 
 import io
+import hashlib
 import uuid
 import zipfile
 
 import pytest
+from sqlalchemy import select, update
 
+import billcommons_ingest.ca_bulk_fulltext as ca_bulk_fulltext
 from billcommons_ingest.ca_bulk_fulltext import (
     ApplyResult,
+    CaBulkTextEntry,
+    BATCH_SIZE,
     ParseResult,
+    PARSER_VERSION,
+    SOURCE_NAME,
     _ca_bill_id_from_url,
     _extract_text_from_bill_xml,
+    _normalize_official_bulk_url,
     _parse_bill_version_tbl,
     apply_ca_bulk_fulltext,
     parse_ca_bulk_zip,
+    run_ca_fulltext,
 )
 from billcommons_schema.models import Bill, BillDocument, BillVersion, Jurisdiction, Session as SessionModel
 
@@ -146,6 +155,67 @@ def test_ca_bill_id_from_url_handles_missing_or_malformed():
     assert _ca_bill_id_from_url(None) is None
     assert _ca_bill_id_from_url("https://example.com/no-query-here") is None
     assert _ca_bill_id_from_url("not a url at all $$$") is None
+
+
+def test_local_zip_requires_explicit_canonical_official_provenance(tmp_path):
+    """A pinned local artifact must never turn stored provenance into file://."""
+
+    with pytest.raises(ValueError, match="requires the matching canonical"):
+        run_ca_fulltext(zip_path=tmp_path / "pubinfo_2025.zip")
+    with pytest.raises(ValueError):
+        run_ca_fulltext(
+            zip_path=tmp_path / "pubinfo_2025.zip",
+            zip_url="https://example.invalid/pubinfo_2025.zip",
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip",
+        "https://downloads.leginfo.legislature.ca.gov:443/pubinfo_2025.zip",
+        "https://user@downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip",
+        "https://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip?cache=1",
+        "https://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip#fragment",
+        "https://downloads.leginfo.legislature.ca.gov/pubinfo_2026.zip",
+        "https://downloads.leginfo.legislature.ca.gov/pubinfo_daily_Funday.zip",
+        "https://downloads.leginfo.legislature.ca.gov/other.zip",
+        "file:///var/lib/billcommons/pubinfo_2025.zip",
+    ],
+)
+def test_official_bulk_url_contract_rejects_noncanonical_artifacts(url):
+    with pytest.raises(ValueError):
+        _normalize_official_bulk_url(url)
+
+
+@pytest.mark.parametrize("day", ["Wed", "Sat", "Sun"])
+def test_official_bulk_url_contract_normalizes_exact_pinned_daily_artifact(day):
+    assert _normalize_official_bulk_url(
+        f"https://DOWNLOADS.LEGINFO.LEGISLATURE.CA.GOV/pubinfo_daily_{day}.zip"
+    ) == f"https://downloads.leginfo.legislature.ca.gov/pubinfo_daily_{day}.zip"
+
+
+def test_apply_rejects_untrusted_parse_provenance_before_database_access():
+    class NoDatabaseAccess:
+        def execute(self, *_args, **_kwargs):
+            raise AssertionError("validation must run before any database query")
+
+    with pytest.raises(ValueError):
+        apply_ca_bulk_fulltext(
+            NoDatabaseAccess(),  # type: ignore[arg-type]
+            ParseResult(zip_source_url="file:///var/lib/billcommons/pubinfo_2025.zip"),
+            dry_run=True,
+        )
+
+
+def test_remote_override_rejects_untrusted_url_before_download(monkeypatch):
+    monkeypatch.setattr(
+        ca_bulk_fulltext,
+        "download_pubinfo_zip",
+        lambda _url: (_ for _ in ()).throw(AssertionError("must not download")),
+    )
+    with pytest.raises(ValueError):
+        run_ca_fulltext(zip_url="https://example.invalid/pubinfo_2025.zip", dry_run=True)
 
 
 def test_parse_ca_bulk_zip_picks_latest_version_by_date_and_num():
@@ -321,7 +391,10 @@ def test_apply_ca_bulk_fulltext_no_match_for_unrelated_bill_id(db_session):
         ],
         {"v1.xml": _SAMPLE_BILL_XML},
     )
-    parse_result = parse_ca_bulk_zip(zip_bytes)
+    parse_result = parse_ca_bulk_zip(
+        zip_bytes,
+        source_url="https://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip",
+    )
     result = _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation)
     assert result.matched == 0
     assert result.no_match == 1
@@ -344,7 +417,10 @@ def test_apply_ca_bulk_fulltext_dry_run_reports_without_writing(db_session):
         ],
         {"v1.xml": _SAMPLE_BILL_XML},
     )
-    parse_result = parse_ca_bulk_zip(zip_bytes)
+    parse_result = parse_ca_bulk_zip(
+        zip_bytes,
+        source_url="https://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip",
+    )
 
     result = _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation, dry_run=True)
     assert result.matched == 1
@@ -356,83 +432,286 @@ def test_apply_ca_bulk_fulltext_dry_run_reports_without_writing(db_session):
     assert document.license_note is None
 
 
-# ---------------------------------------------------------------------------
-# Test-only scoping helper: apply_ca_bulk_fulltext's real query filters on
-# Jurisdiction.abbreviation == "CA" (matching production). To exercise the
-# real function's matching/write logic against a throwaway ZZ_-prefixed
-# jurisdiction instead of the live 'CA' jurisdiction's real rows, this
-# helper re-runs the identical SQLAlchemy query/write logic scoped to an
-# arbitrary abbreviation. Kept as a thin wrapper (not a copy-paste fork) by
-# delegating everything except the WHERE clause to the real function's
-# documented, independently-tested pieces (_ca_bill_id_from_url, the
-# checksum/overwrite rules) -- see apply_ca_bulk_fulltext's docstring for
-# the contract this must mirror exactly.
-# ---------------------------------------------------------------------------
+def _one_entry_parse_result(ca_bill_id: str) -> ParseResult:
+    zip_bytes = _build_synthetic_pubinfo_zip(
+        [
+            {
+                "bill_version_id": "20250ZZTEST95INT",
+                "bill_id": ca_bill_id,
+                "version_num": 1,
+                "action_date": "2025-01-10 00:00:00",
+                "lob_filename": "v1.xml",
+            }
+        ],
+        {"v1.xml": _SAMPLE_BILL_XML},
+    )
+    return parse_ca_bulk_zip(
+        zip_bytes,
+        source_url="https://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip",
+    )
+
+
+def _make_owned_checksum_equal_document(db_session):
+    ca_bill_id = f"202520260ZZ{uuid.uuid4().hex[:6].upper()}"
+    jurisdiction, document = _make_zz_jurisdiction_with_ca_style_document(
+        db_session,
+        ca_bill_id=ca_bill_id,
+        license_note="fulltext_status=ok",
+    )
+    parse_result = _one_entry_parse_result(ca_bill_id)
+    entry = parse_result.by_bill_id[ca_bill_id]
+    document.extracted_text = entry.text
+    document.checksum = entry.checksum
+    document.source_name = SOURCE_NAME
+    document.parser_version = PARSER_VERSION
+    document.source_url = "file:///var/lib/billcommons/pubinfo_2025.zip"
+    db_session.flush()
+    return jurisdiction, document, parse_result
+
+
+def test_checksum_equal_owned_file_provenance_is_repaired_without_rewriting_text(db_session):
+    jurisdiction, document, parse_result = _make_owned_checksum_equal_document(db_session)
+    original_text = document.extracted_text
+    original_status = document.license_note
+    original_retrieved_at = document.retrieved_at
+
+    result = _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation)
+
+    assert result.populated == 0
+    assert result.provenance_repaired == 1
+    assert result.provenance_repair_candidates == 1
+    assert result.provenance_repair_digest == hashlib.sha256(
+        f"{document.id}\t{document.checksum}\tfile:///var/lib/billcommons/pubinfo_2025.zip\n".encode("utf-8")
+    ).hexdigest()
+    assert result.unchanged_skipped == 0
+    db_session.refresh(document)
+    assert document.source_url == parse_result.zip_source_url
+    assert document.extracted_text == original_text
+    assert document.license_note == original_status
+    assert document.retrieved_at == original_retrieved_at
+
+
+def test_checksum_equal_unowned_source_is_not_canonicalized(db_session):
+    jurisdiction, document, parse_result = _make_owned_checksum_equal_document(db_session)
+    document.source_name = "Third-party archive"
+    document.parser_version = "third-party/1"
+    document.source_url = "https://archive.example.invalid/ca-bill.xml"
+    db_session.flush()
+
+    result = _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation)
+
+    assert result.populated == 0
+    assert result.provenance_repaired == 0
+    assert result.unchanged_skipped == 1
+    db_session.refresh(document)
+    assert document.source_url == "https://archive.example.invalid/ca-bill.xml"
+    assert document.source_name == "Third-party archive"
+    assert document.parser_version == "third-party/1"
+
+
+def test_checksum_equal_adapter_owned_https_provenance_is_preserved(db_session):
+    jurisdiction, document, parse_result = _make_owned_checksum_equal_document(db_session)
+    document.source_url = "https://downloads.leginfo.legislature.ca.gov/pubinfo_2023.zip"
+    db_session.flush()
+
+    result = _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation)
+
+    assert result.provenance_repaired == 0
+    assert result.provenance_repair_candidates == 0
+    assert result.unchanged_skipped == 1
+    db_session.refresh(document)
+    assert document.source_url == "https://downloads.leginfo.legislature.ca.gov/pubinfo_2023.zip"
+
+
+def test_provenance_repair_is_idempotent_and_dry_run_does_not_write(db_session):
+    jurisdiction, document, parse_result = _make_owned_checksum_equal_document(db_session)
+
+    dry = _apply_scoped_to_jurisdiction(
+        db_session, parse_result, jurisdiction.abbreviation, dry_run=True
+    )
+    assert dry.populated == 0
+    assert dry.provenance_repaired == 1
+    db_session.refresh(document)
+    assert document.source_url.startswith("file://")
+
+    first = _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation)
+    assert first.provenance_repaired == 1
+    second = _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation)
+    assert second.provenance_repaired == 0
+    assert second.unchanged_skipped == 1
+
+
+def test_provenance_repair_batches_at_the_document_checkpoint(db_session, monkeypatch):
+    jurisdiction = Jurisdiction(
+        name="CA Bulk Batch Test State",
+        abbreviation=f"ZZ_CABULK_{uuid.uuid4().hex[:8].upper()}",
+        classification="state",
+    )
+    db_session.add(jurisdiction)
+    db_session.flush()
+    session_row = SessionModel(
+        jurisdiction_id=jurisdiction.id,
+        identifier="2025-2026 Session",
+        active=True,
+    )
+    db_session.add(session_row)
+    db_session.flush()
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="AB 1",
+        identifier_norm="AB 1",
+        title="A test CA-style bill",
+    )
+    db_session.add(bill)
+    db_session.flush()
+    version = BillVersion(bill_id=bill.id, note="introduced")
+    db_session.add(version)
+    db_session.flush()
+
+    entries = {}
+    for index in range(BATCH_SIZE + 1):
+        ca_bill_id = f"202520260ZZBATCH{index}"
+        text = f"official CA text {index}"
+        checksum = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        entries[ca_bill_id] = CaBulkTextEntry(
+            ca_bill_id=ca_bill_id,
+            version_num=1,
+            action_date=None,
+            text=text,
+            checksum=checksum,
+        )
+        db_session.add(
+            BillDocument(
+                bill_version_id=version.id,
+                url=f"https://leginfo.legislature.ca.gov/faces/billNavClient.xhtml?bill_id={ca_bill_id}",
+                extracted_text=text,
+                checksum=checksum,
+                source_name=SOURCE_NAME,
+                parser_version=PARSER_VERSION,
+                source_url="file:///var/lib/billcommons/pubinfo_2025.zip",
+                license_note="fulltext_status=ok",
+            )
+        )
+    db_session.flush()
+    parse_result = ParseResult(
+        by_bill_id=entries,
+        zip_source_url="https://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip",
+    )
+
+    original_commit = db_session.commit
+    commit_count = 0
+
+    def count_commit():
+        nonlocal commit_count
+        commit_count += 1
+        return original_commit()
+
+    monkeypatch.setattr(db_session, "commit", count_commit)
+    result = _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation)
+
+    assert result.provenance_repaired == BATCH_SIZE + 1
+    assert result.populated == 0
+    assert commit_count == 2
+    repaired = db_session.execute(
+        select(BillDocument.source_url)
+        .join(BillVersion)
+        .join(Bill)
+        .where(Bill.jurisdiction_id == jurisdiction.id)
+    ).scalars().all()
+    assert repaired == [parse_result.zip_source_url] * (BATCH_SIZE + 1)
+
+
+def test_provenance_repair_rowcount_mismatch_rolls_back_batch(db_session, monkeypatch):
+    jurisdiction, document, parse_result = _make_owned_checksum_equal_document(db_session)
+    original_repair = ca_bulk_fulltext._execute_provenance_repairs
+    original_rollback = db_session.rollback
+    rollback_count = 0
+
+    def race_before_repair(db, repairs, *, canonical_source_url, jurisdiction_abbreviation):
+        db.execute(
+            update(BillDocument)
+            .where(BillDocument.id == document.id)
+            .values(source_name="concurrent source")
+        )
+        return original_repair(
+            db,
+            repairs,
+            canonical_source_url=canonical_source_url,
+            jurisdiction_abbreviation=jurisdiction_abbreviation,
+        )
+
+    def count_rollback():
+        nonlocal rollback_count
+        rollback_count += 1
+        return original_rollback()
+
+    monkeypatch.setattr(ca_bulk_fulltext, "_execute_provenance_repairs", race_before_repair)
+    monkeypatch.setattr(db_session, "rollback", count_rollback)
+    with pytest.raises(RuntimeError, match="expected 1, updated 0"):
+        _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation)
+    assert rollback_count == 1
+
+
+def test_provenance_repair_rejects_file_provenance_drift_after_planning(db_session, monkeypatch):
+    jurisdiction, document, parse_result = _make_owned_checksum_equal_document(db_session)
+    original_repair = ca_bulk_fulltext._execute_provenance_repairs
+
+    def replace_file_url(db, repairs, *, canonical_source_url, jurisdiction_abbreviation):
+        db.execute(
+            update(BillDocument)
+            .where(BillDocument.id == document.id)
+            .values(source_url="https://downloads.leginfo.legislature.ca.gov/pubinfo_2023.zip")
+        )
+        return original_repair(
+            db,
+            repairs,
+            canonical_source_url=canonical_source_url,
+            jurisdiction_abbreviation=jurisdiction_abbreviation,
+        )
+
+    monkeypatch.setattr(ca_bulk_fulltext, "_execute_provenance_repairs", replace_file_url)
+    with pytest.raises(RuntimeError, match="expected 1, updated 0"):
+        _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation)
+
+
+def test_provenance_repair_fails_closed_if_jurisdiction_moves_after_planning(db_session, monkeypatch):
+    jurisdiction, _document, parse_result = _make_owned_checksum_equal_document(db_session)
+    original_repair = ca_bulk_fulltext._execute_provenance_repairs
+    original_rollback = db_session.rollback
+    rollback_count = 0
+
+    def move_jurisdiction_before_repair(db, repairs, *, canonical_source_url, jurisdiction_abbreviation):
+        db.execute(
+            update(Jurisdiction)
+            .where(Jurisdiction.id == jurisdiction.id)
+            .values(abbreviation=f"ZZ_MOVED_{uuid.uuid4().hex[:8]}")
+        )
+        return original_repair(
+            db,
+            repairs,
+            canonical_source_url=canonical_source_url,
+            jurisdiction_abbreviation=jurisdiction_abbreviation,
+        )
+
+    def count_rollback():
+        nonlocal rollback_count
+        rollback_count += 1
+        return original_rollback()
+
+    monkeypatch.setattr(ca_bulk_fulltext, "_execute_provenance_repairs", move_jurisdiction_before_repair)
+    monkeypatch.setattr(db_session, "rollback", count_rollback)
+    with pytest.raises(RuntimeError, match="expected 1, updated 0"):
+        _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation)
+    assert rollback_count == 1
 
 
 def _apply_scoped_to_jurisdiction(db_session, parse_result: ParseResult, abbreviation: str, *, dry_run: bool = False) -> ApplyResult:
-    from datetime import datetime, timezone
+    """Exercise the production implementation against an isolated test scope."""
 
-    from sqlalchemy import select
-
-    from billcommons_ingest.ca_bulk_fulltext import (
-        OVERWRITABLE_TERMINAL_NOTES,
-        PARSER_VERSION,
-        SOURCE_NAME,
-        STATUS_OK,
-        _mark_status,
+    return ca_bulk_fulltext._apply_ca_bulk_fulltext_for_jurisdiction(
+        db_session,
+        parse_result,
+        jurisdiction_abbreviation=abbreviation,
+        dry_run=dry_run,
     )
-
-    stmt = (
-        select(BillDocument)
-        .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
-        .join(Bill, Bill.id == BillVersion.bill_id)
-        .join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id)
-        .where(
-            Jurisdiction.abbreviation == abbreviation,
-            BillDocument.url.is_not(None),
-            BillDocument.url != "",
-        )
-    )
-    documents = db_session.execute(stmt).scalars().all()
-    result = ApplyResult(dry_run=dry_run)
-    now = datetime.now(timezone.utc)
-
-    for document in documents:
-        ca_bill_id = _ca_bill_id_from_url(document.url)
-        if not ca_bill_id:
-            result.no_match += 1
-            continue
-        entry = parse_result.by_bill_id.get(ca_bill_id)
-        if entry is None:
-            result.no_match += 1
-            continue
-        result.matched += 1
-
-        has_text = bool(document.extracted_text)
-        is_overwritable_terminal = document.license_note in OVERWRITABLE_TERMINAL_NOTES
-        if has_text and not is_overwritable_terminal:
-            if document.checksum == entry.checksum:
-                result.unchanged_skipped += 1
-                continue
-        elif document.checksum == entry.checksum:
-            result.unchanged_skipped += 1
-            continue
-
-        if dry_run:
-            result.populated += 1
-            continue
-
-        document.extracted_text = entry.text
-        document.source_name = SOURCE_NAME
-        document.source_url = parse_result.zip_source_url or document.source_url
-        document.checksum = entry.checksum
-        document.parser_version = PARSER_VERSION
-        document.retrieved_at = now
-        _mark_status(document, STATUS_OK)
-        result.populated += 1
-
-    if not dry_run:
-        db_session.flush()
-
-    return result

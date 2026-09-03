@@ -41,7 +41,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import Text, column, select, update, values
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_schema.models import Bill, BillDocument, BillVersion, Jurisdiction
@@ -51,6 +51,10 @@ SOURCE_NAME = "CA leginfo official bulk"
 PARSER_VERSION = "ca_bulk/1"
 
 DOWNLOADS_BASE_URL = "https://downloads.leginfo.legislature.ca.gov"
+_OFFICIAL_BULK_HOST = "downloads.leginfo.legislature.ca.gov"
+_OFFICIAL_BULK_PATH_RE = re.compile(
+    r"^/pubinfo_(?:(?P<year>(?:19|20)\d{2})|daily_(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun))\.zip$"
+)
 
 # Fetch-status values persisted (see fulltext.py's identical convention) so a
 # CA bulk-populated document is distinguishable from a "never attempted"
@@ -357,12 +361,210 @@ def _ca_bill_id_from_url(url: str | None) -> str | None:
 class ApplyResult:
     matched: int = 0
     populated: int = 0
+    provenance_repaired: int = 0
+    provenance_repair_candidates: int = 0
+    provenance_repair_digest: str = ""
     unchanged_skipped: int = 0
     no_match: int = 0
     dry_run: bool = False
 
 
 BATCH_SIZE = 200
+
+
+@dataclass(frozen=True)
+class _ContentUpdate:
+    """One content replacement planned from a stable pre-write snapshot."""
+
+    document_id: object
+    expected_checksum: str | None
+    checksum: str
+    text: str
+    source_url: str | None
+
+
+@dataclass(frozen=True)
+class _ProvenanceRepair:
+    """A source URL-only correction for content this adapter already owns."""
+
+    document_id: object
+    expected_checksum: str
+    expected_source_url: str
+
+
+def _normalize_official_bulk_url(source_url: str) -> str:
+    """Validate and normalize the one official CA bulk artifact URL shape.
+
+    The bulk artifact is security/provenance input, not a generic download
+    override.  Reject credentials, ports, query strings, fragments, malformed
+    daily archive names, and non-odd-year annual archives before a DB query or
+    download happens.  Returning a reconstructed URL makes equivalent host
+    casing deterministic in retained provenance.
+    """
+
+    parsed = urlparse(source_url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid CA official bulk URL port") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.hostname.lower() != _OFFICIAL_BULK_HOST
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("CA bulk source must be a canonical official downloads URL")
+    match = _OFFICIAL_BULK_PATH_RE.fullmatch(parsed.path)
+    if match is None:
+        raise ValueError("CA bulk source has an unsupported official artifact path")
+    year = match.group("year")
+    if year is not None and int(year) % 2 == 0:
+        raise ValueError("CA annual bulk source must name an odd session year")
+    return f"https://{_OFFICIAL_BULK_HOST}{parsed.path}"
+
+
+def _provenance_repair_digest(repairs: list[_ProvenanceRepair]) -> str:
+    """Stable operator-proof digest, independent of database select order."""
+
+    payload = "".join(
+        f"{item.document_id}\t{item.expected_checksum}\t{item.expected_source_url}\n"
+        for item in sorted(
+            repairs,
+            key=lambda item: (str(item.document_id), item.expected_checksum, item.expected_source_url),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _chunks(items: list[object], size: int):
+    for index in range(0, len(items), size):
+        yield items[index : index + size]
+
+
+def _execute_content_updates(
+    db: OrmSession,
+    updates: list[_ContentUpdate],
+    *,
+    retrieved_at: datetime,
+    jurisdiction_abbreviation: str,
+) -> None:
+    """Apply a bounded batch without loading/expiring ORM document rows.
+
+    The checksum predicate is a fail-closed concurrency guard: a concurrent
+    writer changes no content here; it turns this run into a visible error
+    instead of silently replacing newer text.
+    """
+
+    if not updates:
+        return
+    payload = values(
+        column("document_id", BillDocument.id.type),
+        column("expected_checksum", BillDocument.checksum.type),
+        column("checksum", BillDocument.checksum.type),
+        column("extracted_text", Text),
+        column("source_url", BillDocument.source_url.type),
+        name="ca_bulk_content_updates",
+    ).data(
+        [
+            (
+                item.document_id,
+                item.expected_checksum,
+                item.checksum,
+                item.text,
+                item.source_url,
+            )
+            for item in updates
+        ]
+    ).alias("updates")
+    result = db.execute(
+        update(BillDocument)
+        .where(BillDocument.id == payload.c.document_id)
+        .where(BillDocument.checksum.is_not_distinct_from(payload.c.expected_checksum))
+        .where(
+            select(1)
+            .select_from(BillVersion)
+            .join(Bill, Bill.id == BillVersion.bill_id)
+            .join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id)
+            .where(
+                BillVersion.id == BillDocument.bill_version_id,
+                Jurisdiction.abbreviation == jurisdiction_abbreviation,
+            )
+            .exists()
+        )
+        .values(
+            extracted_text=payload.c.extracted_text,
+            source_name=SOURCE_NAME,
+            source_url=payload.c.source_url,
+            checksum=payload.c.checksum,
+            parser_version=PARSER_VERSION,
+            retrieved_at=retrieved_at,
+            license_note=f"fulltext_status={STATUS_OK}",
+        )
+    )
+    if result.rowcount != len(updates):
+        raise RuntimeError(
+            "CA bulk full-text content update lost a concurrent row "
+            f"(expected {len(updates)}, updated {result.rowcount})"
+        )
+
+
+def _execute_provenance_repairs(
+    db: OrmSession,
+    repairs: list[_ProvenanceRepair],
+    *,
+    canonical_source_url: str,
+    jurisdiction_abbreviation: str,
+) -> None:
+    """Repair only the URL of checksum-equal rows owned by this adapter.
+
+    This deliberately leaves text, checksum, parser status, classification,
+    and timestamps untouched.  The exact rowcount assertion prevents a stale
+    plan from modifying a row whose ownership/checksum changed concurrently.
+    """
+
+    if not repairs:
+        return
+    payload = values(
+        column("document_id", BillDocument.id.type),
+        column("expected_checksum", BillDocument.checksum.type),
+        column("expected_source_url", BillDocument.source_url.type),
+        name="ca_bulk_provenance_repairs",
+    ).data(
+        [
+            (item.document_id, item.expected_checksum, item.expected_source_url)
+            for item in repairs
+        ]
+    ).alias("repairs")
+    result = db.execute(
+        update(BillDocument)
+        .where(BillDocument.id == payload.c.document_id)
+        .where(BillDocument.checksum == payload.c.expected_checksum)
+        .where(BillDocument.source_name == SOURCE_NAME)
+        .where(BillDocument.parser_version == PARSER_VERSION)
+        .where(BillDocument.source_url == payload.c.expected_source_url)
+        .where(BillDocument.source_url.like("file://%"))
+        .where(
+            select(1)
+            .select_from(BillVersion)
+            .join(Bill, Bill.id == BillVersion.bill_id)
+            .join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id)
+            .where(
+                BillVersion.id == BillDocument.bill_version_id,
+                Jurisdiction.abbreviation == jurisdiction_abbreviation,
+            )
+            .exists()
+        )
+        .values(source_url=canonical_source_url)
+    )
+    if result.rowcount != len(repairs):
+        raise RuntimeError(
+            "CA bulk full-text provenance repair lost a concurrent or non-owned row "
+            f"(expected {len(repairs)}, updated {result.rowcount})"
+        )
 
 
 def apply_ca_bulk_fulltext(
@@ -389,15 +591,42 @@ def apply_ca_bulk_fulltext(
     (not the number of CA bills in parse_result) -- used for bounded
     live-proof runs and tests.
     """
+    return _apply_ca_bulk_fulltext_for_jurisdiction(
+        db,
+        parse_result,
+        jurisdiction_abbreviation="CA",
+        limit=limit,
+        dry_run=dry_run,
+    )
+
+
+def _apply_ca_bulk_fulltext_for_jurisdiction(
+    db: OrmSession,
+    parse_result: ParseResult,
+    *,
+    jurisdiction_abbreviation: str,
+    limit: int | None = None,
+    dry_run: bool = False,
+) -> ApplyResult:
+    """Implementation shared with isolated tests; public calls are CA-only."""
+
+    canonical_source_url = _normalize_official_bulk_url(parse_result.zip_source_url)
     result = ApplyResult(dry_run=dry_run)
 
     stmt = (
-        select(BillDocument)
+        select(
+            BillDocument.id,
+            BillDocument.url,
+            BillDocument.checksum,
+            BillDocument.source_name,
+            BillDocument.parser_version,
+            BillDocument.source_url,
+        )
         .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
         .join(Bill, Bill.id == BillVersion.bill_id)
         .join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id)
         .where(
-            Jurisdiction.abbreviation == "CA",
+            Jurisdiction.abbreviation == jurisdiction_abbreviation,
             BillDocument.url.is_not(None),
             BillDocument.url != "",
         )
@@ -405,12 +634,12 @@ def apply_ca_bulk_fulltext(
     if limit is not None:
         stmt = stmt.limit(limit)
 
-    documents = db.execute(stmt).scalars().all()
+    documents = db.execute(stmt).mappings().all()
     now = datetime.now(timezone.utc)
-    touched = 0
+    mutations: list[_ContentUpdate | _ProvenanceRepair] = []
 
     for document in documents:
-        ca_bill_id = _ca_bill_id_from_url(document.url)
+        ca_bill_id = _ca_bill_id_from_url(document["url"])
         if not ca_bill_id:
             result.no_match += 1
             continue
@@ -421,41 +650,70 @@ def apply_ca_bulk_fulltext(
 
         result.matched += 1
 
-        has_text = bool(document.extracted_text)
-        is_overwritable_terminal = document.license_note in OVERWRITABLE_TERMINAL_NOTES
-        if has_text and not is_overwritable_terminal:
-            # Already has real text from some source and isn't a
-            # dead-lettered document this adapter is meant to unblock --
-            # only touch it if the checksum would actually change (a
-            # legitimate re-run picking up an amended bill version).
-            if document.checksum == entry.checksum:
+        checksum_matches = document["checksum"] == entry.checksum
+        if checksum_matches:
+            if (
+                document["source_name"] == SOURCE_NAME
+                and document["parser_version"] == PARSER_VERSION
+                and isinstance(document["source_url"], str)
+                and document["source_url"].startswith("file://")
+            ):
+                result.provenance_repaired += 1
+                mutations.append(
+                    _ProvenanceRepair(
+                        document_id=document["id"],
+                        expected_checksum=entry.checksum,
+                        expected_source_url=document["source_url"],
+                    )
+                )
+            else:
                 result.unchanged_skipped += 1
-                continue
-        elif document.checksum == entry.checksum:
-            result.unchanged_skipped += 1
             continue
 
-        if dry_run:
-            result.populated += 1
-            continue
-
-        document.extracted_text = entry.text
-        document.source_name = SOURCE_NAME
-        document.source_url = parse_result.zip_source_url or document.source_url
-        document.checksum = entry.checksum
-        document.parser_version = PARSER_VERSION
-        document.retrieved_at = now
-        _mark_status(document, STATUS_OK)
+        # A checksum change is the existing, intentional update path even for
+        # a document that already contains non-terminal text: the CA official
+        # bulk artifact may contain a later amended version.
         result.populated += 1
-        touched += 1
+        mutations.append(
+            _ContentUpdate(
+                document_id=document["id"],
+                expected_checksum=document["checksum"],
+                checksum=entry.checksum,
+                text=entry.text,
+                source_url=canonical_source_url,
+            )
+        )
 
-        if touched % BATCH_SIZE == 0:
-            db.flush()
+    provenance_repairs = [item for item in mutations if isinstance(item, _ProvenanceRepair)]
+    result.provenance_repair_candidates = len(provenance_repairs)
+    result.provenance_repair_digest = _provenance_repair_digest(provenance_repairs)
+
+    if dry_run:
+        return result
+
+    # The plan above is a plain snapshot.  Commit boundaries therefore cannot
+    # expire 10k ORM objects and turn a URL-only repair into an N+1 reload.
+    for batch in _chunks(mutations, BATCH_SIZE):
+        content_updates = [item for item in batch if isinstance(item, _ContentUpdate)]
+        provenance_repairs = [item for item in batch if isinstance(item, _ProvenanceRepair)]
+        try:
+            _execute_content_updates(
+                db,
+                content_updates,
+                retrieved_at=now,
+                jurisdiction_abbreviation=jurisdiction_abbreviation,
+            )
+            if provenance_repairs:
+                _execute_provenance_repairs(
+                    db,
+                    provenance_repairs,
+                    canonical_source_url=canonical_source_url,
+                    jurisdiction_abbreviation=jurisdiction_abbreviation,
+                )
             db.commit()
-
-    if not dry_run:
-        db.flush()
-        db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
     return result
 
@@ -490,17 +748,23 @@ def run_ca_fulltext(
     from billcommons_shared.db import get_session
 
     if zip_path is not None:
+        if zip_url is None:
+            raise ValueError(
+                "--zip-path requires the matching canonical https://downloads.leginfo.legislature.ca.gov "
+                "URL via --zip-url; refusing to persist file:// provenance"
+            )
+        source_url = _normalize_official_bulk_url(zip_url)
         zip_bytes = Path(zip_path).read_bytes()
-        source_url = zip_url or f"file://{Path(zip_path).resolve()}"
     else:
         current_year = datetime.now(timezone.utc).year
         # CA publishes one annual zip per ODD year for the 2-year session
         # (e.g. pubinfo_2025.zip covers the 2025-2026 session); an even
         # current year still uses the prior odd year's file.
         session_year = current_year if current_year % 2 == 1 else current_year - 1
-        url = zip_url or f"{DOWNLOADS_BASE_URL}/pubinfo_{session_year}.zip"
-        zip_bytes = download_pubinfo_zip(url)
-        source_url = url
+        source_url = _normalize_official_bulk_url(
+            zip_url or f"{DOWNLOADS_BASE_URL}/pubinfo_{session_year}.zip"
+        )
+        zip_bytes = download_pubinfo_zip(source_url)
 
     parse_result = parse_ca_bulk_zip(zip_bytes, source_url=source_url)
 
