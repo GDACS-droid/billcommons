@@ -101,20 +101,18 @@ https://leginfo.legislature.ca.gov/faces/billPdf.xhtml?bill_id=202520260SB876&ve
 Confirmed live 2026-07-24 by querying production `bill_documents` for
 `jurisdiction.abbreviation = 'CA'`: sampled URLs' `bill_id=` params match
 the `BILL_ID` format/values seen in the live `pubinfo_Fri.zip` sample's
-`BILL_TBL.dat` (e.g. `202520260SB623`). **This is the adapter's join key**
-— `ca_bulk_fulltext._ca_bill_id_from_url()` extracts it from
-`bill_documents.url` via `urllib.parse.parse_qs`, and
-`apply_ca_bulk_fulltext` looks it up directly in the parsed
-`{BILL_ID: latest_version_text}` map. No fuzzy matching, no title
-matching — a direct, already-present-in-our-own-data string key.
+`BILL_TBL.dat` (e.g. `202520260SB623`). The adapter uses this direct key
+only for canonical unversioned bill-navigation URLs. No fuzzy or title
+matching is performed.
 
-At the time of this recon, `bill_documents.url` also frequently carries a
-per-version `version=` param (e.g. `20250SB87695AMD`) matching CA's
-`BILL_VERSION_ID` format directly — a future refinement could join on that
-instead of always taking "latest version" per bill, but the adapter's
-first cut intentionally keeps it simple: one full-text blob per CA bill
-(the latest version by `(bill_version_action_date, version_num)`), written
-onto every one of that bill's `bill_documents` rows that lacks real text.
+`bill_documents.url` also frequently carries a per-version `version=` param
+(e.g. `20250SB87695AMD`) matching CA's `BILL_VERSION_ID` format directly.
+The adapter indexes that exact ID from `BILL_VERSION_TBL.dat`: a canonical
+`billPdf.xhtml?bill_id=...&version=...` URL receives only that version's
+text, while an unversioned canonical bill-navigation/status URL receives the
+latest version by `(bill_version_action_date, version_num)`. Analysis links,
+unknown versions, and other URLs are deliberately ineligible; they are not
+given bill text merely because they share a `bill_id` parameter.
 
 ## Extraction
 

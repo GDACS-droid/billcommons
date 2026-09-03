@@ -17,17 +17,19 @@ layout, table schema, join key, licensing).
 Design, in one paragraph: `parse_ca_bulk_zip` downloads+parses the annual
 `pubinfo_<year>.zip` (no DB session touched during this phase -- it's a
 pure function of bytes) into an in-memory map of
-`{CA_BILL_ID: [(version_num, bill_version_action_date, plain_text), ...]}`,
-picking the LATEST version's text per bill (the version with the greatest
-`(bill_version_action_date, version_num)`). `apply_ca_bulk_fulltext` then
+`{CA_BILL_ID: [(version_num, bill_version_action_date, plain_text), ...]}`
+plus an exact `BILL_VERSION_ID` index, picking the LATEST version's text per
+bill (the version with the greatest `(bill_version_action_date, version_num)`).
+`apply_ca_bulk_fulltext` then
 opens short, batched DB transactions to match that map against our
 existing CA `bill_documents` rows via the `bill_id=` query-string param
 already present in every CA `source_url`/`bill_documents.url` (populated
 by `openstates_bulk.py` from Open States' own CA scrape), and writes
 `extracted_text` (+ provenance) onto any row whose current text is missing
-or was itself a `robots_disallowed`/other terminal fulltext_status,
-skipping (idempotent) if the computed checksum is unchanged from what's
-already stored.
+or was itself a `robots_disallowed`/other terminal fulltext_status. Exact
+`billPdf.xhtml?version=` links receive only that exact version's text;
+unversioned bill navigation links receive the latest text. Analyses and other
+non-bill-text URLs are never populated.
 """
 from __future__ import annotations
 
@@ -41,7 +43,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-from sqlalchemy import Text, column, select, update, values
+from sqlalchemy import Text, cast, column, select, update, values
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_schema.models import Bill, BillDocument, BillVersion, Jurisdiction
@@ -240,15 +242,21 @@ class CaBulkTextEntry:
     action_date: datetime | None
     text: str
     checksum: str
+    bill_version_id: str = ""
 
 
 @dataclass
 class ParseResult:
-    """One entry per CA BILL_ID, holding the LATEST version's extracted
-    text (by (action_date, version_num), never fabricated if both are
-    missing -- ties fall back to insertion order)."""
+    """Latest per-bill and exact per-``BILL_VERSION_ID`` extracted text.
+
+    The latest map serves canonical unversioned bill pages only.  Versioned
+    URLs must use the exact map, so an older amendment is never silently
+    replaced by enrolled text.
+    """
 
     by_bill_id: dict[str, CaBulkTextEntry] = field(default_factory=dict)
+    by_bill_version_id: dict[str, CaBulkTextEntry] = field(default_factory=dict)
+    conflicted_bill_version_ids: set[str] = field(default_factory=set)
     zip_source_url: str = ""
     versions_seen: int = 0
     versions_with_text: int = 0
@@ -317,20 +325,43 @@ def parse_ca_bulk_zip(zip_bytes: bytes, *, source_url: str = "") -> ParseResult:
                 continue
             result.versions_with_text += 1
 
+            checksum = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            entry = CaBulkTextEntry(
+                ca_bill_id=row.ca_bill_id,
+                version_num=row.version_num,
+                action_date=row.action_date,
+                text=text,
+                checksum=checksum,
+                bill_version_id=row.bill_version_id,
+            )
+            # Exact version identity is the durable key used by billPdf URLs.
+            # Conflicting duplicate source IDs are unsafe: withhold that exact
+            # version and any latest map entry that depended on it rather than
+            # silently selecting whichever row happened to arrive first.
+            exact = result.by_bill_version_id.get(row.bill_version_id)
+            if exact is not None and (
+                exact.ca_bill_id != entry.ca_bill_id or exact.checksum != entry.checksum
+            ):
+                result.conflicted_bill_version_ids.add(row.bill_version_id)
+                result.by_bill_version_id.pop(row.bill_version_id, None)
+                if result.by_bill_id.get(exact.ca_bill_id) == exact:
+                    result.by_bill_id.pop(exact.ca_bill_id, None)
+                result.warnings.append(
+                    "conflicting BILL_VERSION_ID withheld from CA bulk text: "
+                    f"{row.bill_version_id}"
+                )
+                continue
+            if row.bill_version_id in result.conflicted_bill_version_ids:
+                continue
+            result.by_bill_version_id.setdefault(row.bill_version_id, entry)
+
             existing = result.by_bill_id.get(row.ca_bill_id)
             candidate_key = (row.action_date or datetime.min, row.version_num)
             if existing is not None:
                 existing_key = (existing.action_date or datetime.min, existing.version_num)
                 if candidate_key <= existing_key:
                     continue
-            checksum = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            result.by_bill_id[row.ca_bill_id] = CaBulkTextEntry(
-                ca_bill_id=row.ca_bill_id,
-                version_num=row.version_num,
-                action_date=row.action_date,
-                text=text,
-                checksum=checksum,
-            )
+            result.by_bill_id[row.ca_bill_id] = entry
     return result
 
 
@@ -352,6 +383,64 @@ def _ca_bill_id_from_url(url: str | None) -> str | None:
     return values[0]
 
 
+_CA_LEGINFO_HOST = "leginfo.legislature.ca.gov"
+_VERSIONED_BILL_PDF_PATH = "/faces/billPdf.xhtml"
+_LATEST_BILL_PATHS = frozenset(
+    {
+        "/faces/billNavClient.xhtml",
+        "/faces/billStatusClient.xhtml",
+    }
+)
+
+
+def _document_text_entry(
+    url: str | None, parse_result: ParseResult
+) -> CaBulkTextEntry | None:
+    """Return the only official bulk-text entry eligible for ``url``.
+
+    This is deliberately stricter than the historical ``bill_id`` join:
+    bill analyses and arbitrary links may carry the same bill id, but are not
+    bill text.  A malformed/unknown version is fail-closed rather than
+    falling back to latest text.
+    """
+
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+        query = parse_qs(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.hostname.lower() != _CA_LEGINFO_HOST
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+    ):
+        return None
+
+    bill_ids = query.get("bill_id", [])
+    if len(bill_ids) != 1 or not bill_ids[0]:
+        return None
+    if parsed.path == _VERSIONED_BILL_PDF_PATH:
+        versions = query.get("version", [])
+        if (
+            set(query) != {"bill_id", "version"}
+            or len(versions) != 1
+            or not versions[0]
+        ):
+            return None
+        entry = parse_result.by_bill_version_id.get(versions[0])
+        return entry if entry is not None and entry.ca_bill_id == bill_ids[0] else None
+    if parsed.path in _LATEST_BILL_PATHS and set(query) == {"bill_id"}:
+        return parse_result.by_bill_id.get(bill_ids[0])
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Apply to the live DB
 # ---------------------------------------------------------------------------
@@ -366,6 +455,7 @@ class ApplyResult:
     provenance_repair_digest: str = ""
     unchanged_skipped: int = 0
     no_match: int = 0
+    ineligible_cleaned: int = 0
     dry_run: bool = False
 
 
@@ -381,6 +471,9 @@ class _ContentUpdate:
     checksum: str
     text: str
     source_url: str | None
+    expected_document_url: str
+    expected_source_name: str | None
+    expected_parser_version: str | None
 
 
 @dataclass(frozen=True)
@@ -390,6 +483,30 @@ class _ProvenanceRepair:
     document_id: object
     expected_checksum: str
     expected_source_url: str
+
+
+@dataclass(frozen=True)
+class _IneligibleCleanup:
+    """Clear a false CA-bulk attachment from an adapter-owned non-text URL."""
+
+    document_id: object
+    expected_checksum: str | None
+    expected_source_url: str | None
+    expected_parent_source_name: str | None
+    expected_parent_source_url: str | None
+    expected_parent_upstream_id: str | None
+    expected_parent_retrieved_at: datetime | None
+    expected_parent_upstream_updated_at: datetime | None
+    expected_parent_raw_ref: str | None
+    expected_parent_parser_version: str | None
+    document_url: str
+    parent_source_name: str | None
+    parent_source_url: str | None
+    parent_upstream_id: str | None
+    parent_retrieved_at: datetime | None
+    parent_upstream_updated_at: datetime | None
+    parent_raw_ref: str | None
+    parent_parser_version: str | None
 
 
 def _normalize_official_bulk_url(source_url: str) -> str:
@@ -467,6 +584,9 @@ def _execute_content_updates(
         column("checksum", BillDocument.checksum.type),
         column("extracted_text", Text),
         column("source_url", BillDocument.source_url.type),
+        column("expected_document_url", BillDocument.url.type),
+        column("expected_source_name", BillDocument.source_name.type),
+        column("expected_parser_version", BillDocument.parser_version.type),
         name="ca_bulk_content_updates",
     ).data(
         [
@@ -476,6 +596,9 @@ def _execute_content_updates(
                 item.checksum,
                 item.text,
                 item.source_url,
+                item.expected_document_url,
+                item.expected_source_name,
+                item.expected_parser_version,
             )
             for item in updates
         ]
@@ -484,6 +607,13 @@ def _execute_content_updates(
         update(BillDocument)
         .where(BillDocument.id == payload.c.document_id)
         .where(BillDocument.checksum.is_not_distinct_from(payload.c.expected_checksum))
+        .where(BillDocument.url == payload.c.expected_document_url)
+        .where(BillDocument.source_name.is_not_distinct_from(payload.c.expected_source_name))
+        .where(
+            BillDocument.parser_version.is_not_distinct_from(
+                payload.c.expected_parser_version
+            )
+        )
         .where(
             select(1)
             .select_from(BillVersion)
@@ -567,6 +697,135 @@ def _execute_provenance_repairs(
         )
 
 
+def _execute_ineligible_cleanups(
+    db: OrmSession,
+    cleanups: list[_IneligibleCleanup],
+    *,
+    jurisdiction_abbreviation: str,
+) -> None:
+    """Remove only this adapter's false attachment from non-bill-text URLs.
+
+    The parent version is the upstream identity source.  Restore every
+    available parent provenance field; a missing parent source URL falls back
+    to the document URL.  Clear adapter-only text/checksum and leave a
+    terminal robots status. Every snapshot field is rechecked in the DML so a
+    concurrent ingest turns into an explicit rollback.
+    """
+
+    if not cleanups:
+        return
+    payload = values(
+        column("document_id", BillDocument.id.type),
+        column("expected_checksum", BillDocument.checksum.type),
+        column("expected_source_url", BillDocument.source_url.type),
+        column("expected_parent_source_name", BillVersion.source_name.type),
+        column("expected_parent_source_url", BillVersion.source_url.type),
+        column("expected_parent_upstream_id", BillVersion.upstream_id.type),
+        column("expected_parent_retrieved_at", BillVersion.retrieved_at.type),
+        column("expected_parent_upstream_updated_at", BillVersion.upstream_updated_at.type),
+        column("expected_parent_raw_ref", BillVersion.raw_ref.type),
+        column("expected_parent_parser_version", BillVersion.parser_version.type),
+        column("document_url", BillDocument.url.type),
+        column("parent_source_name", BillVersion.source_name.type),
+        column("parent_source_url", BillVersion.source_url.type),
+        column("parent_upstream_id", BillVersion.upstream_id.type),
+        column("parent_retrieved_at", BillVersion.retrieved_at.type),
+        column("parent_upstream_updated_at", BillVersion.upstream_updated_at.type),
+        column("parent_raw_ref", BillVersion.raw_ref.type),
+        column("parent_parser_version", BillVersion.parser_version.type),
+        name="ca_bulk_ineligible_cleanups",
+    ).data(
+        [
+            (
+                item.document_id,
+                item.expected_checksum,
+                item.expected_source_url,
+                item.expected_parent_source_name,
+                item.expected_parent_source_url,
+                item.expected_parent_upstream_id,
+                item.expected_parent_retrieved_at,
+                item.expected_parent_upstream_updated_at,
+                item.expected_parent_raw_ref,
+                item.expected_parent_parser_version,
+                item.document_url,
+                item.parent_source_name,
+                item.parent_source_url,
+                item.parent_upstream_id,
+                item.parent_retrieved_at,
+                item.parent_upstream_updated_at,
+                item.parent_raw_ref,
+                item.parent_parser_version,
+            )
+            for item in cleanups
+        ]
+    ).alias("cleanups")
+    result = db.execute(
+        update(BillDocument)
+        .where(BillDocument.id == payload.c.document_id)
+        .where(BillDocument.checksum.is_not_distinct_from(payload.c.expected_checksum))
+        .where(BillDocument.source_url.is_not_distinct_from(payload.c.expected_source_url))
+        .where(BillDocument.url == payload.c.document_url)
+        .where(BillDocument.source_name == SOURCE_NAME)
+        .where(BillDocument.parser_version == PARSER_VERSION)
+        .where(
+            select(1)
+            .select_from(BillVersion)
+            .join(Bill, Bill.id == BillVersion.bill_id)
+            .join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id)
+            .where(
+                BillVersion.id == BillDocument.bill_version_id,
+                BillVersion.source_name.is_not_distinct_from(
+                    payload.c.expected_parent_source_name
+                ),
+                BillVersion.source_url.is_not_distinct_from(
+                    payload.c.expected_parent_source_url
+                ),
+                BillVersion.upstream_id.is_not_distinct_from(
+                    payload.c.expected_parent_upstream_id
+                ),
+                BillVersion.retrieved_at.is_not_distinct_from(
+                    cast(
+                        payload.c.expected_parent_retrieved_at,
+                        BillVersion.retrieved_at.type,
+                    )
+                ),
+                BillVersion.upstream_updated_at.is_not_distinct_from(
+                    cast(
+                        payload.c.expected_parent_upstream_updated_at,
+                        BillVersion.upstream_updated_at.type,
+                    )
+                ),
+                BillVersion.raw_ref.is_not_distinct_from(payload.c.expected_parent_raw_ref),
+                BillVersion.parser_version.is_not_distinct_from(
+                    payload.c.expected_parent_parser_version
+                ),
+                Jurisdiction.abbreviation == jurisdiction_abbreviation,
+            )
+            .exists()
+        )
+        .values(
+            extracted_text=None,
+            checksum=None,
+            source_name=payload.c.parent_source_name,
+            source_url=payload.c.parent_source_url,
+            upstream_id=payload.c.parent_upstream_id,
+            retrieved_at=cast(payload.c.parent_retrieved_at, BillDocument.retrieved_at.type),
+            upstream_updated_at=cast(
+                payload.c.parent_upstream_updated_at,
+                BillDocument.upstream_updated_at.type,
+            ),
+            raw_ref=payload.c.parent_raw_ref,
+            parser_version=payload.c.parent_parser_version,
+            license_note="fulltext_status=robots_disallowed",
+        )
+    )
+    if result.rowcount != len(cleanups):
+        raise RuntimeError(
+            "CA bulk full-text ineligible cleanup lost a concurrent or non-owned row "
+            f"(expected {len(cleanups)}, updated {result.rowcount})"
+        )
+
+
 def apply_ca_bulk_fulltext(
     db: OrmSession,
     parse_result: ParseResult,
@@ -574,8 +833,7 @@ def apply_ca_bulk_fulltext(
     limit: int | None = None,
     dry_run: bool = False,
 ) -> ApplyResult:
-    """Match `parse_result.by_bill_id` against CA `bill_documents` rows via
-    the `bill_id=` query param in `bill_documents.url`, and write
+    """Match eligible official CA bill-text URLs against parsed bulk entries and write
     `extracted_text` (+ provenance) onto any row that currently has no
     text OR whose fulltext_status is one of the overwritable terminal
     statuses (see OVERWRITABLE_TERMINAL_NOTES) -- skipping (idempotent) any
@@ -621,6 +879,13 @@ def _apply_ca_bulk_fulltext_for_jurisdiction(
             BillDocument.source_name,
             BillDocument.parser_version,
             BillDocument.source_url,
+            BillVersion.source_name.label("version_source_name"),
+            BillVersion.source_url.label("version_source_url"),
+            BillVersion.upstream_id.label("version_upstream_id"),
+            BillVersion.retrieved_at.label("version_retrieved_at"),
+            BillVersion.upstream_updated_at.label("version_upstream_updated_at"),
+            BillVersion.raw_ref.label("version_raw_ref"),
+            BillVersion.parser_version.label("version_parser_version"),
         )
         .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
         .join(Bill, Bill.id == BillVersion.bill_id)
@@ -636,16 +901,42 @@ def _apply_ca_bulk_fulltext_for_jurisdiction(
 
     documents = db.execute(stmt).mappings().all()
     now = datetime.now(timezone.utc)
-    mutations: list[_ContentUpdate | _ProvenanceRepair] = []
+    mutations: list[_ContentUpdate | _ProvenanceRepair | _IneligibleCleanup] = []
 
     for document in documents:
-        ca_bill_id = _ca_bill_id_from_url(document["url"])
-        if not ca_bill_id:
-            result.no_match += 1
-            continue
-        entry = parse_result.by_bill_id.get(ca_bill_id)
+        entry = _document_text_entry(document["url"], parse_result)
         if entry is None:
-            result.no_match += 1
+            if (
+                document["source_name"] == SOURCE_NAME
+                and document["parser_version"] == PARSER_VERSION
+            ):
+                result.ineligible_cleaned += 1
+                mutations.append(
+                    _IneligibleCleanup(
+                        document_id=document["id"],
+                        expected_checksum=document["checksum"],
+                        expected_source_url=document["source_url"],
+                        expected_parent_source_name=document["version_source_name"],
+                        expected_parent_source_url=document["version_source_url"],
+                        expected_parent_upstream_id=document["version_upstream_id"],
+                        expected_parent_retrieved_at=document["version_retrieved_at"],
+                        expected_parent_upstream_updated_at=document[
+                            "version_upstream_updated_at"
+                        ],
+                        expected_parent_raw_ref=document["version_raw_ref"],
+                        expected_parent_parser_version=document["version_parser_version"],
+                        document_url=document["url"],
+                        parent_source_name=document["version_source_name"],
+                        parent_source_url=document["version_source_url"] or document["url"],
+                        parent_upstream_id=document["version_upstream_id"],
+                        parent_retrieved_at=document["version_retrieved_at"],
+                        parent_upstream_updated_at=document["version_upstream_updated_at"],
+                        parent_raw_ref=document["version_raw_ref"],
+                        parent_parser_version=document["version_parser_version"],
+                    )
+                )
+            else:
+                result.no_match += 1
             continue
 
         result.matched += 1
@@ -681,6 +972,9 @@ def _apply_ca_bulk_fulltext_for_jurisdiction(
                 checksum=entry.checksum,
                 text=entry.text,
                 source_url=canonical_source_url,
+                expected_document_url=document["url"],
+                expected_source_name=document["source_name"],
+                expected_parser_version=document["parser_version"],
             )
         )
 
@@ -696,6 +990,7 @@ def _apply_ca_bulk_fulltext_for_jurisdiction(
     for batch in _chunks(mutations, BATCH_SIZE):
         content_updates = [item for item in batch if isinstance(item, _ContentUpdate)]
         provenance_repairs = [item for item in batch if isinstance(item, _ProvenanceRepair)]
+        ineligible_cleanups = [item for item in batch if isinstance(item, _IneligibleCleanup)]
         try:
             _execute_content_updates(
                 db,
@@ -710,6 +1005,11 @@ def _apply_ca_bulk_fulltext_for_jurisdiction(
                     canonical_source_url=canonical_source_url,
                     jurisdiction_abbreviation=jurisdiction_abbreviation,
                 )
+            _execute_ineligible_cleanups(
+                db,
+                ineligible_cleanups,
+                jurisdiction_abbreviation=jurisdiction_abbreviation,
+            )
             db.commit()
         except Exception:
             db.rollback()
@@ -783,6 +1083,7 @@ def main() -> None:  # pragma: no cover - thin CLI-less manual entry point
     result = run_ca_fulltext()
     print(
         f"CA bulk full text: matched={result.matched} populated={result.populated} "
+        f"ineligible_cleaned={result.ineligible_cleaned} "
         f"unchanged_skipped={result.unchanged_skipped} no_match={result.no_match}"
     )
 

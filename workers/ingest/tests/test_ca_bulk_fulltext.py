@@ -20,6 +20,7 @@ import io
 import hashlib
 import uuid
 import zipfile
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import select, update
@@ -249,6 +250,51 @@ def test_parse_ca_bulk_zip_picks_latest_version_by_date_and_num():
     entry = result.by_bill_id["202520260ZZTEST1"]
     assert entry.version_num == 2
     assert "as amended" in entry.text
+    assert result.by_bill_version_id["20250ZZTEST95INT"].version_num == 1
+    assert result.by_bill_version_id["20250ZZTEST96AMD"].version_num == 2
+
+
+def test_document_text_entry_requires_exact_versioned_pdf_and_only_allows_canonical_navigation():
+    bill_id = "202520260SB957"
+    introduced = CaBulkTextEntry(
+        ca_bill_id=bill_id,
+        version_num=1,
+        action_date=None,
+        text="introduced text",
+        checksum="introduced",
+        bill_version_id="20250SB95795INT",
+    )
+    enrolled = CaBulkTextEntry(
+        ca_bill_id=bill_id,
+        version_num=8,
+        action_date=None,
+        text="enrolled text",
+        checksum="enrolled",
+        bill_version_id="20250SB95795ENR",
+    )
+    parsed = ParseResult(
+        by_bill_id={bill_id: enrolled},
+        by_bill_version_id={
+            introduced.bill_version_id: introduced,
+            enrolled.bill_version_id: enrolled,
+        },
+    )
+
+    assert ca_bulk_fulltext._document_text_entry(
+        f"https://leginfo.legislature.ca.gov/faces/billPdf.xhtml?bill_id={bill_id}&version=20250SB95795INT",
+        parsed,
+    ) == introduced
+    assert ca_bulk_fulltext._document_text_entry(
+        f"https://leginfo.legislature.ca.gov/faces/billNavClient.xhtml?bill_id={bill_id}",
+        parsed,
+    ) == enrolled
+    for url in (
+        f"https://leginfo.legislature.ca.gov/faces/billAnalysisClient.xhtml?bill_id={bill_id}",
+        f"https://leginfo.legislature.ca.gov/faces/billPdf.xhtml?bill_id={bill_id}&version=unknown",
+        f"https://leginfo.legislature.ca.gov/faces/billNavClient.xhtml?bill_id={bill_id}&version=20250SB95795INT",
+        f"https://example.invalid/faces/billPdf.xhtml?bill_id={bill_id}&version=20250SB95795INT",
+    ):
+        assert ca_bulk_fulltext._document_text_entry(url, parsed) is None
 
 
 def test_parse_ca_bulk_zip_skips_version_with_missing_lob_file():
@@ -267,6 +313,36 @@ def test_parse_ca_bulk_zip_skips_version_with_missing_lob_file():
     result = parse_ca_bulk_zip(zip_bytes)
     assert "202520260ZZTEST2" not in result.by_bill_id
     assert result.versions_with_text == 0
+
+
+def test_parse_ca_bulk_zip_withholds_conflicting_duplicate_version_id():
+    bill_id = "202520260SB957"
+    version_id = "20250SB95795AMD"
+    result = parse_ca_bulk_zip(
+        _build_synthetic_pubinfo_zip(
+            [
+                {
+                    "bill_version_id": version_id,
+                    "bill_id": bill_id,
+                    "version_num": 2,
+                    "action_date": "2025-02-01 00:00:00",
+                    "lob_filename": "first.xml",
+                },
+                {
+                    "bill_version_id": version_id,
+                    "bill_id": bill_id,
+                    "version_num": 2,
+                    "action_date": "2025-02-01 00:00:00",
+                    "lob_filename": "conflict.xml",
+                },
+            ],
+            {"first.xml": _SAMPLE_BILL_XML, "conflict.xml": _SAMPLE_BILL_XML_V2},
+        )
+    )
+    assert version_id in result.conflicted_bill_version_ids
+    assert version_id not in result.by_bill_version_id
+    assert bill_id not in result.by_bill_id
+    assert any("conflicting BILL_VERSION_ID" in warning for warning in result.warnings)
 
 
 def test_parse_ca_bulk_zip_missing_bill_version_tbl_warns_not_raises():
@@ -322,6 +398,89 @@ def _make_zz_jurisdiction_with_ca_style_document(db_session, *, ca_bill_id: str,
     return jurisdiction, document
 
 
+def _make_versioned_ca_documents(db_session, *, ca_bill_id: str, count: int = 8):
+    """SB 957-shaped fixture: eight version PDFs, one latest nav, analyses."""
+
+    abbr = f"ZZ_CABULK_{uuid.uuid4().hex[:8].upper()}"
+    jurisdiction = Jurisdiction(name="CA Bulk Test State", abbreviation=abbr, classification="state")
+    db_session.add(jurisdiction)
+    db_session.flush()
+    session_row = SessionModel(jurisdiction_id=jurisdiction.id, identifier="2025-2026 Session", active=True)
+    db_session.add(session_row)
+    db_session.flush()
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="SB 957",
+        identifier_norm="SB 957",
+        title="A versioned CA-style bill",
+    )
+    db_session.add(bill)
+    db_session.flush()
+
+    documents = []
+    rows = []
+    lobs = {}
+    for number in range(1, count + 1):
+        version_id = f"20250SB95795V{number:02d}"
+        version = BillVersion(
+            bill_id=bill.id,
+            note=f"version {number}",
+            source_name="openstates_bulk_csv",
+        )
+        db_session.add(version)
+        db_session.flush()
+        document = BillDocument(
+            bill_version_id=version.id,
+            url=(
+                "https://leginfo.legislature.ca.gov/faces/billPdf.xhtml?"
+                f"bill_id={ca_bill_id}&version={version_id}"
+            ),
+            license_note="fulltext_status=robots_disallowed",
+        )
+        db_session.add(document)
+        documents.append(document)
+        rows.append(
+            {
+                "bill_version_id": version_id,
+                "bill_id": ca_bill_id,
+                "version_num": number,
+                "action_date": f"2025-01-{number:02d} 00:00:00",
+                "lob_filename": f"v{number}.xml",
+            }
+        )
+        lobs[f"v{number}.xml"] = (
+            f"<bill><text>SB 957 official version {number}</text></bill>".encode()
+        )
+
+    nav = BillDocument(
+        bill_version_id=documents[-1].bill_version_id,
+        url=f"https://leginfo.legislature.ca.gov/faces/billNavClient.xhtml?bill_id={ca_bill_id}",
+        license_note="fulltext_status=robots_disallowed",
+    )
+    db_session.add(nav)
+    documents.append(nav)
+    analysis = BillDocument(
+        bill_version_id=documents[-2].bill_version_id,
+        url=(
+            "https://leginfo.legislature.ca.gov/faces/billAnalysisClient.xhtml?"
+            f"bill_id={ca_bill_id}"
+        ),
+        extracted_text="incorrectly attached enrolled text",
+        checksum="incorrect-enrolled-checksum",
+        source_name=SOURCE_NAME,
+        source_url="https://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip",
+        parser_version=PARSER_VERSION,
+        license_note="fulltext_status=ok",
+    )
+    db_session.add(analysis)
+    db_session.flush()
+    return jurisdiction, documents, analysis, parse_ca_bulk_zip(
+        _build_synthetic_pubinfo_zip(rows, lobs),
+        source_url="https://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip",
+    )
+
+
 def test_ca_bill_id_join_matches_our_existing_url_format(db_session):
     """Confirms the join key end-to-end against a real bill_documents row
     shaped exactly like production CA rows (per the recon in
@@ -373,6 +532,238 @@ def test_apply_ca_bulk_fulltext_is_idempotent_on_rerun(db_session):
     assert second.matched == 1
     assert second.populated == 0
     assert second.unchanged_skipped == 1
+
+
+def test_content_update_fails_closed_when_url_changes_after_planning(db_session, monkeypatch):
+    ca_bill_id = f"202520260ZZ{uuid.uuid4().hex[:6].upper()}"
+    jurisdiction, document = _make_zz_jurisdiction_with_ca_style_document(
+        db_session, ca_bill_id=ca_bill_id, license_note="fulltext_status=robots_disallowed"
+    )
+    original_update = ca_bulk_fulltext._execute_content_updates
+
+    def change_url(db, updates, *, retrieved_at, jurisdiction_abbreviation):
+        db.execute(
+            update(BillDocument)
+            .where(BillDocument.id == document.id)
+            .values(url="https://leginfo.legislature.ca.gov/faces/billNavClient.xhtml?bill_id=other")
+        )
+        return original_update(
+            db,
+            updates,
+            retrieved_at=retrieved_at,
+            jurisdiction_abbreviation=jurisdiction_abbreviation,
+        )
+
+    monkeypatch.setattr(ca_bulk_fulltext, "_execute_content_updates", change_url)
+    with pytest.raises(RuntimeError, match="expected 1, updated 0"):
+        _apply_scoped_to_jurisdiction(
+            db_session, _one_entry_parse_result(ca_bill_id), jurisdiction.abbreviation
+        )
+
+
+def test_versioned_pdfs_receive_exact_text_nav_receives_latest_and_analysis_is_cleaned(db_session):
+    """Never flatten SB 957-style version history into the enrolled text."""
+
+    ca_bill_id = f"202520260SB{uuid.uuid4().hex[:6].upper()}"
+    jurisdiction, documents, analysis, parse_result = _make_versioned_ca_documents(
+        db_session, ca_bill_id=ca_bill_id
+    )
+
+    result = _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation)
+    assert result.matched == 9  # eight exact PDFs plus one canonical nav URL
+    assert result.populated == 9
+    assert result.ineligible_cleaned == 1
+    db_session.flush()
+
+    for number, document in enumerate(documents[:8], start=1):
+        db_session.refresh(document)
+        assert document.extracted_text == f"SB 957 official version {number}"
+        assert document.checksum == parse_result.by_bill_version_id[
+            f"20250SB95795V{number:02d}"
+        ].checksum
+    db_session.refresh(documents[-1])
+    assert documents[-1].extracted_text == "SB 957 official version 8"
+
+    db_session.refresh(analysis)
+    assert analysis.extracted_text is None
+    assert analysis.checksum is None
+    assert analysis.source_name == "openstates_bulk_csv"
+    assert analysis.source_url == analysis.url
+    assert analysis.parser_version is None
+    assert analysis.license_note == "fulltext_status=robots_disallowed"
+
+    second = _apply_scoped_to_jurisdiction(db_session, parse_result, jurisdiction.abbreviation)
+    assert second.populated == 0
+    assert second.ineligible_cleaned == 0
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "billPdf.xhtml?bill_id={bill_id}&version=unknown",
+        "billNavClient.xhtml?bill_id={bill_id}&version=unexpected",
+        "billAnalysisClient.xhtml?bill_id={bill_id}",
+    ],
+)
+def test_adapter_owned_ineligible_urls_are_cleaned_but_foreign_rows_are_preserved(db_session, suffix):
+    ca_bill_id = f"202520260SB{uuid.uuid4().hex[:6].upper()}"
+    jurisdiction, document = _make_zz_jurisdiction_with_ca_style_document(
+        db_session, ca_bill_id=ca_bill_id
+    )
+    version = db_session.get(BillVersion, document.bill_version_id)
+    assert version is not None
+    version.source_name = "openstates_api_sync"
+    document.url = f"https://leginfo.legislature.ca.gov/faces/{suffix.format(bill_id=ca_bill_id)}"
+    document.extracted_text = "incorrect CA bulk text"
+    document.checksum = "incorrect"
+    document.source_name = SOURCE_NAME
+    document.source_url = "https://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip"
+    document.parser_version = PARSER_VERSION
+    document.license_note = "fulltext_status=ok"
+    db_session.flush()
+
+    result = _apply_scoped_to_jurisdiction(
+        db_session, _one_entry_parse_result(ca_bill_id), jurisdiction.abbreviation
+    )
+    assert result.ineligible_cleaned == 1
+    db_session.refresh(document)
+    assert document.extracted_text is None
+    assert document.checksum is None
+    assert document.source_name == "openstates_api_sync"
+    assert document.source_url == document.url
+    assert document.parser_version is None
+
+    # A non-adapter source may carry an analysis; this CA bulk repair never
+    # mutates it just because it happens to include a CA bill_id parameter.
+    document.extracted_text = "foreign analysis"
+    document.checksum = "foreign"
+    document.source_name = "independent archive"
+    document.source_url = "https://archive.example.invalid/analysis"
+    document.parser_version = "archive/1"
+    db_session.flush()
+    foreign = _apply_scoped_to_jurisdiction(
+        db_session, _one_entry_parse_result(ca_bill_id), jurisdiction.abbreviation
+    )
+    assert foreign.ineligible_cleaned == 0
+    db_session.refresh(document)
+    assert document.extracted_text == "foreign analysis"
+    assert document.checksum == "foreign"
+    assert document.source_name == "independent archive"
+
+
+def test_ineligible_cleanup_fails_closed_on_concurrent_ownership_change(db_session, monkeypatch):
+    ca_bill_id = f"202520260SB{uuid.uuid4().hex[:6].upper()}"
+    jurisdiction, document = _make_zz_jurisdiction_with_ca_style_document(
+        db_session, ca_bill_id=ca_bill_id
+    )
+    version = db_session.get(BillVersion, document.bill_version_id)
+    assert version is not None
+    version.source_name = "openstates_api_sync"
+    document.url = (
+        "https://leginfo.legislature.ca.gov/faces/billAnalysisClient.xhtml?"
+        f"bill_id={ca_bill_id}"
+    )
+    document.extracted_text = "incorrect CA bulk text"
+    document.checksum = "incorrect"
+    document.source_name = SOURCE_NAME
+    document.source_url = "https://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip"
+    document.parser_version = PARSER_VERSION
+    db_session.flush()
+    original_cleanup = ca_bulk_fulltext._execute_ineligible_cleanups
+
+    def change_ownership(db, cleanups, *, jurisdiction_abbreviation):
+        db.execute(
+            update(BillDocument)
+            .where(BillDocument.id == document.id)
+            .values(source_name="concurrent source")
+        )
+        return original_cleanup(
+            db, cleanups, jurisdiction_abbreviation=jurisdiction_abbreviation
+        )
+
+    monkeypatch.setattr(ca_bulk_fulltext, "_execute_ineligible_cleanups", change_ownership)
+    with pytest.raises(RuntimeError, match="expected 1, updated 0"):
+        _apply_scoped_to_jurisdiction(
+            db_session, _one_entry_parse_result(ca_bill_id), jurisdiction.abbreviation
+        )
+
+
+def test_ineligible_cleanup_fails_closed_on_parent_provenance_drift(db_session, monkeypatch):
+    ca_bill_id = f"202520260SB{uuid.uuid4().hex[:6].upper()}"
+    jurisdiction, document = _make_zz_jurisdiction_with_ca_style_document(
+        db_session, ca_bill_id=ca_bill_id
+    )
+    version = db_session.get(BillVersion, document.bill_version_id)
+    assert version is not None
+    version.source_name = "openstates_api_sync"
+    document.url = (
+        "https://leginfo.legislature.ca.gov/faces/billAnalysisClient.xhtml?"
+        f"bill_id={ca_bill_id}"
+    )
+    document.extracted_text = "incorrect CA bulk text"
+    document.checksum = "incorrect"
+    document.source_name = SOURCE_NAME
+    document.source_url = "https://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip"
+    document.parser_version = PARSER_VERSION
+    db_session.flush()
+    original_cleanup = ca_bulk_fulltext._execute_ineligible_cleanups
+
+    def change_parent(db, cleanups, *, jurisdiction_abbreviation):
+        db.execute(
+            update(BillVersion)
+            .where(BillVersion.id == version.id)
+            .values(raw_ref="concurrent-parent-provenance")
+        )
+        return original_cleanup(
+            db, cleanups, jurisdiction_abbreviation=jurisdiction_abbreviation
+        )
+
+    monkeypatch.setattr(ca_bulk_fulltext, "_execute_ineligible_cleanups", change_parent)
+    with pytest.raises(RuntimeError, match="expected 1, updated 0"):
+        _apply_scoped_to_jurisdiction(
+            db_session, _one_entry_parse_result(ca_bill_id), jurisdiction.abbreviation
+        )
+
+
+def test_ineligible_cleanup_restores_available_parent_provenance(db_session):
+    ca_bill_id = f"202520260SB{uuid.uuid4().hex[:6].upper()}"
+    jurisdiction, document = _make_zz_jurisdiction_with_ca_style_document(
+        db_session, ca_bill_id=ca_bill_id
+    )
+    version = db_session.get(BillVersion, document.bill_version_id)
+    assert version is not None
+    parent_time = datetime(2025, 2, 1, tzinfo=timezone.utc)
+    version.source_name = "openstates_bulk_csv"
+    version.source_url = "https://openstates.org/ca/sb957"
+    version.upstream_id = "version-upstream-id"
+    version.retrieved_at = parent_time
+    version.upstream_updated_at = parent_time
+    version.raw_ref = "parent-raw-ref"
+    version.parser_version = "openstates/1"
+    document.url = (
+        "https://leginfo.legislature.ca.gov/faces/billAnalysisClient.xhtml?"
+        f"bill_id={ca_bill_id}"
+    )
+    document.extracted_text = "incorrect CA bulk text"
+    document.checksum = "incorrect"
+    document.source_name = SOURCE_NAME
+    document.source_url = "https://downloads.leginfo.legislature.ca.gov/pubinfo_2025.zip"
+    document.parser_version = PARSER_VERSION
+    document.raw_ref = "bulk-raw-ref"
+    db_session.flush()
+
+    result = _apply_scoped_to_jurisdiction(
+        db_session, _one_entry_parse_result(ca_bill_id), jurisdiction.abbreviation
+    )
+    assert result.ineligible_cleaned == 1
+    db_session.refresh(document)
+    assert document.source_name == version.source_name
+    assert document.source_url == version.source_url
+    assert document.upstream_id == version.upstream_id
+    assert document.retrieved_at == parent_time
+    assert document.upstream_updated_at == parent_time
+    assert document.raw_ref == version.raw_ref
+    assert document.parser_version == version.parser_version
 
 
 def test_apply_ca_bulk_fulltext_no_match_for_unrelated_bill_id(db_session):
