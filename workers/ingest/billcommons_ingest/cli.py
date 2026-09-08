@@ -2627,6 +2627,7 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                         flush=True,
                     )
                     if len(batch) > 1:
+                        unexpected_isolated_failure = False
                         for bill_id in batch:
                             isolated_db = get_session()
                             try:
@@ -2666,7 +2667,10 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                                 )
                             except Exception as isolated_exc:
                                 isolated_db.rollback()
-                                status_failures_this_cycle.add(bill_id)
+                                # An unexpected singleton failure is not a
+                                # malformed-input case. Preserve the remaining
+                                # pending bills and stop this recompute phase now.
+                                unexpected_isolated_failure = True
                                 print(
                                     f"sync-worker {worker_id}: status recompute FAILED "
                                     f"({type(isolated_exc).__name__}) for isolated bill; "
@@ -2675,6 +2679,10 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                                 )
                             finally:
                                 isolated_db.close()
+                            if unexpected_isolated_failure:
+                                break
+                        if unexpected_isolated_failure:
+                            break
                         continue
                     status_failures_this_cycle.add(batch[0])
                     print(

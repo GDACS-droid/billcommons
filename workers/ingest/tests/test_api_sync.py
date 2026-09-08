@@ -2311,3 +2311,64 @@ def test_sync_worker_unexpected_recompute_error_is_not_singleton_retried(monkeyp
     output = capsys.readouterr().out
     assert "RuntimeError" in output
     assert "database unavailable" not in output
+
+
+def test_sync_worker_stops_isolation_after_unexpected_singleton_error(monkeypatch, capsys):
+    """A limit-triggered batch may isolate, but a singleton runtime error
+    terminates the phase before another bill is attempted."""
+    from types import SimpleNamespace
+
+    class Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+        def __iter__(self):
+            return iter(())
+
+    class Session:
+        def execute(self, *_args, **_kwargs):
+            return Result()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    bill_ids = {uuid.uuid4(), uuid.uuid4()}
+    sorted_ids = sorted(bill_ids)
+    job = SimpleNamespace(id=uuid.uuid4(), attempts=1, payload={"state": "ZZ"})
+    claims = iter((job, None))
+    calls = []
+    monkeypatch.setattr(cli_mod, "get_session", lambda: Session())
+    monkeypatch.setattr(cli_mod.scheduler_mod, "run_schedule_pass", lambda _db: [])
+    monkeypatch.setattr(cli_mod.queue_mod, "claim_job", lambda *_args, **_kwargs: next(claims))
+    monkeypatch.setattr(cli_mod.queue_mod, "complete_job", lambda *_args: None)
+    monkeypatch.setattr(
+        cli_mod.api_sync_mod,
+        "run_api_sync_job",
+        lambda *_args, **_kwargs: ApiSyncResult(state="ZZ", touched_bill_ids=bill_ids),
+    )
+    monkeypatch.setattr(cli_mod, "enqueue_api_sync_continuation", lambda *_args: None)
+    monkeypatch.setattr(cli_mod.coverage_mod, "recompute_all_coverage", lambda _db: None)
+
+    def limit_then_unexpected(_db, batch, *_args, **_kwargs):
+        calls.append(list(batch))
+        if len(batch) > 1:
+            raise cli_mod.status_evidence_mod.DerivationInputLimitExceeded("limit")
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(cli_mod, "recompute_status_for_bills", limit_then_unexpected)
+    args = SimpleNamespace(worker_id="test", interval=0, max_jobs=1, once=True)
+    assert cli_mod.cmd_sync_worker(args) == 0
+
+    assert calls == [sorted_ids, [sorted_ids[0]]]
+    output = capsys.readouterr().out
+    assert "RuntimeError" in output
+    assert "store unavailable" not in output
