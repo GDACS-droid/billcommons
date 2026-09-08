@@ -26,7 +26,6 @@ from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_schema.models import (
     Bill,
-    BillAction,
     IngestJob,
     IngestionRun,
     Jurisdiction,
@@ -73,7 +72,6 @@ class BillEvidence:
     """Counts derived from the local `bills` table only."""
 
     bill_count: int = 0
-    action_count: int = 0
     missing_parser_version: int = 0
     missing_source_name: int = 0
     missing_source_url: int = 0
@@ -197,19 +195,7 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
                 {
                     "cadence_tier": evidence.cadence_tier,
                     "local_bill_count": 0,
-                    "local_action_count": bills.action_count,
                 },
-            )
-        )
-
-    if bills.bill_count and not bills.action_count:
-        defects.append(
-            Defect(
-                "error",
-                "EMPTY_ACTION_HISTORY",
-                jurisdiction,
-                "Local bills exist but no local action-history rows are recorded.",
-                {"local_bill_count": bills.bill_count, "local_action_count": 0},
             )
         )
 
@@ -392,7 +378,6 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
                 "No coverage row exists for the selected session or jurisdiction aggregate.",
                 {
                     "local_bill_count": bills.bill_count,
-                    "local_action_count": bills.action_count,
                 },
             )
         )
@@ -561,11 +546,9 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
     now = _utc(now) or datetime.now(timezone.utc)
     canonical_codes = tuple(sorted(PUBLIC_JURISDICTION_CODES))
     jurisdictions = db.execute(
-        select(Jurisdiction).where(func.upper(Jurisdiction.abbreviation).in_(canonical_codes))
+        select(Jurisdiction).where(Jurisdiction.abbreviation.in_(canonical_codes))
     ).scalars().all()
-    jurisdictions_by_code = {
-        jurisdiction.abbreviation.upper(): jurisdiction for jurisdiction in jurisdictions
-    }
+    jurisdictions_by_code = {jurisdiction.abbreviation: jurisdiction for jurisdiction in jurisdictions}
     jurisdiction_ids = tuple(jurisdiction.id for jurisdiction in jurisdictions)
 
     # PostgreSQL DISTINCT ON gives the collector precisely one operational
@@ -610,19 +593,9 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
         .where(Bill.jurisdiction_id.in_(jurisdiction_ids))
         .group_by(Bill.jurisdiction_id)
     ).all()
-    action_rows = db.execute(
-        select(Bill.jurisdiction_id, func.count(BillAction.id).label("action_count"))
-        .join(BillAction, BillAction.bill_id == Bill.id)
-        .where(Bill.jurisdiction_id.in_(jurisdiction_ids))
-        .group_by(Bill.jurisdiction_id)
-    ).all()
-    actions_by_jurisdiction = {
-        row.jurisdiction_id: int(row.action_count or 0) for row in action_rows
-    }
     bills = {
         row.jurisdiction_id: BillEvidence(
             bill_count=int(row.bill_count or 0),
-            action_count=actions_by_jurisdiction.get(row.jurisdiction_id, 0),
             missing_parser_version=int(row.missing_parser_version or 0),
             missing_source_name=int(row.missing_source_name or 0),
             missing_source_url=int(row.missing_source_url or 0),

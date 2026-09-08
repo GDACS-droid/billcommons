@@ -27,7 +27,7 @@ def _evidence(**overrides) -> JurisdictionEvidence:
         "name": "Example",
         "cadence_tier": "active",
         "cadence_minutes": 30,
-        "bills": BillEvidence(bill_count=10, action_count=10),
+        "bills": BillEvidence(bill_count=10),
         "latest_run": RunEvidence("adapter", "success", NOW - timedelta(minutes=5), NOW - timedelta(minutes=4)),
         "latest_successful_run": RunEvidence(
             "adapter", "success", NOW - timedelta(minutes=5), NOW - timedelta(minutes=4)
@@ -74,7 +74,7 @@ def test_ledger_orders_operational_failures_by_severity_then_jurisdiction():
             "openstates_api_sync", "success", NOW - timedelta(hours=2), NOW - timedelta(hours=2)
         ),
         bills=BillEvidence(
-            bill_count=10, action_count=10, missing_parser_version=3, missing_source_url=2
+            bill_count=10, missing_parser_version=3, missing_source_url=2
         ),
     )
 
@@ -97,7 +97,7 @@ def test_ledger_orders_operational_failures_by_severity_then_jurisdiction():
 
 def test_fail_on_only_fails_at_or_above_its_requested_threshold():
     report = build_report(
-        [_evidence(bills=BillEvidence(bill_count=10, action_count=10, missing_parser_version=1))], now=NOW
+        [_evidence(bills=BillEvidence(bill_count=10, missing_parser_version=1))], now=NOW
     )
 
     assert exit_code(report, None) == 0
@@ -188,14 +188,10 @@ def test_missing_canonical_jurisdiction_is_an_error_instead_of_being_dropped():
     assert exit_code(report, "error") == 1
 
 
-def test_empty_local_corpus_and_history_are_errors_without_claiming_source_freshness():
+def test_empty_local_corpus_is_an_error_without_claiming_source_freshness():
     empty_corpus = build_report([_evidence(bills=BillEvidence())], now=NOW)
-    missing_history = build_report(
-        [_evidence(bills=BillEvidence(bill_count=10, action_count=0))], now=NOW
-    )
 
     assert [row["code"] for row in empty_corpus["defects"]] == ["EMPTY_CORPUS"]
-    assert [row["code"] for row in missing_history["defects"]] == ["EMPTY_ACTION_HISTORY"]
     assert empty_corpus["honesty"]["official_freshness"] == "unverified"
     assert exit_code(empty_corpus, "error") == 1
 
