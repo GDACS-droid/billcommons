@@ -86,6 +86,13 @@ This laboratory is the shared foundation for state adapters. It does not claim
 that an official snapshot authorizes deleting local history: a source can be
 partial, revised, or unavailable.
 
+Florida bill-history snapshots are deliberately source-only until an adapter
+has explicit local-scope and occurrence-identity evidence. A retained Florida
+page can be useful provenance, but it is not a local fixture and must not be
+fed to this comparator merely because its text or dates resemble local actions.
+The current 2025 HB 7031 observation has no local association, comparison, or
+corpus mutation.
+
 ### Ambiguous-record shapes in schema version 1
 
 Treat `ambiguous_identities` as a union discriminated by `reason`. For

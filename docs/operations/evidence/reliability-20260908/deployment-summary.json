@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-08T08:42:00.545209+00:00",
+  "checked_at": "2026-09-08T10:03:23Z",
   "goal_status": "active; full autonomous 50-state semantic intelligence not complete",
   "units": {
     "api": {
@@ -15,15 +15,15 @@
       "archive_sha256": "e87652c353293139c6ea084689179ed56cf6097e39f176ac0f6cc849dd46af51"
     },
     "official_worker": {
-      "source_sha": "cff56b07d60885d938882498d028a1882cd50a64",
-      "deployment_id": "67e37132-0196-43ce-9411-0ab0c7fe61c5",
-      "image_digest": "sha256:4002135bee029056426427fba3094d3b184742e02ca3e29d1d1f255ce65db97f",
-      "archive_sha256": "ec9f70f3254e0c139e7a11ee8fa932011f7373505a05b61dfa180a4fc6e37370"
+      "source_sha": "e155da72e7a83c60d531f79103aa959617c81703",
+      "deployment_id": "a19bbb06-8a15-49ed-ad56-9d0e1daf0c32",
+      "image_digest": "sha256:cc5157621ea3ed48a4862bb2cd5802b115da7529b7f478b6260e6c716efefd7b",
+      "archive_sha256": "4870293dc981f7d90629f01f7bc3f11d3ed7381dcad5333dfc3b0103e8c0053c"
     },
     "web": {
-      "source_sha": "3758f511428491a9b1da9ce6f605dd841dbedb42",
-      "deployment_id": "dpl_H7wqdC5NuYdB6y4saDeKSZCDvFT3",
-      "archive_sha256": "a0ae13c710c43cde2f82ae7afd1164fc176221f5a1a97cb3d5b704443c0ea148"
+      "source_sha": "f610d67c7e4e7b4910ba483bac5779cd407b095f",
+      "deployment_id": "dpl_3TrSjdBRXHobJSimpppoj27U9WbJ",
+      "archive_sha256": "36cd3245de93a6999b080ec9d245ec7e562d54ac4988c4952de8f49d8a1265c7"
     }
   },
   "migration": {
@@ -35,10 +35,10 @@
   },
   "official_observations": {
     "jurisdictions": 51,
-    "targets": 58,
-    "enabled": 58,
+    "targets": 59,
+    "enabled": 59,
     "latest_status_counts": {
-      "succeeded": 48,
+      "succeeded": 49,
       "failed": 10
     },
     "remaining_failures": [
@@ -124,7 +124,7 @@
     "ca_comparison_total": 1418,
     "ca_canary_observation_id": "3ea8a9d5-edf6-4b90-a08c-37229e236316",
     "ca_public_hashes_and_sample_comparisons_replayed": true,
-    "scope": "Bounded landing-page discovery and six CA weekday action-delta comparisons; archive pairs are not unique bills or corpus updates",
+    "scope": "Bounded landing-page discovery, six CA weekday action-delta comparisons, and one source-only Florida bill-history snapshot; archive pairs are not unique bills or corpus updates",
     "ca_content_canary": {
       "scoped_bills": 346,
       "events": 8521,
@@ -141,7 +141,19 @@
       "historical_comparison_retained": true,
       "interpretation": "Bounded CA action content comparison; content correspondence is not occurrence proof and no corpus patch or statewide freshness is claimed"
     },
-    "ca_comparison_version_scope": "Thursday latest observation uses ca-action-content-multiset/1; previous comparisons retain their original versions."
+    "ca_comparison_version_scope": "Thursday latest observation uses ca-action-content-multiset/1; previous comparisons retain their original versions.",
+    "fl_semantic_canary": {
+      "source_sha": "e155da72e7a83c60d531f79103aa959617c81703",
+      "observation_id": "02f7c5f2-d50d-45c8-8b93-451539ac88c7",
+      "source_url": "https://www.flsenate.gov/Session/Bill/2025/7031",
+      "raw_sha256": "75218dc17299925b2787801e0d5c0b447faedad1be6573348412570e6a63b9b9",
+      "raw_bytes": 140611,
+      "snapshot_replay": "passed",
+      "local_association": false,
+      "reconciliation_or_comparison": false,
+      "corpus_mutation": false,
+      "interpretation": "One official bill-page history snapshot; not statewide freshness or completeness evidence"
+    }
   },
   "health": {
     "api_15_minute_samples": 16,
@@ -155,7 +167,9 @@
     "web_browser_errors": 0,
     "web_http_errors": 0,
     "official_post_activation_cycles": 2,
-    "latest_health_checked_at": "2026-09-08T08:41:16.496358+00:00"
+    "latest_health_checked_at": "2026-09-08T08:41:16.496358+00:00",
+    "official_e155_post_restore_cycles": 2,
+    "official_e155_cycle_monitor": "fl-semantic-live-monitor-e155da7.json: success"
   },
   "commercial": {
     "checked_at": "2026-09-08T06:21:27.788364+00:00",
@@ -222,6 +236,16 @@
   "official_review": {
     "status": "accepted",
     "coverage": "nine families across original, corrective and recovered full-diff reviews; not nine fresh final-commit reviews",
-    "evidence": "official-lab-review-accepted-cff56b0.json"
+    "evidence": "official-lab-review-accepted-cff56b0.json",
+    "web_f610d67": {
+      "status": "accepted_after_source_grounded_block_adjudication",
+      "evidence": "web-source-label-adjudication-f610d67.json",
+      "scope": "The rejected Senate-only premise conflicted with the retained HB 7031 page and parser contract; no source change was required."
+    },
+    "fl_e155da7": {
+      "status": "accepted_after_source_grounded_block_adjudication",
+      "evidence": "fl-semantic-review-accepted-e155da7.json",
+      "scope": "Three-review chain plus actual PG16 transaction/lock/identity proof; final raw BLOCK preserved and adjudicated against real flush-before-refresh call order."
+    }
   }
 }

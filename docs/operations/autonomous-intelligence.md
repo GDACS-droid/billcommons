@@ -13,23 +13,24 @@ in the original checkout are preserved. The canonical inventory covers 50 states
 plus DC. Generic website observation is never treated as proof of statewide
 semantic freshness or completeness.
 
-## Acceptance and present limits — 2026-09-08 06:53 UTC
+## Acceptance and present limits — 2026-09-08 10:03 UTC
 
 The deployed and hash-bound release status is recorded in
 [data-reliability-control-plane.md](data-reliability-control-plane.md) and its
 [sanitized deployment summary](evidence/reliability-20260908/deployment-summary.json).
-API and sync run `c05ae42`; web runs the data-only `3758f51`; the recurring
-official worker runs the separately accepted CA cap fix `815be4a` on `c05ae42`.
-The additive migrations through `0030` are applied, and the initial UTC-day
-source budget was conservatively seeded at its full 225-request allowance.
+API and sync run `c05ae42`; web runs `f610d67`; the recurring official worker
+runs `e155da7`. The additive migrations through `0030` are applied, and the
+initial UTC-day source budget was conservatively seeded at its full
+225-request allowance. The official worker has completed two healthy cycles
+after the 59-target inventory was restored and enabled.
 
 | Requirement | Current evidence | Remaining acceptance gap |
 | --- | --- | --- |
 | Detect stale data | Live 51-jurisdiction report, 17 overdue sync warnings, explicit source outcomes and future retry eligibility | Semantic freshness/completeness adapters beyond bounded CA archives; finer worker cadence |
 | Repair failures | Shared quota/backoff, bounded observation transactions; confirmed CA parser cap repaired and five failed targets retried successfully | Autonomous fixture-based parser-repair proposal/promotion; discrepancy-driven corpus repair; TX gate below |
-| Discover official material | 58 enabled targets across 51 jurisdictions, every target attempted, 48 latest successes and 10 explicit failures | State-specific facts beyond landing pages; remaining source-access failures; deeper FL/CA Scout |
-| Prove updates | Public exact-byte/hash APIs and versioned comparison/update ledgers; 1,418 completed CA bill/archive comparisons with sampled public replay | Generic-worker forward evidence rollout; no retroactive proof for untracked historical updates; declared external snapshot inputs |
-| Operate autonomously | Dedicated recurring worker, durable schedule/backoff, 300-second hard observation deadline, real claim pause and graceful shutdown; two post-activation cycles | Broader semantic state coverage, automatic discrepancy remediation, durable saved-topic product workflow |
+| Discover official material | 59 enabled targets across 51 jurisdictions, including one bounded Florida bill-history source snapshot; prior 48-success/10-failure inventory outcomes remain retained | State-specific facts beyond landing pages; remaining source-access failures; deeper FL/CA Scout |
+| Prove updates | Public exact-byte/hash APIs and versioned CA comparison/update ledgers; 1,418 completed CA bill/archive comparisons with sampled public replay; one public Florida source-only snapshot replay | Generic-worker forward evidence rollout; no retroactive proof for untracked historical updates; declared external snapshot inputs |
+| Operate autonomously | Dedicated recurring worker, durable schedule/backoff, 300-second hard observation deadline, real claim pause and graceful shutdown; two healthy `e155da7` cycles after all 59 targets were enabled | Broader semantic state coverage, automatic discrepancy remediation, durable saved-topic product workflow |
 | Deploy | API, web, sync and official worker deployed with immutable source/archive/image bindings, restored backup and post-deploy runtime/browser proof | Generic-worker cutover and held TX repair; the full objective remains active |
 
 ## Current release gates
@@ -49,6 +50,26 @@ The initial observer pass and cap repair preserve source failure evidence.
 Robots restrictions, unavailable robots, a denied redirect, JavaScript-only
 content and three timeouts remain explicit; a CA Sunday capture has no retained
 archive. These do not establish source agreement or statewide completeness.
+
+### Florida bill-history canary
+
+`e155da7` added a bounded, source-only Florida observation for
+[`https://www.flsenate.gov/Session/Bill/2025/7031`](https://www.flsenate.gov/Session/Bill/2025/7031).
+The retained 140,611-byte response has SHA-256
+`75218dc17299925b2787801e0d5c0b447faedad1be6573348412570e6a63b9b9`;
+its public snapshot replay and the browser proof both passed. It is one
+official bill-page history observation. It has no local Bill association, no
+reconciliation/comparison record, and no corpus mutation. The web release
+`f610d67` exposes its exact source URL and retained response and says that a
+bill-history check does not establish statewide completeness.
+
+The five-family review of `f610d67` had one block that claimed the adapter was
+Senate-chamber-only. The accepted adjudication checked the retained `HB 7031`
+page and parser: it accepts House and Senate bill titles and preserves both
+chamber values in the history. The Florida Senate is the host; “Florida bill
+history” does not make a Senate-only or statewide claim. The source-grounded
+adjudication is retained as
+`web-source-label-adjudication-f610d67.json`.
 
 ## Historical preflight, implementation and review record
 
@@ -85,6 +106,9 @@ and July 24 existed, but no scheduled volume backups were configured.
   the same archive across bounded 500-bill pages without refetching. Cursor and
   comparison records commit together. Offline replay checks hashes, versions,
   exact diff bytes and summary without HTTP or current action reads.
+- Florida bill-history observations retain one exact, canonical Florida Senate
+  bill page and its parsed page-local facts. They deliberately do not map that
+  page to a local Bill, compare it with local actions, or mutate corpus data.
 - The source overview includes missing targets, failures, overdue observations,
   next retry and exact evidence pointers for all 51 canonical jurisdictions.
 - API-sync retains the exact Open States response before JSON decoding. Actual
