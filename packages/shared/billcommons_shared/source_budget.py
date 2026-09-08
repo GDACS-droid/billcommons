@@ -51,7 +51,9 @@ def reserve_request(
     Caller commits before sending HTTP. Production uses the database clock;
     ``now`` exists for deterministic clock-boundary tests. A lower limit or
     slower caller tightens the current day's shared policy, never loosens it.
-    The global pacing timestamp survives midnight independently of the count.
+    Tightening pacing also moves a pending admission out to the new interval
+    once; repeated calls at the same interval do not keep sliding it. The
+    global pacing timestamp survives midnight independently of the count.
     """
     if not re.fullmatch(r"[a-z0-9][a-z0-9_.:-]{0,79}", scope):
         raise ValueError("invalid public request-budget scope")
@@ -80,6 +82,7 @@ def reserve_request(
     observed_at = (now or db.scalar(select(func.clock_timestamp()))).astimezone(timezone.utc)
     if observed_at.date() < row.budget_date:
         raise RequestBudgetUnavailable("request-budget clock moved backwards")
+    interval_tightened = minimum_interval_seconds > row.minimum_interval_seconds
     if observed_at.date() > row.budget_date:
         row.budget_date = observed_at.date()
         row.requests_reserved = 0
@@ -88,6 +91,11 @@ def reserve_request(
     else:
         row.request_limit = min(row.request_limit, daily_limit)
         row.minimum_interval_seconds = max(row.minimum_interval_seconds, minimum_interval_seconds)
+    if interval_tightened:
+        row.next_request_at = max(
+            row.next_request_at,
+            observed_at + timedelta(seconds=row.minimum_interval_seconds),
+        )
     row.updated_at = observed_at
 
     exhausted = row.requests_reserved >= row.request_limit

@@ -48,16 +48,38 @@ def test_concurrent_connections_share_daily_limit_and_pacing(scope):
         assert row.requests_reserved == 7
 
 
-def test_midnight_resets_count_without_resetting_global_pacing(scope):
+def test_tightening_pacing_blocks_an_early_same_day_arrival(scope):
+    assert admit(scope, NOW, limit=5, interval=1).admitted
+    waiting = admit(scope, NOW + timedelta(seconds=1), limit=2, interval=10)
+    assert not waiting.admitted and not waiting.exhausted
+    assert waiting.retry_after_seconds == 10
+    assert admit(scope, NOW + timedelta(seconds=11), limit=2, interval=10).admitted
+
+
+def test_same_interval_wait_does_not_keep_sliding_pacing(scope):
+    assert admit(scope, NOW, interval=10).admitted
+    first_wait = admit(scope, NOW + timedelta(seconds=5), interval=10)
+    second_wait = admit(scope, NOW + timedelta(seconds=6), interval=10)
+    assert not first_wait.admitted and first_wait.retry_after_seconds == 5
+    assert not second_wait.admitted and second_wait.retry_after_seconds == 4
+
+
+def test_existing_later_wait_is_preserved_when_policy_changes(scope):
+    assert admit(scope, NOW, interval=30).admitted
+    waiting = admit(scope, NOW + timedelta(seconds=5), interval=10)
+    assert not waiting.admitted
+    assert waiting.retry_after_seconds == 25
+
+
+def test_midnight_tightening_resets_count_but_preserves_new_global_pacing(scope):
     before = NOW.replace(hour=23, minute=59, second=58)
-    assert admit(scope, before, limit=1, interval=10).admitted
-    after = before + timedelta(seconds=3)
-    waiting = admit(scope, after, limit=1, interval=10)
+    assert admit(scope, before, limit=2, interval=1).admitted
+    midnight = before + timedelta(seconds=2)
+    waiting = admit(scope, midnight, limit=2, interval=10)
     assert not waiting.admitted and not waiting.exhausted
     assert waiting.requests_reserved == 0
-    assert waiting.retry_after_seconds == 7
-    assert admit(scope, before + timedelta(seconds=10), limit=1, interval=10).admitted
-    assert admit(scope, before + timedelta(seconds=20), limit=1, interval=10).exhausted
+    assert waiting.retry_after_seconds == 10
+    assert admit(scope, midnight + timedelta(seconds=10), limit=2, interval=10).admitted
 
 
 def test_restart_or_ingest_rollback_does_not_refund_admission(scope):
@@ -76,7 +98,8 @@ def test_restart_or_ingest_rollback_does_not_refund_admission(scope):
 
 def test_tighter_callers_cannot_be_overridden_later_that_day(scope):
     assert admit(scope, NOW, limit=5, interval=1).admitted
-    assert admit(scope, NOW + timedelta(seconds=1), limit=2, interval=10).admitted
+    assert not admit(scope, NOW + timedelta(seconds=1), limit=2, interval=10).admitted
+    assert admit(scope, NOW + timedelta(seconds=11), limit=2, interval=10).admitted
     limited = admit(scope, NOW + timedelta(seconds=30), limit=100, interval=1)
     assert limited.exhausted and limited.request_limit == 2
     with Session(get_engine()) as db:
