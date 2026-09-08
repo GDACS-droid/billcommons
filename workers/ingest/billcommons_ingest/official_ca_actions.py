@@ -17,12 +17,13 @@ import csv
 import hashlib
 import io
 import re
+import time
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from types import MappingProxyType
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 from urllib.parse import urlsplit
 
 import httpx
@@ -56,6 +57,9 @@ HISTORY_COLUMNS = (
 # The delta is normally only a few MB.  These values deliberately bound both
 # wire bytes and every decompressed member before any CSV parsing occurs.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_RESPONSE_CHUNK_BYTES = 64 * 1024
+PER_READ_TIMEOUT_SECONDS = 30.0
+TOTAL_RESPONSE_DEADLINE_SECONDS = 180.0
 MAX_ZIP_MEMBERS = 32
 MAX_MEMBER_UNCOMPRESSED_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -139,6 +143,22 @@ class ParsedCaOfficialActionsBatch:
     @property
     def event_count(self) -> int:
         return sum(len(events) for events in self.events_by_official_bill_id.values())
+
+
+@dataclass(frozen=True)
+class CapturedCaOfficialActionsResponse:
+    """Exact response evidence captured before any ZIP or table parsing.
+
+    Callers persist this object before parsing so a malformed publisher
+    response remains independently inspectable alongside its failed parser
+    observation.
+    """
+
+    source_url: str
+    raw_bytes: bytes
+    sha256: str
+    retrieved_at: datetime
+    upstream_modified: str | None
 
 
 def ca_delta_url(day: str) -> str:
@@ -411,24 +431,40 @@ def parse_ca_official_actions_zip(
     )
 
 
-def fetch_ca_official_actions_delta(
+def _require_before_response_deadline(started_at: float, clock: Callable[[], float]) -> None:
+    if clock() - started_at > TOTAL_RESPONSE_DEADLINE_SECONDS:
+        raise OfficialCaActionsError(
+            f"official CA delta response exceeded {TOTAL_RESPONSE_DEADLINE_SECONDS:g}s total deadline"
+        )
+
+
+def fetch_ca_official_actions_response(
     day: str,
     *,
     client: httpx.Client | None = None,
     retrieved_at: datetime | None = None,
-) -> ParsedCaOfficialActionsBatch:
-    """Fetch and parse one exact CA delta URL with a hard streaming cap.
+    clock: Callable[[], float] = time.monotonic,
+) -> CapturedCaOfficialActionsResponse:
+    """Capture one exact CA delta response without parsing it.
 
     Only ``Last-Modified`` is retained as upstream freshness evidence.  The
     response ``Date`` header is transport metadata and is never promoted to
-    upstream freshness.
+    upstream freshness.  The request does not follow redirects, so a redirect
+    cannot cause this adapter to fetch a government HTML page or another URL.
     """
 
     source_url = ca_delta_url(day)
     owns_client = client is None
-    client = client or new_client(timeout=httpx.Timeout(30.0, read=120.0))
+    client = client or new_client(timeout=httpx.Timeout(PER_READ_TIMEOUT_SECONDS))
+    started_at = clock()
     try:
-        with client.stream("GET", source_url) as response:
+        with client.stream(
+            "GET",
+            source_url,
+            follow_redirects=False,
+            timeout=httpx.Timeout(PER_READ_TIMEOUT_SECONDS),
+        ) as response:
+            _require_before_response_deadline(started_at, clock)
             if str(response.url) != source_url:
                 raise OfficialCaActionsError("official CA delta fetch was redirected away from its exact source URL")
             if response.status_code != 200:
@@ -445,7 +481,10 @@ def fetch_ca_official_actions_delta(
                     raise OfficialCaActionsError("official CA delta Content-Length exceeds response cap")
             chunks: list[bytes] = []
             received = 0
-            for chunk in response.iter_bytes():
+            for chunk in response.iter_bytes(chunk_size=MAX_RESPONSE_CHUNK_BYTES):
+                _require_before_response_deadline(started_at, clock)
+                if len(chunk) > MAX_RESPONSE_CHUNK_BYTES:
+                    raise OfficialCaActionsError("official CA delta response chunk exceeds chunk cap")
                 received += len(chunk)
                 if received > MAX_RESPONSE_BYTES:
                     raise OfficialCaActionsError("official CA delta streamed response exceeds response cap")
@@ -455,9 +494,33 @@ def fetch_ca_official_actions_delta(
     finally:
         if owns_client:
             client.close()
-    return parse_ca_official_actions_zip(
-        raw_bytes,
+    return CapturedCaOfficialActionsResponse(
         source_url=source_url,
-        retrieved_at=retrieved_at or datetime.now(timezone.utc),
+        raw_bytes=raw_bytes,
+        sha256=hashlib.sha256(raw_bytes).hexdigest(),
+        retrieved_at=_require_aware_utc(retrieved_at or datetime.now(timezone.utc)),
         upstream_modified=upstream_modified,
+    )
+
+
+def fetch_ca_official_actions_delta(
+    day: str,
+    *,
+    client: httpx.Client | None = None,
+    retrieved_at: datetime | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> ParsedCaOfficialActionsBatch:
+    """Fetch and parse one exact CA delta URL with the capture contract."""
+
+    captured = fetch_ca_official_actions_response(
+        day,
+        client=client,
+        retrieved_at=retrieved_at,
+        clock=clock,
+    )
+    return parse_ca_official_actions_zip(
+        captured.raw_bytes,
+        source_url=captured.source_url,
+        retrieved_at=captured.retrieved_at,
+        upstream_modified=captured.upstream_modified,
     )

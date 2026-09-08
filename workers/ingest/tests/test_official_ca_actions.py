@@ -140,17 +140,77 @@ def test_fetch_does_not_infer_upstream_freshness_from_http_date():
     assert batch.upstream_modified is None
 
 
-def test_fetch_rejects_a_followed_redirect_away_from_the_exact_source_url():
-    raw = _valid_zip()
+def test_fetch_rejects_redirect_without_fetching_its_destination():
+    requests: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "downloads.leginfo.legislature.ca.gov":
-            return httpx.Response(302, headers={"Location": "https://example.test/delta.zip"}, request=request)
-        return httpx.Response(200, content=raw, request=request)
+        requests.append(str(request.url))
+        return httpx.Response(302, headers={"Location": "https://example.test/delta.zip"}, request=request)
 
     with httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
-        with pytest.raises(adapter.OfficialCaActionsError, match="redirected away"):
+        with pytest.raises(adapter.OfficialCaActionsError, match="HTTP 302"):
+            adapter.fetch_ca_official_actions_response("Mon", client=client, retrieved_at=RETRIEVED_AT)
+
+    assert requests == ["https://downloads.leginfo.legislature.ca.gov/pubinfo_Mon.zip"]
+
+
+def test_capture_returns_malformed_zip_evidence_before_parser_failure():
+    raw = b"not a ZIP archive"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=raw,
+            headers={"Last-Modified": "Mon, 07 Sep 2026 14:00:00 GMT"},
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        captured = adapter.fetch_ca_official_actions_response("Mon", client=client, retrieved_at=RETRIEVED_AT)
+
+    assert isinstance(captured, adapter.CapturedCaOfficialActionsResponse)
+    assert captured.raw_bytes == raw
+    assert captured.sha256 == hashlib.sha256(raw).hexdigest()
+    assert captured.upstream_modified == "Mon, 07 Sep 2026 14:00:00 GMT"
+    with pytest.raises(adapter.OfficialCaActionsError, match="valid ZIP archive"):
+        adapter.parse_ca_official_actions_zip(
+            captured.raw_bytes,
+            source_url=captured.source_url,
+            retrieved_at=captured.retrieved_at,
+            upstream_modified=captured.upstream_modified,
+        )
+
+    # Compatibility wrapper still gives callers the former fetch-and-parse
+    # behavior; orchestration that needs durable evidence uses capture first.
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(adapter.OfficialCaActionsError, match="valid ZIP archive"):
             adapter.fetch_ca_official_actions_delta("Mon", client=client, retrieved_at=RETRIEVED_AT)
+
+
+def test_capture_fails_a_slow_drip_at_the_total_monotonic_deadline():
+    class SlowStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"partial response"
+
+        def close(self) -> None:
+            return None
+
+    ticks = iter((0.0, 0.0, adapter.TOTAL_RESPONSE_DEADLINE_SECONDS + 0.1))
+
+    def clock() -> float:
+        return next(ticks)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=SlowStream(), request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(adapter.OfficialCaActionsError, match="total deadline"):
+            adapter.fetch_ca_official_actions_response(
+                "Mon",
+                client=client,
+                retrieved_at=RETRIEVED_AT,
+                clock=clock,
+            )
 
 
 @pytest.mark.parametrize(
