@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -223,6 +223,41 @@ def test_scout_partial_monitor_snapshot_excludes_unverified_stages(monkeypatch):
         "https://www.leginfo.ca.gov/retained/no-finding.zip",
     }
     assert by_url["https://www.leginfo.ca.gov/retained/no-finding.zip"]["finding_ids"] == []
+
+
+def test_scout_monitor_rejects_finding_without_final_snapshot_source(monkeypatch):
+    """A finding cannot make staged or incomplete evidence monitorable."""
+    app, owner, _other, sessions = _app(monkeypatch)
+    with sessions() as db:
+        job = ScoutResearchJob(
+            customer_id=owner.id, original_query="AB 123 2025-2026", normalized_query="ab 123 2025-2026",
+            jurisdiction="CA", cache_key="monitor-incomplete-only", status="partial",
+            strategy={"adapter": "california_retained_p0", "mode": "retained_official_archive"},
+            limits={}, usage={}, completed_at=datetime.now(timezone.utc),
+        )
+        db.add(job)
+        db.flush()
+        incomplete = ScoutSource(
+            job_id=job.id, canonical_url="https://www.leginfo.ca.gov/retained/incomplete-only.zip",
+            official=True, retrieval_mechanism="official_retained_archive",
+        )
+        db.add(incomplete)
+        db.flush()
+        db.add(ScoutFinding(
+            job_id=job.id, source_id=incomplete.id, title="AB 123", what_happened="Incomplete retention.",
+            confidence="high", extractor_version="incomplete-monitor-test",
+        ))
+        db.commit()
+        job_id = job.id
+    headers = {"x-test-customer": str(owner.id)}
+    with TestClient(app) as client:
+        rejected = client.post(f"/api/v1/scout/jobs/{job_id}/monitor", json={}, headers=headers)
+    assert rejected.status_code == 422
+    assert rejected.json()["error"]["code"] == "monitor_baseline_missing_final_evidence"
+    with sessions() as db:
+        assert db.scalar(select(func.count()).select_from(ScoutMonitor).where(
+            ScoutMonitor.customer_id == owner.id
+        )) == 0
 
 
 def test_scout_creation_snapshots_document_processing_caps(monkeypatch):

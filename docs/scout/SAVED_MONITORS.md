@@ -36,3 +36,9 @@ approved capacity. Resuming a monitor requires the current rollout policy;
 pause and owner history remain available during a dark rollback.
 4. Monitor `deferred` runs and quota codes before increasing the monitor cap
 or shortening the minimum cadence. No monitor is a reserved provider budget.
+
+The `scout_monitor_runs.job_id` foreign key is `NO ACTION DEFERRABLE
+INITIALLY DEFERRED`. A standalone job deletion is rejected at transaction
+commit while its monitor-run journal still references it. An owner deletion
+can commit because its cascades remove the owner's monitors and their runs in
+that same transaction before the deferred check runs.

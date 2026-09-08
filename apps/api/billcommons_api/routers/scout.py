@@ -473,6 +473,17 @@ def _validate_monitor_cadence(cadence_seconds: int, settings: ScoutSettings) -> 
         )
 
 
+def _require_monitorable_baseline(job: ScoutResearchJob) -> None:
+    if job.status not in {"completed", "partial"} or is_operator_strategy(job):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_monitor_baseline",
+                "message": "Save a completed Scout result with user-visible evidence.",
+            },
+        )
+
+
 @router.post("/jobs/{job_id}/monitor", status_code=201)
 def save_monitor(
     job_id: uuid.UUID,
@@ -486,15 +497,30 @@ def save_monitor(
     customer = _require_session(request, db)
     _require_canary(customer, settings)
     _validate_monitor_cadence(body.cadence_seconds, settings)
-    # Follow the admission lock ordering: owner row first, then the selected
-    # terminal job. This makes a concurrent duplicate save deterministic.
+    # A running job may be terminalizing while it holds its job lock and walks
+    # monitor runs. Reject it before taking the customer lock, so an invalid
+    # save cannot form monitor -> customer -> job with that terminalizer.
+    _require_monitorable_baseline(_job_for_owner(db, customer, job_id))
+    # Once the preflight sees a terminal result, acquire owner then job for a
+    # deterministic duplicate-save decision and revalidate under that lock.
     db.execute(select(ApiCustomer.id).where(ApiCustomer.id == customer.id).with_for_update())
     job = _job_for_owner(db, customer, job_id, lock=True)
-    if job.status not in {"completed", "partial"} or is_operator_strategy(job):
-        raise HTTPException(status_code=422, detail={"code": "invalid_monitor_baseline", "message": "Save a completed Scout result with user-visible evidence."})
+    _require_monitorable_baseline(job)
     evidence_count = db.scalar(select(func.count()).select_from(ScoutFinding).where(ScoutFinding.job_id == job.id)) or 0
     if evidence_count < 1:
         raise HTTPException(status_code=422, detail={"code": "monitor_baseline_missing_evidence", "message": "Save a Scout result that retained evidence."})
+    try:
+        snapshot = source_snapshot(db, job.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": str(exc), "message": "Baseline evidence is too large to monitor safely."}) from exc
+    if not snapshot["sources"]:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "monitor_baseline_missing_final_evidence",
+                "message": "Save a Scout result with a retained final official source.",
+            },
+        )
     existing = db.execute(select(ScoutMonitor).where(
         ScoutMonitor.customer_id == customer.id,
         ScoutMonitor.normalized_query == job.normalized_query,
@@ -520,10 +546,6 @@ def save_monitor(
     )
     db.add(monitor)
     db.flush()
-    try:
-        snapshot = source_snapshot(db, job.id)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail={"code": str(exc), "message": "Baseline evidence is too large to monitor safely."}) from exc
     baseline = ScoutMonitorRun(
         monitor_id=monitor.id,
         job_id=job.id,

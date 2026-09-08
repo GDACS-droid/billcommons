@@ -1724,7 +1724,9 @@ class ScoutMonitorRun(UUIDPkMixin, Base):
         UUID(as_uuid=True), ForeignKey("scout_monitors.id", ondelete="CASCADE"), nullable=False
     )
     job_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("scout_research_jobs.id", ondelete="RESTRICT"), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("scout_research_jobs.id", ondelete="NO ACTION", deferrable=True, initially="DEFERRED"),
+        nullable=True,
     )
     baseline_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     status: Mapped[str] = mapped_column(Text, nullable=False)

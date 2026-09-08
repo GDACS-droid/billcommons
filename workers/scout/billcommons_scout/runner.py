@@ -45,6 +45,7 @@ from billcommons_shared.scout import (
     content_hash, discover_florida_senate_related_documents, discover_florida_senate_vote_records,
     CALIFORNIA, extract_california_bill_query, extract_florida_bill_identifier, summarize_content_change,
     is_pdf_attachment_payload, topical_search_terms,
+    scout_cache_key, scout_cache_namespace,
 )
 from billcommons_scout.providers import ProviderSessionPersistenceError, SolariProviderError
 from billcommons_scout.pdf_extract import extract_pdf_text
@@ -267,7 +268,7 @@ class ScoutRunner:
                 select(ScoutResearchJob)
                 .where(or_(ScoutResearchJob.status == "queued", (ScoutResearchJob.status == "running") & (ScoutResearchJob.lease_expires_at < now)))
                 .order_by(ScoutResearchJob.created_at)
-                .with_for_update(skip_locked=True)
+                .with_for_update(key_share=True, skip_locked=True)
                 .limit(1)
             )
             job = db.execute(stmt).scalar_one_or_none()
@@ -366,13 +367,22 @@ class ScoutRunner:
                 self._defer_monitor(db, monitor, now, "scout_rollout_not_available")
                 db.commit()
                 return True
+            # The baseline run retains its original job/evidence references,
+            # while a scheduler turn uses today's cache namespace so it
+            # coalesces with an identical interactive request after a
+            # semantic bump.
+            cache_key = scout_cache_key(
+                monitor.normalized_query,
+                monitor.jurisdiction,
+                freshness_bucket=scout_cache_namespace(monitor.jurisdiction),
+            )
             try:
                 admission = admit_scout_job(
                     db, customer,
                     original_query=monitor.original_query,
                     normalized_query=monitor.normalized_query,
                     jurisdiction=monitor.jurisdiction,
-                    cache_key=monitor.cache_key,
+                    cache_key=cache_key,
                     settings=self.settings,
                 )
             except ScoutAdmissionError as exc:
@@ -384,6 +394,7 @@ class ScoutRunner:
             # already consumed a normal scheduling opportunity, and a later
             # terminalizer must not erase a newer unrelated deferral.
             monitor.consecutive_deferrals = 0
+            monitor.cache_key = cache_key
             mode = "cached" if admission.cached else "coalesced" if admission.coalesced else "new"
             run = ScoutMonitorRun(
                 monitor_id=monitor.id,
@@ -420,9 +431,10 @@ class ScoutRunner:
         return True
 
     def _finalize_monitor_runs(self, db: Session, job: ScoutResearchJob, status: str, completed_at: datetime) -> None:
-        # All terminal paths acquire a run before its monitor.  Scheduler
-        # admission deliberately does not lock a job while holding a monitor,
-        # so this cannot form a monitor/job lock inversion.
+        # All terminal paths acquire a run before its monitor. Scheduler run
+        # inserts take an implicit FK KEY SHARE on the job while holding a
+        # monitor; claim/fence paths therefore use NO KEY UPDATE, which is
+        # compatible with that FK lock.
         runs = db.scalars(select(ScoutMonitorRun).where(
             ScoutMonitorRun.job_id == job.id, ScoutMonitorRun.status == "queued"
         ).with_for_update(skip_locked=True)).all()
@@ -622,7 +634,7 @@ class ScoutRunner:
             ScoutResearchJob.claim_token == token,
             ScoutResearchJob.lease_expires_at.is_not(None),
             ScoutResearchJob.lease_expires_at > now,
-        ).with_for_update()).scalar_one_or_none()
+        ).with_for_update(key_share=True)).scalar_one_or_none()
 
     def _candidates(self, db: Session, job: ScoutResearchJob) -> list[tuple]:
         identifier = extract_florida_bill_identifier(job.original_query)

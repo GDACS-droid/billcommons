@@ -40,7 +40,13 @@ def upgrade() -> None:
         "scout_monitor_runs",
         sa.Column("id", UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
         sa.Column("monitor_id", UUID(as_uuid=True), sa.ForeignKey("scout_monitors.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("job_id", UUID(as_uuid=True), sa.ForeignKey("scout_research_jobs.id", ondelete="RESTRICT"), nullable=True),
+        sa.Column(
+            "job_id", UUID(as_uuid=True),
+            sa.ForeignKey(
+                "scout_research_jobs.id", ondelete="NO ACTION", deferrable=True, initially="DEFERRED"
+            ),
+            nullable=True,
+        ),
         sa.Column("baseline_run_id", UUID(as_uuid=True), nullable=True),
         sa.Column("status", sa.Text(), nullable=False),
         sa.Column("execution_mode", sa.Text(), nullable=False),
