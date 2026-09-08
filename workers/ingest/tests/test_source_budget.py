@@ -149,3 +149,26 @@ def test_pacing_sleep_occurs_after_session_closes(monkeypatch):
     module.consume_request(scope="test", daily_limit=1, minimum_interval_seconds=1,
                            session_factory=FakeSession, sleep=lambda _: events.append("sleep"))
     assert events == ["open", "commit", "close", "sleep", "open", "commit", "close"]
+
+
+def test_midnight_resets_count_without_resetting_global_pacing(scope):
+    before = NOW.replace(hour=23, minute=59, second=58)
+    assert admit(scope, before, limit=1, interval=10).admitted
+    after = before + timedelta(seconds=3)
+    waiting = admit(scope, after, limit=1, interval=10)
+    assert not waiting.admitted and not waiting.exhausted
+    assert waiting.requests_reserved == 0
+    assert waiting.retry_after_seconds == 7
+    assert admit(scope, before + timedelta(seconds=10), limit=1, interval=10).admitted
+    assert admit(scope, before + timedelta(seconds=20), limit=1, interval=10).exhausted
+
+
+
+def test_interval_tightening_preserves_an_already_later_reservation(scope):
+    assert admit(scope, NOW, interval=1).admitted
+    with Session(get_engine()) as db:
+        db.get(SourceRequestBudget, scope).next_request_at = NOW + timedelta(seconds=30)
+        db.commit()
+    waiting = admit(scope, NOW + timedelta(seconds=5), interval=10)
+    assert not waiting.admitted and waiting.retry_after_seconds == 25
+    assert admit(scope, NOW + timedelta(seconds=30), interval=10).admitted
