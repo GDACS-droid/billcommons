@@ -13,6 +13,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
@@ -207,6 +208,100 @@ def test_failed_fetch_stores_no_raw_and_uses_durable_backoff(db_session, unique_
     assert db_session.scalar(select(func.count()).select_from(OfficialRawBlob)) == 0
     assert target.consecutive_failures == 1
     assert target.next_check_at == NOW + timedelta(seconds=300)
+
+
+def test_http_503_capture_failure_persists_safe_diagnosis_and_observed_status(
+    db_session, unique_abbr, monkeypatch
+):
+    _, target = _target(db_session, unique_abbr)
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(unavailable)) as client:
+        monkeypatch.setattr(
+            observer,
+            "_capture_ca_response",
+            lambda day: ca_actions.fetch_ca_official_actions_response(day, client=client, retrieved_at=NOW),
+        )
+        result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "failed"
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.raw_sha256 is None
+    assert observation.http_status == 503
+    assert observation.scope["failure"] == {
+        "version": 1,
+        "stage": "capture",
+        "code": "http_status_unexpected",
+        "recommended_action": "retry_as_scheduled",
+        "details": {"http_status": 503},
+    }
+    assert "failure" not in target.scope
+    assert db_session.scalar(select(func.count()).select_from(OfficialRawBlob)) == 0
+
+
+def test_capture_deadline_never_invents_http_200(db_session, unique_abbr, monkeypatch):
+    _, _ = _target(db_session, unique_abbr)
+    timeout = ca_actions.OfficialCaActionsError(
+        "private capture timeout text",
+        code="response_deadline_exceeded",
+        details={"limit": int(ca_actions.TOTAL_RESPONSE_DEADLINE_SECONDS)},
+    )
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: (_ for _ in ()).throw(timeout))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "failed"
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.raw_sha256 is None
+    assert observation.http_status is None
+    assert observation.scope["failure"] == {
+        "version": 1,
+        "stage": "capture",
+        "code": "response_deadline_exceeded",
+        "recommended_action": "retry_as_scheduled",
+        "details": {"limit": int(ca_actions.TOTAL_RESPONSE_DEADLINE_SECONDS)},
+    }
+
+
+def test_member_count_parse_cap_keeps_raw_and_diagnosis_without_corpus_writes(
+    db_session, unique_abbr, monkeypatch
+):
+    _, target = _target(db_session, unique_abbr)
+    stream = io.BytesIO()
+    bill = ["202520260AB12", "20252026", "0", "AB", "12"] + [""] * 14
+    history = [
+        "202520260AB12", "101", "2026-09-01 00:00:00", "Read first time.", "src",
+        "2026-09-01 12:00:00", "1", "x", "x", "x", "x", "x", "x",
+    ]
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("BILL_TBL.dat", _tsv([bill]))
+        archive.writestr("BILL_HISTORY_TBL.dat", _tsv([history]))
+        for index in range(255):
+            archive.writestr(f"auxiliary-{index}.dat", b"x")
+    raw = stream.getvalue()
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: _captured(raw))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "invalid"
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert observation.scope["failure"] == {
+        "version": 1,
+        "stage": "parse",
+        "code": "archive_member_count_limit_exceeded",
+        "recommended_action": "review_parser_limit",
+        "details": {"observed": 257, "limit": ca_actions.MAX_ZIP_MEMBERS},
+    }
+    assert "failure" not in target.scope
+    assert db_session.scalar(select(func.count()).select_from(OfficialRawBlob)) == 1
+    assert db_session.scalar(select(func.count()).select_from(OfficialReconciliationRun)) == 0
+    assert db_session.scalar(select(func.count()).select_from(BillAction)) == 0
 
 
 def test_missing_local_mapping_is_partial_and_does_not_guess_a_bill(db_session, unique_abbr, monkeypatch):

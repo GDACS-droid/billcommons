@@ -282,12 +282,14 @@ def test_parse_accepts_observed_auxiliary_member_counts_but_keeps_member_cap():
         history_rows,
         members={f"BILL_VERSION_TBL_{index}.lob": b"x" for index in range(255)},
     )
-    with pytest.raises(adapter.OfficialCaActionsError, match="257 members; cap is 256"):
+    with pytest.raises(adapter.OfficialCaActionsError, match="257 members; cap is 256") as exc_info:
         adapter.parse_ca_official_actions_zip(
             over_cap,
             source_url=adapter.ca_delta_url("Mon"),
             retrieved_at=RETRIEVED_AT,
         )
+    assert exc_info.value.diagnostic_code == "archive_member_count_limit_exceeded"
+    assert exc_info.value.diagnostic_details == {"observed": 257, "limit": 256}
 
 
 def test_parse_rejects_zip_bomb_and_crc_failure_before_table_parsing():
@@ -313,8 +315,11 @@ def test_fetch_rejects_http_status_and_stream_bytes_when_content_length_lies():
         return httpx.Response(503, request=request)
 
     with httpx.Client(transport=httpx.MockTransport(unavailable)) as client:
-        with pytest.raises(adapter.OfficialCaActionsError, match="HTTP 503"):
+        with pytest.raises(adapter.OfficialCaActionsError, match="HTTP 503") as exc_info:
             adapter.fetch_ca_official_actions_delta("Mon", client=client, retrieved_at=RETRIEVED_AT)
+    assert exc_info.value.diagnostic_code == "http_status_unexpected"
+    assert exc_info.value.http_status == 503
+    assert exc_info.value.diagnostic_details == {"http_status": 503}
 
     oversized = b"x" * (adapter.MAX_RESPONSE_BYTES + 1)
 

@@ -29,6 +29,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from billcommons_shared.httpc import new_client
+from billcommons_ingest.official_diagnostics import MAX_SAFE_NUMERIC, validate_error_metadata
 
 
 ADAPTER_VERSION = "ca-official-actions/1"
@@ -72,6 +73,35 @@ MAX_COMPRESSION_RATIO = 100
 
 class OfficialCaActionsError(RuntimeError):
     """A source-contract failure that must not be treated as partial input."""
+
+    def __init__(
+        self,
+        *args: object,
+        code: str | None = None,
+        details: Mapping[str, int] | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        # Keep RuntimeError's argument and stringification behavior intact for
+        # existing callers; the structured fields are strictly additive.
+        super().__init__(*args)
+        if http_status is not None:
+            if not isinstance(http_status, int) or isinstance(http_status, bool) or not 100 <= http_status <= 599:
+                raise ValueError("http_status must be an HTTP status integer")
+            details = {**(details or {}), "http_status": http_status}
+        self.diagnostic_code, self.diagnostic_details = validate_error_metadata(code, details)
+
+    @property
+    def http_status(self) -> int | None:
+        """Return an observed non-success HTTP status, if this error has one."""
+
+        value = self.diagnostic_details.get("http_status")
+        return value if isinstance(value, int) else None
+
+
+def _safe_diagnostic_details(**values: int) -> dict[str, int]:
+    """Omit unrepresentable metadata without changing the source failure."""
+
+    return {key: value for key, value in values.items() if 0 <= value <= MAX_SAFE_NUMERIC}
 
 
 @dataclass(frozen=True)
@@ -253,26 +283,51 @@ def map_official_bill_id(official_bill_id: str) -> OfficialBillMapping:
 def _validate_zip(archive: zipfile.ZipFile) -> None:
     members = archive.infolist()
     if len(members) > MAX_ZIP_MEMBERS:
-        raise OfficialCaActionsError(f"official CA ZIP has {len(members)} members; cap is {MAX_ZIP_MEMBERS}")
+        raise OfficialCaActionsError(
+            f"official CA ZIP has {len(members)} members; cap is {MAX_ZIP_MEMBERS}",
+            code="archive_member_count_limit_exceeded",
+            details=_safe_diagnostic_details(observed=len(members), limit=MAX_ZIP_MEMBERS),
+        )
     names = [member.filename for member in members]
     if len(set(names)) != len(names):
-        raise OfficialCaActionsError("official CA ZIP has duplicate member names")
+        raise OfficialCaActionsError("official CA ZIP has duplicate member names", code="archive_duplicate_member_names")
     if "BILL_TBL.dat" not in names or "BILL_HISTORY_TBL.dat" not in names:
-        raise OfficialCaActionsError("official CA ZIP is missing required BILL_TBL.dat or BILL_HISTORY_TBL.dat")
+        raise OfficialCaActionsError(
+            "official CA ZIP is missing required BILL_TBL.dat or BILL_HISTORY_TBL.dat",
+            code="archive_missing_required_tables",
+        )
 
     total_uncompressed = 0
     for member in members:
         if member.flag_bits & 0x1:
-            raise OfficialCaActionsError(f"official CA ZIP member is encrypted: {member.filename}")
+            raise OfficialCaActionsError(f"official CA ZIP member is encrypted: {member.filename}", code="archive_encrypted_member")
         if member.file_size > MAX_MEMBER_UNCOMPRESSED_BYTES:
-            raise OfficialCaActionsError(f"official CA ZIP member exceeds uncompressed cap: {member.filename}")
+            raise OfficialCaActionsError(
+                f"official CA ZIP member exceeds uncompressed cap: {member.filename}",
+                code="archive_member_size_limit_exceeded",
+                details=_safe_diagnostic_details(observed=member.file_size, limit=MAX_MEMBER_UNCOMPRESSED_BYTES),
+            )
         total_uncompressed += member.file_size
         if total_uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES:
-            raise OfficialCaActionsError("official CA ZIP exceeds total uncompressed cap")
+            raise OfficialCaActionsError(
+                "official CA ZIP exceeds total uncompressed cap",
+                code="archive_total_size_limit_exceeded",
+                details=_safe_diagnostic_details(observed=total_uncompressed, limit=MAX_TOTAL_UNCOMPRESSED_BYTES),
+            )
         if member.file_size and not member.compress_size:
-            raise OfficialCaActionsError(f"official CA ZIP member has invalid compressed size: {member.filename}")
+            raise OfficialCaActionsError(
+                f"official CA ZIP member has invalid compressed size: {member.filename}",
+                code="archive_invalid_compressed_size",
+            )
         if member.compress_size and member.file_size / member.compress_size > MAX_COMPRESSION_RATIO:
-            raise OfficialCaActionsError(f"official CA ZIP member exceeds compression ratio cap: {member.filename}")
+            raise OfficialCaActionsError(
+                f"official CA ZIP member exceeds compression ratio cap: {member.filename}",
+                code="archive_compression_ratio_limit_exceeded",
+                details=_safe_diagnostic_details(
+                    observed=(member.file_size + member.compress_size - 1) // member.compress_size,
+                    limit=MAX_COMPRESSION_RATIO,
+                ),
+            )
 
     # Force decompression and CRC verification before parsing.  Bytes are not
     # retained for unrelated members, and metadata caps above bound this work.
@@ -282,9 +337,17 @@ def _validate_zip(archive: zipfile.ZipFile) -> None:
             for chunk in iter(lambda: stream.read(64 * 1024), b""):
                 consumed += len(chunk)
                 if consumed > MAX_MEMBER_UNCOMPRESSED_BYTES:
-                    raise OfficialCaActionsError(f"official CA ZIP member exceeds read cap: {member.filename}")
+                    raise OfficialCaActionsError(
+                        f"official CA ZIP member exceeds read cap: {member.filename}",
+                        code="archive_member_size_limit_exceeded",
+                        details=_safe_diagnostic_details(observed=consumed, limit=MAX_MEMBER_UNCOMPRESSED_BYTES),
+                    )
         if consumed != member.file_size:
-            raise OfficialCaActionsError(f"official CA ZIP member size changed while reading: {member.filename}")
+            raise OfficialCaActionsError(
+                f"official CA ZIP member size changed while reading: {member.filename}",
+                code="archive_member_size_changed",
+                details=_safe_diagnostic_details(observed=consumed, limit=member.file_size),
+            )
 
 
 def _table_rows(archive: zipfile.ZipFile, member_name: str, columns: tuple[str, ...]) -> Iterable[tuple[int, dict[str, str]]]:
@@ -392,7 +455,11 @@ def parse_ca_official_actions_zip(
     if not isinstance(raw_bytes, bytes):
         raise TypeError("raw_bytes must be bytes")
     if len(raw_bytes) > MAX_RESPONSE_BYTES:
-        raise OfficialCaActionsError(f"official CA response exceeds {MAX_RESPONSE_BYTES} byte cap")
+        raise OfficialCaActionsError(
+            f"official CA response exceeds {MAX_RESPONSE_BYTES} byte cap",
+            code="parser_response_size_limit_exceeded",
+            details=_safe_diagnostic_details(observed=len(raw_bytes), limit=MAX_RESPONSE_BYTES),
+        )
     if upstream_modified is not None and not isinstance(upstream_modified, str):
         raise TypeError("upstream_modified must be a string or None")
     try:
@@ -404,7 +471,10 @@ def parse_ca_official_actions_zip(
                 reject_duplicate_history_ids=True,
             )
     except zipfile.BadZipFile as exc:
-        raise OfficialCaActionsError("official CA response is not a valid ZIP archive") from exc
+        raise OfficialCaActionsError(
+            "official CA response is not a valid ZIP archive",
+            code="archive_crc_or_invalid_zip",
+        ) from exc
 
     events = {
         bill_id: tuple(
@@ -438,7 +508,9 @@ def parse_ca_official_actions_zip(
 def _require_before_response_deadline(started_at: float, clock: Callable[[], float]) -> None:
     if clock() - started_at > TOTAL_RESPONSE_DEADLINE_SECONDS:
         raise OfficialCaActionsError(
-            f"official CA delta response exceeded {TOTAL_RESPONSE_DEADLINE_SECONDS:g}s total deadline"
+            f"official CA delta response exceeded {TOTAL_RESPONSE_DEADLINE_SECONDS:g}s total deadline",
+            code="response_deadline_exceeded",
+            details=_safe_diagnostic_details(limit=int(TOTAL_RESPONSE_DEADLINE_SECONDS)),
         )
 
 
@@ -470,28 +542,48 @@ def fetch_ca_official_actions_response(
         ) as response:
             _require_before_response_deadline(started_at, clock)
             if str(response.url) != source_url:
-                raise OfficialCaActionsError("official CA delta fetch was redirected away from its exact source URL")
+                raise OfficialCaActionsError(
+                    "official CA delta fetch was redirected away from its exact source URL",
+                    code="unexpected_response_url",
+                )
             if response.status_code != 200:
                 raise OfficialCaActionsError(
-                    f"official CA delta fetch failed with HTTP {response.status_code}"
+                    f"official CA delta fetch failed with HTTP {response.status_code}",
+                    code="http_status_unexpected",
+                    http_status=response.status_code,
                 )
             content_length = response.headers.get("Content-Length")
             if content_length is not None:
                 try:
                     declared_length = int(content_length)
                 except ValueError as exc:
-                    raise OfficialCaActionsError("official CA delta has invalid Content-Length") from exc
+                    raise OfficialCaActionsError(
+                        "official CA delta has invalid Content-Length",
+                        code="invalid_content_length",
+                    ) from exc
                 if declared_length < 0 or declared_length > MAX_RESPONSE_BYTES:
-                    raise OfficialCaActionsError("official CA delta Content-Length exceeds response cap")
+                    raise OfficialCaActionsError(
+                        "official CA delta Content-Length exceeds response cap",
+                        code="content_length_limit_exceeded",
+                        details=_safe_diagnostic_details(observed=declared_length, limit=MAX_RESPONSE_BYTES),
+                    )
             chunks: list[bytes] = []
             received = 0
             for chunk in response.iter_bytes(chunk_size=MAX_RESPONSE_CHUNK_BYTES):
                 _require_before_response_deadline(started_at, clock)
                 if len(chunk) > MAX_RESPONSE_CHUNK_BYTES:
-                    raise OfficialCaActionsError("official CA delta response chunk exceeds chunk cap")
+                    raise OfficialCaActionsError(
+                        "official CA delta response chunk exceeds chunk cap",
+                        code="response_chunk_limit_exceeded",
+                        details=_safe_diagnostic_details(observed=len(chunk), limit=MAX_RESPONSE_CHUNK_BYTES),
+                    )
                 received += len(chunk)
                 if received > MAX_RESPONSE_BYTES:
-                    raise OfficialCaActionsError("official CA delta streamed response exceeds response cap")
+                    raise OfficialCaActionsError(
+                        "official CA delta streamed response exceeds response cap",
+                        code="response_size_limit_exceeded",
+                        details=_safe_diagnostic_details(observed=received, limit=MAX_RESPONSE_BYTES),
+                    )
                 chunks.append(chunk)
             raw_bytes = b"".join(chunks)
             upstream_modified = response.headers.get("Last-Modified")

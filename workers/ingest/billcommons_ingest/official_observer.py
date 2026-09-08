@@ -34,6 +34,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest import official_ca_actions as ca_actions
+from billcommons_ingest import official_diagnostics
 from billcommons_ingest import official_discovery as discovery
 from billcommons_schema.models import (
     Bill,
@@ -128,6 +129,19 @@ def _safe_error_class(error: BaseException) -> str:
 
     name = type(error).__name__
     return name[:120] if name else "UnknownError"
+
+
+def _failure_scope(target: OfficialSourceTarget, error: BaseException, *, stage: str) -> dict[str, Any]:
+    """Add a public-safe diagnosis to this observation only, never its target."""
+
+    return {**_observation_scope(target), "failure": official_diagnostics.failure_diagnosis(error, stage=stage)}
+
+
+def _observed_http_status(error: BaseException) -> int | None:
+    """Keep a status only when the capture adapter safely observed one."""
+
+    value = getattr(error, "http_status", None)
+    return value if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599 else None
 
 
 def _require_deadline(started_at: float) -> None:
@@ -575,7 +589,7 @@ def _resume_ca_continuation(
         failure = _add_observation(
             db,
             target=target,
-            scope=_observation_scope(target),
+            scope=_failure_scope(target, exc, stage="replay"),
             retrieved_at=observed_at,
             status="failed",
             raw_sha256=continuation.raw_sha256 if raw_blob is not None else None,
@@ -691,7 +705,7 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
         observation = _add_observation(
             db,
             target=target,
-            scope=_observation_scope(target),
+            scope=_failure_scope(target, exc, stage="evidence_validation"),
             retrieved_at=observed_at,
             status="invalid",
             error_class=_safe_error_class(exc),
@@ -717,10 +731,11 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
         observation = _add_observation(
             db,
             target=target,
-            scope=_observation_scope(target),
+            scope=_failure_scope(target, exc, stage="capture"),
             retrieved_at=observed_at,
             status="failed",
             error_class=_safe_error_class(exc),
+            http_status=_observed_http_status(exc),
         )
         _schedule_failure(target, observed_at)
         return OfficialObservationResult(target.id, observation.status, None, 0)
@@ -742,7 +757,7 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
         observation = _add_observation(
             db,
             target=target,
-            scope=_observation_scope(target),
+            scope=_failure_scope(target, exc, stage="evidence_validation"),
             retrieved_at=getattr(captured, "retrieved_at", observed_at),
             status="invalid",
             error_class=_safe_error_class(exc),
@@ -766,7 +781,7 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
         observation = _add_observation(
             db,
             target=target,
-            scope=_observation_scope(target),
+            scope=_failure_scope(target, exc, stage="parse"),
             retrieved_at=getattr(captured, "retrieved_at", observed_at),
             status="invalid",
             raw_sha256=raw_sha256,
