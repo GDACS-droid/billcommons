@@ -26,7 +26,7 @@ DEFAULT_MAX_RETAINED_RAWSTORE_BYTES = 512 * 1024 * 1024
 # Bump whenever extraction changes user-visible evidence semantics. Jobs from
 # earlier namespaces remain auditable records, but must not be returned as a
 # fresh result under a corrected presentation contract.
-SCOUT_CACHE_NAMESPACE = "scout-p0-3-provenance"
+SCOUT_CACHE_NAMESPACE = "scout-p0-4-bill-text-version"
 SCOUT_CA_RETAINED_CACHE_NAMESPACE = "scout-ca-retained-p0"
 OFFICIAL_FLORIDA_HOSTS = frozenset({
     "www.flsenate.gov", "flsenate.gov", "www.myfloridahouse.gov",

@@ -432,7 +432,7 @@ def test_scout_reuses_only_fresh_terminal_cache(monkeypatch):
         assert stale.status_code == 201
 
 
-def test_scout_does_not_reuse_a_fresh_pre_provenance_cache_namespace(monkeypatch):
+def test_scout_does_not_reuse_a_fresh_pre_bill_text_cache_namespace(monkeypatch):
     app, owner, _other, sessions = _app(monkeypatch)
     with sessions() as db:
         db.add(ScoutResearchJob(
@@ -440,7 +440,7 @@ def test_scout_does_not_reuse_a_fresh_pre_provenance_cache_namespace(monkeypatch
             original_query="HB 625",
             normalized_query="hb 625",
             jurisdiction="FL",
-            cache_key=scout_cache_key("HB 625", "FL", freshness_bucket="p0"),
+            cache_key=scout_cache_key("HB 625", "FL", freshness_bucket="scout-p0-3-provenance"),
             status="completed",
             strategy={},
             limits={},
