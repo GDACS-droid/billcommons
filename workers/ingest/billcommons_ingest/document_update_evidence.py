@@ -35,12 +35,13 @@ def _canonical_json_bytes(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-def sanitize_source_url(url: str | None) -> str | None:
+def sanitize_source_url(url: str | None, *, allow_legacy_ftp: bool = False) -> str | None:
     """Retain a fetch location without credentials or request-only data."""
     if url is None:
         return None
     parsed = urlsplit(url)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+    allowed_schemes = {"http", "https", "ftp"} if allow_legacy_ftp else {"http", "https"}
+    if parsed.scheme.lower() not in allowed_schemes or not parsed.hostname:
         raise ValueError("document evidence requires an absolute http(s) source URL")
     host = parsed.hostname
     try:
@@ -65,7 +66,10 @@ def snapshot_document(document: BillDocument) -> dict[str, Any]:
             "id": str(document.id),
             "bill_version_id": str(document.bill_version_id),
             "media_type": document.media_type,
-            "url": sanitize_source_url(document.url),
+            # A legacy FTP pointer is retained metadata, not fetch authority.
+            # Resolvers can retrieve its reviewed HTTPS successor while the
+            # before/after snapshots preserve the original source pointer.
+            "url": sanitize_source_url(document.url, allow_legacy_ftp=True),
             "extracted_text": document.extracted_text,
             "source_name": document.source_name,
             "checksum": document.checksum,

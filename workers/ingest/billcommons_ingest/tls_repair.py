@@ -70,7 +70,7 @@ _MISSING_ISSUER_MARKER = "unable to get local issuer certificate"
 _CERT_VERIFY_MARKER = "certificate_verify_failed"
 
 
-class RepairAttemptTimeout(RuntimeError):
+class RepairAttemptTimeout(BaseException):
     """The bounded repair invocation exceeded its total wall-time allowance."""
 
 
@@ -170,19 +170,6 @@ def _tx_witness_candidate(url: str | None) -> str | None:
     """Return only the reviewed TX resolver output for the three evidence eras."""
     if not url:
         return None
-    try:
-        parsed = urlsplit(url)
-    except ValueError:
-        return None
-    if (
-        parsed.scheme != "ftp"
-        or parsed.hostname != "ftp.legis.state.tx.us"
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.port not in (None, 21)
-        or not parsed.path.startswith(("/bills/89R/witlistbill/html/", "/bills/891/witlistbill/html/", "/bills/892/witlistbill/html/"))
-    ):
-        return None
     # The resolver is deliberately owned separately; this repair merely uses
     # its pure reviewed candidate as a witness, never inventing a TX URL.
     from billcommons_ingest import url_resolvers
@@ -195,7 +182,7 @@ def _tx_witness_candidate(url: str | None) -> str | None:
 
 
 def _is_tx_redirect_error(error: str | None) -> bool:
-    return bool(error and fulltext.STATUS_UNSUPPORTED_REDIRECT_SCHEME in error)
+    return bool(error and fulltext.STATUS_UNSUPPORTED_REDIRECT_SCHEME in error.casefold())
 
 
 def _active_normal_fetch_job_exists(db: Session, document_id: object) -> bool:
@@ -361,7 +348,7 @@ def discover_tx_candidates(db: Session, *, limit: int = DEFAULT_CYCLE_LIMIT) -> 
         TlsFulltextRepair.remediation_version == TX_REMEDIATION_VERSION,
     )
     stmt = (
-        select(BillDocument.id, dead.c.source_dead_job_id, dead.c.last_error)
+        select(BillDocument.id, dead.c.source_dead_job_id, dead.c.last_error, BillDocument.url)
         .join(dead, dead.c.document_id == cast(BillDocument.id, Text))
         .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
         .join(Bill, Bill.id == BillVersion.bill_id)
@@ -374,7 +361,12 @@ def discover_tx_candidates(db: Session, *, limit: int = DEFAULT_CYCLE_LIMIT) -> 
             fulltext.license_note_matches_status(
                 BillDocument.license_note, (fulltext.STATUS_UNSUPPORTED_REDIRECT_SCHEME,)
             ),
-            BillDocument.url.like("ftp://ftp.legis.state.tx.us/%"),
+            # Exclude stable malformed/unreviewed paths before LIMIT; an
+            # earlier invalid row must not starve a later eligible document.
+            BillDocument.url.op("~")(
+                r"^ftp://ftp[.]legis[.]state[.]tx[.]us/bills/(89R|891|892)/"
+                r"witlistbill/html/[A-Za-z0-9][A-Za-z0-9._-]*[.][hH][tT][mM]([lL])?$"
+            ),
             ~active, ~existing,
         ).order_by(BillDocument.id).limit(limit)
     )
@@ -383,7 +375,7 @@ def discover_tx_candidates(db: Session, *, limit: int = DEFAULT_CYCLE_LIMIT) -> 
                         source_error_sha256=hashlib.sha256(row[2].encode("utf-8")).hexdigest())
         for row in db.execute(stmt)
         if _is_tx_redirect_error(row[2])
-        and _tx_witness_candidate(db.get(BillDocument, row[0]).url) is not None
+        and _tx_witness_candidate(row[3]) is not None
     ]
 
 
@@ -594,12 +586,15 @@ def _attempt_deadline(seconds: int = ATTEMPT_WALL_TIMEOUT_SECONDS) -> Iterator[N
         # closed before outbound I/O instead of silently losing the wall cap.
         raise RepairAttemptTimeout("repair deadline unavailable outside main thread")
     previous_handler = signal.getsignal(signal.SIGALRM)
-    previous_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer != (0.0, 0.0):
+        raise RepairAttemptTimeout("repair requires exclusive ownership of its deadline timer")
 
     def expire(_signum, _frame) -> None:
         raise RepairAttemptTimeout("repair attempt deadline exceeded")
 
     signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
     started = monotonic()
     try:
         yield
@@ -711,7 +706,7 @@ def execute_reserved_repair(
         repair.completed_at = finished_at
         repair.last_outcome = "unfetchable"
         return "skipped"
-    except Exception:
+    except (Exception, RepairAttemptTimeout):
         db.refresh(document)
         finished_at = _utc()
         _append_attempt_event(

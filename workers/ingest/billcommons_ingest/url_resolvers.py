@@ -156,7 +156,12 @@ def tx_ftp_tlodocs_candidate(
     prevents a caller from deriving a destination from unreviewed metadata.
     """
     del bill_identifier, session
-    parsed = urlparse(source_url)
+    if not isinstance(source_url, str) or any(ord(char) < 32 for char in source_url):
+        return None
+    try:
+        parsed = urlparse(source_url)
+    except ValueError:
+        return None
     if (
         parsed.scheme != "ftp"
         or parsed.netloc != _TX_FTP_HOST

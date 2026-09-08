@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import signal
+from pathlib import Path
+
+import httpx
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -14,6 +19,8 @@ from billcommons_schema.models import (
     Bill,
     BillDocument,
     BillVersion,
+    CorpusUpdateEvidence,
+    OfficialRawBlob,
     IngestJob,
     Jurisdiction,
     Session as SessionModel,
@@ -340,11 +347,19 @@ def test_success_mutation_and_outcome_rollback_together(db_session, monkeypatch)
     assert _outcomes(db_session) == ["admitted"]
 
 
-def _tx_document(db, *, url="ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/SB00001.htm"):
-    document = _document(db, url=url, status=f"fulltext_status={fulltext.STATUS_UNSUPPORTED_REDIRECT_SCHEME}", attempts=0)
+def _tx_document(db, *, url="ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/SB00001.htm", document_id=None):
+    document = _document(db, url=url, status=f"fulltext_status={fulltext.STATUS_UNSUPPORTED_REDIRECT_SCHEME}", attempts=0, document_id=document_id)
     bill = db.scalar(select(Bill).join(BillVersion, BillVersion.bill_id == Bill.id).where(BillVersion.id == document.bill_version_id))
     jurisdiction = db.get(Jurisdiction, bill.jurisdiction_id)
-    jurisdiction.abbreviation = "TX"
+    existing_tx = db.scalar(select(Jurisdiction).where(Jurisdiction.abbreviation == "TX"))
+    if existing_tx is None:
+        jurisdiction.abbreviation = "TX"
+    else:
+        bill.jurisdiction_id = existing_tx.id
+        session = db.get(SessionModel, bill.session_id)
+        session.jurisdiction_id = existing_tx.id
+        session.identifier = f"2026-{session.id}"
+    db.flush()
     return document
 
 
@@ -391,3 +406,61 @@ def test_tx_success_uses_shared_fulltext_tail_and_ledger(db_session, monkeypatch
     repair = db_session.scalar(select(TlsFulltextRepair).where(TlsFulltextRepair.reason == tls_repair.TX_REPAIR_REASON))
     assert repair.status == "succeeded"
     assert _outcomes(db_session)[-2:] == ["admitted", "succeeded"]
+
+
+def test_tx_invalid_earlier_path_does_not_starve_valid_candidate(db_session):
+    invalid = _tx_document(db_session, url="ftp://ftp.legis.state.tx.us/bills/90R/witlistbill/html/SB1.htm", document_id=uuid.UUID(int=1))
+    valid = _tx_document(db_session, document_id=uuid.UUID(int=2))
+    _dead_tls_job(db_session, invalid, error="unsupported_redirect_scheme")
+    source = _dead_tls_job(db_session, valid, error="unsupported_redirect_scheme")
+    candidates = tls_repair.discover_tx_candidates(db_session, limit=1)
+    assert [(row.document_id, row.source_dead_job_id) for row in candidates] == [(valid.id, source.id)]
+
+
+def test_repair_deadline_escapes_generic_extraction_error_handler():
+    swallowed = False
+    with pytest.raises(tls_repair.RepairAttemptTimeout):
+        with tls_repair._attempt_deadline(seconds=5):
+            try:
+                signal.raise_signal(signal.SIGALRM)
+            except Exception:
+                swallowed = True
+    assert not swallowed
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_tx_repair_real_resolver_extraction_and_retained_evidence(db_session, rawstore):
+    source_url = "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm"
+    target_url = "https://capitol.texas.gov/tlodocs/89R/witlistbill/html/HB00576H.htm"
+    document = _tx_document(db_session, url=source_url)
+    source = _dead_tls_job(db_session, document, error="unsupported_redirect_scheme")
+    body = (Path(__file__).parent / "fixtures/tx_witness_89r_HB00576H.html").read_bytes()
+    assert hashlib.sha256(body).hexdigest() == "f7ae367343adc5c6835d43f81302453c626ebb46633147b165af9a07c6de4880"
+    requested = []
+    def wire(request):
+        requested.append(str(request.url))
+        if str(request.url) == "https://capitol.texas.gov/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        assert str(request.url) == target_url
+        return httpx.Response(200, content=body, headers={"content-type": "text/html"})
+    client = httpx.Client(transport=httpx.MockTransport(wire))
+    fetcher = fulltext.FullTextFetcher(client=client)
+    assert tls_repair.seed_tx_candidates(db_session, now=NOW) == 1
+    reservation = tls_repair.reserve_one_due_repair(db_session, now=NOW, reason=tls_repair.TX_REPAIR_REASON)
+    assert tls_repair.execute_reserved_repair(db_session, reservation, fetcher=fetcher, rawstore=rawstore, now=NOW) == "succeeded"
+    assert requested == ["https://capitol.texas.gov/robots.txt", target_url]
+    assert document.url == source_url
+    assert document.extracted_text and "HB 576" in document.extracted_text
+    assert "url_resolver=tx_ftp_tlodocs" in document.license_note
+    evidence = db_session.scalar(select(CorpusUpdateEvidence).where(CorpusUpdateEvidence.request_scope["document_id"].astext == str(document.id)))
+    assert evidence.request_scope["resolver"] == "tx_ftp_tlodocs"
+    assert db_session.get(OfficialRawBlob, evidence.response_sha256).data == body
+    before = json.loads(db_session.get(OfficialRawBlob, evidence.before_snapshot_sha256).data)
+    after = json.loads(db_session.get(OfficialRawBlob, evidence.after_snapshot_sha256).data)
+    assert before["document"]["extracted_text"] is None
+    assert before["document"]["url"] == source_url
+    assert after["document"]["url"] == source_url
+    assert after["document"]["extracted_text"] == document.extracted_text
+    assert source.status == "dead" and source.last_error == "unsupported_redirect_scheme"
+    assert _outcomes(db_session) == ["admitted", "succeeded"]
+    client.close()

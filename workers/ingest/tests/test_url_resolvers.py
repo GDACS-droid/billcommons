@@ -128,6 +128,11 @@ def test_tx_resolver_preserves_the_original_ftp_url_before_the_https_candidate()
         "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm?download=1",
         "ftp://ftp.legis.state.tx.us:21/bills/89R/witlistbill/html/HB00576H.htm",
         "ftp://user@ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm",
+        "ftp://[bad/bills/89R/witlistbill/html/HB00576H.htm",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB\n00576H.htm",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm#section",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/%2e%2e/HB00576H.htm",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm;other",
     ],
 )
 def test_tx_ftp_tlodocs_candidate_rejects_unreviewed_or_unsafe_source_shape(source_url):
