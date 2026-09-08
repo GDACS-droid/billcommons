@@ -20,7 +20,7 @@ semantic freshness or completeness.
 | Detect stale data | Canonical 51-jurisdiction report, bounded history queries, sync cadence/queue/provenance defects, fail-closed report cache; durable official observation status | Semantic freshness adapters beyond the limited CA archive |
 | Repair failures | Existing retry queues, shared durable request quotas, official-worker backoff/deadlines/checkpoints, reviewed missing-intermediate TLS repair for five hosts | Fixture-replayed parser repair and controlled promotion; discrepancy-driven corpus repair |
 | Discover official material | Robots-first official landing-page checks for all 51 jurisdictions, bounded same-origin links, exact retained response bytes | State-specific parsing of discovered facts; remaining explicit source-access failures |
-| Prove updates | Atomic Open States API and document extraction before/after records with source bytes, hashes, versions and download API; offline CA comparison replay | Derived-status path audit; historical updates have no retroactive proof |
+| Prove updates | Atomic Open States API, document extraction and local derived-status before/after records with retained inputs, hashes, versions and download APIs; offline CA comparison replay | Independent derived-input sufficiency audit; historical updates have no retroactive proof |
 | Operate autonomously | Dedicated recurring worker, explicit registration/enablement, durable target schedule and transaction deadline; resumable 500-bill CA pages | Production activation and measured recurring cycles |
 | Deploy | Pinned first-stage source, restored production backup, safe local checks | Canonical review, staged rollout and post-deploy proof |
 
@@ -28,13 +28,13 @@ semantic freshness or completeness.
 
 - Owner: Codex executing Alberto's authorized session. No new approval is needed
   for the scoped deployment. Stop at a failed required check or unsafe cutover.
-- First-stage source: `5f47ad2946c2073ffd61e1c15c7934e165a64d06` in
+- First-stage source: `bdd5b61194b018b29af59f8bb18157126de1c41c` in
   `billcommons-control-plane-fixed-20260908`. Initial rollout is API plus dedicated
   sync worker; no new schema or official worker in that stage. Web follows its
   applicable checks.
-- First-stage aggregate review: `ff83068`, exact binary diff from baseline
+- First-stage aggregate review: `c3ec3c5`, exact binary diff from baseline
   `26e99e2` checked against the release source. Canonical nine-family run:
-  `/home/alberto/verify-runs/20260908T025146Z-ff83068` (pending).
+  `/home/alberto/verify-runs/20260908T031416Z-c3ec3c5` (pending).
 - Earlier reviews found real case-normalization, undated-run ordering,
   quota-delayed queue age, canonical-inventory, bounded-query, cache and test
   routing defects. These are repaired and have focused regression coverage.
@@ -48,7 +48,7 @@ semantic freshness or completeness.
   idle boundary. Hold on failed review, repeated 5xx/503, unhealthy database,
   active-work risk or missing artifact evidence. Roll back the affected app
   artifact; preserve database rows and evidence.
-- Follow-on schema revisions `0026`–`0028` are additive and currently undeployed.
+- Follow-on schema revisions `0026`–`0030` are additive and currently undeployed.
   Controlled migration requires the exact revision acknowledgement. Before the
   shared Open States quota is activated, seed current-day consumption
   conservatively so the new ledger cannot reset the upstream day's allowance.
@@ -87,6 +87,11 @@ and July 24 existed, but no scheduled volume backups were configured.
 - API-sync retains the exact Open States response before JSON decoding. Actual
   core/child changes retain bounded before/after snapshots in the same transaction.
   No-op updates add no evidence. Open States is labeled as an aggregator.
+- Local status and substituted-by relationship changes retain separate derived
+  evidence with algorithm version, exact consulted local inputs, before/after
+  values and an optional causal API-update record. Bill pages link to both
+  source/document and derived change histories. No evidence history is implied
+  for changes before tracking began.
 - Ordinary and browser-assisted successful extraction share the evidence tail.
   Database evidence failure rolls back semantic document changes. Optional
   filesystem archival remains a best-effort compatibility cache.
@@ -134,3 +139,39 @@ Then run canonical review on the complete follow-on diff, migrate exact revision
 activate quotas/observation targets, deploy the recurring worker and establish
 production evidence. Semantic state adapters and controlled discrepancy repair
 remain explicit work until their required evidence exists.
+
+## Integration check — 2026-09-08 03:10 UTC
+
+The integrated derived-evidence implementation passed 427 worker/shared tests
+and 30 API tests against disposable PostgreSQL with migrations through `0029`.
+Two subsequent failure-isolation regressions are undergoing the final combined
+run. The production web build and TypeScript checks passed. Desktop/mobile
+fixtures exercised filters, unavailable reports, evidence links, German-locale
+hydration, and mobile overflow; browser errors were zero. Bill evidence links
+were checked against a retained public API fixture. An initial browser selector
+used an incorrect heading name; it was corrected to the existing Attribution
+heading and the check passed. These are local checks, not deployment proof.
+
+### Repair and replay follow-up
+
+The integrated TLS repair module reserves and commits one of at most two
+attempts before HTTP, verifies the source dead-job fingerprint/document link,
+and records admitted/outcome events. No-text outcomes are skipped rather than
+reported repaired. A crash after admission remains reserved for explicit
+operator review. `OFFICIAL_TLS_REPAIR_ENABLED=1` enables a separate, two-repair
+batch per recurring official-worker cycle; observations commit independently.
+The integrated test run through `0030` passed 440 worker/shared and 32 API tests.
+The latest recurring-worker wiring is being checked separately.
+
+The derived-input audit found missing substitution candidate/order inputs and
+an effective-date mismatch. Existing records remain useful forward evidence,
+but full offline substitution replay is not yet proved. A bounded replay
+implementation is in progress.
+
+First-stage `ff83068` canonical review returned BLOCK and its advocate was
+cancelled. Confirmed observation-age/UI waiting/checkout-url findings were
+repaired; the current exact aggregate is `c3ec3c5`. It has 89 worker/shared and
+12 API checks, TypeScript/lint/production build, and real browser checks for
+info-only filtering and six intercepted malformed checkout responses. None
+created a payment, navigated, or emitted redirect success. Current review is
+pending; no production artifact has changed.
