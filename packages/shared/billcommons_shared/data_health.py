@@ -77,6 +77,16 @@ class CoverageEvidence:
     status: str
     bill_count: int
     full_text_count: int
+    scope: str = "jurisdiction"
+    session_identifier: str | None = None
+
+
+@dataclass(frozen=True)
+class RefreshTarget:
+    session_id: Any
+    session_identifier: str
+    cadence_tier: str
+    cadence_minutes: int
 
 
 @dataclass(frozen=True)
@@ -91,6 +101,7 @@ class JurisdictionEvidence:
     latest_api_sync_run: RunEvidence | None
     latest_successful_api_sync: RunEvidence | None
     coverage: CoverageEvidence | None
+    aggregate_coverage_signal: CoverageEvidence | None = None
     dead_api_sync_jobs: int = 0
     queued_api_sync_jobs: int = 0
     running_api_sync_jobs: int = 0
@@ -291,7 +302,7 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
                 "warning",
                 "MISSING_JURISDICTION_COVERAGE",
                 jurisdiction,
-                "Local bills exist but there is no jurisdiction-level coverage row.",
+                "Local bills exist but no coverage row exists for the selected session or jurisdiction aggregate.",
                 {"local_bill_count": bills.bill_count},
             )
         )
@@ -306,8 +317,29 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
                     f"Jurisdiction coverage is marked {evidence.coverage.status}.",
                     {
                         "coverage_status": evidence.coverage.status,
+                        "coverage_scope": evidence.coverage.scope,
+                        "coverage_session_identifier": evidence.coverage.session_identifier,
                         "coverage_bill_count": evidence.coverage.bill_count,
                         "coverage_full_text_count": evidence.coverage.full_text_count,
+                    },
+                )
+            )
+
+    if evidence.aggregate_coverage_signal is not None:
+        aggregate = evidence.aggregate_coverage_signal
+        severity = {"BLOCKED": "critical", "DEGRADED": "warning"}.get(aggregate.status)
+        if severity:
+            defects.append(
+                Defect(
+                    severity,
+                    f"JURISDICTION_COVERAGE_{aggregate.status}",
+                    jurisdiction,
+                    f"The jurisdiction-wide coverage aggregate is marked {aggregate.status}.",
+                    {
+                        "coverage_status": aggregate.status,
+                        "coverage_scope": aggregate.scope,
+                        "coverage_bill_count": aggregate.bill_count,
+                        "coverage_full_text_count": aggregate.full_text_count,
                     },
                 )
             )
@@ -351,6 +383,11 @@ def build_report(evidence: Iterable[JurisdictionEvidence], *, now: datetime | No
                 },
                 "parser_health": asdict(item.bills),
                 "coverage": asdict(item.coverage) if item.coverage else None,
+                "additional_jurisdiction_coverage_signal": (
+                    asdict(item.aggregate_coverage_signal)
+                    if item.aggregate_coverage_signal
+                    else None
+                ),
                 "official_reconciliation": {
                     "state": RECONCILIATION_UNAVAILABLE,
                     "reason": "No persisted differential result against a freshly read official source exists.",
@@ -406,7 +443,7 @@ def _cadence_minutes(tier: str) -> int:
     }[tier]
 
 
-def _session_targets(sessions: Iterable[SessionModel], *, now: datetime) -> dict[Any, tuple[str, int]]:
+def _session_targets(sessions: Iterable[SessionModel], *, now: datetime) -> dict[Any, RefreshTarget]:
     """Choose the same operational session priority as the refresh scheduler."""
     grouped: dict[Any, list[SessionModel]] = defaultdict(list)
     for session in sessions:
@@ -419,7 +456,9 @@ def _session_targets(sessions: Iterable[SessionModel], *, now: datetime) -> dict
             key=lambda session: (bool(session.active), session.start_date or date.min),
         )
         tier = _cadence_tier(active=bool(selected.active), end_date=selected.end_date, now=now)
-        targets[jurisdiction_id] = (tier, _cadence_minutes(tier))
+        targets[jurisdiction_id] = RefreshTarget(
+            selected.id, selected.identifier, tier, _cadence_minutes(tier)
+        )
     return targets
 
 
@@ -502,14 +541,23 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
         "success", source_name=API_SYNC_SOURCE
     )
 
-    coverage_by_jurisdiction: dict[Any, CoverageEvidence] = {}
-    for coverage in db.execute(
-        select(JurisdictionCoverage).where(JurisdictionCoverage.session_id.is_(None))
-    ).scalars():
-        coverage_by_jurisdiction[coverage.jurisdiction_id] = CoverageEvidence(
-            coverage.status,
-            int(coverage.bill_count or 0),
-            int(coverage.full_text_count or 0),
+    session_identifiers = {
+        session.id: session.identifier
+        for session in db.execute(select(SessionModel)).scalars()
+    }
+    coverage_by_jurisdiction: dict[Any, list[tuple[Any, CoverageEvidence]]] = defaultdict(list)
+    for coverage in db.execute(select(JurisdictionCoverage)).scalars():
+        coverage_by_jurisdiction[coverage.jurisdiction_id].append(
+            (
+                coverage.session_id,
+                CoverageEvidence(
+                    coverage.status,
+                    int(coverage.bill_count or 0),
+                    int(coverage.full_text_count or 0),
+                    scope="session" if coverage.session_id is not None else "jurisdiction",
+                    session_identifier=session_identifiers.get(coverage.session_id),
+                ),
+            )
         )
 
     jobs_by_state: dict[str, dict[str, tuple[int, datetime | None]]] = defaultdict(dict)
@@ -534,7 +582,22 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
 
     result = []
     for jurisdiction in jurisdictions:
-        tier, target = targets.get(jurisdiction.id, (None, None))
+        refresh_target = targets.get(jurisdiction.id)
+        tier = refresh_target.cadence_tier if refresh_target else None
+        target = refresh_target.cadence_minutes if refresh_target else None
+        coverage_rows = coverage_by_jurisdiction[jurisdiction.id]
+        aggregate_coverage = next((item for session_id, item in coverage_rows if session_id is None), None)
+        selected_coverage = (
+            next(
+                (
+                    item
+                    for session_id, item in coverage_rows
+                    if refresh_target is not None and session_id == refresh_target.session_id
+                ),
+                None,
+            )
+            or aggregate_coverage
+        )
         jobs = jobs_by_state[jurisdiction.abbreviation.upper()]
         result.append(
             JurisdictionEvidence(
@@ -549,7 +612,10 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
                 latest_successful_api_sync=latest_api_sync_successes_by_jurisdiction.get(
                     jurisdiction.id
                 ),
-                coverage=coverage_by_jurisdiction.get(jurisdiction.id),
+                coverage=selected_coverage,
+                aggregate_coverage_signal=(
+                    aggregate_coverage if selected_coverage is not aggregate_coverage else None
+                ),
                 dead_api_sync_jobs=jobs.get("dead", (0, None))[0],
                 queued_api_sync_jobs=jobs.get("queued", (0, None))[0],
                 running_api_sync_jobs=jobs.get("running", (0, None))[0],
