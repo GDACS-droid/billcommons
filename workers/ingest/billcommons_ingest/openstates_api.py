@@ -106,17 +106,16 @@ _daily_request_counts: dict[str, int] = {}
 _budget_lock = threading.Lock()
 
 
-def _safe_endpoint_url(base_url: str, path: str) -> str:
+def _safe_endpoint_url(response_url: str) -> str:
     """Return a replay endpoint with credentials, query, and fragment removed."""
-    parsed = urlsplit(base_url)
-    if not parsed.scheme or not parsed.hostname:
-        raise ValueError("OpenStates base URL must include a scheme and host")
+    parsed = urlsplit(response_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("OpenStates response URL must be an absolute HTTP(S) URL")
     hostname = parsed.hostname
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"
     netloc = hostname if parsed.port is None else f"{hostname}:{parsed.port}"
-    base_path = parsed.path.rstrip("/")
-    return urlunsplit((parsed.scheme, netloc, f"{base_path}{path}", "", ""))
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 def _daily_budget() -> int:
@@ -202,7 +201,7 @@ class OpenStatesClient:
 
     def _request_with_raw(
         self, method: str, path: str, *, params: dict | None = None
-    ) -> tuple[dict, bytes]:
+    ) -> tuple[dict, bytes, str]:
         api_key = self._resolve_api_key()
         headers = {"X-API-KEY": api_key}
 
@@ -254,11 +253,14 @@ class OpenStatesClient:
                 raise OpenStatesAPIError(f"{method} {path} returned invalid JSON") from exc
             if not isinstance(payload, dict):
                 raise OpenStatesAPIError(f"{method} {path} returned a non-object JSON response")
-            return payload, raw_bytes
+            # An injected client or followed redirect can use a different URL
+            # from self.base_url. Bind provenance to the actual response while
+            # excluding credentials and query values from public metadata.
+            return payload, raw_bytes, _safe_endpoint_url(str(response.url))
 
     def _request(self, method: str, path: str, *, params: dict | None = None) -> dict:
         """Return parsed JSON for established non-provenance callers."""
-        payload, _ = self._request_with_raw(method, path, params=params)
+        payload, _, _ = self._request_with_raw(method, path, params=params)
         return payload
 
     def get_jurisdictions(self, *, classification: str | None = None) -> dict:
@@ -337,11 +339,11 @@ class OpenStatesClient:
             params["updated_since"] = updated_since
         if include:
             params["include"] = include
-        payload, raw_bytes = self._request_with_raw("GET", "/bills", params=params)
+        payload, raw_bytes, source_url = self._request_with_raw("GET", "/bills", params=params)
         return RetainedOpenStatesResponse(
             payload=payload,
             raw_bytes=raw_bytes,
-            source_url=_safe_endpoint_url(self.base_url, "/bills"),
+            source_url=source_url,
             request_scope={
                 "jurisdiction": jurisdiction,
                 "session": session,

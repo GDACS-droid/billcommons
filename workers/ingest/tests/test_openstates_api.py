@@ -118,14 +118,17 @@ def test_search_bills_omits_optional_filters_by_default():
 
 def test_retained_bill_response_keeps_entity_bytes_and_excludes_credentials_from_metadata():
     raw = b'{\n  "results": [], "pagination": {"max_page": 1}\n}'
+    captured = {}
 
     def handler(request):
+        captured["url"] = request.url
         return httpx.Response(200, content=raw, headers={"content-type": "application/json"})
 
     transport = httpx.MockTransport(handler)
     http_client = httpx.Client(
         transport=transport,
-        base_url="https://ignored.invalid",
+        base_url="https://user:secret@actual.invalid:8443/api/",
+        params={"api_key": "not-recorded"},
     )
     client = OpenStatesClient(
         base_url="https://user:secret@v3.openstates.org/api?api_key=not-recorded",
@@ -141,7 +144,8 @@ def test_retained_bill_response_keeps_entity_bytes_and_excludes_credentials_from
     assert response.is_retained_response is True
     assert response.raw_bytes == raw
     assert response.payload == {"results": [], "pagination": {"max_page": 1}}
-    assert response.source_url == "https://v3.openstates.org/api/bills"
+    assert captured["url"].host == "actual.invalid"
+    assert response.source_url == "https://actual.invalid:8443/api/bills"
     assert response.request_scope == {
         "jurisdiction": "nc",
         "session": None,
@@ -151,6 +155,44 @@ def test_retained_bill_response_keeps_entity_bytes_and_excludes_credentials_from
         "updated_since": "2026-09-01T00:00:00+00:00",
         "includes": ["actions"],
     }
+
+
+def test_retained_bill_response_uses_the_effective_redirect_url():
+    requested = []
+
+    def handler(request):
+        requested.append(request.url)
+        if request.url.host == "v3.openstates.org":
+            return httpx.Response(302, headers={"Location": "https://actual.invalid/archive/bills?token=private#section"})
+        return httpx.Response(200, content=b'{"results": []}')
+
+    client = OpenStatesClient(
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            base_url="https://v3.openstates.org",
+            follow_redirects=True,
+        ),
+        api_key="test-key",
+        consume_budget=lambda: None,
+    )
+    response = client.search_bills_with_response()
+
+    assert len(requested) == 2
+    assert response.source_url == "https://actual.invalid/archive/bills"
+    assert response.raw_bytes == b'{"results": []}'
+    assert response.is_retained_response
+
+
+@pytest.mark.parametrize("url", ["/bills", "file:///bills", "ftp://example.test/bills"])
+def test_retained_endpoint_rejects_non_http_urls(url):
+    with pytest.raises(ValueError, match="absolute HTTP"):
+        openstates_api_mod._safe_endpoint_url(url)
+
+
+def test_retained_endpoint_keeps_ipv6_port_and_encoded_path_without_secrets():
+    assert openstates_api_mod._safe_endpoint_url(
+        "https://user:secret@[2001:db8::1]:8443/api/bills%2Farchive/?token=private#fragment"
+    ) == "https://[2001:db8::1]:8443/api/bills%2Farchive/"
 
 
 def test_iter_bills_paginates_across_pages():
