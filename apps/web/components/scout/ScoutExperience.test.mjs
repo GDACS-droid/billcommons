@@ -33,7 +33,7 @@ test("Scout intro does not show a signed-out prompt over an authenticated result
 
 test("linked monitor evidence loads an existing job without creating research and rejects malformed identifiers", () => {
   assert.match(source, /const SCOUT_JOB_ID_PATTERN = \/\^\[A-Za-z0-9\]\[A-Za-z0-9_-\]\{0,127\}\$\//);
-  assert.match(source, /if \(initialJobId === undefined\) return;/);
+  assert.match(source, /if \(initialJobId === undefined\) \{/);
   assert.match(source, /The requested Scout research link is invalid\./);
   assert.match(source, /const beginJobRequest = useCallback/);
   assert.match(source, /jobRequest\.current\.controller\?\.abort\(\)/);
@@ -57,8 +57,12 @@ test("Scout polling only applies results from the active request generation", ()
 test("Scout cancellation cannot apply after a newer request takes ownership", () => {
   assert.match(source, /setCanceling\(false\);/);
   assert.match(source, /const jobId = job\.id;/);
-  assert.match(source, /const generation = jobRequest\.current\.generation;/);
+  assert.match(source, /const request = beginJobRequest\(\);\n    const generation = request\.generation;/);
   assert.match(source, /cancelScoutJob\(jobId\)/);
   assert.match(source, /if \(jobRequest\.current\.generation !== generation\) return;/);
   assert.match(source, /if \(jobRequest\.current\.generation === generation\) setCanceling\(false\);/);
+});
+
+test("removing a linked job clears its view and errors", () => {
+  assert.match(source, /if \(initialJobId === undefined\) \{\n      setJob\(null\);\n      setError\(""\);\n      setRefreshError\(""\);/);
 });

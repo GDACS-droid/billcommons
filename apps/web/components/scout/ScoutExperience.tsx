@@ -457,7 +457,12 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
   useEffect(() => {
     const request = beginJobRequest();
     setSubmitting(false);
-    if (initialJobId === undefined) return;
+    if (initialJobId === undefined) {
+      setJob(null);
+      setError("");
+      setRefreshError("");
+      return;
+    }
     const jobId = initialJobId?.trim() ?? "";
     if (!SCOUT_JOB_ID_PATTERN.test(jobId)) {
       setJob(null);
@@ -591,7 +596,8 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
   async function cancel() {
     if (!job || isScoutTerminal(job.status) || canceling) return;
     const jobId = job.id;
-    const generation = jobRequest.current.generation;
+    const request = beginJobRequest();
+    const generation = request.generation;
     setCanceling(true);
     setError("");
     try {

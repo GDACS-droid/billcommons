@@ -29,6 +29,8 @@ test("saved monitor UI distinguishes pending, unavailable, missing, and zero-cou
   assert.match(source, /Comparison counts were not returned for this run\./);
   assert.match(source, /listStatus === "ready" && !monitors\.length/);
   assert.match(source, /monitorVersion\.current !== version/);
+  assert.match(source, /const saveDisabled = saving \|\| listStatus !== "ready" \|\| limitReached/);
+  assert.match(source, /Saved monitor count unavailable/);
 });
 
 test("acknowledged monitor mutations merge locally before one authoritative post-settlement refresh", () => {
