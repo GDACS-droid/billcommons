@@ -58,7 +58,11 @@ MAX_LOCAL_ACTIONS_PER_BILL = 1_000
 MAX_RECONCILIATIONS_PER_OBSERVATION = 500
 MAX_BACKOFF_SECONDS = 604_800
 MAX_BLOB_BYTES = 8 * 1024 * 1024
-OBSERVATION_DEADLINE_SECONDS = 300.0
+# The worker arms its non-recoverable transaction SIGALRM before calling this
+# module.  Keep this cooperative budget materially below that 300s boundary
+# so a CA continuation checkpoint and the caller-owned commit have headroom.
+OBSERVATION_WORK_BUDGET_SECONDS = 270.0
+OBSERVATION_DEADLINE_SECONDS = OBSERVATION_WORK_BUDGET_SECONDS
 DB_STATEMENT_TIMEOUT_MS = 10_000
 DB_LOCK_TIMEOUT_MS = 5_000
 DB_IDLE_TRANSACTION_TIMEOUT_MS = 240_000
@@ -127,8 +131,8 @@ def _safe_error_class(error: BaseException) -> str:
 
 
 def _require_deadline(started_at: float) -> None:
-    if _monotonic() - started_at > OBSERVATION_DEADLINE_SECONDS:
-        raise ObservationDeadlineExceeded("official observation exceeded total deadline")
+    if _monotonic() - started_at > OBSERVATION_WORK_BUDGET_SECONDS:
+        raise ObservationDeadlineExceeded("official observation exceeded work budget")
 
 
 def _configure_transaction(db: OrmSession) -> None:

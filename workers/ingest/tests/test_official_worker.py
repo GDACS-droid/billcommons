@@ -1,3 +1,4 @@
+import hashlib
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -5,10 +6,14 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
 
+from billcommons_ingest import official_ca_actions as ca_actions
+from billcommons_ingest import official_observer, official_worker
 from billcommons_ingest.official_worker import (
     ObservationDeadlineExceeded,
+    MAX_OBSERVATION_SECONDS,
     TLS_REPAIR_CYCLE_LIMIT,
     _run_tls_repair_cycle,
     _tls_repair_enabled_from_env,
@@ -16,7 +21,8 @@ from billcommons_ingest.official_worker import (
     run_cycle,
     seed_ca_targets,
 )
-from billcommons_schema.models import Jurisdiction, OfficialSourceTarget
+from billcommons_schema.models import Jurisdiction, OfficialRawBlob, OfficialSourceObservation, OfficialSourceTarget
+from billcommons_shared.db import get_engine
 
 
 def test_seed_requires_existing_jurisdiction(db_session):
@@ -152,6 +158,88 @@ def test_deadline_rolls_back_without_emitting_success():
             session_factory=lambda: SessionProbe(events), observer=expired,
             emit=lambda record: events.append("unexpected success"))
     assert events == ["rollback", "close"]
+
+
+def test_soft_observer_budget_commits_continuation_before_hard_worker_timer(monkeypatch):
+    """Exercise the real worker wrapper and observer transaction together.
+
+    A synthetic monotonic clock reaches the cooperative 270s budget while
+    mocked timer hooks prove the outer worker still owns a separate 300s hard
+    deadline.  No wall-clock delay or provider request is involved.
+    """
+    engine = get_engine()
+    seeded = Session(engine)
+    now = datetime.now(timezone.utc)
+    try:
+        jurisdiction = Jurisdiction(name="Deadline California", abbreviation="CA", classification="state")
+        seeded.add(jurisdiction)
+        seeded.flush()
+        target = OfficialSourceTarget(
+            jurisdiction_id=jurisdiction.id,
+            adapter_name=official_observer.ADAPTER_NAME,
+            source_url=ca_actions.ca_delta_url("Mon"),
+            scope={"day": "Mon", "sessions": ["20252026 regular", "special1"]},
+            enabled=True, cadence_seconds=300, next_check_at=now,
+        )
+        seeded.add(target)
+        seeded.commit()
+        target_id, jurisdiction_id = target.id, jurisdiction.id
+    finally:
+        seeded.close()
+
+    captured = SimpleNamespace(
+        source_url=ca_actions.ca_delta_url("Mon"), raw_bytes=b"deadline-proof",
+        sha256=hashlib.sha256(b"deadline-proof").hexdigest(),
+        retrieved_at=now, upstream_modified=None,
+    )
+    batch = SimpleNamespace(
+        source_url=captured.source_url, raw_bytes=captured.raw_bytes, sha256=captured.sha256,
+        retrieved_at=now, upstream_modified=None, adapter_version=ca_actions.ADAPTER_VERSION,
+        event_count=0, scoped_bill_ids=("202520260AB1",), events_by_official_bill_id={},
+    )
+    clock_calls = 0
+    def soft_clock():
+        nonlocal clock_calls
+        clock_calls += 1
+        return 0.0 if clock_calls < 5 else official_observer.OBSERVATION_WORK_BUDGET_SECONDS + 0.01
+    timer_calls = []
+    monkeypatch.setattr(official_observer, "_monotonic", soft_clock)
+    monkeypatch.setattr(official_observer, "_capture_ca_response", lambda _day: captured)
+    monkeypatch.setattr(official_observer, "_parse_ca_response", lambda _captured: batch)
+    monkeypatch.setattr(official_worker.signal, "getsignal", lambda _signal: object())
+    monkeypatch.setattr(official_worker.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(
+        official_worker.signal, "setitimer",
+        lambda which, seconds, *rest: (timer_calls.append((which, seconds, rest)) or (0.0, 0.0)),
+    )
+
+    emitted = []
+    assert run_cycle(
+        stop=threading.Event(), max_observations=1,
+        session_factory=lambda: Session(engine), observer=official_observer.observe_due_target,
+        emit=emitted.append,
+    ) == 1
+    check = Session(engine)
+    try:
+        target_after = check.get(OfficialSourceTarget, target_id)
+        assert target_after.scope["continuation"]["next_bill_index"] == 0
+    finally:
+        check.close()
+    assert any(seconds == MAX_OBSERVATION_SECONDS for _which, seconds, _rest in timer_calls)
+    assert emitted[0]["status"] == "continuing"
+    # The timer hooks are re-entrant and the process can run another cycle.
+    assert run_cycle(stop=threading.Event(), max_observations=1,
+                     session_factory=lambda: Session(engine), observer=lambda _db: None,
+                     emit=lambda _record: None) == 0
+    cleanup = Session(engine)
+    try:
+        cleanup.execute(delete(OfficialSourceObservation).where(OfficialSourceObservation.target_id == target_id))
+        cleanup.execute(delete(OfficialRawBlob).where(OfficialRawBlob.data == b"deadline-proof"))
+        cleanup.delete(cleanup.get(OfficialSourceTarget, target_id))
+        cleanup.delete(cleanup.get(Jurisdiction, jurisdiction_id))
+        cleanup.commit()
+    finally:
+        cleanup.close()
 
 
 def test_tls_repair_is_disabled_by_default_and_requires_exact_env_opt_in(monkeypatch):
