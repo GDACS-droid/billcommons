@@ -5,6 +5,7 @@ import hashlib
 import re
 import uuid
 from datetime import datetime
+from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Response
 from sqlalchemy import text
@@ -31,9 +32,18 @@ def _session():
         db.execute(text("SET LOCAL statement_timeout = '5s'"))
         return db
     except Exception:
-        db.rollback()
-        db.close()
-        raise
+        _close(db)
+        raise _public_failure() from None
+
+
+def _close(db) -> None:
+    try:
+        try:
+            db.rollback()
+        finally:
+            db.close()
+    except Exception:
+        raise _public_failure() from None
 
 
 def _public_failure() -> HTTPException:
@@ -59,6 +69,7 @@ def _iso(value: datetime | None) -> str | None:
 def observations(
     jurisdiction: str = Query(..., min_length=2, max_length=2),
     limit: int = Query(20, ge=1, le=_MAX_LIMIT),
+    offset: Annotated[int, Query(ge=0, le=10000)] = 0,
 ) -> dict:
     code = _jurisdiction(jurisdiction)
     db = None
@@ -75,12 +86,14 @@ def observations(
                      JOIN jurisdictions j ON j.id = t.jurisdiction_id
                     WHERE j.abbreviation = :jurisdiction
                     ORDER BY o.retrieved_at DESC, o.id DESC
-                    LIMIT :limit"""
+                    LIMIT :limit OFFSET :offset"""
             ),
-            {"jurisdiction": code, "limit": limit},
+            {"jurisdiction": code, "limit": limit + 1, "offset": offset},
         ).mappings().all()
         return {
             "jurisdiction": code,
+            "has_more": len(rows) > limit,
+            "next_offset": offset + limit if len(rows) > limit and offset + limit <= 10000 else None,
             "items": [
                 {
                     "observation_id": str(row["id"]),
@@ -92,14 +105,13 @@ def observations(
                     "retrieved_at": _iso(row["retrieved_at"]),
                     "upstream_updated_at": _iso(row["upstream_updated_at"]),
                     "http_status": row["http_status"],
-                    "raw_sha": row["raw_sha256"],
                     "raw_sha256": row["raw_sha256"],
                     "status": row["status"],
                     "error_class": row["error_class"],
                     "record_count": row["record_count"],
                     "created_at": _iso(row["created_at"]),
                 }
-                for row in rows
+                for row in rows[:limit]
             ],
         }
     except HTTPException:
@@ -108,14 +120,14 @@ def observations(
         raise _public_failure() from None
     finally:
         if db is not None:
-            db.rollback()
-            db.close()
+            _close(db)
 
 
 @router.get("/reconciliations")
 def reconciliations(
     observation_id: uuid.UUID = Query(...),
     limit: int = Query(20, ge=1, le=_MAX_LIMIT),
+    offset: Annotated[int, Query(ge=0, le=10000)] = 0,
 ) -> dict:
     db = None
     try:
@@ -129,12 +141,14 @@ def reconciliations(
                      FROM official_reconciliation_runs
                     WHERE observation_id = :observation_id
                     ORDER BY completed_at DESC, id DESC
-                    LIMIT :limit"""
+                    LIMIT :limit OFFSET :offset"""
             ),
-            {"observation_id": observation_id, "limit": limit},
+            {"observation_id": observation_id, "limit": limit + 1, "offset": offset},
         ).mappings().all()
         return {
             "observation_id": str(observation_id),
+            "has_more": len(rows) > limit,
+            "next_offset": offset + limit if len(rows) > limit and offset + limit <= 10000 else None,
             "items": [
                 {
                     "reconciliation_id": str(row["id"]),
@@ -145,14 +159,12 @@ def reconciliations(
                     "comparator_version": row["comparator_version"],
                     "status": row["status"],
                     "summary": row["summary"],
-                    "local_hash": row["local_snapshot_sha256"],
-                    "diff_hash": row["diff_sha256"],
                     "local_snapshot_sha256": row["local_snapshot_sha256"],
                     "diff_sha256": row["diff_sha256"],
                     "error_class": row["error_class"],
                     "completed_at": _iso(row["completed_at"]),
                 }
-                for row in rows
+                for row in rows[:limit]
             ],
         }
     except HTTPException:
@@ -161,8 +173,7 @@ def reconciliations(
         raise _public_failure() from None
     finally:
         if db is not None:
-            db.rollback()
-            db.close()
+            _close(db)
 
 
 @router.get("/blobs/{sha256}")
@@ -196,5 +207,4 @@ def blob(sha256: str) -> Response:
         raise _public_failure() from None
     finally:
         if db is not None:
-            db.rollback()
-            db.close()
+            _close(db)

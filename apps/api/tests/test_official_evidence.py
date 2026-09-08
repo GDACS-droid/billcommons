@@ -73,11 +73,11 @@ def test_observations_is_bounded_public_metadata_and_read_only(monkeypatch):
     assert result["jurisdiction"] == "CA"
     assert result["items"][0]["observation_id"] == str(observation_id)
     assert result["items"][0]["target_scope"] == {"jurisdiction": "CA"}
-    assert result["items"][0]["raw_sha"] == "a" * 64
+    assert result["items"][0]["raw_sha256"] == "a" * 64
     assert "data" not in result["items"][0]
     assert any("READ ONLY" in query for query, _ in db.calls)
     assert any("statement_timeout" in query for query, _ in db.calls)
-    assert db.calls[-1][1]["limit"] == 100
+    assert db.calls[-1][1]["limit"] == 101
     assert db.closed
 
 
@@ -109,8 +109,8 @@ def test_reconciliations_returns_bounded_summary_metadata(monkeypatch):
 
     assert result["items"][0]["reconciliation_id"] == str(run_id)
     assert result["items"][0]["summary"] == {"changed": 1}
-    assert result["items"][0]["local_hash"] == "b" * 64
-    assert result["items"][0]["diff_hash"] == "c" * 64
+    assert result["items"][0]["local_snapshot_sha256"] == "b" * 64
+    assert result["items"][0]["diff_sha256"] == "c" * 64
     assert result["items"][0]["diff_sha256"] == "c" * 64
     assert db.closed
 
@@ -142,3 +142,59 @@ def test_blob_corruption_fails_closed_and_jurisdiction_is_validated(monkeypatch)
     with pytest.raises(HTTPException) as invalid:
         official_evidence.observations("XX", 20)
     assert invalid.value.status_code == 400
+
+
+def test_cleanup_failure_is_redacted_and_always_closes(monkeypatch):
+    class Broken(_DB):
+        def rollback(self):
+            raise RuntimeError("private connection diagnostic")
+    db = Broken([])
+    monkeypatch.setattr(official_evidence, "get_session", lambda: db)
+    with pytest.raises(HTTPException) as failure:
+        official_evidence.observations("CA", 20)
+    assert db.closed
+    assert failure.value.status_code == 503
+    assert "private" not in failure.value.detail
+
+
+def test_initialization_failure_still_closes_when_rollback_also_fails(monkeypatch):
+    class Broken(_DB):
+        def execute(self, *args, **kwargs):
+            raise RuntimeError("private initialization diagnostic")
+        def rollback(self):
+            raise RuntimeError("private rollback diagnostic")
+    db = Broken([])
+    monkeypatch.setattr(official_evidence, "get_session", lambda: db)
+    with pytest.raises(HTTPException) as failure:
+        official_evidence.observations("CA", 20)
+    assert db.closed
+    assert failure.value.status_code == 503
+    assert "private" not in failure.value.detail
+
+
+def test_http_validation_rejects_bad_filters_before_database(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    def no_database():
+        pytest.fail("invalid request opened a database")
+    monkeypatch.setattr(official_evidence, "get_session", no_database)
+    app = FastAPI()
+    app.include_router(official_evidence.router)
+    with TestClient(app) as client:
+        for path in (
+            "/official-evidence/observations?jurisdiction=CA&limit=101",
+            "/official-evidence/observations?jurisdiction=CA&offset=-1",
+            "/official-evidence/observations?jurisdiction=CA&offset=10001",
+            "/official-evidence/reconciliations?observation_id=bad",
+            "/official-evidence/blobs/not-a-hash",
+        ):
+            assert client.get(path).status_code == 422
+
+
+def test_missing_blob_is_404_and_closes(monkeypatch):
+    db = _DB([])
+    monkeypatch.setattr(official_evidence, "get_session", lambda: db)
+    with pytest.raises(HTTPException) as failure:
+        official_evidence.blob("a" * 64)
+    assert failure.value.status_code == 404
+    assert db.closed

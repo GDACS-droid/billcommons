@@ -54,7 +54,9 @@ def main() -> int:
          "workers/ingest/tests/test_data_health_database.py",
          "packages/shared/tests/test_data_health.py",
          "packages/shared/tests/test_reconciliation.py"],
-        ["apps/api/tests/test_data_health.py"],
+        ["apps/api/tests/test_data_health.py",
+         "apps/api/tests/test_official_evidence.py",
+         "apps/api/tests/test_official_evidence_database.py"],
     ]
     for tests in groups:
         result = subprocess.call([sys.executable, "-m", "pytest", *tests, "-q"])
