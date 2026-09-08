@@ -24,9 +24,23 @@ from billcommons_schema.models import (
 )
 
 PROCESSING_VERSION = "status_derivation_evidence/1"
+# Increment when the local status/substitution algorithm changes in a way that
+# makes an old input record replay under different semantics.
+ALGORITHM_VERSION = "status-recompute/1"
 MAX_BLOB_BYTES = 8 * 1024 * 1024
+# The maintenance command's established default is 2,000 bills. Keep the
+# derivation entry point within that published unit of work regardless of a
+# caller-provided command-line chunk value.
+MAX_BILLS_PER_RECOMPUTE = 2_000
 MAX_ACTIONS_PER_BILL = 1_000
 MAX_RELATIONS_PER_BILL = 1_000
+MAX_ACTION_ROWS_PER_RECOMPUTE = 100_000
+MAX_RELATION_ROWS_PER_RECOMPUTE = 100_000
+STREAM_FETCH_SIZE = 500
+
+
+class DerivationInputLimitExceeded(ValueError):
+    """A bounded evidence input cannot safely represent this recompute unit."""
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -56,6 +70,8 @@ def snapshot_state(db: OrmSession, bill_ids: list[object]) -> dict[object, dict[
     """Capture only the semantic fields this derivation can mutate."""
     if not bill_ids:
         return {}
+    if len(bill_ids) > MAX_BILLS_PER_RECOMPUTE:
+        raise DerivationInputLimitExceeded("derived status evidence bill batch exceeds configured cap")
     # Query scalar columns rather than ORM ``Bill`` instances. Status is
     # updated with raw SQL in the caller, which deliberately does not refresh
     # any already-loaded identity-map instance.
@@ -72,12 +88,21 @@ def snapshot_state(db: OrmSession, bill_ids: list[object]) -> dict[object, dict[
             RelatedBill.relation_type == "substituted-by",
         )
         .order_by(RelatedBill.bill_id, RelatedBill.created_at, RelatedBill.id)
-    ).scalars().all()
+        .execution_options(stream_results=True)
+    ).scalars().yield_per(STREAM_FETCH_SIZE)
     relations: dict[object, list[dict[str, Any]]] = {bill_id: [] for bill_id in bill_ids}
+    total_rows = 0
     for relation in rows:
+        total_rows += 1
+        if total_rows > MAX_RELATION_ROWS_PER_RECOMPUTE:
+            raise DerivationInputLimitExceeded(
+                "derived status evidence relation batch exceeds configured record cap"
+            )
         records = relations.setdefault(relation.bill_id, [])
         if len(records) >= MAX_RELATIONS_PER_BILL:
-            raise ValueError("derived status evidence relation input exceeds configured record cap")
+            raise DerivationInputLimitExceeded(
+                "derived status evidence relation input exceeds configured record cap"
+            )
         records.append(
             {
                 "id": str(relation.id),
@@ -107,13 +132,19 @@ def derivation_input(
     actions: list[dict[str, Any]],
     consulted_relations: list[dict[str, Any]],
     resolved_survivor: dict[str, Any] | None,
+    substitution_decision: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Build the bounded, canonical local inputs used for one bill."""
     if len(actions) > MAX_ACTIONS_PER_BILL:
-        raise ValueError("derived status evidence action input exceeds configured record cap")
+        raise DerivationInputLimitExceeded(
+            "derived status evidence action input exceeds configured record cap"
+        )
     if len(consulted_relations) > MAX_RELATIONS_PER_BILL:
-        raise ValueError("derived status evidence relation input exceeds configured record cap")
+        raise DerivationInputLimitExceeded(
+            "derived status evidence relation input exceeds configured record cap"
+        )
     return {
+        "algorithm_version": ALGORITHM_VERSION,
         "as_of_date": as_of_date.isoformat(),
         "bill_id": str(bill_id),
         "session": {
@@ -125,6 +156,7 @@ def derivation_input(
         "actions": actions,
         "consulted_substitution_relations": consulted_relations,
         "resolved_survivor": resolved_survivor,
+        "substitution_decision": substitution_decision,
     }
 
 
@@ -148,8 +180,12 @@ def record_changes(
         if after is None or _canonical_json_bytes(before) == _canonical_json_bytes(after):
             continue
         causal_id = (causal_evidence_by_bill or {}).get(bill_id)
-        if causal_id is not None and db.get(CorpusUpdateEvidence, causal_id) is None:
-            raise ValueError("derived status evidence causal corpus record is absent")
+        if causal_id is not None:
+            causal_record = db.get(CorpusUpdateEvidence, causal_id)
+            if causal_record is None:
+                raise ValueError("derived status evidence causal corpus record is absent")
+            if causal_record.bill_id != bill_id:
+                raise ValueError("derived status evidence causal corpus record belongs to another bill")
         evidence = DerivedStatusEvidence(
             bill_id=bill_id,
             causal_corpus_update_evidence_id=causal_id,

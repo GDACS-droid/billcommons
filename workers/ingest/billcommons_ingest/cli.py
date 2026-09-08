@@ -80,7 +80,6 @@ from billcommons_schema.models import (
     BillAction,
     BillDocument,
     BillVersion,
-    CorpusUpdateEvidence,
     IngestJob,
     IngestionRun,
     Jurisdiction,
@@ -139,6 +138,11 @@ CHAMBER_ACTIVITY_PATTERNS = (
 # small -- starving the sync to fill a date would be a bad trade, and the set
 # shrinks to zero as dates land.
 SESSION_DATE_TOPUP_PER_CYCLE = 5
+
+# Keep worker retries small enough that one malformed bill can be isolated
+# without holding every other jurisdiction's status refresh behind it. The
+# maintenance command retains its established 2,000-bill bounded chunk.
+STATUS_RECOMPUTE_WORKER_BATCH = 200
 
 DEFAULT_REGISTRY_PATH = "data/registry/sessions-2026.json"
 DEFAULT_COVERAGE_OUTPUT = "docs/state-coverage/coverage-latest.json"
@@ -1526,6 +1530,12 @@ def recompute_status_for_bills(
     """
     if not bill_ids:
         return (0, 0, 0)
+    if len(bill_ids) > status_evidence_mod.MAX_BILLS_PER_RECOMPUTE:
+        raise status_evidence_mod.DerivationInputLimitExceeded(
+            "status recompute bill batch exceeds configured cap"
+        )
+    if len(set(bill_ids)) != len(bill_ids):
+        raise ValueError("status recompute bill batch contains duplicate ids")
     # The session's end date is part of the derivation, not decoration: a bill
     # short of the governor's desk in an adjourned session is dead however
     # alive its own actions look. Joined here so it costs one query for the
@@ -1596,6 +1606,7 @@ def recompute_status_for_bills(
 
     actions_by_bill: dict[object, list[status_mod.ActionRow]] = {bid: [] for bid in bill_ids}
     action_evidence_by_bill: dict[object, list[dict]] = {bid: [] for bid in bill_ids}
+    action_row_count = 0
     for a in db.execute(
         select(
             BillAction.id,
@@ -1620,7 +1631,17 @@ def recompute_status_for_bills(
             BillAction.order.asc().nulls_first(),
             BillAction.id,
         )
-    ).all():
+        .execution_options(stream_results=True)
+    ).yield_per(status_evidence_mod.STREAM_FETCH_SIZE):
+        action_row_count += 1
+        if action_row_count > status_evidence_mod.MAX_ACTION_ROWS_PER_RECOMPUTE:
+            raise status_evidence_mod.DerivationInputLimitExceeded(
+                "derived status evidence action batch exceeds configured record cap"
+            )
+        if len(action_evidence_by_bill[a.bill_id]) >= status_evidence_mod.MAX_ACTIONS_PER_BILL:
+            raise status_evidence_mod.DerivationInputLimitExceeded(
+                "derived status evidence action input exceeds configured record cap"
+            )
         actions_by_bill[a.bill_id].append(
             status_mod.ActionRow(
                 action_date=a.action_date,
@@ -1656,6 +1677,10 @@ def recompute_status_for_bills(
                 bill_session.get(bid) in sessions_with_recent_activity
             ),
         )
+
+    # Preserve the pure action/session result separately from any cross-bill
+    # propagation. Evidence records the later substitution decision too.
+    base_derived_status = dict(derived_status)
 
     # Pass 2 -- substitution propagation (Jaya gap #1, R3). A substituted
     # print (e.g. an NY bill carrying "SUBSTITUTED BY A10008C") is not itself
@@ -1712,10 +1737,23 @@ def recompute_status_for_bills(
         # wins the last-write-wins assignment below -- depended on
         # whatever the planner felt like handing back that day.
         .order_by(RelatedBill.bill_id, RelatedBill.created_at, RelatedBill.id)
-    ).all()
+        .execution_options(stream_results=True)
+    ).yield_per(status_evidence_mod.STREAM_FETCH_SIZE)
     consulted_relations_by_bill: dict[object, list[dict]] = {bid: [] for bid in bill_ids}
+    related_rows_materialized = []
+    related_row_count = 0
     for row in related_rows:
-        consulted_relations_by_bill[row.bill_id].append(
+        related_row_count += 1
+        if related_row_count > status_evidence_mod.MAX_RELATION_ROWS_PER_RECOMPUTE:
+            raise status_evidence_mod.DerivationInputLimitExceeded(
+                "derived status evidence relation batch exceeds configured record cap"
+            )
+        records = consulted_relations_by_bill[row.bill_id]
+        if len(records) >= status_evidence_mod.MAX_RELATIONS_PER_BILL:
+            raise status_evidence_mod.DerivationInputLimitExceeded(
+                "derived status evidence relation input exceeds configured record cap"
+            )
+        records.append(
             {
                 "id": str(row.id),
                 "related_bill_id": str(row.related_bill_id) if row.related_bill_id else None,
@@ -1723,7 +1761,8 @@ def recompute_status_for_bills(
                 "relation_type": row.relation_type,
             }
         )
-    for row in related_rows:
+        related_rows_materialized.append(row)
+    for row in related_rows_materialized:
         if row.related_bill_id is not None:
             # A bill can only ever be substituted by ONE survivor. If THIS
             # bid's own action text already named a different identifier
@@ -1900,6 +1939,20 @@ def recompute_status_for_bills(
                 "identifier": identifier,
                 "status": None,
             }
+
+    substitution_decision_by_bill = {
+        bid: {
+            "base_status": base_derived_status.get(bid),
+            "text_derived_identifier": text_derived_identifier.get(bid),
+            "selected_identifier": survivor_identifier.get(bid),
+            "selected_survivor_bill_id": (
+                str(survivor_bill_id[bid]) if survivor_bill_id.get(bid) is not None else None
+            ),
+            "selected_survivor_identifier": survivor_bill_id_identifier.get(bid),
+            "final_status": derived_status.get(bid),
+        }
+        for bid in bill_ids
+    }
 
     # Persist the substitution relation itself. Everything above only ever
     # derives a STATUS from the survivor; nothing wrote the relation, so
@@ -2081,6 +2134,7 @@ def recompute_status_for_bills(
             actions=action_evidence_by_bill.get(bid, []),
             consulted_relations=consulted_relations_by_bill.get(bid, []),
             resolved_survivor=resolved_survivor_by_bill.get(bid),
+            substitution_decision=substitution_decision_by_bill.get(bid),
         )
         for bid in before_evidence
     }
@@ -2295,7 +2349,7 @@ def cmd_recompute_status(args: argparse.Namespace) -> int:
         while True:
             if args.limit and processed >= args.limit:
                 break
-            chunk = args.chunk
+            chunk = min(args.chunk, status_evidence_mod.MAX_BILLS_PER_RECOMPUTE)
             if args.limit:
                 chunk = min(chunk, args.limit - processed)
             q = select(Bill.id, Bill.status).order_by(Bill.id).limit(chunk)
@@ -2390,6 +2444,10 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
     # Bills whose status still needs re-deriving, carried across cycles so a
     # failed recompute is retried instead of being lost with the cycle.
     pending_status_bills: set = set()
+    # Exact source-response links survive a failed status phase. They are
+    # removed only after the corresponding bounded recompute transaction
+    # commits, never inferred later from historical ledger rows.
+    pending_status_causal_evidence_by_bill: dict = {}
 
     # Jurisdictions the session-date top-up has already tried this round.
     # Some sessions have no upstream end date and never will -- a two-year
@@ -2403,6 +2461,7 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
     try:
         while True:
             touched_this_cycle: set = set()
+            touched_causal_evidence_by_bill: dict = {}
 
             # Step 1: enqueue whatever is due.
             db = get_session()
@@ -2453,6 +2512,9 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                         # Collected only after the commit succeeds: a rolled-back
                         # sync wrote nothing, so its bills need no recompute.
                         touched_this_cycle |= result.touched_bill_ids
+                        touched_causal_evidence_by_bill.update(
+                            result.corpus_evidence_by_bill
+                        )
                         processed += 1
                         print(
                             f"sync-worker {worker_id}: api_sync {result.state} "
@@ -2528,26 +2590,23 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
             # and the bill serves a stale status until some unrelated edit
             # happens to touch it again.
             pending_status_bills |= touched_this_cycle
-            if pending_status_bills:
+            pending_status_causal_evidence_by_bill.update(touched_causal_evidence_by_bill)
+            status_failures_this_cycle: set = set()
+            while pending_status_bills - status_failures_this_cycle:
+                # The maintenance command has long used 2,000-bill chunks;
+                # worker batches are deliberately smaller so a bounded-input
+                # failure can be isolated without delaying other states.
+                batch = sorted(
+                    pending_status_bills - status_failures_this_cycle
+                )[:STATUS_RECOMPUTE_WORKER_BATCH]
                 db = get_session()
                 try:
-                    batch = sorted(pending_status_bills)
                     recompute_counts: dict[str, int] = {}
-                    # Source-response evidence is available for API-synced
-                    # bills. Keep the newest record per bill so a later local
-                    # derivation can name the exact corpus update it followed.
-                    causal_evidence_by_bill: dict = {}
-                    for evidence in db.execute(
-                        select(CorpusUpdateEvidence)
-                        .where(CorpusUpdateEvidence.bill_id.in_(batch))
-                        .order_by(
-                            CorpusUpdateEvidence.bill_id,
-                            CorpusUpdateEvidence.retrieved_at.desc(),
-                            CorpusUpdateEvidence.created_at.desc(),
-                            CorpusUpdateEvidence.id.desc(),
-                        )
-                    ).scalars():
-                        causal_evidence_by_bill.setdefault(evidence.bill_id, evidence.id)
+                    causal_evidence_by_bill = {
+                        bill_id: pending_status_causal_evidence_by_bill[bill_id]
+                        for bill_id in batch
+                        if bill_id in pending_status_causal_evidence_by_bill
+                    }
                     changed, cleared, _related = recompute_status_for_bills(
                         db,
                         batch,
@@ -2555,25 +2614,76 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                         causal_evidence_by_bill=causal_evidence_by_bill,
                     )
                     db.commit()
-                    pending_status_bills = set()
-                    print(
-                        f"sync-worker {worker_id}: status recomputed for "
-                        f"{len(batch)} touched bill(s) -- {changed} changed, "
-                        f"{cleared} cleared, "
-                        f"{recompute_counts.get('_related_removed', 0)} "
-                        f"related row(s) removed",
-                        flush=True,
-                    )
                 except Exception:
                     db.rollback()
                     traceback.print_exc()
+                    # A single bill with oversized local inputs must not hold
+                    # every later state behind this batch forever. Retry the
+                    # members independently; successful singleton commits are
+                    # removed below, while the failing bill and its exact
+                    # source-evidence link remain pending for a later repair.
+                    if len(batch) > 1:
+                        for bill_id in batch:
+                            isolated_db = get_session()
+                            try:
+                                isolated_counts: dict[str, int] = {}
+                                isolated_causal = (
+                                    {bill_id: pending_status_causal_evidence_by_bill[bill_id]}
+                                    if bill_id in pending_status_causal_evidence_by_bill
+                                    else {}
+                                )
+                                isolated_changed, isolated_cleared, _isolated_related = (
+                                    recompute_status_for_bills(
+                                        isolated_db,
+                                        [bill_id],
+                                        isolated_counts,
+                                        causal_evidence_by_bill=isolated_causal,
+                                    )
+                                )
+                                isolated_db.commit()
+                                pending_status_bills.remove(bill_id)
+                                pending_status_causal_evidence_by_bill.pop(bill_id, None)
+                                print(
+                                    f"sync-worker {worker_id}: status recomputed for "
+                                    f"1 isolated bill -- {isolated_changed} changed, "
+                                    f"{isolated_cleared} cleared, "
+                                    f"{isolated_counts.get('_related_removed', 0)} "
+                                    f"related row(s) removed",
+                                    flush=True,
+                                )
+                            except Exception:
+                                isolated_db.rollback()
+                                status_failures_this_cycle.add(bill_id)
+                                traceback.print_exc()
+                                print(
+                                    f"sync-worker {worker_id}: status recompute FAILED for "
+                                    f"isolated bill {bill_id}; retrying next cycle",
+                                    flush=True,
+                                )
+                            finally:
+                                isolated_db.close()
+                        continue
+                    status_failures_this_cycle.add(batch[0])
                     print(
                         f"sync-worker {worker_id}: status recompute FAILED for "
-                        f"{len(pending_status_bills)} bill(s); retrying next cycle",
+                        f"isolated bill {batch[0]}; retrying next cycle",
                         flush=True,
                     )
+                    continue
                 finally:
                     db.close()
+
+                pending_status_bills.difference_update(batch)
+                for bill_id in batch:
+                    pending_status_causal_evidence_by_bill.pop(bill_id, None)
+                print(
+                    f"sync-worker {worker_id}: status recomputed for "
+                    f"{len(batch)} touched bill(s) -- {changed} changed, "
+                    f"{cleared} cleared, "
+                    f"{recompute_counts.get('_related_removed', 0)} "
+                    f"related row(s) removed",
+                    flush=True,
+                )
 
             # Step 3a: top up missing session end dates.
             #

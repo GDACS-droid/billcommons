@@ -116,6 +116,10 @@ class ApiSyncResult:
     # A bill missing from that window never gets its status re-derived, so the
     # field keeps serving a stale answer with no error anywhere.
     touched_bill_ids: set = field(default_factory=set)
+    # Exact corpus ledger rows created by this successful sync transaction.
+    # The status worker receives this map only after committing the job, so it
+    # never guesses from historical evidence when it records a derivation.
+    corpus_evidence_by_bill: dict = field(default_factory=dict)
 
 
 def _bill_checksum(payload: dict) -> str:
@@ -553,7 +557,7 @@ def sync_state(
             _upsert_actions(db, bill, bill_payload.get("actions") or [], result, retrieved_at)
             _upsert_sponsorships(db, bill, bill_payload.get("sponsorships") or [], result, retrieved_at)
             db.flush()
-            corpus_update_evidence.record_update_evidence(
+            evidence = corpus_update_evidence.record_update_evidence(
                 db,
                 bill=bill,
                 original_bill_upstream_id=original_bill_upstream_id,
@@ -562,6 +566,8 @@ def sync_state(
                 after=corpus_update_evidence.snapshot_bill(db, bill),
                 retrieved_at=retrieved_at,
             )
+            if evidence is not None:
+                result.corpus_evidence_by_bill[bill.id] = evidence.id
 
         if page >= upstream_max_page:
             result.next_page = None

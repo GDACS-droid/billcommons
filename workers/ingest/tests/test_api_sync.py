@@ -145,9 +145,10 @@ def test_sync_state_records_exact_openstates_response_bytes_for_a_mutation(db_se
         {"pagination": {"max_page": 1}, "results": [payload]}, indent=2, separators=(",", ": ")
     ).encode("utf-8")
 
-    sync_state(db_session, jurisdiction, client=_client_with_raw_page(raw))
+    result = sync_state(db_session, jurisdiction, client=_client_with_raw_page(raw))
 
     evidence = db_session.execute(select(CorpusUpdateEvidence)).scalar_one()
+    assert result.corpus_evidence_by_bill == {evidence.bill_id: evidence.id}
     stored_response = db_session.get(OfficialRawBlob, evidence.response_sha256)
     before, after = _evidence_snapshots(db_session, evidence)
 

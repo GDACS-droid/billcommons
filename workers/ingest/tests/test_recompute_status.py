@@ -19,10 +19,12 @@ import pytest
 from sqlalchemy import select
 
 from billcommons_ingest import derived_status_evidence as status_evidence_mod
+from billcommons_ingest import status as status_mod
 from billcommons_ingest.cli import recompute_status_for_bills
 from billcommons_schema.models import (
     Bill,
     BillAction,
+    BillEvent,
     CorpusUpdateEvidence,
     DerivedStatusEvidence,
     Jurisdiction,
@@ -1237,6 +1239,7 @@ def test_status_derivation_records_replayable_status_change_with_causal_source_e
     inputs = _read_evidence_blob(db_session, record.derivation_input_sha256)
     before = _read_evidence_blob(db_session, record.before_snapshot_sha256)
     after = _read_evidence_blob(db_session, record.after_snapshot_sha256)
+    assert inputs["algorithm_version"] == status_evidence_mod.ALGORITHM_VERSION
     assert inputs["bill_id"] == str(bill.id)
     assert inputs["actions"] == [
         {
@@ -1257,6 +1260,25 @@ def test_status_derivation_records_replayable_status_change_with_causal_source_e
     }
     assert before == {"bill": {"id": str(bill.id), "status": None}, "substitution_relations": []}
     assert after == {"bill": {"id": str(bill.id), "status": "enacted"}, "substitution_relations": []}
+    replayed_actions = [
+        status_mod.ActionRow(
+            action_date=date.fromisoformat(action["action_date"]) if action["action_date"] else None,
+            classification=action["classification"],
+            description=action["description"],
+            organization_id=action["organization_id"],
+            order=action["order"],
+            source_name=action["source_name"],
+        )
+        for action in inputs["actions"]
+    ]
+    session = inputs["session"]
+    replayed_status = status_mod.apply_session_outcome(
+        status_mod.derive_status(replayed_actions),
+        date.fromisoformat(session["end_date"]) if session["end_date"] else None,
+        session_active=session["active"],
+        session_has_recent_activity=session["has_recent_chamber_activity"],
+    )
+    assert replayed_status == after["bill"]["status"]
 
 
 def test_status_derivation_records_relation_only_change_when_status_is_already_current(db_session):
@@ -1361,4 +1383,83 @@ def test_status_derivation_rejects_unbounded_action_input_and_rolls_back(db_sess
             recompute_status_for_bills(db_session, [bill.id], stamp=False)
 
     assert db_session.get(Bill, bill.id).status is None
+    assert _derived_evidence(db_session) == []
+
+
+
+def test_status_derivation_replays_saved_substitution_decision(db_session):
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    survivor = _bill(db_session, jurisdiction, session_row, "HB 10")
+    substituted = _bill(db_session, jurisdiction, session_row, "SB 10")
+    db_session.add_all([
+        BillAction(bill_id=survivor.id, action_date=date(2026, 2, 3), description="Signed by Governor", classification="executive-signature"),
+        BillAction(bill_id=substituted.id, action_date=date(2026, 2, 4), description="SUBSTITUTED BY HB10", classification=None),
+    ])
+    db_session.flush()
+    recompute_status_for_bills(db_session, [survivor.id, substituted.id], stamp=False)
+    db_session.flush()
+    record = db_session.execute(
+        select(DerivedStatusEvidence).where(DerivedStatusEvidence.bill_id == substituted.id)
+    ).scalar_one()
+    inputs = _read_evidence_blob(db_session, record.derivation_input_sha256)
+    after = _read_evidence_blob(db_session, record.after_snapshot_sha256)
+    decision = inputs["substitution_decision"]
+    survivor_input = inputs["resolved_survivor"]
+    assert decision["text_derived_identifier"] == "HB 10"
+    assert decision["selected_survivor_bill_id"] == str(survivor.id)
+    assert survivor_input["status"] == "enacted"
+    # Relation lookup itself is not replayed here. The saved decision records
+    # its exact selected survivor, and the pure terminal propagation rule
+    # reproduces the persisted result from that bounded input.
+    replayed_status = (
+        survivor_input["status"]
+        if survivor_input["status"] in status_mod.TERMINAL_STATUSES
+        else status_mod.SUBSTITUTED
+    )
+    assert replayed_status == after["bill"]["status"] == "enacted"
+
+
+def test_status_derivation_evidence_failure_rolls_back_stamp_event(db_session, monkeypatch):
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    bill = _bill(db_session, jurisdiction, session_row, "HB 11")
+    db_session.add(BillAction(bill_id=bill.id, action_date=date(2026, 2, 3), description="Signed by Governor", classification="executive-signature"))
+    db_session.flush()
+    monkeypatch.setattr(status_evidence_mod, "_store_blob", lambda *_args: (_ for _ in ()).throw(RuntimeError("evidence store unavailable")))
+    with pytest.raises(RuntimeError, match="evidence store unavailable"):
+        with db_session.begin_nested():
+            recompute_status_for_bills(db_session, [bill.id], stamp=True)
+    assert db_session.get(Bill, bill.id).status is None
+    assert db_session.execute(select(BillEvent).where(BillEvent.bill_id == bill.id)).scalars().all() == []
+
+
+def test_status_derivation_rejects_unbounded_related_input_before_mutation(db_session, monkeypatch):
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    bill = _bill(db_session, jurisdiction, session_row, "HB 12")
+    db_session.add_all([
+        RelatedBill(bill_id=bill.id, related_identifier="HB 1", relation_type="substituted-by"),
+        RelatedBill(bill_id=bill.id, related_identifier="HB 2", relation_type="substituted-by"),
+    ])
+    db_session.flush()
+    monkeypatch.setattr(status_evidence_mod, "MAX_RELATIONS_PER_BILL", 1)
+    with pytest.raises(ValueError, match="relation input exceeds configured record cap"):
+        with db_session.begin_nested():
+            recompute_status_for_bills(db_session, [bill.id], stamp=False)
+    assert _derived_evidence(db_session) == []
+
+
+def test_status_derivation_rejects_causal_evidence_for_another_bill(db_session):
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    source_bill = _bill(db_session, jurisdiction, session_row, "HB 13")
+    target_bill = _bill(db_session, jurisdiction, session_row, "HB 14")
+    db_session.add(BillAction(bill_id=target_bill.id, action_date=date(2026, 2, 3), description="Signed by Governor", classification="executive-signature"))
+    source_evidence = _corpus_evidence(db_session, source_bill.id)
+    with pytest.raises(ValueError, match="belongs to another bill"):
+        with db_session.begin_nested():
+            recompute_status_for_bills(
+                db_session,
+                [target_bill.id],
+                stamp=False,
+                causal_evidence_by_bill={target_bill.id: source_evidence.id},
+            )
+    assert db_session.get(Bill, target_bill.id).status is None
     assert _derived_evidence(db_session) == []
