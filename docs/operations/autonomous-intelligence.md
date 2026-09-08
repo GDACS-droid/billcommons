@@ -230,22 +230,22 @@ dissenting mechanisms against exact source. Cache writers share one lock;
 PostgreSQL permits transaction attributes as the first statement after BEGIN;
 all 503 paths already set no-store; zero deferred count cannot enter the JSX
 branch. Trusted checkout responses come directly from Stripe, and magic-link
-success is actually HTTP202. The hypothetical compromised-API/error-200 cases
+success is actually HTTP 202. The hypothetical compromised-API/error-200 cases
 are not demonstrated regressions. The advocate's NULL cases are excluded by
 actual production NOT NULL constraints. Two exact-source live, read-only
-report loads passed in 3.266/1.616 seconds; the slowest SQL took0.436 seconds.
+report loads passed in 3.266/1.616 seconds; the slowest SQL took 0.436 seconds.
 The current bounds have measured headroom; future corpus growth remains an
 operational risk. Owner adjudication accepted the source without pretending
 the tool's BLOCK was a unanimous pass. The complete safe adjudication and live
 proof are retained in the release evidence directory.
 
 Only the API is deploying in this action. Production-specific readiness
-configuration was applied and read back: `/api/v1/data-health`, timeout300,
-draining60, overlap0. Restore environment config ETag remained unchanged.
-The exact frozen Git archive contained476 verified tracked files, SHA-256
+configuration was applied and read back: `/api/v1/data-health`, timeout 300,
+draining 60, overlap 0. Restore environment config ETag remained unchanged.
+The exact frozen Git archive contained 476 verified tracked files, SHA-256
 `cdc7343e4656a675b1b9ae28e165b9ed7c0172fb27893e7f4aee2a41256d2885`.
 Railway accepted API deployment `c2537036-b510-48a8-8fcc-20e1aaa2135c`.
-A deterministic monitor watches that ID through startup and900 seconds of
+A deterministic monitor watches that ID through startup and 900 seconds of
 repeated health/readiness/report/bill/web/MCP proof. Its handle is
 `api-c2537036-b510-48a8-8fcc-20e1aaa2135c`; state is
 `~/.local/share/billcommons/reliability-release-20260908/api-c2537036-monitor.json`.
