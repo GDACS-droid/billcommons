@@ -48,6 +48,11 @@ class ScoutAdmission:
 
 def customer_is_admitted(customer: ApiCustomer, settings: ScoutSettings) -> bool:
     """Whether a customer remains within the current controlled rollout."""
+    # Scheduler-owned monitors do not pass through cookie-session admission,
+    # so suspension must independently stop future queue work here. Readable
+    # history remains owner-scoped.
+    if customer.suspended_at is not None:
+        return False
     if settings.canary_emails:
         return customer.email.strip().casefold() in settings.canary_emails
     return settings.allow_public_rollout

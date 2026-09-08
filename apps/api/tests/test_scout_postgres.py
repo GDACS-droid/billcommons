@@ -1349,6 +1349,84 @@ def test_postgres_saved_monitor_defers_when_shared_daily_admission_refuses(
     assert monitor.consecutive_deferrals == 1
 
 
+def test_postgres_suspended_monitor_defers_without_reserving_a_job(
+    pg_scout: PostgresScoutHarness, scout_api, tmp_path
+):
+    """A saved monitor cannot revive queue work after its owner is suspended."""
+    customer = pg_scout.customer("monitor-suspended")
+    baseline = _terminal_monitor_baseline(pg_scout, customer)
+    with TestClient(scout_api) as client:
+        saved = client.post(
+            f"/api/v1/scout/jobs/{baseline.id}/monitor", json={},
+            headers={"x-test-customer": str(customer.id)},
+        )
+        assert saved.status_code == 201
+        monitor_id = uuid.UUID(saved.json()["monitor"]["id"])
+    with pg_scout.sessions() as db:
+        stored_customer = db.get(ApiCustomer, customer.id)
+        stored_customer.suspended_at = datetime.now(timezone.utc)
+        monitor = db.get(ScoutMonitor, monitor_id)
+        monitor.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+    runner = ScoutRunner(
+        pg_scout.sessions, FilesystemRawStore(tmp_path / "monitor-suspended-raw"), MockResearchBrowserProvider(),
+        settings=ScoutSettings(enabled=True, allow_public_rollout=True),
+    )
+    assert runner.schedule_one_due_monitor() is True
+    with pg_scout.sessions() as db:
+        jobs = db.scalars(select(ScoutResearchJob).where(
+            ScoutResearchJob.customer_id == customer.id
+        )).all()
+        deferred = db.scalar(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.monitor_id == monitor_id, ScoutMonitorRun.status == "deferred"
+        ))
+    assert [job.id for job in jobs] == [baseline.id]
+    assert deferred is not None and deferred.error_class == "scout_rollout_not_available"
+
+
+def test_postgres_terminal_monitor_reconciliation_does_not_lock_readonly_job(
+    pg_scout: PostgresScoutHarness, tmp_path
+):
+    """A held job lock must not make the run-only reconciliation skip work."""
+    customer = pg_scout.customer("monitor-reconcile-lock")
+    now = datetime.now(timezone.utc)
+    with pg_scout.sessions() as db:
+        job = ScoutResearchJob(
+            customer_id=customer.id, original_query="HB 625", normalized_query="hb 625",
+            jurisdiction="FL", cache_key=f"monitor-reconcile-{uuid.uuid4().hex}", status="completed",
+            strategy={}, limits={}, usage={}, completed_at=now,
+        )
+        monitor = ScoutMonitor(
+            customer_id=customer.id, original_query="HB 625", normalized_query="hb 625",
+            jurisdiction="FL", cache_key=job.cache_key, cadence_seconds=6 * 60 * 60,
+            next_run_at=now,
+        )
+        db.add_all((job, monitor))
+        db.flush()
+        run = ScoutMonitorRun(
+            monitor_id=monitor.id, job_id=job.id, status="queued", execution_mode="new",
+            scheduled_for=now, source_snapshot={}, change_summary={},
+        )
+        db.add(run)
+        db.commit()
+        job_id, run_id = job.id, run.id
+    runner = ScoutRunner(
+        pg_scout.sessions, FilesystemRawStore(tmp_path / "monitor-reconcile-lock"), MockResearchBrowserProvider(),
+        settings=ScoutSettings(enabled=True, allow_public_rollout=True),
+    )
+    with pg_scout.sessions() as locking_db:
+        # If reconciliation's joined SELECT locks ScoutResearchJob as well,
+        # SKIP LOCKED silently misses this otherwise-ready run.
+        locking_db.execute(select(ScoutResearchJob).where(
+            ScoutResearchJob.id == job_id
+        ).with_for_update()).scalar_one()
+        assert runner._reconcile_terminal_monitor_run(run_id) is True
+        locking_db.rollback()
+    with pg_scout.sessions() as db:
+        reconciled = db.get(ScoutMonitorRun, run_id)
+    assert reconciled.status == "completed"
+
+
 
 def test_postgres_monitor_scheduler_and_ad_hoc_admission_share_owner_and_platform_locks(
     monkeypatch, pg_scout: PostgresScoutHarness, scout_api, tmp_path

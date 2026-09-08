@@ -453,7 +453,12 @@ class ScoutRunner:
                 stmt = stmt.where(ScoutResearchJob.status.in_(terminal)).order_by(
                     ScoutMonitorRun.scheduled_for
                 )
-            run = db.execute(stmt.with_for_update(skip_locked=True).limit(1)).scalar_one_or_none()
+            # The joined job is read only. Locking it here would conflict with
+            # the terminalizer's job → run → monitor order, so lock only the
+            # queue journal row before taking the monitor lock below.
+            run = db.execute(
+                stmt.with_for_update(of=ScoutMonitorRun, skip_locked=True).limit(1)
+            ).scalar_one_or_none()
             if run is None:
                 return False
             job = db.get(ScoutResearchJob, run.job_id)
