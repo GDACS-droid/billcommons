@@ -60,6 +60,24 @@ Scout objects is destructive and is not part of the rollback procedure.
 
 The first real adapter is Florida-focused. P0 does not pretend to be a generic 50-state autonomous crawler.
 
+### California retained archive lane
+
+California has one deliberately smaller lane. It accepts only an exact current-session
+query: `AB 123 2025-2026` for the regular session, or `AB 123 2025-2026 Special
+Session 1` for the special session. It does not infer a session from a bare bill
+number or run a topical CA search. The worker joins that exact local bill/session to a
+successful retained `ca_official_actions` observation, reparses its exact ZIP, and
+requires that the archive contain the corresponding official bill ID.
+
+This lane makes no network or browser request. It copies the exact archive into the
+tenant Scout RawStore only when it fits the job's already-admitted `max_direct_bytes`
+limit and the existing raw-store capacity guard. The source keeps the archive publisher
+URL and original observation time. Its finding states that the archive is weekday
+delta-only evidence; it does not represent current, complete, or statewide California
+bill history. An oversized, missing, or malformed archive produces a truthful partial
+result instead of falling back to an older or external source; an archive that simply
+does not include the bill is skipped because a delta is not a full-history assertion.
+
 ## Provider lifecycle
 
 Every browser run has centrally configured ceilings for wall time, pages, actions, routed network requests, retries, response bytes, per-user concurrent jobs, and global browser concurrency. Global concurrency is enforced with a PostgreSQL advisory lock and durable browser-session rows, not an in-process semaphore. The provider calls Solari `sessions.create(recording=True)`, records the signed provider ID durably before Patchright connects, and attempts bounded release independently of the drive timeout, including cancellation and extraction failures. P0 opens one allowlisted page and intercepts that page's navigation and subresource requests; it blocks image/media/font requests, WebSockets, and popups, and does not click arbitrary links or initiate downloads. Those interactions require additional policy tests before broader planning is enabled. Direct fetching connects to the DNS address admitted for that hop rather than re-resolving at socket time.

@@ -18,6 +18,7 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 from billcommons_shared.safe_http import SsrfRejected, admit_url
 
 FLORIDA = "FL"
+CALIFORNIA = "CA"
 DEFAULT_PLATFORM_MAX_ACTIVE_JOBS = 10
 DEFAULT_PLATFORM_MAX_DAILY_JOBS = 100
 DEFAULT_PLATFORM_MAX_DAILY_BROWSER_SECONDS = 3_600
@@ -26,6 +27,7 @@ DEFAULT_MAX_RETAINED_RAWSTORE_BYTES = 512 * 1024 * 1024
 # earlier namespaces remain auditable records, but must not be returned as a
 # fresh result under a corrected presentation contract.
 SCOUT_CACHE_NAMESPACE = "scout-p0-3-provenance"
+SCOUT_CA_RETAINED_CACHE_NAMESPACE = "scout-ca-retained-p0"
 OFFICIAL_FLORIDA_HOSTS = frozenset({
     "www.flsenate.gov", "flsenate.gov", "www.myfloridahouse.gov",
     "myfloridahouse.gov", "www.leg.state.fl.us", "leg.state.fl.us",
@@ -48,6 +50,15 @@ _UNUSABLE_DIRECT_MARKERS = (
 )
 _SPACE_RE = re.compile(r"\s+")
 _BILL_RE = re.compile(r"\b(?:H\.?\s*B\.?|S\.?\s*B\.?|HB|SB)\s*(\d{1,6})\b", re.I)
+# The CA official-current feed documents these bill and resolution prefixes.
+# Keeping the grammar explicit avoids interpreting arbitrary tokens as a bill.
+_CA_MEASURE_TYPES = frozenset({"AB", "ACA", "ACR", "AJR", "AR", "SB", "SCA", "SCR", "SJR", "SR"})
+_CA_EXACT_BILL_RE = re.compile(
+    r"^\s*(?P<measure>[A-Za-z]+)\s*\.?\s*(?P<number>\d{1,6})"
+    r"\s+2025\s*[-–]\s*2026"
+    r"(?:\s+(?P<special>Special\s+Session\s+1)|\s+(?P<regular>Regular\s+Session))?\s*$",
+    re.I,
+)
 _TOPICAL_STOPWORDS = frozenset({
     "about", "and", "bill", "bills", "find", "florida", "for",
     "in", "involving", "is", "law", "laws", "legislation", "legislative", "of",
@@ -304,9 +315,57 @@ def normalize_query(query: str, *, max_chars: int = 500) -> str:
 
 def normalize_jurisdiction(jurisdiction: str) -> str:
     value = jurisdiction.strip().upper()
-    if value != FLORIDA:
+    if value not in {FLORIDA, CALIFORNIA}:
         raise ScoutPolicyError("unsupported_jurisdiction")
     return value
+
+
+@dataclass(frozen=True)
+class CaliforniaBillQuery:
+    """One explicit current-session California bill query for retained evidence."""
+
+    identifier: str
+    session_identifier: str
+    official_bill_id: str
+
+
+def extract_california_bill_query(query: str) -> CaliforniaBillQuery | None:
+    """Parse the intentionally narrow CA Scout grammar without guessing a session.
+
+    ``AB 123 2025-2026`` means the current regular session.  The special
+    session must be named explicitly as ``AB 123 2025-2026 Special Session 1``.
+    Topics, a bare bill number, and any other session all return ``None``.
+    """
+
+    match = _CA_EXACT_BILL_RE.fullmatch(query)
+    if match is None:
+        return None
+    measure = match.group("measure").upper()
+    number = int(match.group("number"))
+    if measure not in _CA_MEASURE_TYPES or number <= 0:
+        return None
+    identifier = f"{measure} {number}"
+    if match.group("special"):
+        return CaliforniaBillQuery(
+            identifier=identifier,
+            session_identifier="2025-2026 Special Session 1",
+            official_bill_id=f"202520261{measure}{number}",
+        )
+    return CaliforniaBillQuery(
+        identifier=identifier,
+        session_identifier="2025-2026 Regular Session",
+        official_bill_id=f"202520260{measure}{number}",
+    )
+
+
+def scout_cache_namespace(jurisdiction: str) -> str:
+    """Keep CA retained-evidence jobs out of the Florida result cache."""
+
+    return (
+        SCOUT_CA_RETAINED_CACHE_NAMESPACE
+        if normalize_jurisdiction(jurisdiction) == CALIFORNIA
+        else SCOUT_CACHE_NAMESPACE
+    )
 
 
 def scout_cache_key(

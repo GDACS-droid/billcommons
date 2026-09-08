@@ -30,7 +30,16 @@ from billcommons_schema.models import (
     ScoutResearchJob,
     ScoutSource,
 )
-from billcommons_shared.scout import ScoutPolicyError, ScoutSettings, normalize_jurisdiction, normalize_query, scout_cache_key
+from billcommons_shared.scout import (
+    CALIFORNIA,
+    ScoutPolicyError,
+    ScoutSettings,
+    extract_california_bill_query,
+    normalize_jurisdiction,
+    normalize_query,
+    scout_cache_key,
+    scout_cache_namespace,
+)
 
 router = APIRouter(prefix="/scout", tags=["scout"])
 
@@ -363,11 +372,17 @@ def create_job(
     try:
         jurisdiction = normalize_jurisdiction(body.jurisdiction)
         normalized = normalize_query(body.query, max_chars=settings.max_query_chars)
+        if jurisdiction == CALIFORNIA and extract_california_bill_query(body.query) is None:
+            raise ScoutPolicyError("invalid_california_retained_query")
     except ScoutPolicyError as exc:
         # The API validation contract need not disclose policy implementation.
         from fastapi import HTTPException
         raise HTTPException(status_code=422, detail={"code": "invalid_scout_request", "message": str(exc)}) from exc
-    key = scout_cache_key(body.query, jurisdiction)
+    key = scout_cache_key(
+        body.query,
+        jurisdiction,
+        freshness_bucket=scout_cache_namespace(jurisdiction),
+    )
 
     # Serializes a customer's quota/check-and-create decision on Postgres.
     # The partial cache-key index remains the authority for equivalent jobs.
@@ -454,13 +469,18 @@ def create_job(
         if active_count >= settings.per_customer_active_jobs:
             raise too_many_requests("scout_active_job_limit", "Too many active Scout jobs.", 60)
 
+        is_california_retained = jurisdiction == CALIFORNIA
         job = ScoutResearchJob(
             customer_id=customer.id,
             original_query=body.query.strip(),
             normalized_query=normalized,
             jurisdiction=jurisdiction,
             cache_key=key,
-            strategy={"adapter": "florida_p0", "mode": "structured_first"},
+            strategy=(
+                {"adapter": "california_retained_p0", "mode": "retained_official_archive"}
+                if is_california_retained
+                else {"adapter": "florida_p0", "mode": "structured_first"}
+            ),
             limits={
                 "max_pages": settings.max_pages,
                 "max_actions": settings.max_actions,

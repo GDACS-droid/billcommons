@@ -13,17 +13,33 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 from urllib.parse import urlsplit
 
-from sqlalchemy import and_, delete, exists, or_, select, text
+from sqlalchemy import and_, delete, exists, func, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from billcommons_schema.models import ApiCustomer, Bill, BillSubject, Jurisdiction, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutRawBlob, ScoutResearchJob, ScoutSource, Session as LegislativeSession
+from billcommons_schema.models import (
+    ApiCustomer,
+    Bill,
+    BillSubject,
+    Jurisdiction,
+    OfficialRawBlob,
+    OfficialSourceObservation,
+    OfficialSourceTarget,
+    ScoutBrowserSession,
+    ScoutFinding,
+    ScoutJobEvent,
+    ScoutRawBlob,
+    ScoutResearchJob,
+    ScoutSource,
+    Session as LegislativeSession,
+)
+from billcommons_shared.ca_official_actions import OfficialCaActionsError, parse_ca_official_actions_zip
 from billcommons_shared.rawstore import RawStore
 from billcommons_shared.safe_http import SafeHttpError, SsrfRejected, new_safe_http_client
 from billcommons_shared.scout import (
     BrowserCapture, BrowserRequest, ResearchBrowserProvider, ScoutPolicyError,
     ScoutSettings, browser_required, canonicalize_url, classify_direct_response,
     content_hash, discover_florida_senate_related_documents, discover_florida_senate_vote_records,
-    extract_florida_bill_identifier, summarize_content_change,
+    CALIFORNIA, extract_california_bill_query, extract_florida_bill_identifier, summarize_content_change,
     is_pdf_attachment_payload, topical_search_terms,
 )
 from billcommons_scout.providers import ProviderSessionPersistenceError, SolariProviderError
@@ -74,6 +90,16 @@ class RelatedDocumentDescription:
     what_happened: str
     relevant_date: date | None
     confidence: str
+
+
+@dataclass(frozen=True)
+class RetainedCaliforniaObservation:
+    id: uuid.UUID
+    source_url: str
+    retrieved_at: datetime
+    upstream_updated_at: datetime | None
+    http_status: int | None
+    raw_sha256: str
 
 
 def describe_related_document(
@@ -556,6 +582,253 @@ class ScoutRunner:
             )))
         return db.execute(stmt.limit(1)).scalar_one_or_none() is not None
 
+    def _california_retained_evidence(self, db: Session, job: ScoutResearchJob):
+        """Return one exact local bill and matching retained CA archive evidence.
+
+        The CA source is a weekday delta, so this intentionally accepts only
+        the explicit query grammar and only returns an archive that includes
+        the requested official bill.  It never treats an absent bill as proof
+        of current or comprehensive history.
+        """
+
+        query = extract_california_bill_query(job.original_query)
+        if query is None:
+            return None, "unsupported_query"
+        bills = db.execute(
+            select(Bill.id).join(
+                Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id
+            ).join(
+                LegislativeSession, LegislativeSession.id == Bill.session_id
+            ).where(
+                Jurisdiction.abbreviation == CALIFORNIA,
+                LegislativeSession.identifier == query.session_identifier,
+                Bill.identifier_norm == query.identifier,
+            )
+        ).scalars().all()
+        if len(bills) != 1:
+            return None, "unsupported_query"
+
+        maximum_bytes = self._job_limit(job, "max_direct_bytes", self.settings.max_direct_bytes)
+        observations = db.execute(
+            select(
+                OfficialSourceObservation.id,
+                OfficialSourceObservation.source_url,
+                OfficialSourceObservation.retrieved_at,
+                OfficialSourceObservation.upstream_updated_at,
+                OfficialSourceObservation.http_status,
+                OfficialSourceObservation.raw_sha256,
+                func.length(OfficialRawBlob.data).label("raw_byte_length"),
+            ).join(
+                OfficialRawBlob, OfficialRawBlob.sha256 == OfficialSourceObservation.raw_sha256
+            ).join(
+                OfficialSourceTarget, OfficialSourceTarget.id == OfficialSourceObservation.target_id
+            ).join(
+                Jurisdiction, Jurisdiction.id == OfficialSourceTarget.jurisdiction_id
+            ).where(
+                Jurisdiction.abbreviation == CALIFORNIA,
+                OfficialSourceTarget.adapter_name == "ca_official_actions",
+                OfficialSourceObservation.adapter_name == "ca_official_actions",
+                OfficialSourceObservation.status == "succeeded",
+                OfficialSourceObservation.raw_sha256.is_not(None),
+            ).order_by(
+                OfficialSourceObservation.retrieved_at.desc(),
+                OfficialSourceObservation.id.desc(),
+            ).limit(8)
+        ).all()
+        for observation_id, source_url, retrieved_at, upstream_updated_at, http_status, raw_sha256, raw_byte_length in observations:
+            if not isinstance(raw_sha256, str) or not isinstance(raw_byte_length, int):
+                return None, "retained_archive_integrity_failed"
+            # This metadata query intentionally precedes the blob read. An
+            # over-limit newest archive remains a truthful terminal outcome;
+            # selecting an older archive would conceal why current evidence
+            # cannot be attached to this job.
+            if raw_byte_length > maximum_bytes:
+                return None, "retained_archive_exceeds_job_limit"
+            raw_bytes = db.execute(
+                select(OfficialRawBlob.data).where(OfficialRawBlob.sha256 == raw_sha256)
+            ).scalar_one_or_none()
+            if raw_bytes is None:
+                return None, "retained_archive_integrity_failed"
+            observation = RetainedCaliforniaObservation(
+                id=observation_id,
+                source_url=source_url,
+                retrieved_at=retrieved_at,
+                upstream_updated_at=upstream_updated_at,
+                http_status=http_status,
+                raw_sha256=raw_sha256,
+            )
+            raw_bytes = bytes(raw_bytes)
+            if len(raw_bytes) != raw_byte_length or content_hash(raw_bytes) != observation.raw_sha256:
+                return None, "retained_archive_integrity_failed"
+            try:
+                parsed = parse_ca_official_actions_zip(
+                    raw_bytes,
+                    source_url=observation.source_url,
+                    retrieved_at=observation.retrieved_at,
+                )
+            except (OfficialCaActionsError, TypeError, ValueError):
+                return None, "retained_archive_unavailable"
+            if parsed.sha256 != observation.raw_sha256:
+                return None, "retained_archive_integrity_failed"
+            events = parsed.events_by_official_bill_id.get(query.official_bill_id)
+            if events:
+                return (bills[0], observation, raw_bytes, events, query), None
+        return None, "retained_archive_unavailable"
+
+    def _persist_california_retained_evidence(
+        self,
+        job_id: uuid.UUID,
+        token: str,
+        bill_id: uuid.UUID,
+        observation: RetainedCaliforniaObservation,
+        raw_bytes: bytes,
+        events,
+        query,
+    ) -> bool:
+        """Attach an already-retained CA ZIP through Scout's normal raw store.
+
+        Scout evidence is tenant-owned, while the observer archive is corpus
+        evidence.  Copying the exact bounded ZIP preserves the established
+        Scout raw-ref invariant without putting a corpus blob key in a tenant
+        raw store column.
+        """
+
+        digest = content_hash(raw_bytes)
+        if observation.raw_sha256 != digest:
+            return False
+        with self.sessions() as db:
+            if self._fenced(db, job_id, token) is None:
+                return False
+            stage = ScoutSource(
+                job_id=job_id,
+                canonical_url=observation.source_url,
+                official=False,
+                retrieval_mechanism="staged",
+                http_status=observation.http_status,
+                mime_type="application/zip",
+                retrieved_at=observation.retrieved_at,
+            )
+            db.add(stage)
+            db.commit()
+            stage_id = stage.id
+        try:
+            raw_ref = self.rawstore.put(
+                raw_bytes,
+                {
+                    "source_url": observation.source_url,
+                    "mechanism": "official_retained_archive",
+                    "official_observation_id": str(observation.id),
+                },
+            )
+            if raw_ref != digest:
+                raise RuntimeError("scout raw store returned a mismatched content hash")
+        except ValueError as exc:
+            with self.sessions() as db:
+                stage = db.get(ScoutSource, stage_id)
+                if stage is not None:
+                    db.delete(stage)
+                job = self._fenced(db, job_id, token)
+                if job is not None and str(exc) == "scout_rawstore_capacity_exceeded":
+                    db.add(ScoutJobEvent(job_id=job.id, kind="rawstore_capacity_exceeded", detail={}))
+                    self._finish(db, job, token, "failed", "rawstore_capacity_exceeded", False)
+                db.commit()
+            return False
+        except Exception:
+            with self.sessions() as db:
+                stage = db.get(ScoutSource, stage_id)
+                if stage is not None:
+                    db.delete(stage)
+                    db.commit()
+            return False
+
+        latest_event = events[-1]
+        action_date = latest_event.action_date
+        action_text = _SPACE_RE.sub(" ", latest_event.description).strip()[:350]
+        date_text = action_date.isoformat() if action_date else "undated"
+        excerpt = f"{query.identifier} — {date_text}: {action_text}"[:500]
+        with self.sessions() as db:
+            job = self._fenced(db, job_id, token)
+            source = db.get(ScoutSource, stage_id)
+            if job is None or source is None:
+                return False
+            source.title = f"{query.identifier}: retained California official action archive"
+            source.official = True
+            source.retrieval_mechanism = "official_retained_archive"
+            source.content_hash = digest
+            source.document_hash = digest
+            source.raw_ref = raw_ref
+            source.retrieved_at = observation.retrieved_at
+            source.upstream_updated_at = observation.upstream_updated_at
+            finding = ScoutFinding(
+                job_id=job_id,
+                source_id=source.id,
+                title=f"{query.identifier}: California official archive action",
+                what_happened=(
+                    f"California's retained weekday delta archive records this action for "
+                    f"{query.identifier}: {action_text}"
+                ),
+                why_it_matters=(
+                    "This retained weekday delta is bill-specific evidence only; it does not "
+                    "establish a current or comprehensive California bill history."
+                ),
+                relevant_date=action_date,
+                excerpt=excerpt,
+                excerpt_hash=content_hash(excerpt.encode()),
+                # ZIP members are compressed, so a character offset in the
+                # archive would be invented provenance. The parser-derived
+                # excerpt remains tied to the retained source and parser
+                # version, but intentionally carries no raw-byte position.
+                excerpt_start=None,
+                excerpt_end=None,
+                confidence="high",
+                extractor_version="scout-ca-retained-archive-p0",
+                bill_id=bill_id,
+            )
+            db.add(finding)
+            db.add(ScoutJobEvent(
+                job_id=job.id,
+                kind="retained_official_archive_selected",
+                detail={"observation_id": str(observation.id), "coverage": "delta_only"},
+            ))
+            db.add(ScoutJobEvent(
+                job_id=job.id,
+                kind="source_persisted",
+                detail={"mechanism": "official_retained_archive", "change_kind": None},
+            ))
+            db.add(ScoutJobEvent(
+                job_id=job.id,
+                kind="finding_persisted",
+                detail={"mechanism": "official_retained_archive"},
+            ))
+            db.commit()
+        return True
+
+    def _process_california_retained(self, job_id: uuid.UUID, token: str) -> None:
+        """Complete one CA job without browser or network activity."""
+
+        with self.sessions() as db:
+            job = self._fenced(db, job_id, token)
+            if job is None:
+                return
+            selected, reason = self._california_retained_evidence(db, job)
+            if selected is None:
+                db.add(ScoutJobEvent(job_id=job.id, kind="retained_official_archive_unavailable", detail={"reason": reason}))
+                self._finish(db, job, token, "partial", reason, False)
+                return
+            bill, observation, raw_bytes, events, query = selected
+            db.commit()
+        persisted = self._persist_california_retained_evidence(
+            job_id, token, bill, observation, raw_bytes, events, query
+        )
+        with self.sessions() as db:
+            job = self._fenced(db, job_id, token)
+            if job is None:
+                return
+            if persisted:
+                self._finish(db, job, token, "completed", None, True)
+            else:
+                self._finish(db, job, token, "partial", "retained_archive_unavailable", False)
+
     def process(self, job_id: uuid.UUID, claim_token: str | None = None) -> None:
         """Perform slow I/O after the claim transaction has committed."""
         with self.sessions() as db:
@@ -567,6 +840,10 @@ class ScoutRunner:
                 return
             job = self._fenced(db, job_id, token)
             if job is None:
+                return
+            if job.jurisdiction == CALIFORNIA:
+                db.commit()
+                self._process_california_retained(job_id, token)
                 return
             cancel_version = job.cancel_version
             candidates = self._candidates(db, job)

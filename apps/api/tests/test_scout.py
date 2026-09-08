@@ -94,6 +94,32 @@ def test_scout_create_coalesces_and_owner_scopes_reads(monkeypatch):
         assert [event.detail["status"] for event in terminal] == ["canceled"]
 
 
+def test_scout_california_admission_requires_explicit_session_and_uses_retained_strategy(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    headers = {"x-test-customer": str(owner.id)}
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/v1/scout/jobs", json={"query": "AB 123", "jurisdiction": "CA"}, headers=headers
+        )
+        assert rejected.status_code == 422
+        created = client.post(
+            "/api/v1/scout/jobs",
+            json={"query": "AB 123 2025-2026", "jurisdiction": "CA"},
+            headers=headers,
+        )
+        assert created.status_code == 201
+        job_id = uuid.UUID(created.json()["job"]["id"])
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert job.strategy == {
+            "adapter": "california_retained_p0",
+            "mode": "retained_official_archive",
+        }
+        assert job.cache_key == scout_cache_key(
+            "AB 123 2025-2026", "CA", freshness_bucket="scout-ca-retained-p0"
+        )
+
+
 def test_scout_creation_snapshots_document_processing_caps(monkeypatch):
     app, owner, _other, sessions = _app(monkeypatch)
     monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_RELATED_DOCUMENTS", "1")
