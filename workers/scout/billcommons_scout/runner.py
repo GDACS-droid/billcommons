@@ -362,8 +362,17 @@ class ScoutRunner:
             ).order_by(ScoutMonitor.next_run_at).with_for_update(skip_locked=True).limit(1)).scalar_one_or_none()
             if monitor is None:
                 return False
-            customer = db.execute(select(ApiCustomer).where(ApiCustomer.id == monitor.customer_id).with_for_update()).scalar_one_or_none()
-            if customer is None or not self.settings.enabled or not customer_is_admitted(customer, self.settings):
+            # A customer deletion takes the parent row before cascading to its
+            # monitors. Do not wait on that parent while holding this monitor:
+            # SKIP LOCKED abandons this transaction without journaling a false
+            # deferral, and the FK prevents a durable orphan after deletion.
+            customer = db.execute(select(ApiCustomer).where(
+                ApiCustomer.id == monitor.customer_id
+            ).with_for_update(skip_locked=True)).scalar_one_or_none()
+            if customer is None:
+                db.rollback()
+                return False
+            if not self.settings.enabled or not customer_is_admitted(customer, self.settings):
                 self._defer_monitor(db, monitor, now, "scout_rollout_not_available")
                 db.commit()
                 return True

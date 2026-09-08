@@ -1240,6 +1240,77 @@ def test_postgres_running_monitor_save_rejects_before_waiting_on_customer_lock(
     assert response.json()["error"]["code"] == "invalid_monitor_baseline"
 
 
+def test_postgres_scheduler_skips_locked_owner_without_journaling_then_schedules(
+    pg_scout: PostgresScoutHarness, tmp_path
+):
+    """A deletion-equivalent owner lock cannot strand a due monitor or deadlock.
+
+    A customer DELETE owns the parent row before its monitor cascade. Holding
+    the same row lock proves the scheduler's monitor → customer transition
+    returns promptly through SKIP LOCKED, without manufacturing a deferral.
+    """
+    customer = pg_scout.customer("monitor-owner-delete-lock")
+    due_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    cache_key = scout_cache_key("hb 625", "FL", freshness_bucket=scout_cache_namespace("FL"))
+    with pg_scout.sessions() as db:
+        monitor = ScoutMonitor(
+            customer_id=customer.id,
+            original_query="HB 625",
+            normalized_query="hb 625",
+            jurisdiction="FL",
+            cache_key=cache_key,
+            cadence_seconds=6 * 60 * 60,
+            next_run_at=due_at,
+        )
+        db.add(monitor)
+        db.commit()
+        monitor_id = monitor.id
+
+    runner = ScoutRunner(
+        pg_scout.sessions,
+        FilesystemRawStore(tmp_path / "monitor-owner-delete-lock"),
+        MockResearchBrowserProvider(),
+        settings=ScoutSettings(enabled=True, allow_public_rollout=True),
+    )
+    owner_locked = threading.Event()
+    release_owner = threading.Event()
+
+    def hold_owner_lock() -> None:
+        with pg_scout.sessions() as db:
+            db.execute(select(ApiCustomer).where(
+                ApiCustomer.id == customer.id
+            ).with_for_update()).scalar_one()
+            owner_locked.set()
+            assert release_owner.wait(timeout=10)
+            db.rollback()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        holder = pool.submit(hold_owner_lock)
+        assert owner_locked.wait(timeout=10)
+        assert pool.submit(runner.schedule_one_due_monitor).result(timeout=2) is False
+        with pg_scout.sessions() as db:
+            monitor = db.get(ScoutMonitor, monitor_id)
+            assert (monitor.next_run_at, monitor.consecutive_deferrals) == (due_at, 0)
+            assert db.scalar(select(func.count()).select_from(ScoutMonitorRun).where(
+                ScoutMonitorRun.monitor_id == monitor_id
+            )) == 0
+            assert db.scalar(select(func.count()).select_from(ScoutResearchJob).where(
+                ScoutResearchJob.customer_id == customer.id
+            )) == 0
+        release_owner.set()
+        holder.result(timeout=10)
+
+    assert runner.schedule_one_due_monitor() is True
+    with pg_scout.sessions() as db:
+        monitor = db.get(ScoutMonitor, monitor_id)
+        queued = db.scalar(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.monitor_id == monitor_id,
+            ScoutMonitorRun.status == "queued",
+        ))
+        assert monitor.consecutive_deferrals == 0 and monitor.next_run_at > due_at
+        assert queued is not None and queued.execution_mode == "new" and queued.job_id is not None
+
+
 def test_postgres_scheduler_fk_key_share_completes_alongside_terminal_run_lock(
     monkeypatch, pg_scout: PostgresScoutHarness, scout_api, tmp_path
 ):
@@ -1747,7 +1818,12 @@ def test_postgres_terminal_monitor_reconciliation_does_not_lock_readonly_job(
 def test_postgres_monitor_scheduler_and_ad_hoc_admission_share_owner_and_platform_locks(
     monkeypatch, pg_scout: PostgresScoutHarness, scout_api, tmp_path
 ):
-    """A due monitor and a direct request contend safely without queue bypass or deadlock."""
+    """A due monitor and direct request share admission without a queue bypass.
+
+    The API may own the customer row first. In that case the scheduler skips
+    its still-due monitor and retries after the API commits, rather than
+    waiting while it holds the monitor row.
+    """
     customer = pg_scout.customer("monitor-admission-race")
     baseline = _terminal_monitor_baseline(pg_scout, customer)
     monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "800")
@@ -1785,7 +1861,15 @@ def test_postgres_monitor_scheduler_and_ad_hoc_admission_share_owner_and_platfor
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         scheduled, submitted = list(pool.map(lambda fn: fn(), (schedule, submit)))
-    assert scheduled is True and submitted == "created"
+    assert submitted == "created"
+    if not scheduled:
+        with pg_scout.sessions() as db:
+            monitor = db.get(ScoutMonitor, monitor_id)
+            assert monitor.consecutive_deferrals == 0
+            assert db.scalar(select(func.count()).select_from(ScoutMonitorRun).where(
+                ScoutMonitorRun.monitor_id == monitor_id
+            )) == 1  # baseline only
+        assert runner.schedule_one_due_monitor() is True
     with pg_scout.sessions() as db:
         active = db.scalars(select(ScoutResearchJob).where(
             ScoutResearchJob.customer_id == customer.id,

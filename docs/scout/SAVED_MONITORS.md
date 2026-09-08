@@ -9,6 +9,9 @@ runs retain source IDs, canonical URLs, hashes, raw references, and finding
 IDs; they do not copy source bytes or excerpts. A comparison can report
 new, changed, and unchanged observed sources. It never reports a removal,
 because an incomplete fetch cannot prove that an upstream source disappeared.
+Each comparison is against the prior completed or partial observed snapshot.
+“New” means absent from that prior snapshot, not never seen or newly
+published; a source observed before a partial run can therefore reappear.
 
 The Scout worker selects one due active monitor with `FOR UPDATE SKIP LOCKED`.
 It sends the saved request through `admit_scout_job`, the exact shared path
