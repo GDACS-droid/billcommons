@@ -175,6 +175,7 @@ def _limits(settings: ScoutSettings) -> dict:
         "max_external_requests": settings.max_external_requests,
         "max_related_documents": settings.max_related_documents,
         "max_related_vote_records": settings.max_related_vote_records,
+        "max_related_bill_versions": settings.max_related_bill_versions,
         "max_direct_bytes": settings.max_direct_bytes,
         "max_pdf_pages": settings.max_pdf_pages,
         "max_pdf_text_chars": settings.max_pdf_text_chars,

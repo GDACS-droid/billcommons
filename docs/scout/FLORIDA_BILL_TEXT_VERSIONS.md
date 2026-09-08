@@ -40,7 +40,7 @@ that the current page or PDF will remain unchanged.
 
 Florida's cache namespace is `scout-p0-4-bill-text-version`, so completed
 results from the prior provenance namespace are retained for audit but never
-returned as fresh bill-text-capable results. When this lane is merged with the
-saved-monitor branch, its shared `scout_admission._limits` snapshot must add
-`max_related_bill_versions`; this isolated branch still snapshots limits in the
-API router.
+returned as fresh bill-text-capable results. In the saved-monitor integration,
+the shared `scout_admission._limits` snapshot includes
+`max_related_bill_versions`, so API-created and scheduler-created jobs retain
+the same immutable allowance.

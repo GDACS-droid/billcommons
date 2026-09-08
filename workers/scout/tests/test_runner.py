@@ -224,6 +224,9 @@ def test_california_monitor_scheduler_uses_retained_admission_and_parse_limit(tm
     assert scheduled.jurisdiction == "CA"
     assert scheduled.strategy == {"adapter": "california_retained_p0", "mode": "retained_official_archive"}
     assert scheduled.limits["max_ca_parse_seconds"] == 7
+    # The scheduler shares the same immutable admission snapshot as the API.
+    # This Florida-only lane remains inert for California retained jobs.
+    assert scheduled.limits["max_related_bill_versions"] == 1
 
 
 def test_california_retained_archive_over_job_cap_is_truthful_partial_and_not_copied(tmp_path):

@@ -1442,6 +1442,45 @@ def test_postgres_monitor_scheduler_rekeys_legacy_baseline_for_current_api_coale
     assert coalesced.json()["job"]["id"] == str(scheduled.id)
 
 
+def test_postgres_current_florida_namespace_does_not_reuse_fresh_pre_bill_text_cache(
+    pg_scout: PostgresScoutHarness, scout_api
+):
+    """A terminal p0-3 job stays auditable but cannot hide the new direct lane."""
+    customer = pg_scout.customer("pre-bill-text-cache")
+    query = "HB 625"
+    old_key = scout_cache_key(query, "FL", freshness_bucket="scout-p0-3-provenance")
+    current_key = scout_cache_key(
+        query, "FL", freshness_bucket=scout_cache_namespace("FL")
+    )
+    with pg_scout.sessions() as db:
+        db.add(ScoutResearchJob(
+            customer_id=customer.id,
+            original_query=query,
+            normalized_query="hb 625",
+            jurisdiction="FL",
+            cache_key=old_key,
+            status="completed",
+            strategy={"adapter": "florida_p0", "mode": "structured_first"},
+            limits={},
+            usage={},
+            completed_at=datetime.now(timezone.utc),
+            fresh_until=datetime.now(timezone.utc) + timedelta(minutes=5),
+        ))
+        db.commit()
+    with TestClient(scout_api) as client:
+        created = client.post(
+            "/api/v1/scout/jobs",
+            json={"query": query, "jurisdiction": "FL"},
+            headers={"x-test-customer": str(customer.id)},
+        )
+    assert created.status_code == 201, created.text
+    assert created.json()["coalesced"] is False
+    with pg_scout.sessions() as db:
+        current = db.get(ScoutResearchJob, uuid.UUID(created.json()["job"]["id"]))
+        assert current is not None and current.cache_key == current_key
+        assert current.limits["max_related_bill_versions"] == 1
+
+
 def test_postgres_saved_monitor_history_cursor_returns_every_run_once(
     pg_scout: PostgresScoutHarness, scout_api
 ):
