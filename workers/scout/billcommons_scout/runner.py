@@ -42,7 +42,8 @@ from billcommons_shared.safe_http import SafeHttpError, SsrfRejected, new_safe_h
 from billcommons_shared.scout import (
     BrowserCapture, BrowserRequest, ResearchBrowserProvider, ScoutPolicyError,
     ScoutSettings, browser_required, canonicalize_url, classify_direct_response,
-    content_hash, discover_florida_senate_related_documents, discover_florida_senate_vote_records,
+    content_hash, discover_florida_senate_bill_text_versions, discover_florida_senate_related_documents,
+    discover_florida_senate_vote_records,
     CALIFORNIA, extract_california_bill_query, extract_florida_bill_identifier, summarize_content_change,
     is_pdf_attachment_payload, topical_search_terms,
     scout_cache_key, scout_cache_namespace,
@@ -113,6 +114,7 @@ def describe_related_document(
     identifier: str,
     artifact_type: str,
     url: str,
+    version_token: str | None = None,
 ) -> RelatedDocumentDescription:
     """Describe a related Florida attachment only from evidence it contains.
 
@@ -123,6 +125,16 @@ def describe_related_document(
     similarly named official attachments.
     """
     display_text = _SPACE_RE.sub(" ", text).strip()
+    if artifact_type == "bill text version":
+        # The URL route proves only this safely admitted token. Do not promote
+        # it into a legislative stage when the PDF header is absent or silent.
+        token_label = f" ({version_token})" if version_token else ""
+        return RelatedDocumentDescription(
+            title=f"{identifier}: official bill text version{token_label}",
+            what_happened=f"Official bill text version{token_label} retrieved for {identifier}.",
+            relevant_date=None,
+            confidence="medium",
+        )
     if artifact_type == "vote record":
         # The URL establishes only a one-hop official vote-record attachment.
         # Do not transform its path, the parent page, or a later PDF header
@@ -310,6 +322,15 @@ class ScoutRunner:
         """Read the vote lane only when the immutable job explicitly permits it."""
         limits = job.limits if isinstance(job.limits, dict) else {}
         value = limits.get("max_related_vote_records")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return 0
+        return min(1, value)
+
+    @staticmethod
+    def _bill_text_version_limit(job: ScoutResearchJob) -> int:
+        """Read the bill-text lane only when this immutable job permits it."""
+        limits = job.limits if isinstance(job.limits, dict) else {}
+        value = limits.get("max_related_bill_versions")
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             return 0
         return min(1, value)
@@ -1234,6 +1255,7 @@ class ScoutRunner:
                 return 0, 0, False
             maximum = self._job_limit(job, "max_related_documents", self.settings.max_related_documents)
             vote_maximum = self._vote_record_limit(job)
+            bill_text_maximum = self._bill_text_version_limit(job)
             max_direct_bytes = self._job_limit(job, "max_direct_bytes", self.settings.max_direct_bytes)
         related = discover_florida_senate_related_documents(
             parent_url, parent_body, maximum=maximum, max_html_bytes=max_direct_bytes
@@ -1256,9 +1278,21 @@ class ScoutRunner:
                     db.add(ScoutJobEvent(job_id=job_id, kind="vote_records_discovered", detail={"count": len(vote_records)}))
                     db.commit()
 
+        # Bill text is a fifth and final direct lane: primary page, two
+        # analyses/amendments, one vote record, then at most one version PDF.
+        # The immutable cap keeps historical jobs from acquiring new spend.
+        bill_text_versions = discover_florida_senate_bill_text_versions(
+            parent_url, parent_body, maximum=bill_text_maximum, max_html_bytes=max_direct_bytes
+        )
+        if bill_text_versions:
+            with self.sessions() as db:
+                if self._fenced(db, job_id, token) is not None:
+                    db.add(ScoutJobEvent(job_id=job_id, kind="bill_text_versions_discovered", detail={"count": len(bill_text_versions)}))
+                    db.commit()
+
         successes = 0
         failures = 0
-        for document in (*related, *vote_records):
+        for document in (*related, *vote_records, *bill_text_versions):
             if document.canonical_url in seen_urls:
                 continue
             seen_urls.add(document.canonical_url)
@@ -1305,6 +1339,8 @@ class ScoutRunner:
                     continue
                 related_metadata = dict(metadata)
                 related_metadata["related_artifact_type"] = document.artifact_type
+                if document.version_token is not None:
+                    related_metadata["related_version_token"] = document.version_token
                 source_id = self._persist_capture(
                     job_id,
                     token,
@@ -1477,7 +1513,7 @@ class ScoutRunner:
                     exact_raw_ref = None
             mime_base = (mime or "").split(";", 1)[0].lower()
             related_artifact_type = metadata.get("related_artifact_type")
-            if related_artifact_type not in {"committee analysis", "amendment", "vote record"}:
+            if related_artifact_type not in {"committee analysis", "amendment", "vote record", "bill text version"}:
                 related_artifact_type = None
             evidence: tuple[str, int, int] | None = None
             related_description: RelatedDocumentDescription | None = None
@@ -1507,6 +1543,11 @@ class ScoutRunner:
                         identifier=str(metadata.get("identifier") or bill_title),
                         artifact_type=related_artifact_type,
                         url=url,
+                        version_token=(
+                            str(metadata["related_version_token"])
+                            if isinstance(metadata.get("related_version_token"), str)
+                            else None
+                        ),
                     )
         except Exception:
             self._record_failed_source(job_id, token, url, mechanism, status, mime)
