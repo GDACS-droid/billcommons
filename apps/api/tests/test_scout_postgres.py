@@ -1171,6 +1171,7 @@ def test_postgres_saved_monitor_scheduler_uses_admission_and_finalizes_hash_delt
     with pg_scout.sessions() as db:
         monitor = db.get(ScoutMonitor, monitor_id)
         monitor.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        monitor.consecutive_deferrals = 2
         db.commit()
     runner = ScoutRunner(
         pg_scout.sessions, FilesystemRawStore(tmp_path / "monitor-raw"), MockResearchBrowserProvider(),
@@ -1181,6 +1182,7 @@ def test_postgres_saved_monitor_scheduler_uses_admission_and_finalizes_hash_delt
         queued = db.scalar(select(ScoutMonitorRun).where(
             ScoutMonitorRun.monitor_id == monitor_id, ScoutMonitorRun.status == "queued"
         ))
+        assert db.get(ScoutMonitor, monitor_id).consecutive_deferrals == 0
         assert queued is not None and queued.execution_mode == "new" and queued.job_id is not None
         scheduled_job_id = queued.job_id
     claim = runner.claim_next("monitor-postgres-test")
@@ -1235,6 +1237,7 @@ def test_postgres_cached_monitor_run_flushes_its_id_before_advancing_baseline(
     with pg_scout.sessions() as db:
         monitor = db.get(ScoutMonitor, monitor_id)
         monitor.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        monitor.consecutive_deferrals = 2
         db.commit()
     runner = ScoutRunner(
         pg_scout.sessions, FilesystemRawStore(tmp_path / "monitor-cached-baseline"), MockResearchBrowserProvider(),
@@ -1248,6 +1251,7 @@ def test_postgres_cached_monitor_run_flushes_its_id_before_advancing_baseline(
         monitor = db.get(ScoutMonitor, monitor_id)
     assert run is not None and run.status == "completed"
     assert monitor.last_completed_run_id == run.id
+    assert monitor.consecutive_deferrals == 0
 
 
 def test_postgres_coalesced_monitor_run_reconciles_terminalization_before_commit(
@@ -1347,6 +1351,69 @@ def test_postgres_saved_monitor_defers_when_shared_daily_admission_refuses(
         monitor = db.get(ScoutMonitor, monitor_id)
     assert deferred is not None and deferred.error_class == "scout_daily_job_limit"
     assert monitor.consecutive_deferrals == 1
+
+
+@pytest.mark.parametrize("terminal_status", ("failed", "canceled"))
+def test_postgres_admitted_monitor_resets_backoff_before_terminal_failure(
+    terminal_status: str, pg_scout: PostgresScoutHarness, scout_api, tmp_path
+):
+    """A completed admission resets retry delay even when its job later fails."""
+    customer = pg_scout.customer(f"monitor-backoff-{terminal_status}")
+    baseline = _terminal_monitor_baseline(pg_scout, customer)
+    with TestClient(scout_api) as client:
+        saved = client.post(
+            f"/api/v1/scout/jobs/{baseline.id}/monitor", json={},
+            headers={"x-test-customer": str(customer.id)},
+        )
+        assert saved.status_code == 201
+        monitor_id = uuid.UUID(saved.json()["monitor"]["id"])
+
+    # The baseline consumes this one-job daily budget, so the first due
+    # attempt is durably deferred with a non-zero backoff counter.
+    refusing = ScoutRunner(
+        pg_scout.sessions, FilesystemRawStore(tmp_path / f"backoff-refuse-{terminal_status}"),
+        MockResearchBrowserProvider(),
+        settings=ScoutSettings(enabled=True, allow_public_rollout=True, per_customer_daily_jobs=1),
+    )
+    with pg_scout.sessions() as db:
+        db.get(ScoutMonitor, monitor_id).next_run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+    assert refusing.schedule_one_due_monitor() is True
+    with pg_scout.sessions() as db:
+        assert db.get(ScoutMonitor, monitor_id).consecutive_deferrals == 1
+        db.get(ScoutMonitor, monitor_id).next_run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+
+    # Raising the normal limit permits exactly one ordinary queued job. Its
+    # later terminal failure/cancellation must not retain the old deferral.
+    admitting = ScoutRunner(
+        pg_scout.sessions, FilesystemRawStore(tmp_path / f"backoff-admit-{terminal_status}"),
+        MockResearchBrowserProvider(),
+        settings=ScoutSettings(enabled=True, allow_public_rollout=True, per_customer_daily_jobs=2),
+    )
+    assert admitting.schedule_one_due_monitor() is True
+    claim = admitting.claim_next(f"monitor-backoff-{terminal_status}")
+    assert claim is not None
+    with pg_scout.sessions() as db:
+        job = db.get(ScoutResearchJob, claim.job_id)
+        admitting._finish(db, job, claim.token, terminal_status, terminal_status, False)
+    with pg_scout.sessions() as db:
+        monitor = db.get(ScoutMonitor, monitor_id)
+        assert monitor.consecutive_deferrals == 0
+        monitor.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+
+    # The failed/canceled job now consumes the two-job budget. The next
+    # refusal starts over at 15 minutes rather than retaining the old backoff.
+    assert admitting.schedule_one_due_monitor() is True
+    with pg_scout.sessions() as db:
+        monitor = db.get(ScoutMonitor, monitor_id)
+        deferred = db.scalar(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.monitor_id == monitor_id, ScoutMonitorRun.status == "deferred"
+        ).order_by(ScoutMonitorRun.scheduled_for.desc()))
+    assert deferred is not None and deferred.error_class == "scout_daily_job_limit"
+    assert monitor.consecutive_deferrals == 1
+    assert monitor.next_run_at - deferred.scheduled_for == timedelta(minutes=15)
 
 
 def test_postgres_suspended_monitor_defers_without_reserving_a_job(

@@ -379,6 +379,11 @@ class ScoutRunner:
                 self._defer_monitor(db, monitor, now, exc.code)
                 db.commit()
                 return True
+            # A successful admission—not its later terminal outcome—is the
+            # boundary for retry backoff.  A failed/canceled admitted job has
+            # already consumed a normal scheduling opportunity, and a later
+            # terminalizer must not erase a newer unrelated deferral.
+            monitor.consecutive_deferrals = 0
             mode = "cached" if admission.cached else "coalesced" if admission.coalesced else "new"
             run = ScoutMonitorRun(
                 monitor_id=monitor.id,

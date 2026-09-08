@@ -116,7 +116,6 @@ def finalize_monitor_run(
             complete=status == "completed",
         )
         monitor.last_completed_run_id = run.id
-        monitor.consecutive_deferrals = 0
 
 
 def defer_delay_seconds(cadence_seconds: int, consecutive_deferrals: int) -> int:
