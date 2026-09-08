@@ -13,9 +13,7 @@ the caller must pin the exact archive SHA-256.  It does no network I/O.
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
-import io
 import json
 import signal
 import sys
@@ -33,6 +31,10 @@ from sqlalchemy import column, delete, func, select, text, update, values
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest import events, status
+from billcommons_ingest.official_ca_actions import (
+    OfficialCaActionsError,
+    parse_ca_pubinfo_action_archive,
+)
 from billcommons_schema.models import Bill, BillAction, Jurisdiction, Session
 from billcommons_shared.db import get_session
 
@@ -222,45 +224,28 @@ def _official_bill_id(session: Session, bill: Bill) -> str:
 
 def load_official_actions(zip_path: Path) -> dict[str, tuple[OfficialAction, ...]]:
     """Read only the bill and history TSVs necessary for action reconciliation."""
-    bill_ids: set[str] = set()
-    actions: dict[str, list[OfficialAction]] = defaultdict(list)
     try:
         with zipfile.ZipFile(zip_path) as archive:
-            with archive.open("BILL_TBL.dat") as raw, io.TextIOWrapper(raw, encoding="utf-8", errors="strict", newline="") as stream:
-                for line_number, row in enumerate(csv.reader(stream, delimiter="\t", quotechar="`"), start=1):
-                    if len(row) != 19:
-                        raise OfficialActionSweepError(f"BILL_TBL.dat:{line_number} has {len(row)} fields; expected 19")
-                    # The archive can retain older history-only rows.  The
-                    # present two-session scope is explicitly selected here.
-                    if row[1] != OFFICIAL_PREFIX or row[2] not in {"0", "1"}:
-                        continue
-                    if row[0] in bill_ids:
-                        raise OfficialActionSweepError(f"duplicate official bill ID {row[0]}")
-                    bill_ids.add(row[0])
-            with archive.open("BILL_HISTORY_TBL.dat") as raw, io.TextIOWrapper(raw, encoding="utf-8", errors="strict", newline="") as stream:
-                for line_number, row in enumerate(csv.reader(stream, delimiter="\t", quotechar="`"), start=1):
-                    if len(row) != 13:
-                        raise OfficialActionSweepError(f"BILL_HISTORY_TBL.dat:{line_number} has {len(row)} fields; expected 13")
-                    if row[0] not in bill_ids:
-                        continue
-                    description = _normal_description(row[3])
-                    if not description:
-                        raise OfficialActionSweepError(f"BILL_HISTORY_TBL.dat:{line_number} has blank action text")
-                    if not row[1].strip():
-                        raise OfficialActionSweepError(f"BILL_HISTORY_TBL.dat:{line_number} has blank history ID")
-                    actions[row[0]].append(
-                        OfficialAction(
-                            official_bill_id=row[0], history_id=row[1].strip(), action_date=_parse_date(row[2]),
-                            description=description, sequence=_parse_sequence(row[6]), updated_at=row[5].strip(),
-                        )
-                    )
-    except (KeyError, zipfile.BadZipFile) as exc:
-        raise OfficialActionSweepError("official ZIP is missing a required readable table") from exc
-    if not bill_ids:
-        raise OfficialActionSweepError("official ZIP contains no CA 2025-26 regular/special bills")
+            parsed = parse_ca_pubinfo_action_archive(
+                archive,
+                strict_current_scope=False,
+                reject_duplicate_history_ids=False,
+            )
+    except (OfficialCaActionsError, zipfile.BadZipFile) as exc:
+        raise OfficialActionSweepError(str(exc)) from exc
     return {
-        bill_id: tuple(sorted(actions[bill_id], key=_official_sort_key))
-        for bill_id in bill_ids
+        bill_id: tuple(
+            OfficialAction(
+                official_bill_id=action.official_bill_id,
+                history_id=action.history_id,
+                action_date=action.action_date,
+                description=action.description,
+                sequence=action.sequence,
+                updated_at=action.updated_at,
+            )
+            for action in actions
+        )
+        for bill_id, actions in parsed.items()
     }
 
 

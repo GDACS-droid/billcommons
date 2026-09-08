@@ -1,0 +1,15 @@
+{
+  "source_url": "https://downloads.leginfo.legislature.ca.gov/pubinfo_Mon.zip",
+  "bills": {
+    "202520260AB12": {
+      "history_id": "1001",
+      "description": "Read first time.",
+      "sequence": 3
+    },
+    "202520261SB2": {
+      "history_id": "2001",
+      "description": "Chaptered by Secretary of State.",
+      "sequence": 1
+    }
+  }
+}
