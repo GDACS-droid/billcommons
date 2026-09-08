@@ -53,3 +53,12 @@ test("Scout polling only applies results from the active request generation", ()
   assert.match(source, /\[jobGeneration, pollJobId, pollJobStatus\]/);
   assert.match(source, /const request = beginJobRequest\(\);\n    setJob\(null\);/);
 });
+
+test("Scout cancellation cannot apply after a newer request takes ownership", () => {
+  assert.match(source, /setCanceling\(false\);/);
+  assert.match(source, /const jobId = job\.id;/);
+  assert.match(source, /const generation = jobRequest\.current\.generation;/);
+  assert.match(source, /cancelScoutJob\(jobId\)/);
+  assert.match(source, /if \(jobRequest\.current\.generation !== generation\) return;/);
+  assert.match(source, /if \(jobRequest\.current\.generation === generation\) setCanceling\(false\);/);
+});

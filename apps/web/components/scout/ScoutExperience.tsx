@@ -427,6 +427,7 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
     const generation = jobRequest.current.generation + 1;
     jobRequest.current = { generation, controller };
     setJobGeneration(generation);
+    setCanceling(false);
     return { generation, controller };
   }, []);
   const pollJobId = job?.id;
@@ -589,16 +590,20 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
 
   async function cancel() {
     if (!job || isScoutTerminal(job.status) || canceling) return;
+    const jobId = job.id;
+    const generation = jobRequest.current.generation;
     setCanceling(true);
     setError("");
     try {
-      const next = await cancelScoutJob(job.id);
+      const next = await cancelScoutJob(jobId);
+      if (jobRequest.current.generation !== generation) return;
       setJob(next);
       track("scout_job_cancel_requested", { status: next.status });
     } catch (reason) {
+      if (jobRequest.current.generation !== generation) return;
       setError(reason instanceof Error ? reason.message : "Scout could not cancel this research job.");
     } finally {
-      setCanceling(false);
+      if (jobRequest.current.generation === generation) setCanceling(false);
     }
   }
 
