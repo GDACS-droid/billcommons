@@ -29,7 +29,7 @@ def _reset_daily_budget_counter():
 def _client_with_handler(handler, api_key="test-key") -> OpenStatesClient:
     transport = httpx.MockTransport(handler)
     http_client = httpx.Client(transport=transport, base_url="https://v3.openstates.org")
-    return OpenStatesClient(client=http_client, api_key=api_key)
+    return OpenStatesClient(client=http_client, api_key=api_key, consume_budget=openstates_api_mod._check_and_consume_budget)
 
 
 def test_client_constructs_without_api_key_env_var(monkeypatch):
@@ -273,3 +273,40 @@ def test_retries_count_against_the_daily_budget(monkeypatch):
     with pytest.raises(OpenStatesDailyBudgetExceeded):
         client.get_jurisdictions()
     assert calls["count"] == 2
+
+
+def test_default_client_requires_shared_admission_before_http(monkeypatch):
+    calls = []
+
+    def denied(**kwargs):
+        raise openstates_api_mod.RequestBudgetUnavailable("private details")
+
+    monkeypatch.setattr(openstates_api_mod, "consume_request", denied)
+    client = OpenStatesClient(
+        client=httpx.Client(transport=httpx.MockTransport(lambda request: calls.append(request))),
+        api_key="fixture-key",
+    )
+    client.rate_limiter.acquire = lambda host: None
+    with pytest.raises(openstates_api_mod.OpenStatesBudgetUnavailable) as error:
+        client.get_jurisdictions()
+    assert calls == []
+    assert "private details" not in str(error.value)
+
+
+def test_default_client_retries_each_require_committed_admission(monkeypatch):
+    events = []
+
+    def handler(request):
+        events.append("http")
+        if events.count("http") == 1:
+            return httpx.Response(502)
+        return httpx.Response(200, json={"results": []})
+
+    monkeypatch.setattr(openstates_api_mod, "consume_request", lambda **kwargs: events.append("admitted"))
+    client = OpenStatesClient(
+        client=httpx.Client(transport=httpx.MockTransport(handler), base_url="https://v3.openstates.org"),
+        api_key="fixture-key",
+    )
+    client.rate_limiter.acquire = lambda host: None
+    assert client.get_jurisdictions() == {"results": []}
+    assert events == ["admitted", "http", "admitted", "http"]

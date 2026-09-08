@@ -452,6 +452,32 @@ class RelatedBill(UUIDPkMixin, TimestampMixin, Base):
 # ---------------------------------------------------------------------------
 
 
+class SourceRequestBudget(Base):
+    """One durable admission ledger per upstream account/scope.
+
+    Admission commits independently of an ingestion transaction: rolling back
+    a parser or restarting a worker must not refund requests already sent.
+    The scope is a public service label, never an API key or credential hash.
+    """
+
+    __tablename__ = "source_request_budgets"
+
+    scope: Mapped[str] = mapped_column(Text, primary_key=True)
+    budget_date: Mapped[date] = mapped_column(Date, nullable=False)
+    requests_reserved: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    request_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    minimum_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    next_request_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("length(scope) BETWEEN 1 AND 80", name="ck_source_budget_scope"),
+        CheckConstraint("requests_reserved >= 0", name="ck_source_budget_reserved"),
+        CheckConstraint("request_limit > 0", name="ck_source_budget_limit"),
+        CheckConstraint("minimum_interval_seconds BETWEEN 1 AND 3600", name="ck_source_budget_interval"),
+    )
+
+
 class SourceRecord(UUIDPkMixin, TimestampMixin, Base):
     """Raw-source pointer for an ingested entity (links entity -> rawstore key)."""
 

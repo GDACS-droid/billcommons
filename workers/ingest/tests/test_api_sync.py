@@ -91,6 +91,13 @@ def _v3_bill_payload(
     return payload
 
 
+class _FixtureRateLimiter:
+    """No wall-clock pacing for an injected transport that sends no HTTP."""
+
+    def acquire(self, host):
+        pass
+
+
 def _client_with_pages(pages: dict) -> OpenStatesClient:
     def handler(request):
         page = int(dict(request.url.params).get("page", "1"))
@@ -98,7 +105,7 @@ def _client_with_pages(pages: dict) -> OpenStatesClient:
 
     transport = httpx.MockTransport(handler)
     http_client = httpx.Client(transport=transport, base_url="https://v3.openstates.org")
-    return OpenStatesClient(client=http_client, api_key="test-key")
+    return OpenStatesClient(client=http_client, api_key="test-key", consume_budget=lambda: None, rate_limiter=_FixtureRateLimiter())
 
 
 def test_sync_state_creates_new_bill(db_session):
@@ -620,6 +627,8 @@ def test_sync_state_forwards_optional_session_and_identifier_filters(db_session)
     client = OpenStatesClient(
         client=httpx.Client(transport=httpx.MockTransport(handler), base_url="https://v3.openstates.org"),
         api_key="test-key",
+        consume_budget=lambda: None,
+        rate_limiter=_FixtureRateLimiter(),
     )
     result = sync_state(
         db_session,
@@ -739,7 +748,7 @@ def test_truncated_run_is_not_a_success_or_next_watermark(db_session):
             {1: {"results": [], "pagination": {"max_page": 1}}}, seen_updated_since
         ),
     )
-    assert seen_updated_since == [last_real_success.isoformat()]
+    assert [datetime.fromisoformat(value) for value in seen_updated_since] == [last_real_success]
 
 
 def test_run_api_sync_job_can_resume_from_reported_page(db_session):
@@ -885,7 +894,7 @@ def test_completed_continuation_keeps_first_chunk_watermark(db_session):
             {1: {"results": [], "pagination": {"max_page": 1}}}, seen
         ),
     )
-    assert seen == [first_chunk_started.isoformat()]
+    assert [datetime.fromisoformat(value) for value in seen] == [first_chunk_started]
 
 
 def test_run_api_sync_job_raises_for_unknown_state(db_session):
@@ -957,7 +966,7 @@ def _client_capturing_params(pages: dict, seen_params: list) -> OpenStatesClient
 
     transport = httpx.MockTransport(handler)
     http_client = httpx.Client(transport=transport, base_url="https://v3.openstates.org")
-    return OpenStatesClient(client=http_client, api_key="test-key")
+    return OpenStatesClient(client=http_client, api_key="test-key", consume_budget=lambda: None, rate_limiter=_FixtureRateLimiter())
 
 
 def test_sync_state_requests_and_persists_versions_documents(db_session):
@@ -1360,7 +1369,7 @@ def _client_recording_updated_since(pages: dict, seen_updated_since: list) -> Op
 
     transport = httpx.MockTransport(handler)
     http_client = httpx.Client(transport=transport, base_url="https://v3.openstates.org")
-    return OpenStatesClient(client=http_client, api_key="test-key")
+    return OpenStatesClient(client=http_client, api_key="test-key", consume_budget=lambda: None, rate_limiter=_FixtureRateLimiter())
 
 
 def test_sync_state_watermark_ignores_coverage_recompute_stamps(db_session):
@@ -1415,7 +1424,7 @@ def test_sync_state_watermark_ignores_coverage_recompute_stamps(db_session):
     sync_state(db_session, jurisdiction, client=client)
 
     assert len(seen_updated_since) == 1
-    assert seen_updated_since[0] == real_sync_finished_at.isoformat(), (
+    assert datetime.fromisoformat(seen_updated_since[0]) == real_sync_finished_at, (
         "updated_since must come from the last SUCCESSFUL api_sync ingestion_runs row, "
         "not the (later, spurious) jurisdiction_coverage.last_success_at stamp"
     )
@@ -1812,7 +1821,7 @@ def test_sync_state_watermark_uses_started_at_not_finished_at(db_session):
     sync_state(db_session, jurisdiction, client=client)
 
     assert len(seen_updated_since) == 1
-    assert seen_updated_since[0] == run_started_at.isoformat(), (
+    assert datetime.fromisoformat(seen_updated_since[0]) == run_started_at, (
         "updated_since must be the last successful run's started_at, not its finished_at -- "
         "using finished_at would silently skip upstream changes that landed during the run"
     )

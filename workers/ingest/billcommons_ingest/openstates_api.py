@@ -18,14 +18,11 @@ requests/minute (250/day); we default to that via
 `billcommons_shared.httpc.RateLimiter` and respect `Retry-After` /
 `X-RateLimit-*` response headers when present, backing off on 429s.
 
-Daily request budget: a module-level counter (keyed by UTC date) caps the
-number of actual HTTP requests this process will send today at
-`DAILY_REQUEST_BUDGET` (override via `OPENSTATES_DAILY_BUDGET`). This is a
-PER-PROCESS brake, not a cross-process ledger -- the backfill CLI and the
-sync-worker each run in their own process and each get their own budget.
-There is deliberately no shared storage backing this; it exists to stop a
-single runaway process (many pages x many jobs) from blowing through the
-~250/day allowance on its own, not to coordinate across processes.
+Daily request admission is stored in PostgreSQL under the shared `openstates`
+scope. Every real client, worker restart and backfill shares one UTC-day cap
+and pacing clock. Reservations commit before HTTP and survive ingestion
+rollback. An unavailable ledger refuses the HTTP request. Fixture clients can
+explicitly inject a local admission function; production has no local fallback.
 """
 from __future__ import annotations
 
@@ -34,10 +31,16 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Callable
 
 import httpx
 
 from billcommons_shared.httpc import DEFAULT_TIMEOUT, RateLimiter, new_client
+from billcommons_shared.source_budget import (
+    RequestBudgetExhausted,
+    RequestBudgetUnavailable,
+    consume_request,
+)
 
 DEFAULT_BASE_URL = "https://v3.openstates.org"
 DEFAULT_RATE_PER_MINUTE = 6
@@ -63,9 +66,11 @@ class OpenStatesAuthError(OpenStatesAPIError):
 
 
 class OpenStatesDailyBudgetExceeded(OpenStatesAPIError):
-    """Raised when this process has already sent `DAILY_REQUEST_BUDGET`
-    requests today. See the module docstring: this is a per-process brake,
-    not a cross-process ledger."""
+    """The shared upstream request budget has been exhausted for today."""
+
+
+class OpenStatesBudgetUnavailable(OpenStatesAPIError):
+    """The shared ledger cannot safely admit another upstream request."""
 
 
 # utc_date.isoformat() -> requests sent so far today, this process only.
@@ -88,7 +93,9 @@ def _daily_budget() -> int:
 
 
 def _check_and_consume_budget() -> None:
-    """Raise OpenStatesDailyBudgetExceeded if today's budget is already
+    """Explicit fixture-only local budget; real clients do not use this.
+
+    Raise OpenStatesDailyBudgetExceeded if today's budget is already
     spent; otherwise record one more request against it. Called once per
     actual HTTP request (including retries), immediately before it is sent
     -- i.e. AFTER the rate limiter's (possibly blocking) acquire, not
@@ -107,6 +114,18 @@ def _check_and_consume_budget() -> None:
         _daily_request_counts[today] = count + 1
 
 
+def _consume_shared_budget() -> None:
+    try:
+        consume_request(
+            scope="openstates", daily_limit=_daily_budget(),
+            minimum_interval_seconds=10,
+        )
+    except RequestBudgetExhausted:
+        raise OpenStatesDailyBudgetExceeded("shared daily Open States request budget exhausted") from None
+    except RequestBudgetUnavailable:
+        raise OpenStatesBudgetUnavailable("shared Open States request budget is unavailable") from None
+
+
 @dataclass
 class OpenStatesClient:
     """Thin v3 API client. Construct with an injected httpx.Client (or the
@@ -119,6 +138,7 @@ class OpenStatesClient:
     client: httpx.Client | None = None
     rate_limiter: RateLimiter | None = None
     max_retries_on_429: int = 5
+    consume_budget: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if self.client is None:
@@ -152,7 +172,7 @@ class OpenStatesClient:
             # Checked/counted AFTER the (possibly blocking) limiter wait so
             # the UTC date used is the day the request actually goes out on
             # -- see _check_and_consume_budget's docstring.
-            _check_and_consume_budget()
+            (self.consume_budget or _consume_shared_budget)()
             try:
                 response = self.client.request(method, path, params=params, headers=headers)
             except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TransportError) as exc:
