@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const source = await readFile(new URL("./ScoutExperience.tsx", import.meta.url), "utf8");
+const pageSource = await readFile(new URL("../../app/scout/page.tsx", import.meta.url), "utf8");
 
 test("Scout leaves unsupported significance absent, marks bounded excerpts, and suppresses empty event detail", () => {
   assert.match(source, /const EXCERPT_CHARACTER_LIMIT = 500/);
@@ -28,4 +29,15 @@ test("Scout open waits briefly for the root analytics queue instead of dropping 
 test("Scout intro does not show a signed-out prompt over an authenticated result", () => {
   assert.match(source, /Research jobs are owner-scoped\. <Link href="\/account\/login"[^>]*>Account access<\/Link>/);
   assert.doesNotMatch(source, /Sign in<\/Link> to create and view research jobs/);
+});
+
+test("linked monitor evidence loads an existing job without creating research and rejects malformed identifiers", () => {
+  assert.match(source, /const SCOUT_JOB_ID_PATTERN = \/\^\[A-Za-z0-9\]\[A-Za-z0-9_-\]\{0,127\}\$\//);
+  assert.match(source, /if \(initialJobId === undefined\) return;/);
+  assert.match(source, /The requested Scout research link is invalid\./);
+  assert.match(source, /getScoutJob\(jobId, controller\.signal\)/);
+  assert.match(source, /controller\.abort\(\)/);
+  assert.doesNotMatch(source, /new URLSearchParams\(window\.location\.search\)/);
+  assert.match(pageSource, /searchParams: Promise<\{ job\?: string \| string\[\] \}>/);
+  assert.match(pageSource, /initialJobId=\{jobId\}/);
 });

@@ -516,7 +516,12 @@ export async function getScoutJob(id: string, signal?: AbortSignal): Promise<Sco
   }
 
   const payload = await responseJson(response);
-  if (!response.ok) throw apiError(response, payload);
+  if (!response.ok) {
+    if (response.status === 404) {
+      throw new ScoutApiError("This Scout research result is unavailable. It may no longer exist or you may not have access to it.", response.status);
+    }
+    throw apiError(response, payload);
+  }
   const job = normalizeScoutJob(payload);
   if (!job.id) throw new ScoutApiError("Scout returned a response without a job identifier.");
   return job;

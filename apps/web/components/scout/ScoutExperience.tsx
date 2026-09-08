@@ -28,6 +28,7 @@ const CALIFORNIA_EXAMPLES = ["AB 123 2025-2026", "SB 1 2025-2026", "AB 1 2025-20
 // Scout evidence windows are bounded in the worker.  Preserve the original
 // retained excerpt while making a potentially bounded display unmistakable.
 const EXCERPT_CHARACTER_LIMIT = 500;
+const SCOUT_JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 function label(value?: string | null): string {
   return value ? value.replaceAll("_", " ") : "Not recorded";
 }
@@ -406,7 +407,7 @@ function JobDetails({ job, refreshError, onCancel, canceling }: { job: ScoutJob;
   );
 }
 
-export default function ScoutExperience({ enabled }: { enabled: boolean }) {
+export default function ScoutExperience({ enabled, initialJobId }: { enabled: boolean; initialJobId?: string | null }) {
   const [query, setQuery] = useState("");
   const [jurisdiction, setJurisdiction] = useState("FL");
   const california = jurisdiction === "CA";
@@ -420,18 +421,6 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
   const unknownPolls = useRef(0);
   const pollJobId = job?.id;
   const pollJobStatus = job?.status;
-
-  useEffect(() => {
-    const linkedJobId = new URLSearchParams(window.location.search).get("job");
-    if (!linkedJobId) return;
-    let active = true;
-    void getScoutJob(linkedJobId).then((linkedJob) => {
-      if (active) setJob(linkedJob);
-    }).catch((reason) => {
-      if (active) setError(reason instanceof Error ? reason.message : "Scout could not open linked evidence.");
-    });
-    return () => { active = false; };
-  }, []);
 
   useEffect(() => {
     // Child passive effects can run before the root <Analytics /> effect has
@@ -453,6 +442,33 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [enabled]);
+
+  useEffect(() => {
+    if (initialJobId === undefined) return;
+    const jobId = initialJobId?.trim() ?? "";
+    if (!SCOUT_JOB_ID_PATTERN.test(jobId)) {
+      setJob(null);
+      setError("The requested Scout research link is invalid.");
+      setRefreshError("");
+      return;
+    }
+    let active = true;
+    const controller = new AbortController();
+    setJob(null);
+    setError("");
+    setRefreshError("");
+    void getScoutJob(jobId, controller.signal).then((next) => {
+      if (active) setJob(next);
+    }).catch((reason) => {
+      if (!active || (reason instanceof DOMException && reason.name === "AbortError")) return;
+      setJob(null);
+      setError(reason instanceof Error ? reason.message : "Scout could not load linked research.");
+    });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [initialJobId]);
 
   useEffect(() => {
     if (!job) return;

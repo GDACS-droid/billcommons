@@ -17,6 +17,7 @@ new Function("exports", "module", javascript)(compiled.exports, compiled);
 
 const {
   isScoutTerminal,
+  getScoutJob,
   normalizeScoutJob,
   safeHttpsUrl,
   scoutAnalyticsFacts,
@@ -288,4 +289,17 @@ test("monitor eligibility requires retained terminal evidence and excludes opera
   assert.equal(compiled.exports.isScoutMonitorEligible(normalizeScoutJob({ status: "completed", findings: [{ id: "f", title: "Evidence" }], strategy: "structured_first" })), true);
   assert.equal(compiled.exports.isScoutMonitorEligible(normalizeScoutJob({ status: "partial", findings: [], strategy: "structured_first" })), false);
   assert.equal(compiled.exports.isScoutMonitorEligible(normalizeScoutJob({ status: "completed", findings: [{ id: "f", title: "Evidence" }], strategy: "operator_canary" })), false);
+});
+
+
+test("linked jobs surface unavailable owner-scoped evidence without creating research", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  globalThis.fetch = async (url, options) => {
+    assert.match(String(url), /\/api\/v1\/scout\/jobs\/missing-job$/);
+    assert.equal(options.method, undefined);
+    return new Response(JSON.stringify({ detail: "not found" }), { status: 404 });
+  };
+  await assert.rejects(getScoutJob("missing-job"), (error) =>
+    error.status === 404 && /unavailable/.test(error.message) && /may not have access/.test(error.message));
 });
