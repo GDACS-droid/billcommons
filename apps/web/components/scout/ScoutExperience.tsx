@@ -3,6 +3,7 @@
 import { track } from "@vercel/analytics";
 import Link from "next/link";
 import { FormEvent, useEffect, useRef, useState } from "react";
+import SavedMonitors from "@/components/scout/SavedMonitors";
 import {
   cancelScoutJob,
   createScoutJob,
@@ -421,6 +422,18 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
   const pollJobStatus = job?.status;
 
   useEffect(() => {
+    const linkedJobId = new URLSearchParams(window.location.search).get("job");
+    if (!linkedJobId) return;
+    let active = true;
+    void getScoutJob(linkedJobId).then((linkedJob) => {
+      if (active) setJob(linkedJob);
+    }).catch((reason) => {
+      if (active) setError(reason instanceof Error ? reason.message : "Scout could not open linked evidence.");
+    });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
     // Child passive effects can run before the root <Analytics /> effect has
     // installed Vercel's queue. Retry this one page-entry fact briefly rather
     // than silently dropping it; all later Scout events are user-driven.
@@ -624,6 +637,7 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
       </form>
 
       {job ? <JobDetails job={job} refreshError={refreshError} onCancel={cancel} canceling={canceling} /> : null}
+      <SavedMonitors job={job ?? undefined} />
     </div>
   );
 }

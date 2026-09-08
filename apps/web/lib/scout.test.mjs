@@ -258,3 +258,34 @@ test("California admission errors explain the exact session grammar", async (t) 
   };
   await assert.rejects(compiled.exports.createScoutJob("AB 123", "CA"), (error) => error.status === 422 && /AB 123 2025-2026/.test(error.message));
 });
+
+test("saved monitor client uses owner-scoped endpoints and preserves bounded history state", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push([String(url), options]);
+    if (String(url).endsWith("/monitor")) return new Response(JSON.stringify({ created: true, monitor: { id: "m-1", query: "AB 123 2025-2026", jurisdiction: "CA", cadence_seconds: 86400, active: true } }));
+    if (String(url).includes("/runs")) return new Response(JSON.stringify({ monitor: { id: "m-1", query: "AB 123 2025-2026", jurisdiction: "CA", cadence_seconds: 86400, active: true }, runs: [{ id: "r-1", status: "completed", execution_mode: "cached", change_summary: { absence_evaluated: false, new_sources: [], changed_sources: [], unchanged_source_count: 1 } }], next_cursor: "older" }));
+    if (String(url).endsWith("/monitors")) return new Response(JSON.stringify({ monitors: [{ id: "m-1", query: "AB 123 2025-2026", jurisdiction: "CA", cadence_seconds: 86400, active: true }] }));
+    return new Response(JSON.stringify({ monitor: { id: "m-1", query: "AB 123 2025-2026", jurisdiction: "CA", cadence_seconds: 21600, active: false } }));
+  };
+  const saved = await compiled.exports.saveScoutMonitor("job-1", 86400);
+  const monitors = await compiled.exports.listScoutMonitors();
+  const history = await compiled.exports.getScoutMonitorRuns("m-1", "older");
+  const updated = await compiled.exports.updateScoutMonitor("m-1", { active: false, cadenceSeconds: 21600 });
+  assert.equal(saved.monitor.cadenceSeconds, 86400);
+  assert.equal(monitors[0].active, true);
+  assert.equal(history.nextCursor, "older");
+  assert.equal(history.runs[0].changeSummary.absence_evaluated, false);
+  assert.equal(updated.active, false);
+  assert.deepEqual(JSON.parse(calls[0][1].body), { cadence_seconds: 86400 });
+  assert.match(calls[2][0], /\/runs\?cursor=older$/);
+  assert.deepEqual(JSON.parse(calls[3][1].body), { active: false, cadence_seconds: 21600 });
+});
+
+test("monitor eligibility requires retained terminal evidence and excludes operator strategies", () => {
+  assert.equal(compiled.exports.isScoutMonitorEligible(normalizeScoutJob({ status: "completed", findings: [{ id: "f", title: "Evidence" }], strategy: "structured_first" })), true);
+  assert.equal(compiled.exports.isScoutMonitorEligible(normalizeScoutJob({ status: "partial", findings: [], strategy: "structured_first" })), false);
+  assert.equal(compiled.exports.isScoutMonitorEligible(normalizeScoutJob({ status: "completed", findings: [{ id: "f", title: "Evidence" }], strategy: "operator_canary" })), false);
+});
