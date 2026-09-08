@@ -25,6 +25,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest import official_ca_actions as ca_actions
+from billcommons_ingest import official_discovery as discovery
 from billcommons_schema.models import (
     Bill,
     BillAction,
@@ -198,7 +199,11 @@ def _schedule_success(target: OfficialSourceTarget, now: datetime) -> None:
 def _observation_scope(target: OfficialSourceTarget) -> dict[str, Any]:
     # This exact adapter observes a weekday delta, not a full CA history.
     target_scope = dict(target.scope) if isinstance(target.scope, Mapping) else {}
-    return {**target_scope, "coverage": "delta_only"}
+    coverage = "delta_only" if target.adapter_name == ADAPTER_NAME else "not_established"
+    result = {**target_scope, "coverage": coverage}
+    if len(_canonical_json_bytes(result)) > 60000:
+        return {"coverage": coverage, "target_scope_retained_on_target": True}
+    return result
 
 
 def _add_observation(
@@ -214,6 +219,7 @@ def _add_observation(
     record_count: int | None = None,
     adapter_name: str = ADAPTER_NAME,
     adapter_version: str = ca_actions.ADAPTER_VERSION,
+    http_status: int | None = None,
 ) -> OfficialSourceObservation:
     observation = OfficialSourceObservation(
         target_id=target.id,
@@ -223,7 +229,7 @@ def _add_observation(
         scope=scope,
         retrieved_at=retrieved_at,
         upstream_updated_at=upstream_updated_at,
-        http_status=200 if raw_sha256 is not None else None,
+        http_status=http_status if http_status is not None else 200 if raw_sha256 is not None else None,
         raw_sha256=raw_sha256,
         status=status,
         error_class=error_class,
@@ -437,6 +443,69 @@ def _reconcile_batch(
     return run_count
 
 
+def _observe_discovery_target(db, target, jurisdiction, observed_at) -> OfficialObservationResult:
+    expected_scope = {
+        "jurisdiction": jurisdiction.abbreviation if jurisdiction else None,
+        "inventory_version": discovery.INVENTORY_VERSION,
+        "coverage": "bounded_link_discovery",
+    }
+    try:
+        if jurisdiction is None or target.scope != expected_scope:
+            raise InvalidOfficialTarget("discovery scope differs from reviewed inventory")
+        captured = discovery.capture_official_landing_page(jurisdiction.abbreviation, target.source_url)
+    except Exception as exc:
+        observation = _add_observation(db, target=target, scope={"coverage": "not_established"},
+            retrieved_at=observed_at, status="invalid", error_class=_safe_error_class(exc),
+            adapter_name=discovery.ADAPTER_NAME, adapter_version=discovery.ADAPTER_VERSION)
+        _schedule_failure(target, observed_at)
+        return OfficialObservationResult(target.id, observation.status, None, 0)
+
+    # Storage errors deliberately escape: no source outcome is allowed to
+    # commit with missing evidence or an aborted transaction.
+    raw_sha = (store_official_raw_blob(db, captured.raw_bytes, captured.content_type or "application/octet-stream")
+               if captured.raw_bytes else None)
+    robots_sha = (store_official_raw_blob(db, captured.robots_bytes, "text/plain")
+                  if captured.robots_bytes else None)
+    scope = {**expected_scope,
+        "robots": {"source_url": captured.robots_url, "http_status": captured.robots_status,
+                   "raw_sha256": robots_sha,
+                   "body_bytes": len(captured.robots_bytes) if captured.robots_bytes is not None else None},
+        "candidate_links": [vars(link) for link in captured.links], "truncated": captured.truncated,
+        "legislative_freshness": "not_established"}
+    if captured.error_class is None:
+        previous = db.scalar(select(OfficialSourceObservation).where(
+            OfficialSourceObservation.target_id == target.id,
+            OfficialSourceObservation.status == "succeeded",
+        ).order_by(OfficialSourceObservation.retrieved_at.desc(), OfficialSourceObservation.id.desc()).limit(1))
+        old_links = {link["url"]: link for link in previous.scope.get("candidate_links", [])} if previous else {}
+        new_links = {link.url: vars(link) for link in captured.links}
+        diff = {
+            "comparator_version": "official-link-set/1", "scope": "bounded_same_origin_links",
+            "previous_observation_id": str(previous.id) if previous else None,
+            "previous_source_sha256": previous.raw_sha256 if previous else None,
+            "current_source_sha256": raw_sha,
+            "newly_observed_links": [new_links[url] for url in sorted(new_links.keys() - old_links.keys())],
+            "not_observed_this_time": [old_links[url] for url in sorted(old_links.keys() - new_links.keys())],
+            "truncated_input": captured.truncated or bool(previous and previous.scope.get("truncated")),
+            "absence_is_not_removal": True,
+        }
+        scope["discovery_diff_sha256"] = store_official_raw_blob(db, _canonical_json_bytes(diff), "application/json")
+        scope["previous_observation_id"] = str(previous.id) if previous else None
+        scope["content_changed"] = (previous.raw_sha256 != raw_sha) if previous else None
+    succeeded = captured.error_class is None
+    observation = _add_observation(db, target=target, scope=scope,
+        retrieved_at=captured.retrieved_at, status="succeeded" if succeeded else "failed",
+        raw_sha256=raw_sha, upstream_updated_at=_upstream_updated_at(captured.upstream_modified),
+        error_class=captured.error_class, record_count=len(captured.links) if succeeded else None,
+        adapter_name=discovery.ADAPTER_NAME, adapter_version=discovery.ADAPTER_VERSION,
+        http_status=captured.http_status)
+    if succeeded:
+        _schedule_success(target, observed_at)
+    else:
+        _schedule_failure(target, observed_at)
+    return OfficialObservationResult(target.id, observation.status, observation.record_count, 0)
+
+
 def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> OfficialObservationResult | None:
     """Observe one due, enabled reviewed CA target without committing.
 
@@ -461,6 +530,8 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
         return None
 
     jurisdiction = db.get(Jurisdiction, target.jurisdiction_id)
+    if target.adapter_name == discovery.ADAPTER_NAME:
+        return _observe_discovery_target(db, target, jurisdiction, observed_at)
     try:
         day = _target_day(target, jurisdiction)
     except InvalidOfficialTarget as exc:

@@ -1,0 +1,19 @@
+{
+  "inventory_version": "2026-09-08",
+  "overrides": {
+    "KS": {
+      "replaces": "http://www.kslegislature.org/",
+      "source_url": "https://www.kslegislature.gov/b2025_26/",
+      "evidence_url": "https://www.kslegislature.org/",
+      "checked_at": "2026-09-08",
+      "reason": "The official legislature endpoint redirects to its HTTPS .gov session site."
+    },
+    "IN": {
+      "replaces": "https://www.in.gov/legislative/",
+      "source_url": "https://iga.in.gov/",
+      "evidence_url": "https://www.in.gov/legislative/",
+      "checked_at": "2026-09-08",
+      "reason": "The official state-government legislature URL redirects to the General Assembly site."
+    }
+  }
+}

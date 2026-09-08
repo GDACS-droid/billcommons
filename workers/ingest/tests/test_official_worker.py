@@ -1,11 +1,14 @@
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 
-from billcommons_ingest.official_worker import run_cycle, seed_ca_targets
+from billcommons_ingest.official_worker import (
+    ObservationDeadlineExceeded, _transaction_deadline, run_cycle, seed_ca_targets,
+)
 from billcommons_schema.models import Jurisdiction, OfficialSourceTarget
 
 
@@ -100,3 +103,25 @@ def test_cycle_hard_cap_prevents_unbounded_claims():
         session_factory=lambda: SessionProbe(events), observer=lambda db: result(),
         emit=lambda record: None) == 2
     assert events == ["commit", "close", "commit", "close"]
+
+
+def test_total_deadline_escapes_adapter_exception_handler():
+    swallowed = []
+    with pytest.raises(ObservationDeadlineExceeded):
+        with _transaction_deadline(0.02):
+            try:
+                time.sleep(1)
+            except Exception:
+                swallowed.append(True)
+    assert swallowed == []
+
+
+def test_deadline_rolls_back_without_emitting_success():
+    events = []
+    def expired(db):
+        raise ObservationDeadlineExceeded()
+    with pytest.raises(ObservationDeadlineExceeded):
+        run_cycle(stop=threading.Event(), max_observations=1,
+            session_factory=lambda: SessionProbe(events), observer=expired,
+            emit=lambda record: events.append("unexpected success"))
+    assert events == ["rollback", "close"]
