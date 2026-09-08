@@ -1874,6 +1874,8 @@ def recompute_status_for_bills(
                     for candidate in candidates
                 ]
 
+            candidate_row_count = 0
+
             in_chunk_by_key = {
                 (bill_jurisdiction.get(other), bill_session.get(other), bill_identifier_norm.get(other)): other
                 for other in bill_ids
@@ -1913,7 +1915,8 @@ def recompute_status_for_bills(
                 # Scope in SQL as well as in Python: without the jurisdiction
                 # + session predicates a nationwide sweep would pull every
                 # "HB 1"-shaped row in the corpus for each rank.
-                rows = db.execute(
+                rows_by_key: dict = {}
+                candidate_rows = db.execute(
                     select(
                         Bill.id,
                         Bill.jurisdiction_id,
@@ -1923,19 +1926,32 @@ def recompute_status_for_bills(
                         Bill.jurisdiction_id.in_({bill_jurisdiction.get(bid) for bid in still_needed}),
                         Bill.session_id.in_({bill_session.get(bid) for bid in still_needed}),
                         Bill.identifier_norm.in_(rank_candidates),
-                    ).order_by(Bill.id)
-                ).all()
-                rows_by_key: dict = {}
-                for row in rows:
+                    ).order_by(Bill.id).execution_options(stream_results=True)
+                ).yield_per(status_evidence_mod.STREAM_FETCH_SIZE)
+                for row in candidate_rows:
+                    candidate_row_count += 1
+                    if candidate_row_count > status_evidence_mod.MAX_CANDIDATE_ROWS_PER_RECOMPUTE:
+                        raise status_evidence_mod.DerivationInputLimitExceeded(
+                            "derived status evidence candidate batch exceeds configured record cap"
+                        )
                     rows_by_key.setdefault(
                         (row.jurisdiction_id, row.session_id, row.identifier_norm), []
                     ).append(row)
                 for bid in still_needed:
                     candidate = candidates_by_bid[bid][rank]
                     key = (bill_jurisdiction.get(bid), bill_session.get(bid), candidate)
+                    captured_candidates = rows_by_key.get(key, ())
+                    if (
+                        len(substitution_lookup_by_bill[bid]["ranks"][rank]["candidates"])
+                        + len(captured_candidates)
+                        > status_evidence_mod.MAX_CANDIDATES_PER_BILL
+                    ):
+                        raise status_evidence_mod.DerivationInputLimitExceeded(
+                            "derived status evidence candidate input exceeds configured record cap"
+                        )
                     substitution_lookup_by_bill[bid]["ranks"][rank]["candidates"].extend(
                         {"source": "database", "bill_id": str(row.id), "identifier": candidate}
-                        for row in rows_by_key.get(key, ())
+                        for row in captured_candidates
                     )
                     match = next(
                         (row for row in rows_by_key.get(key, ()) if row.id != bid), None

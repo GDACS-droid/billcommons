@@ -1566,3 +1566,55 @@ def test_offline_replay_rejects_tampered_or_missing_required_input(mutate):
     mutate(input_data)
     with pytest.raises(status_evidence_mod.DerivedStatusReplayError):
         status_evidence_mod.replay_derivation(input_data, _offline_before())
+
+@pytest.mark.parametrize("mutate", [
+    lambda value: value.__setitem__("as_of_date", None),
+    lambda value: value.__setitem__("bill_id", "another-bill"),
+])
+def test_offline_replay_requires_effective_date_and_matching_before_bill(mutate):
+    input_data = _offline_replay_record()
+    mutate(input_data)
+    with pytest.raises(status_evidence_mod.DerivedStatusReplayError):
+        status_evidence_mod.replay_derivation(input_data, _offline_before())
+
+
+def test_offline_replay_rejects_mismatched_after_bill():
+    input_data = _offline_replay_record()
+    with pytest.raises(status_evidence_mod.DerivedStatusReplayError):
+        status_evidence_mod.assert_replay_matches_after(
+            input_data,
+            _offline_before(),
+            {"bill": {"id": "another-bill", "status": "introduced"}, "substitution_relations": []},
+        )
+
+
+def test_status_derivation_refuses_to_record_unreplayable_v2_mutation(db_session, monkeypatch):
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    bill = _bill(db_session, jurisdiction, session_row, "HB 13")
+    db_session.add(BillAction(bill_id=bill.id, description="Introduced", classification="introduction"))
+    db_session.flush()
+    monkeypatch.setattr(
+        status_evidence_mod,
+        "assert_replay_matches_after",
+        lambda *_args: (_ for _ in ()).throw(status_evidence_mod.DerivedStatusReplayError("fixture mismatch")),
+    )
+    with pytest.raises(status_evidence_mod.DerivedStatusReplayError, match="fixture mismatch"):
+        with db_session.begin_nested():
+            recompute_status_for_bills(db_session, [bill.id], stamp=False)
+    assert db_session.get(Bill, bill.id).status is None
+    assert _derived_evidence(db_session) == []
+
+
+def test_status_derivation_rejects_unbounded_candidate_input_before_mutation(db_session, monkeypatch):
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    _bill(db_session, jurisdiction, session_row, "HB 14")
+    substituted = _bill(db_session, jurisdiction, session_row, "SB 14")
+    db_session.add(BillAction(bill_id=substituted.id, description="SUBSTITUTED BY HB14", classification=None))
+    db_session.flush()
+    monkeypatch.setattr(status_evidence_mod, "MAX_CANDIDATES_PER_BILL", 0)
+    with pytest.raises(ValueError, match="candidate input exceeds configured record cap"):
+        with db_session.begin_nested():
+            recompute_status_for_bills(db_session, [substituted.id], stamp=False)
+    assert db_session.get(Bill, substituted.id).status is None
+    assert _related_bills_for(db_session, substituted.id) == []
+    assert _derived_evidence(db_session) == []

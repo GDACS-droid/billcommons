@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import lru_cache
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,8 @@ MAX_ACTIONS_PER_BILL = 1_000
 MAX_RELATIONS_PER_BILL = 1_000
 MAX_ACTION_ROWS_PER_RECOMPUTE = 100_000
 MAX_RELATION_ROWS_PER_RECOMPUTE = 100_000
+MAX_CANDIDATES_PER_BILL = 1_000
+MAX_CANDIDATE_ROWS_PER_RECOMPUTE = 100_000
 STREAM_FETCH_SIZE = 500
 
 
@@ -54,14 +57,27 @@ class DerivedStatusReplayError(ValueError):
     """A retained record cannot be replayed as a self-contained derivation."""
 
 
+@lru_cache(maxsize=1)
 def algorithm_source_sha256() -> str:
-    """Fingerprint the source files that execute the persisted algorithm."""
+    """Fingerprint all local source files that define replay semantics.
+
+    Worker source is immutable for a process/batch, so cache the result rather
+    than hashing the large CLI module once per changed bill.
+    """
     package_dir = Path(__file__).resolve().parent
+    repository_root = package_dir.parents[2]
+    sources = (
+        package_dir / "status.py",
+        package_dir / "cli.py",
+        package_dir / "derived_status_evidence.py",
+        repository_root / "packages/shared/billcommons_shared/normalize.py",
+        repository_root / "packages/shared/billcommons_shared/enrollment.py",
+    )
     digest = hashlib.sha256()
-    for name in ("status.py", "cli.py", "derived_status_evidence.py"):
-        digest.update(name.encode("utf-8"))
+    for source in sources:
+        digest.update(str(source.relative_to(repository_root)).encode("utf-8"))
         digest.update(b"\0")
-        digest.update((package_dir / name).read_bytes())
+        digest.update(source.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -107,6 +123,16 @@ def replay_derivation(derivation_input_data: dict[str, Any], before_snapshot: di
         raise DerivedStatusReplayError("unsupported derived-status algorithm version")
     if derivation_input_data.get("algorithm_source_sha256") != algorithm_source_sha256():
         raise DerivedStatusReplayError("local derived-status source does not match retained input")
+    bill_id = derivation_input_data.get("bill_id")
+    before_bill = before_snapshot.get("bill")
+    if not isinstance(bill_id, str) or not isinstance(before_bill, dict) or before_bill.get("id") != bill_id:
+        raise DerivedStatusReplayError("derivation input and before snapshot bill ids disagree")
+    as_of_date = derivation_input_data.get("as_of_date")
+    if not isinstance(as_of_date, str):
+        raise DerivedStatusReplayError("derivation input is missing effective date")
+    effective_date = _parse_date(as_of_date)
+    if effective_date is None:
+        raise DerivedStatusReplayError("derivation input is missing effective date")
     session, external = derivation_input_data.get("session"), derivation_input_data.get("external_snapshots")
     if not isinstance(session, dict) or not isinstance(external, dict):
         raise DerivedStatusReplayError("derivation input is missing session or external snapshots")
@@ -212,7 +238,11 @@ def replay_derivation(derivation_input_data: dict[str, Any], before_snapshot: di
 def assert_replay_matches_after(derivation_input_data: dict[str, Any], before_snapshot: dict[str, Any], after_snapshot: dict[str, Any]) -> dict[str, Any]:
     """Return pure replay output or raise if it differs from retained after-state."""
     replayed = replay_derivation(derivation_input_data, before_snapshot)
-    expected = {"bill": {"id": after_snapshot.get("bill", {}).get("id"), "status": after_snapshot.get("bill", {}).get("status")}, "substitution_relations": _semantic_relations(after_snapshot.get("substitution_relations", []))}
+    input_bill_id = derivation_input_data["bill_id"]
+    after_bill = after_snapshot.get("bill")
+    if not isinstance(after_bill, dict) or after_bill.get("id") != input_bill_id:
+        raise DerivedStatusReplayError("derivation input and after snapshot bill ids disagree")
+    expected = {"bill": {"id": after_bill["id"], "status": after_bill.get("status")}, "substitution_relations": _semantic_relations(after_snapshot.get("substitution_relations", []))}
     if replayed != expected:
         raise DerivedStatusReplayError("offline replay does not match retained after snapshot")
     return replayed
@@ -365,6 +395,11 @@ def record_changes(
         after = after_by_bill.get(bill_id)
         if after is None or _canonical_json_bytes(before) == _canonical_json_bytes(after):
             continue
+        # New records promise a self-contained replayable derivation. Refuse
+        # to persist that claim unless the same retained bytes reproduce the
+        # semantic after-state before the transaction can commit.
+        if inputs_by_bill[bill_id].get("replay_input_version") == REPLAY_INPUT_VERSION:
+            assert_replay_matches_after(inputs_by_bill[bill_id], before, after)
         causal_id = (causal_evidence_by_bill or {}).get(bill_id)
         if causal_id is not None:
             causal_record = db.get(CorpusUpdateEvidence, causal_id)
