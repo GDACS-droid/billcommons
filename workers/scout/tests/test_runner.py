@@ -227,6 +227,75 @@ def test_california_retained_parse_budget_exhaustion_is_truthful_partial(tmp_pat
         assert db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalars().all() == []
 
 
+def test_california_retained_newest_match_ignores_older_missing_and_oversized_archives(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _bill_id, observation_id, observed_at = _seed_ca_retained_archive(sessions, raw)
+    oversized = raw + b"x"
+    engine = sessions.kw["bind"]
+    with engine.begin() as conn:
+        target_id = conn.execute(text("SELECT id FROM official_source_targets")).scalar_one()
+        oversized_hash = content_hash(oversized)
+        conn.execute(text("INSERT INTO official_raw_blobs (sha256, data) VALUES (:sha256, :data)"), {"sha256": oversized_hash, "data": oversized})
+        conn.execute(
+            text("INSERT INTO official_source_observations (id, target_id, adapter_name, status, raw_sha256, source_url, retrieved_at, http_status) VALUES (:id, :target_id, 'ca_official_actions', 'succeeded', :sha256, :source_url, :retrieved_at, 200)"),
+            [
+                {"id": str(uuid.uuid4()), "target_id": target_id, "sha256": oversized_hash, "source_url": ca_delta_url("Thu"), "retrieved_at": observed_at - timedelta(minutes=2)},
+                {"id": str(uuid.uuid4()), "target_id": target_id, "sha256": "e" * 64, "source_url": ca_delta_url("Fri"), "retrieved_at": observed_at - timedelta(minutes=1)},
+            ],
+        )
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        source = db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalar_one()
+        selected = db.execute(select(ScoutJobEvent).where(
+            ScoutJobEvent.job_id == job_id,
+            ScoutJobEvent.kind == "retained_official_archive_selected",
+        )).scalar_one()
+        assert job.status == "completed"
+        assert source.canonical_url == ca_delta_url("Mon")
+        assert selected.detail["observation_id"] == str(observation_id)
+
+
+def test_california_retained_newer_absent_bill_allows_older_matching_delta(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    older_raw = _ca_archive()
+    _bill_id, _observation_id, observed_at = _seed_ca_retained_archive(sessions, older_raw)
+    newer_raw = _ca_archive("202520260AB124")
+    engine = sessions.kw["bind"]
+    with engine.begin() as conn:
+        target_id = conn.execute(text("SELECT id FROM official_source_targets")).scalar_one()
+        newer_hash = content_hash(newer_raw)
+        conn.execute(text("INSERT INTO official_raw_blobs (sha256, data) VALUES (:sha256, :data)"), {"sha256": newer_hash, "data": newer_raw})
+        conn.execute(
+            text("INSERT INTO official_source_observations (id, target_id, adapter_name, status, raw_sha256, source_url, retrieved_at, http_status) VALUES (:id, :target_id, 'ca_official_actions', 'succeeded', :sha256, :source_url, :retrieved_at, 200)"),
+            {"id": str(uuid.uuid4()), "target_id": target_id, "sha256": newer_hash, "source_url": ca_delta_url("Tue"), "retrieved_at": observed_at + timedelta(minutes=1)},
+        )
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": max(len(older_raw), len(newer_raw))}
+        db.commit()
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        source = db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalar_one()
+        assert job.status == "completed"
+        assert source.canonical_url == ca_delta_url("Mon")
+        assert source.raw_ref == content_hash(older_raw)
+
+
 def test_california_retained_missing_newest_raw_is_integrity_partial_without_older_copy(tmp_path):
     runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
     raw = _ca_archive()

@@ -630,37 +630,54 @@ class ScoutRunner:
         ).all()
         candidates = []
         for observation_id, source_url, retrieved_at, upstream_updated_at, http_status, raw_sha256, raw_byte_length in observations:
-            # Do not skip a succeeded observation whose supposedly retained
-            # bytes have disappeared. The newest eligible delta must remain a
-            # truthful integrity result rather than silently falling back.
+            # Retain each marker in archive order. A malformed or over-limit
+            # older delta must not hide a newer matching archive, while a
+            # marker reached before any matching archive remains terminal.
             if not isinstance(raw_sha256, str) or not isinstance(raw_byte_length, int):
-                return None, "retained_archive_integrity_failed"
+                candidates.append(("retained_archive_integrity_failed",))
+                continue
             if raw_byte_length > maximum_bytes:
-                return None, "retained_archive_exceeds_job_limit"
-            raw_bytes = db.execute(
-                select(OfficialRawBlob.data).where(OfficialRawBlob.sha256 == raw_sha256)
-            ).scalar_one_or_none()
-            if raw_bytes is None:
-                return None, "retained_archive_integrity_failed"
-            observation = RetainedCaliforniaObservation(
-                id=observation_id,
-                source_url=source_url,
-                retrieved_at=retrieved_at,
-                upstream_updated_at=upstream_updated_at,
-                http_status=http_status,
-                raw_sha256=raw_sha256,
-            )
-            raw_bytes = bytes(raw_bytes)
-            if len(raw_bytes) != raw_byte_length or content_hash(raw_bytes) != observation.raw_sha256:
-                return None, "retained_archive_integrity_failed"
-            candidates.append((observation, raw_bytes))
+                candidates.append(("retained_archive_exceeds_job_limit",))
+                continue
+            candidates.append((
+                RetainedCaliforniaObservation(
+                    id=observation_id,
+                    source_url=source_url,
+                    retrieved_at=retrieved_at,
+                    upstream_updated_at=upstream_updated_at,
+                    http_status=http_status,
+                    raw_sha256=raw_sha256,
+                ),
+                raw_byte_length,
+            ))
         return (bills[0], query, tuple(candidates)), None
 
     def _california_retained_evidence(self, candidates, *, deadline: float | None):
-        """Parse already-read candidates outside any database transaction."""
+        """Validate and parse ordered candidates outside any DB transaction."""
 
         bill_id, query, archives = candidates
-        for observation, raw_bytes in archives:
+        for candidate in archives:
+            if len(candidate) == 1:
+                return None, candidate[0]
+            observation, raw_byte_length = candidate
+            # Read and release one retained blob at a time. This avoids both a
+            # parse transaction and materializing older candidates after the
+            # first matching delta has been selected.
+            with self.sessions() as db:
+                raw_value = db.execute(
+                    select(OfficialRawBlob.data).where(
+                        OfficialRawBlob.sha256 == observation.raw_sha256
+                    )
+                ).scalar_one_or_none()
+                db.commit()
+            if raw_value is None:
+                return None, "retained_archive_integrity_failed"
+            try:
+                raw_bytes = bytes(raw_value)
+            except (TypeError, ValueError):
+                return None, "retained_archive_integrity_failed"
+            if len(raw_bytes) != raw_byte_length or content_hash(raw_bytes) != observation.raw_sha256:
+                return None, "retained_archive_integrity_failed"
             try:
                 parsed = parse_ca_official_actions_zip(
                     raw_bytes,
@@ -818,6 +835,7 @@ class ScoutRunner:
             if job is None:
                 return
             candidates, reason = self._california_retained_candidates(db, job)
+            parse_seconds = self._job_limit(job, "max_ca_parse_seconds", self.settings.max_ca_parse_seconds)
             db.commit()
         if candidates is None:
             with self.sessions() as db:
@@ -827,7 +845,6 @@ class ScoutRunner:
                 db.add(ScoutJobEvent(job_id=job.id, kind="retained_official_archive_unavailable", detail={"reason": reason}))
                 self._finish(db, job, token, "partial", reason, False)
             return
-        parse_seconds = self._job_limit(job, "max_ca_parse_seconds", self.settings.max_ca_parse_seconds)
         selected, reason = self._california_retained_evidence(
             candidates, deadline=time.monotonic() + parse_seconds,
         )
