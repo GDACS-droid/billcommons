@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { API_BASE } from "@/lib/config";
+import { trackFunnel } from "@/lib/funnel";
 
 /** POST /api/v1/account/magic-link -- always 202, never reveals whether an
  * account exists (see routers/account.py). */
@@ -14,11 +15,14 @@ export default function MagicLinkForm() {
     if (state === "busy") return;
     setState("busy");
     try {
-      await fetch(`${API_BASE}/api/v1/account/magic-link`, {
+      const response = await fetch(`${API_BASE}/api/v1/account/magic-link`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email }),
       });
+      // A 202 confirms only that the privacy-preserving request was accepted;
+      // it does not prove sign-in, account creation, or email delivery.
+      if (response.ok) trackFunnel("magic_link_requested");
     } finally {
       setState("done");
     }

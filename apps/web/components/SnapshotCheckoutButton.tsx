@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { API_BASE } from "@/lib/config";
+import { trackFunnel } from "@/lib/funnel";
 
 type Props = {
   scope: "state" | "full";
@@ -20,6 +21,7 @@ export default function SnapshotCheckoutButton({ scope, jurisdiction, label, cla
     if (busy) return;
     setBusy(true);
     setError("");
+    trackFunnel("checkout_intent", { product: "snapshot", scope });
     try {
       const res = await fetch(`${API_BASE}/api/v1/billing/checkout/snapshot`, {
         method: "POST",
@@ -34,6 +36,7 @@ export default function SnapshotCheckoutButton({ scope, jurisdiction, label, cla
         return;
       }
       const body = await res.json();
+      trackFunnel("checkout_redirect_created", { product: "snapshot", scope });
       window.location.href = body.url;
     } catch {
       setError("Could not reach the server — please try again.");

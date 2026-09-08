@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { API_BASE } from "@/lib/config";
+import { trackFunnel } from "@/lib/funnel";
 
 /**
  * Item 17 fix: `/docs/api-keys` tells customers "rotate a key... or revoke
@@ -75,6 +76,7 @@ export function KeyActions({
       return;
     const body = await post("/rotate");
     if (body?.key) {
+      trackFunnel("api_key_revealed", { operation: "rotate" });
       if (onRotated) {
         onRotated(body.key);
       } else {
@@ -94,7 +96,10 @@ export function KeyActions({
 
   async function reveal() {
     const body = await post("/reveal");
-    if (body?.key) setRevealed(body.key);
+    if (body?.key) {
+      trackFunnel("api_key_revealed", { operation: "reveal" });
+      setRevealed(body.key);
+    }
   }
 
   if (revealed) {
@@ -164,6 +169,7 @@ export function MintKeyButton({ onMinted }: { onMinted: () => void }) {
         return;
       }
       const body = await res.json();
+      trackFunnel("api_key_revealed", { operation: "mint" });
       setRevealed(body.key);
       onMinted();
     } catch {

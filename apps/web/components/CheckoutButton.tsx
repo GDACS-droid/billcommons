@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { API_BASE } from "@/lib/config";
+import { trackFunnel } from "@/lib/funnel";
 
 type Props = {
   plan: "builder" | "scale";
@@ -25,6 +26,7 @@ export default function CheckoutButton({ plan, interval, label, className }: Pro
     if (busy) return;
     setBusy(true);
     setError("");
+    trackFunnel("checkout_intent", { product: "subscription", plan, interval });
     try {
       const res = await fetch(`${API_BASE}/api/v1/billing/checkout`, {
         method: "POST",
@@ -43,6 +45,7 @@ export default function CheckoutButton({ plan, interval, label, className }: Pro
         return;
       }
       const body = await res.json();
+      trackFunnel("checkout_redirect_created", { product: "subscription", plan, interval });
       window.location.href = body.url;
     } catch {
       setError("Could not reach the server — please try again.");
