@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import threading
 from contextlib import contextmanager
@@ -21,11 +22,15 @@ from billcommons_schema.models import Jurisdiction, OfficialSourceTarget
 from billcommons_shared.db import get_session
 from billcommons_ingest.official_ca_actions import ca_delta_url
 from billcommons_ingest import official_discovery as discovery
+from billcommons_ingest import fulltext, tls_repair
+from billcommons_shared.rawstore import FilesystemRawStore, RawStore
 
 
 DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 DEFAULT_CADENCE_SECONDS = 86400
 MAX_OBSERVATION_SECONDS = 300
+TLS_REPAIR_CYCLE_LIMIT = 2
+TLS_REPAIR_ENABLED_ENV = "OFFICIAL_TLS_REPAIR_ENABLED"
 
 
 class ObservationDeadlineExceeded(BaseException):
@@ -129,10 +134,61 @@ def seed_discovery_targets(db, *, enable: bool = False) -> int:
     return len(inventory)
 
 
+def _run_tls_repair_cycle(
+    *,
+    session_factory: Callable,
+    fetcher: fulltext.FullTextFetcher,
+    rawstore: RawStore,
+    limit: int = TLS_REPAIR_CYCLE_LIMIT,
+    seed_candidates: Callable = tls_repair.seed_candidates,
+    run_due_repairs: Callable = tls_repair.run_due_repairs,
+) -> dict[str, int]:
+    """Seed then execute a tiny TLS-repair batch in independent transactions.
+
+    The caller runs this only after each official observation is committed.
+    Planning owns one short transaction; ``run_due_repairs`` commits durable
+    admission before every outbound request. Consequently a repair failure
+    cannot roll back an official source observation from the same scan.
+    """
+    if not 1 <= limit <= TLS_REPAIR_CYCLE_LIMIT:
+        raise ValueError(f"TLS repair limit must be between 1 and {TLS_REPAIR_CYCLE_LIMIT}")
+    db = session_factory()
+    try:
+        planned = seed_candidates(db, limit=limit)
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    result = run_due_repairs(
+        session_factory=session_factory,
+        fetcher=fetcher,
+        rawstore=rawstore,
+        limit=limit,
+    )
+    return {
+        "planned": planned,
+        "succeeded": result.succeeded,
+        "failed": result.failed,
+        "skipped": result.skipped,
+        "expired": result.expired,
+    }
+
+
+def _tls_repair_enabled_from_env() -> bool:
+    """Only an explicit opt-in value permits recurrent outbound repairs."""
+    return os.environ.get(TLS_REPAIR_ENABLED_ENV) == "1"
+
+
 def run_cycle(*, stop: threading.Event, max_observations: int,
               session_factory: Callable = get_session, observer: Callable | None = None,
-              emit: Callable[[dict], None] | None = None) -> int:
-    """Observe at most the requested count, committing each result separately."""
+              emit: Callable[[dict], None] | None = None,
+              tls_repair_enabled: bool = False,
+              tls_repair_fetcher: fulltext.FullTextFetcher | None = None,
+              tls_repair_rawstore: RawStore | None = None,
+              tls_repair_runner: Callable | None = None) -> int:
+    """Observe due targets, then optionally run an isolated tiny TLS batch."""
     if not 1 <= max_observations <= 100:
         raise ValueError("max_observations must be between 1 and 100")
     if observer is None:
@@ -160,6 +216,27 @@ def run_cycle(*, stop: threading.Event, max_observations: int,
         emit({"event": "official_observation", "target_id": str(result.target_id),
               "status": result.status, "record_count": result.record_count,
               "reconciliation_count": result.reconciliation_count})
+
+    # Do not begin an additional outbound task during shutdown. Otherwise,
+    # each enabled scan seeds and executes a bounded repair batch only after
+    # the observation transactions above have committed.
+    if tls_repair_enabled and not stop.is_set():
+        runner = tls_repair_runner or _run_tls_repair_cycle
+        active_fetcher = tls_repair_fetcher or fulltext.FullTextFetcher()
+        active_rawstore = tls_repair_rawstore or FilesystemRawStore()
+        try:
+            counts = runner(
+                session_factory=session_factory,
+                fetcher=active_fetcher,
+                rawstore=active_rawstore,
+                limit=TLS_REPAIR_CYCLE_LIMIT,
+            )
+        except Exception as exc:
+            # TLS repair is intentionally supplementary. Keep the safe class
+            # only and preserve committed official observations/scheduling.
+            emit({"event": "official_tls_repair_failed", "error_class": type(exc).__name__})
+        else:
+            emit({"event": "official_tls_repair_cycle", **counts})
     return processed
 
 
@@ -193,6 +270,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.enable_seeded and not (args.seed_ca or args.seed_discovery):
         parser.error("--enable-seeded requires --seed-ca or --seed-discovery")
     stop = threading.Event()
+    tls_repair_enabled = _tls_repair_enabled_from_env()
+    # Construct once per process so the repair path retains its rate limiter,
+    # robots cache, AIA cache, and optional filesystem archive across cycles.
+    tls_repair_fetcher = fulltext.FullTextFetcher() if tls_repair_enabled else None
+    tls_repair_rawstore = FilesystemRawStore() if tls_repair_enabled else None
     previous = {}
     for signum in (signal.SIGTERM, signal.SIGINT):
         previous[signum] = signal.signal(signum, lambda *_: stop.set())
@@ -216,7 +298,13 @@ def main(argv: list[str] | None = None) -> int:
         failures = 0
         while not stop.is_set():
             try:
-                processed = run_cycle(stop=stop, max_observations=args.max_observations)
+                processed = run_cycle(
+                    stop=stop,
+                    max_observations=args.max_observations,
+                    tls_repair_enabled=tls_repair_enabled,
+                    tls_repair_fetcher=tls_repair_fetcher,
+                    tls_repair_rawstore=tls_repair_rawstore,
+                )
                 failures = 0
                 _emit({"event": "official_cycle_complete", "observations": processed})
             except ObservationDeadlineExceeded:

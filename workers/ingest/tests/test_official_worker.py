@@ -8,7 +8,13 @@ import pytest
 from sqlalchemy import select
 
 from billcommons_ingest.official_worker import (
-    ObservationDeadlineExceeded, _transaction_deadline, run_cycle, seed_ca_targets,
+    ObservationDeadlineExceeded,
+    TLS_REPAIR_CYCLE_LIMIT,
+    _run_tls_repair_cycle,
+    _tls_repair_enabled_from_env,
+    _transaction_deadline,
+    run_cycle,
+    seed_ca_targets,
 )
 from billcommons_schema.models import Jurisdiction, OfficialSourceTarget
 
@@ -146,3 +152,116 @@ def test_deadline_rolls_back_without_emitting_success():
             session_factory=lambda: SessionProbe(events), observer=expired,
             emit=lambda record: events.append("unexpected success"))
     assert events == ["rollback", "close"]
+
+
+def test_tls_repair_is_disabled_by_default_and_requires_exact_env_opt_in(monkeypatch):
+    monkeypatch.delenv("OFFICIAL_TLS_REPAIR_ENABLED", raising=False)
+    assert _tls_repair_enabled_from_env() is False
+    monkeypatch.setenv("OFFICIAL_TLS_REPAIR_ENABLED", "true")
+    assert _tls_repair_enabled_from_env() is False
+    monkeypatch.setenv("OFFICIAL_TLS_REPAIR_ENABLED", "1")
+    assert _tls_repair_enabled_from_env() is True
+
+
+def test_cycle_default_never_invokes_tls_repair_runner():
+    calls = []
+    events = []
+    assert run_cycle(
+        stop=threading.Event(),
+        max_observations=1,
+        session_factory=lambda: SessionProbe(events),
+        observer=lambda _db: None,
+        tls_repair_runner=lambda **_kwargs: calls.append("called"),
+        emit=lambda record: events.append(record["event"]),
+    ) == 0
+    assert calls == []
+    assert events == ["commit", "close"]
+
+
+def test_enabled_cycle_runs_bounded_tls_repair_with_reused_dependencies():
+    events = []
+    calls = []
+    fetcher = object()
+    rawstore = object()
+
+    def run_repair(**kwargs):
+        calls.append(kwargs)
+        return {"planned": 2, "succeeded": 1, "failed": 0, "skipped": 1, "expired": 0}
+
+    assert run_cycle(
+        stop=threading.Event(),
+        max_observations=1,
+        session_factory=lambda: SessionProbe(events),
+        observer=lambda _db: None,
+        tls_repair_enabled=True,
+        tls_repair_fetcher=fetcher,
+        tls_repair_rawstore=rawstore,
+        tls_repair_runner=run_repair,
+        emit=lambda record: events.append(record),
+    ) == 0
+    assert len(calls) == 1
+    assert calls[0]["limit"] == TLS_REPAIR_CYCLE_LIMIT
+    assert calls[0]["fetcher"] is fetcher
+    assert calls[0]["rawstore"] is rawstore
+    assert events[-1] == {
+        "event": "official_tls_repair_cycle",
+        "planned": 2,
+        "succeeded": 1,
+        "failed": 0,
+        "skipped": 1,
+        "expired": 0,
+    }
+
+
+def test_tls_repair_failure_isolated_after_observation_commit():
+    events = []
+
+    def broken_repair(**_kwargs):
+        raise RuntimeError("upstream diagnostic must not be emitted")
+
+    assert run_cycle(
+        stop=threading.Event(),
+        max_observations=1,
+        session_factory=lambda: SessionProbe(events),
+        observer=lambda _db: result(),
+        tls_repair_enabled=True,
+        tls_repair_fetcher=object(),
+        tls_repair_rawstore=object(),
+        tls_repair_runner=broken_repair,
+        emit=events.append,
+    ) == 1
+    emitted = [record for record in events if isinstance(record, dict)]
+    assert emitted == [
+        {"event": "official_observation", "target_id": "target", "status": "succeeded",
+         "record_count": 2, "reconciliation_count": 1},
+        {"event": "official_tls_repair_failed", "error_class": "RuntimeError"},
+    ]
+    assert events.count("commit") == 1
+
+
+def test_tls_repair_planning_commits_before_bounded_execution():
+    events = []
+    calls = []
+
+    def seed(db, *, limit):
+        calls.append(("seed", limit))
+        return 2
+
+    def execute(*, session_factory, fetcher, rawstore, limit):
+        calls.append(("execute", limit, fetcher, rawstore))
+        return SimpleNamespace(succeeded=1, failed=0, skipped=1, expired=0)
+
+    counts = _run_tls_repair_cycle(
+        session_factory=lambda: SessionProbe(events),
+        fetcher="shared-fetcher",
+        rawstore="shared-rawstore",
+        limit=TLS_REPAIR_CYCLE_LIMIT,
+        seed_candidates=seed,
+        run_due_repairs=execute,
+    )
+    assert calls == [
+        ("seed", TLS_REPAIR_CYCLE_LIMIT),
+        ("execute", TLS_REPAIR_CYCLE_LIMIT, "shared-fetcher", "shared-rawstore"),
+    ]
+    assert events == ["commit", "close"]
+    assert counts == {"planned": 2, "succeeded": 1, "failed": 0, "skipped": 1, "expired": 0}
