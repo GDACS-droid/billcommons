@@ -28,6 +28,23 @@ def test_non_finite_fixture_json_is_rejected(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "invalid_reconciliation_input"
 
 
+@pytest.mark.parametrize("raw", [
+    '[{"occurrence_id":"id","date":"2026-01-01","date":"2026-02-01"}]',
+    '{"events":[],"events":[{"occurrence_id":"id"}]}',
+    '[{"occurrence_id":"id","raw_capture":{"x":1,"x":2}}]',
+    '[{"occurrence_id":"id","value":' + '1' * 5000 + '}]',
+])
+def test_ambiguous_or_oversized_integer_json_returns_controlled_error(tmp_path, capsys, raw):
+    official = tmp_path / "official.json"
+    local = tmp_path / "local.json"
+    official.write_text(raw)
+    local.write_text('[]')
+    assert main(["--official", str(official), "--local", str(local)]) == 2
+    output = capsys.readouterr()
+    assert json.loads(output.out)["error"]["code"] == "invalid_reconciliation_input"
+    assert output.err == ""
+
+
 def event(occurrence_id: str | None, **overrides):
     value = {
         "occurrence_id": occurrence_id,

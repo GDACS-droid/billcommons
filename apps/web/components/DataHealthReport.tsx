@@ -20,6 +20,8 @@ interface JurisdictionHealth {
     dead_api_sync_jobs: number;
     queued_api_sync_jobs: number;
     running_api_sync_jobs: number;
+    deferred_api_sync_jobs?: number;
+    next_deferred_api_sync_at?: string | null;
   };
   parser_health: {
     bill_count: number;
@@ -159,7 +161,11 @@ export default function DataHealthReport({ report, officialSources }: {
                   <div><dt className="text-xs text-slate-600">Scheduling target</dt>
                     <dd className="mt-1 text-slate-900">{row.refresh_target.target_minutes === null ? "" : "Every "}{cadence(row.refresh_target.target_minutes)}</dd></div>
                   <div><dt className="text-xs text-slate-600">Sync queue</dt>
-                    <dd className="mt-1 tabular-nums text-slate-900">{row.source_health.queued_api_sync_jobs} queued · {row.source_health.running_api_sync_jobs} running</dd></div>
+                    <dd className="mt-1 tabular-nums text-slate-900">{row.source_health.queued_api_sync_jobs} queued · {row.source_health.running_api_sync_jobs} running
+                      {!!row.source_health.deferred_api_sync_jobs && <span className="mt-1 block text-xs text-slate-600">
+                        {row.source_health.deferred_api_sync_jobs} waiting until {timestamp(row.source_health.next_deferred_api_sync_at)}
+                      </span>}
+                    </dd></div>
                   <div><dt className="text-xs text-slate-600">Official-source agreement</dt>
                     <dd className="mt-1 text-slate-900">Not yet verified</dd></div>
                 </dl>

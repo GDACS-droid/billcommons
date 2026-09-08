@@ -434,8 +434,18 @@ def load_fixture(path: Path) -> Any:
         def reject_constant(value: str):
             raise ReconciliationInputError("fixture must not contain non-finite JSON numbers")
 
-        return json.loads(raw, parse_constant=reject_constant)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ReconciliationInputError("fixture must not contain duplicate JSON object keys")
+                result[key] = value
+            return result
+
+        return json.loads(raw, parse_constant=reject_constant, object_pairs_hook=unique_object)
+    except ReconciliationInputError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise ReconciliationInputError("fixture is not readable JSON") from exc
 
 

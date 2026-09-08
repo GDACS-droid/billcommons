@@ -127,6 +127,8 @@ class JurisdictionEvidence:
     running_api_sync_jobs: int = 0
     oldest_queued_api_sync_at: datetime | None = None
     oldest_running_api_sync_at: datetime | None = None
+    deferred_api_sync_jobs: int = 0
+    next_deferred_api_sync_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -273,6 +275,13 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
     # the condition for human inspection; it must never reclaim or alter a
     # job automatically.
     pending_age_threshold = max((evidence.cadence_minutes or 0) * 2, 60)
+    if evidence.deferred_api_sync_jobs:
+        defects.append(Defect(
+            "info", "API_SYNC_WAITING_FOR_ELIGIBILITY", jurisdiction,
+            "API sync work is waiting for its scheduled eligibility time; duplicate dispatch is suppressed.",
+            {"deferred_job_count": evidence.deferred_api_sync_jobs,
+             "next_eligible_at": _timestamp(evidence.next_deferred_api_sync_at)},
+        ))
     for status, oldest_at in (
         ("queued", evidence.oldest_queued_api_sync_at),
         ("running", evidence.oldest_running_api_sync_at),
@@ -455,6 +464,8 @@ def build_report(evidence: Iterable[JurisdictionEvidence], *, now: datetime | No
                     "running_api_sync_jobs": item.running_api_sync_jobs,
                     "oldest_queued_api_sync_at": _timestamp(item.oldest_queued_api_sync_at),
                     "oldest_running_api_sync_at": _timestamp(item.oldest_running_api_sync_at),
+                    "deferred_api_sync_jobs": item.deferred_api_sync_jobs,
+                    "next_deferred_api_sync_at": _timestamp(item.next_deferred_api_sync_at),
                 },
                 "parser_health": asdict(item.bills),
                 "coverage": asdict(item.coverage) if item.coverage else None,
@@ -689,6 +700,7 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
                 coverage_by_selected_session[coverage.session_id] = evidence
 
     jobs_by_state: dict[str, dict[str, tuple[int, datetime | None]]] = defaultdict(dict)
+    deferred_by_state: dict[str, tuple[int, datetime | None]] = {}
     job_state = func.upper(IngestJob.payload["state"].astext)
     queued_eligible_at = func.greatest(IngestJob.created_at, IngestJob.run_after)
     for row in db.execute(
@@ -699,6 +711,12 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
             func.min(queued_eligible_at)
             .filter(IngestJob.status == "queued", IngestJob.run_after <= now)
             .label("oldest_queued_eligible_at"),
+            func.count(IngestJob.id)
+            .filter(IngestJob.status == "queued", IngestJob.run_after > now)
+            .label("deferred_count"),
+            func.min(IngestJob.run_after)
+            .filter(IngestJob.status == "queued", IngestJob.run_after > now)
+            .label("next_deferred_at"),
             func.min(func.coalesce(IngestJob.locked_at, IngestJob.created_at)).label(
                 "oldest_running_at"
             ),
@@ -711,6 +729,8 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
         .group_by(job_state, IngestJob.status)
     ).all():
         if row.state:
+            if row.status == "queued":
+                deferred_by_state[str(row.state).upper()] = (int(row.deferred_count), row.next_deferred_at)
             oldest_at = (
                 row.oldest_running_at
                 if row.status == "running"
@@ -770,6 +790,8 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
                 running_api_sync_jobs=jobs.get("running", (0, None))[0],
                 oldest_queued_api_sync_at=jobs.get("queued", (0, None))[1],
                 oldest_running_api_sync_at=jobs.get("running", (0, None))[1],
+                deferred_api_sync_jobs=deferred_by_state.get(abbreviation, (0, None))[0],
+                next_deferred_api_sync_at=deferred_by_state.get(abbreviation, (0, None))[1],
             )
         )
     return result

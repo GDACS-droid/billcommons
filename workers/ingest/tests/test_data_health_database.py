@@ -268,7 +268,13 @@ def test_unknown_api_sync_time_and_future_queued_job_are_not_silently_healthy(db
 
     assert row["source_health"]["queued_api_sync_jobs"] == 1
     assert row["source_health"]["oldest_queued_api_sync_at"] is None
-    assert codes == ["UNKNOWN_SYNC_TIME"]
+    assert row["source_health"]["deferred_api_sync_jobs"] == 1
+    assert row["source_health"]["next_deferred_api_sync_at"] == (NOW + timedelta(hours=3)).isoformat()
+    assert codes == ["UNKNOWN_SYNC_TIME", "API_SYNC_WAITING_FOR_ELIGIBILITY"]
+    deferred = next(d for d in report["defects"] if d["jurisdiction"] == "CO"
+                    and d["code"] == "API_SYNC_WAITING_FOR_ELIGIBILITY")
+    assert deferred["severity"] == "info"
+    assert deferred["evidence"]["next_eligible_at"] == (NOW + timedelta(hours=3)).isoformat()
 
 
 def test_selected_session_query_ignores_historical_coverage_rows(db_session):
