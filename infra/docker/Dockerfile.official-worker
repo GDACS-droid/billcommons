@@ -1,0 +1,18 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpq-dev gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./requirements.txt
+COPY packages/schema ./packages/schema
+COPY packages/shared ./packages/shared
+COPY workers/ingest ./workers/ingest
+COPY data/registry ./data/registry
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -e workers/ingest
+
+# Targets must already be registered and explicitly enabled by the operator.
+# SIGTERM stops new claims; the current bounded observation finishes first.
+CMD ["python", "-m", "billcommons_ingest.official_worker"]

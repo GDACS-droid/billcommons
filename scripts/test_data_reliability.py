@@ -45,6 +45,8 @@ def main() -> int:
     # fixture contracts without monkeypatching pytest's module loader.
     groups = [
         ["workers/ingest/tests/test_scheduler.py",
+         "workers/ingest/tests/test_official_ca_actions.py",
+         "workers/ingest/tests/test_official_worker.py",
          "workers/ingest/tests/test_source_budget.py",
          "workers/ingest/tests/test_openstates_api.py",
          "workers/ingest/tests/test_api_sync.py",

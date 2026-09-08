@@ -9,11 +9,11 @@ must not be described as a disposable cache.
 
 ## What Railway's managed Postgres provides
 
-Railway's managed Postgres plugin takes automatic volume-level snapshots on
-its own schedule/retention (visible under the Postgres service's Backups
-tab in the Railway dashboard) and supports point-in-time restore through
-the dashboard UI. This is Railway's platform-level safety net — it is not
-something this repo configures or controls, and it is **not** a substitute
+Railway supports volume backups, but their schedule must be configured and
+verified for the actual volume. The production control-plane query on
+2026-09-08 found two existing backups and **no configured backup schedule**.
+Point-in-time recovery was not enabled. Do not assume either protection
+exists from the managed Postgres label. A provider backup is **not** a substitute
 for an application-level `pg_dump` if you need a portable, inspectable, or
 off-Railway copy of the data (e.g. before a risky migration, or to seed a
 local dev DB with production-shaped data).
