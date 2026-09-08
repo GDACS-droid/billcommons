@@ -189,6 +189,65 @@ def test_upgrade_requires_acknowledgement_and_expected_pre_revision_before_subpr
         )
 
 
+def test_target_specific_acknowledgement_rejects_wrong_revision_before_alembic():
+    target = _target()
+    with pytest.raises(migration.ControlledMigrationError, match="does not match"):
+        migration.run(
+            target=target,
+            repo_root=Path.cwd(),
+            check_only=False,
+            acknowledged=True,
+            acknowledgement_revision="0025",
+            expected_current="0021",
+            target_revision="0026",
+            environ=_environment(),
+            connector=_connector(["0021"]),
+            runner=lambda **kwargs: pytest.fail("wrong acknowledgement must stop before Alembic"),
+        )
+
+
+@pytest.mark.parametrize("revision", ["0026", "0027"])
+def test_upgrade_uses_explicit_pinned_revision_and_checks_matching_post_revision(revision: str):
+    calls: list[dict] = []
+
+    def runner(*args, **kwargs):
+        kwargs["args"] = args[0]
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(kwargs["args"], 0)
+
+    report = migration.run(
+        target=_target(),
+        repo_root=Path("/repo"),
+        check_only=False,
+        acknowledged=True,
+        acknowledgement_revision=revision,
+        expected_current="0025",
+        target_revision=revision,
+        environ=_environment(),
+        connector=_connector(["0025", revision]),
+        runner=runner,
+    )
+
+    assert report.post_revision == revision
+    assert calls[0]["args"][-2:] == ["upgrade", revision]
+
+
+def test_upgrade_rejects_unexpected_post_revision_for_explicit_target():
+    with pytest.raises(migration.ControlledMigrationError, match="not 0027"):
+        migration.run(
+            target=_target(),
+            repo_root=Path("/repo"),
+            check_only=False,
+            acknowledged=True,
+            acknowledgement_revision="0027",
+            expected_current="0025",
+            target_revision="0027",
+            environ=_environment(),
+            connector=_connector(["0025", "0026"]),
+            runner=lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0),
+        )
+
+
 def test_upgrade_invokes_exactly_one_pinned_alembic_command_in_an_isolated_environment():
     calls: list[dict] = []
 

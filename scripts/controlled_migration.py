@@ -41,6 +41,7 @@ import psycopg
 
 
 RELEASE_REVISION = "0025"
+SUPPORTED_REVISIONS = ("0025", "0026", "0027")
 _BINDING_FIELDS = ("PROJECT_ID", "ENVIRONMENT_ID", "SERVICE_ID")
 _PROXY_FIELDS = ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE")
 _MIGRATION_URL_ENV = "BILLCOMMONS_MIGRATION_DATABASE_URL"
@@ -265,6 +266,7 @@ def _invoke_alembic_once(
     repo_root: Path,
     environ: Mapping[str, str],
     url: str,
+    target_revision: str = RELEASE_REVISION,
     runner: Callable[..., object] = subprocess.run,
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="billcommons-controlled-migration-") as isolated_home:
@@ -276,7 +278,7 @@ def _invoke_alembic_once(
                 "-c",
                 "packages/schema/alembic.ini",
                 "upgrade",
-                RELEASE_REVISION,
+                target_revision,
             ],
             cwd=repo_root,
             env=_alembic_environment(environ, url=url, isolated_home=isolated_home),
@@ -300,24 +302,42 @@ def run(
     acknowledged: bool,
     expected_current: str | None,
     environ: Mapping[str, str],
+    target_revision: str = RELEASE_REVISION,
+    acknowledgement_revision: str | None = None,
     connector: Callable[..., object] = psycopg.connect,
     runner: Callable[..., object] = subprocess.run,
 ) -> MigrationReport:
+    if target_revision not in SUPPORTED_REVISIONS:
+        raise ControlledMigrationError("target revision is not an allowed pinned revision")
     pre_revision, fingerprint = _revision_and_fingerprint(target.url, connector=connector)
     if check_only:
         return MigrationReport(target.source, fingerprint, pre_revision, pre_revision, 0, "check")
+    expected_acknowledgement = acknowledgement_revision or target_revision
     if not acknowledged:
-        raise ControlledMigrationError("--acknowledge-upgrade-0025 is required before any upgrade")
+        raise ControlledMigrationError(
+            f"--acknowledge-upgrade-{target_revision} is required before any upgrade"
+        )
+    if expected_acknowledgement != target_revision:
+        raise ControlledMigrationError(
+            f"--acknowledge-upgrade-{expected_acknowledgement} does not match "
+            f"--target-revision {target_revision}"
+        )
     if expected_current is None:
         raise ControlledMigrationError("--expected-current is required before any upgrade")
     if pre_revision != expected_current:
         raise ControlledMigrationError("target pre-revision does not match --expected-current")
-    _invoke_alembic_once(repo_root=repo_root, environ=environ, url=target.url, runner=runner)
+    _invoke_alembic_once(
+        repo_root=repo_root,
+        environ=environ,
+        url=target.url,
+        target_revision=target_revision,
+        runner=runner,
+    )
     post_revision, post_fingerprint = _revision_and_fingerprint(target.url, connector=connector)
     if post_fingerprint != fingerprint:
         raise ControlledMigrationError("database server fingerprint changed during migration")
-    if post_revision != RELEASE_REVISION:
-        raise ControlledMigrationError("target post-revision is not 0025")
+    if post_revision != target_revision:
+        raise ControlledMigrationError(f"target post-revision is not {target_revision}")
     return MigrationReport(target.source, fingerprint, pre_revision, post_revision, 1, "upgrade")
 
 
@@ -332,9 +352,22 @@ def _parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--upgrade",
         action="store_true",
-        help="apply revision 0025 exactly once after acknowledgement",
+        help="apply the selected pinned revision exactly once after acknowledgement",
     )
-    parser.add_argument("--acknowledge-upgrade-0025", action="store_true")
+    parser.add_argument(
+        "--target-revision",
+        choices=SUPPORTED_REVISIONS,
+        default=RELEASE_REVISION,
+        help="pinned Alembic revision to apply (default: 0025)",
+    )
+    acknowledgement = parser.add_mutually_exclusive_group()
+    for revision in SUPPORTED_REVISIONS:
+        acknowledgement.add_argument(
+            f"--acknowledge-upgrade-{revision}",
+            dest="acknowledgement_revision",
+            action="store_const",
+            const=revision,
+        )
     parser.add_argument(
         "--expected-current",
         help="required pre-revision for --upgrade (for Scout production: 0021)",
@@ -361,9 +394,11 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
             target=target,
             repo_root=Path(__file__).resolve().parents[1],
             check_only=args.check_only,
-            acknowledged=args.acknowledge_upgrade_0025,
+            acknowledged=args.acknowledgement_revision is not None,
             expected_current=args.expected_current,
             environ=environment,
+            target_revision=args.target_revision,
+            acknowledgement_revision=args.acknowledgement_revision,
         )
     except ControlledMigrationError as exc:
         print(f"controlled migration refused: {exc}", file=sys.stderr)
