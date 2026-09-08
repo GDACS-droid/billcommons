@@ -33,13 +33,20 @@ An event is matched only with an explicit, shared identity:
 
 Use either `occurrence_id` or `source_identity`; values must be stable within
 the source namespace and appear unchanged in both fixtures. `occurrence_id`
-is preferred. Text, a date, a chamber, or an input-array position never form
-an identity. If an upstream source cannot provide an occurrence identity, keep
-that field absent: the result is `ambiguous_identities`, never a guessed merge.
+is preferred. When neither fixture supplies `jurisdiction`, `session`,
+`bill_id`, or `source_namespace`, the chosen identity must be globally unique
+across those scopes. When a scope field is supplied, the comparator treats a
+different known value as conflicting evidence and an absent counterpart as
+uncertain evidence. Text, a date, a chamber, or an input-array position never
+form an identity. If an upstream source cannot provide an occurrence identity,
+keep that field absent: the result is `ambiguous_identities`, never a guessed
+merge.
 
 Dates accept `YYYY-MM-DD`, `YYYY-MM`, or `YYYY`. A month and a day inside that
-month are compatible evidence. Missing fields and unknown dates become
-`uncertain_evidence`; a true mismatch requires contradictory known evidence.
+month are compatible but still imprecise evidence, so their comparison is
+`uncertain_evidence` unless both values and precisions are identical. Missing
+core date or description evidence also becomes `uncertain_evidence`; a true
+mismatch requires contradictory known evidence.
 
 ## Run it
 

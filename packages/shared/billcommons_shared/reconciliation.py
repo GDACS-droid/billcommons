@@ -97,7 +97,7 @@ def _source_url(record: Mapping[str, Any]) -> str | None:
         return None
     if not isinstance(value, str):
         raise ReconciliationInputError("event field 'source_url' must be a string or null")
-    return value.strip().rstrip("/") or None
+    return value.strip() or None
 
 
 def _date_evidence(record: Mapping[str, Any]) -> DateEvidence:
@@ -137,12 +137,15 @@ def _date_evidence(record: Mapping[str, Any]) -> DateEvidence:
                 raise ReconciliationInputError("event date must be YYYY, YYYY-MM, or YYYY-MM-DD")
             year = int(match.group(1))
             inferred = "year"
-            result = DateEvidence(
-                value=value,
-                precision=inferred,
-                lower=date(year, 1, 1),
-                upper=date(year, 12, 31),
-            )
+            try:
+                result = DateEvidence(
+                    value=value,
+                    precision=inferred,
+                    lower=date(year, 1, 1),
+                    upper=date(year, 12, 31),
+                )
+            except ValueError as exc:
+                raise ReconciliationInputError("event date is not a real calendar year") from exc
 
     if declared_precision not in {None, inferred}:
         raise ReconciliationInputError("date_precision conflicts with the supplied date")
@@ -184,6 +187,12 @@ def _normalize_event(raw: Any) -> NormalizedEvent:
         "stage": _required_string(raw, "stage"),
         "source_url": _source_url(raw),
         "source_identity": source_identity,
+        # Scope does not create identity. It protects an otherwise matching
+        # occurrence from being silently attributed to another bill or source.
+        "jurisdiction": _required_string(raw, "jurisdiction"),
+        "session": _required_string(raw, "session"),
+        "bill_id": _required_string(raw, "bill_id"),
+        "source_namespace": _required_string(raw, "source_namespace"),
     }
     return NormalizedEvent(
         raw=raw,
@@ -228,10 +237,25 @@ def _event_report(event: NormalizedEvent) -> dict[str, Any]:
 def _compare_pair(official: NormalizedEvent, local: NormalizedEvent) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     differences: list[dict[str, Any]] = []
     uncertainties: list[dict[str, Any]] = []
-    for field in ("event_type", "description", "chamber", "stage", "source_url", "source_identity"):
+    for field in (
+        "event_type",
+        "description",
+        "chamber",
+        "stage",
+        "source_url",
+        "source_identity",
+        "jurisdiction",
+        "session",
+        "bill_id",
+        "source_namespace",
+    ):
         official_value = official.evidence[field]
         local_value = local.evidence[field]
-        if official_value is None or local_value is None:
+        if field == "description" and official_value is None and local_value is None:
+            uncertainties.append(
+                {"field": field, "official": None, "local": None, "reason": "missing_on_both_sides"}
+            )
+        elif official_value is None or local_value is None:
             if official_value != local_value:
                 uncertainties.append({"field": field, "official": official_value, "local": local_value})
         elif official_value != local_value:
@@ -249,6 +273,17 @@ def _compare_pair(official: NormalizedEvent, local: NormalizedEvent) -> tuple[li
                     "local_precision": local_date.precision,
                 }
             )
+        elif official_date.value is None:
+            uncertainties.append(
+                {
+                    "field": "date",
+                    "official": None,
+                    "official_precision": official_date.precision,
+                    "local": None,
+                    "local_precision": local_date.precision,
+                    "reason": "missing_on_both_sides",
+                }
+            )
     elif official_date.upper < local_date.lower or local_date.upper < official_date.lower:
         differences.append(
             {
@@ -257,6 +292,20 @@ def _compare_pair(official: NormalizedEvent, local: NormalizedEvent) -> tuple[li
                 "official_precision": official_date.precision,
                 "local": local_date.value,
                 "local_precision": local_date.precision,
+            }
+        )
+    elif (
+        official_date.value != local_date.value
+        or official_date.precision != local_date.precision
+    ):
+        uncertainties.append(
+            {
+                "field": "date",
+                "official": official_date.value,
+                "official_precision": official_date.precision,
+                "local": local_date.value,
+                "local_precision": local_date.precision,
+                "reason": "overlapping_imprecise_dates",
             }
         )
     return differences, uncertainties

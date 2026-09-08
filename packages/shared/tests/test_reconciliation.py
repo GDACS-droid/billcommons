@@ -77,6 +77,14 @@ def test_explicit_identifiers_and_source_urls_remain_case_sensitive_evidence():
     ]
 
 
+def test_trailing_source_url_slash_is_preserved_as_evidence():
+    official = event("official:Action:100", source_url="https://legislature.example/Actions/")
+    local = event("official:Action:100", source_url="https://legislature.example/Actions")
+    report = reconcile_events([official], [local])
+
+    assert report["mismatched_evidence"][0]["differences"][0]["field"] == "source_url"
+
+
 def test_duplicate_explicit_identity_is_ambiguous_not_paired_by_text_or_position():
     first = event("official:action:100", ordinal=1)
     second = event("official:action:100", ordinal=2)
@@ -122,6 +130,59 @@ def test_missing_official_field_is_uncertain_not_a_proven_difference():
     assert report["uncertain_evidence"][0]["uncertain_fields"][0]["field"] == "description"
 
 
+def test_missing_core_date_and_description_on_both_sides_are_uncertain_not_matched():
+    official = event("official:action:100", description=None, date=None)
+    local = event("official:action:100", description=None, date=None)
+    report = reconcile_events([official], [local])
+
+    assert report["summary"]["matched"] == 0
+    assert report["summary"]["uncertain_evidence"] == 1
+    assert {item["field"] for item in report["uncertain_evidence"][0]["uncertain_fields"]} == {
+        "date",
+        "description",
+    }
+
+
+def test_overlapping_imprecise_dates_are_uncertain_unless_value_and_precision_match():
+    official = event("official:action:100", date="2026")
+    local = event("official:action:100", date="2026-01-15")
+    report = reconcile_events([official], [local])
+
+    assert report["summary"]["matched"] == 0
+    assert report["summary"]["uncertain_evidence"] == 1
+    assert report["uncertain_evidence"][0]["uncertain_fields"] == [
+        {
+            "field": "date",
+            "official": "2026",
+            "official_precision": "year",
+            "local": "2026-01-15",
+            "local_precision": "day",
+            "reason": "overlapping_imprecise_dates",
+        }
+    ]
+
+
+def test_scope_fields_prevent_same_identifier_from_matching_a_different_record():
+    official = event("shared-action", jurisdiction="CA", session="2025-2026", bill_id="AB 17")
+    local = event("shared-action", jurisdiction="NV", session="2025-2026", bill_id="AB 17")
+    report = reconcile_events([official], [local])
+
+    assert report["summary"]["mismatched_evidence"] == 1
+    assert report["mismatched_evidence"][0]["differences"] == [
+        {"field": "jurisdiction", "official": "ca", "local": "nv"}
+    ]
+
+
+def test_missing_scope_on_one_side_is_uncertain_not_a_proven_match():
+    official = event("shared-action", source_namespace="official-ca")
+    local = event("shared-action")
+    report = reconcile_events([official], [local])
+
+    assert report["summary"]["matched"] == 0
+    assert report["summary"]["uncertain_evidence"] == 1
+    assert report["uncertain_evidence"][0]["uncertain_fields"][0]["field"] == "source_namespace"
+
+
 def test_records_without_explicit_identity_are_not_merged_even_when_text_matches():
     official = event(None)
     local = event(None)
@@ -136,6 +197,7 @@ def test_records_without_explicit_identity_are_not_merged_even_when_text_matches
     "fixture",
     [
         [{"occurrence_id": "x", "date": "2026-02-31"}],
+        [{"occurrence_id": "x", "date": "0000"}],
         [{"occurrence_id": "x", "date": "not-a-date"}],
         [{"occurrence_id": 17}],
         {"events": "not an array"},
