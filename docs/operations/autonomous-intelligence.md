@@ -20,7 +20,7 @@ semantic freshness or completeness.
 | Detect stale data | Canonical 51-jurisdiction report, bounded history queries, sync cadence/queue/provenance defects, fail-closed report cache; durable official observation status | Semantic freshness adapters beyond the limited CA archive |
 | Repair failures | Existing retry queues, shared durable request quotas, official-worker backoff/deadlines/checkpoints, reviewed missing-intermediate TLS repair for five hosts | Fixture-replayed parser repair and controlled promotion; discrepancy-driven corpus repair |
 | Discover official material | Robots-first official landing-page checks for all 51 jurisdictions, bounded same-origin links, exact retained response bytes | State-specific parsing of discovered facts; remaining explicit source-access failures |
-| Prove updates | Atomic Open States API, document extraction and local derived-status before/after records with retained inputs, hashes, versions and download APIs; offline CA comparison replay | Independent derived-input sufficiency audit; historical updates have no retroactive proof |
+| Prove updates | Atomic Open States API, document extraction and local derived-status before/after records with retained inputs, hashes, versions and download APIs; offline CA comparison replay | Historical updates have no retroactive proof; external session-activity and survivor-status snapshots remain explicit inputs |
 | Operate autonomously | Dedicated recurring worker, explicit registration/enablement, durable target schedule and transaction deadline; resumable 500-bill CA pages | Production activation and measured recurring cycles |
 | Deploy | Pinned first-stage source, restored production backup, safe local checks | Canonical review, staged rollout and post-deploy proof |
 
@@ -164,9 +164,17 @@ The integrated test run through `0030` passed 440 worker/shared and 32 API tests
 The latest recurring-worker wiring is being checked separately.
 
 The derived-input audit found missing substitution candidate/order inputs and
-an effective-date mismatch. Existing records remain useful forward evidence,
-but full offline substitution replay is not yet proved. A bounded replay
-implementation is in progress.
+an effective-date mismatch. Version 2 now retains deterministic candidate ranks,
+relation order, an explicit effective date, and versioned session-activity and
+survivor-status snapshots. Pure offline replay reproduces status and semantic
+substitution relations; the writer rejects any mismatch before inserting a
+ledger record. Source fingerprints cover the CLI, status/replay modules and
+shared normalization/enrollment dependencies, cached per immutable process.
+Replay requires that exact source; retain the release archive with its records.
+Version 1 remains readable without an offline-replay claim. This proves the
+local derivation from declared snapshots, not the snapshots' recursive origin.
+The integrated disposable PostgreSQL run passed 459 worker/shared and 32 API
+tests through revision `0030` at approximately 03:34 UTC.
 
 First-stage `ff83068` canonical review returned BLOCK and its advocate was
 cancelled. Confirmed observation-age/UI waiting/checkout-url findings were
@@ -192,3 +200,23 @@ text. Before deployment, read-only inventory still found revision `0025`,
 1,131 done API-sync jobs and no eligible/running API-sync jobs. The crawl
 worker continues processing document work; its safe cutover boundary is under
 separate release review.
+
+### Concrete recovery inventory — 2026-09-08
+
+Read-only aggregate and robots-respecting probes identified 3,917 Texas
+unsupported-FTP witness-list documents. Three representative 89R/891/892
+files succeeded at corresponding official HTTPS locations with retained raw
+bytes and hashes. A strict resolver is being implemented; no requeue has run.
+Indiana's 883 terminal records reflect 3,444 HTTP 403 and four HTTP 401 job
+outcomes. Its unauthenticated robots endpoint also returns 403. No document
+probe followed that denial. Recovery requires provisioned official API
+credentials, a successful authorized probe, then a scoped reset.
+
+API readiness is prepared as an environment-specific `environmentPatchCommit`
+patch for `/api/v1/data-health`, a 300-second readiness timeout and 60-second
+draining allowance. Existing `/health` and `/ready` retain compatibility.
+The new data-health endpoint fails with HTTP 503 when the fresh-process
+database read fails. Exact before/apply/rollback metadata is retained in the
+release evidence directory. No config mutation has run. The separate restore
+environment is excluded. Canonical first-stage review remains pending its
+last family and advocate; eight completed families currently report SHIP.
