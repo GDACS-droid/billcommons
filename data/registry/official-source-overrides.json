@@ -14,6 +14,69 @@
       "evidence_url": "https://www.in.gov/legislative/",
       "checked_at": "2026-09-08",
       "reason": "The official state-government legislature URL redirects to the General Assembly site."
+    },
+    "AL": {
+      "replaces": "https://www.legislature.state.al.us/",
+      "source_url": "https://alison.legislature.state.al.us/",
+      "evidence_url": "https://www.legislature.state.al.us/",
+      "checked_at": "2026-09-08",
+      "reason": "The reviewed official legislature endpoint redirects directly to this HTTPS destination; its robots policy was checked separately."
+    },
+    "KY": {
+      "replaces": "https://legislature.ky.gov/",
+      "source_url": "https://legislature.ky.gov/Pages/index.aspx",
+      "evidence_url": "https://legislature.ky.gov/",
+      "checked_at": "2026-09-08",
+      "reason": "The reviewed official legislature endpoint redirects directly to this HTTPS destination; its robots policy was checked separately."
+    },
+    "MO": {
+      "replaces": "https://www.house.mo.gov/",
+      "source_url": "https://house.mo.gov/",
+      "evidence_url": "https://www.house.mo.gov/",
+      "checked_at": "2026-09-08",
+      "reason": "The reviewed official legislature endpoint redirects directly to this HTTPS destination; its robots policy was checked separately."
+    },
+    "MT": {
+      "replaces": "https://leg.mt.gov/",
+      "source_url": "https://www.legmt.gov/",
+      "evidence_url": "https://leg.mt.gov/",
+      "checked_at": "2026-09-08",
+      "reason": "The reviewed official legislature endpoint redirects directly to this HTTPS destination; its robots policy was checked separately."
+    },
+    "ND": {
+      "replaces": "https://www.ndlegis.gov/",
+      "source_url": "https://ndlegis.gov/",
+      "evidence_url": "https://www.ndlegis.gov/",
+      "checked_at": "2026-09-08",
+      "reason": "The reviewed official legislature endpoint redirects directly to this HTTPS destination; its robots policy was checked separately."
+    },
+    "NH": {
+      "replaces": "https://www.gencourt.state.nh.us/",
+      "source_url": "https://gc.nh.gov/",
+      "evidence_url": "https://www.gencourt.state.nh.us/",
+      "checked_at": "2026-09-08",
+      "reason": "The reviewed official legislature endpoint redirects directly to this HTTPS destination; its robots policy was checked separately."
+    },
+    "PA": {
+      "replaces": "https://www.legis.state.pa.us/",
+      "source_url": "https://www.palegis.us/",
+      "evidence_url": "https://www.legis.state.pa.us/",
+      "checked_at": "2026-09-08",
+      "reason": "The reviewed official legislature endpoint redirects directly to this HTTPS destination; its robots policy was checked separately."
+    },
+    "RI": {
+      "replaces": "https://www.rilegislature.gov/",
+      "source_url": "https://www.rilegislature.gov/Pages/Default.aspx",
+      "evidence_url": "https://www.rilegislature.gov/",
+      "checked_at": "2026-09-08",
+      "reason": "The reviewed official legislature endpoint redirects directly to this HTTPS destination; its robots policy was checked separately."
+    },
+    "VA": {
+      "replaces": "https://virginiageneralassembly.gov/",
+      "source_url": "https://vga.virginia.gov/",
+      "evidence_url": "https://virginiageneralassembly.gov/",
+      "checked_at": "2026-09-08",
+      "reason": "The reviewed official legislature endpoint redirects directly to this HTTPS destination; its robots policy was checked separately."
     }
   }
 }
