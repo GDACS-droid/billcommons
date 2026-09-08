@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -38,6 +39,24 @@ _DISCOVERY_ACTIONS = {
     'source_not_html': 'review_source_schema',
     'source_body_invalid': 'review_capture_limit',
 }
+
+
+def _candidate_parser_sha256(parser: object) -> str:
+    """Fingerprint the file which supplied the callable used for replay.
+
+    ``official_ca_actions`` is a transport-compatible wrapper.  Its parser is
+    imported from the shared module, so hashing the wrapper would not attest a
+    pure-parser change.  Resolve the callable's loaded module instead and
+    fail closed if Python cannot identify a regular source file.
+    """
+    module = inspect.getmodule(parser)
+    source_file = getattr(module, "__file__", None) if module is not None else None
+    if not isinstance(source_file, str) or not source_file:
+        raise EvidenceReplayError("candidate parser source is unavailable")
+    try:
+        return hashlib.sha256(Path(source_file).read_bytes()).hexdigest()
+    except OSError as exc:
+        raise EvidenceReplayError("candidate parser source is unavailable") from exc
 
 
 def plan_observation_repair(db, observation_id: uuid.UUID) -> dict:
@@ -91,7 +110,11 @@ def plan_observation_repair(db, observation_id: uuid.UUID) -> dict:
         plan['raw_integrity'] = 'verified'
     if observation.adapter_name == ADAPTER_NAME and raw is not None:
         plan['candidate_adapter_version'] = ca.ADAPTER_VERSION
-        plan['candidate_parser_sha256'] = hashlib.sha256(Path(ca.__file__).read_bytes()).hexdigest()
+        # Preserve this public field name while binding it to the actual
+        # callable executed below, which currently lives in shared code.
+        plan['candidate_parser_sha256'] = _candidate_parser_sha256(
+            ca.parse_ca_official_actions_zip
+        )
         try:
             batch = ca.parse_ca_official_actions_zip(raw, source_url=observation.source_url,
                                                     retrieved_at=observation.retrieved_at)

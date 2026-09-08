@@ -208,8 +208,9 @@ normal verification uses disposable `pg_virtualenv` clusters.
 `python -m billcommons_ingest.official_repair_plan OBSERVATION_UUID` requires an
 explicit database target and opens a repeatable-read, read-only transaction.
 The planner verifies retained blob hashes and size limits before replaying a
-failed CA archive under the current parser. Output records the parser source
-hash, current replay outcome, and a bounded recommendation. It never fetches
+failed CA archive under the current parser. Output records the source hash of
+the loaded shared parser callable, rather than its ingest transport wrapper,
+alongside the current replay outcome and a bounded recommendation. It never fetches
 upstream material, advances a retry, changes a target or writes corpus data.
 A successful local replay is a candidate for review and a bounded canary.
 Superseded failures become regression fixtures; they are not retry candidates.
