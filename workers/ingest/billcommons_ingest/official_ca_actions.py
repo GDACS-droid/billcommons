@@ -60,7 +60,11 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_RESPONSE_CHUNK_BYTES = 64 * 1024
 PER_READ_TIMEOUT_SECONDS = 30.0
 TOTAL_RESPONSE_DEADLINE_SECONDS = 180.0
-MAX_ZIP_MEMBERS = 32
+# Retained CA deltas had 104 and 146 members because they include auxiliary
+# bill-version LOBs.  A 256-entry directory remains bounded while admitting
+# those observed shapes; wire, aggregate decompression, per-member, CRC,
+# encryption, and compression-ratio limits below still apply.
+MAX_ZIP_MEMBERS = 256
 MAX_MEMBER_UNCOMPRESSED_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 100

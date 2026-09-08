@@ -261,6 +261,35 @@ def test_parse_rejects_duplicate_history_occurrence_id():
         adapter.parse_ca_official_actions_zip(raw, source_url=adapter.ca_delta_url("Mon"), retrieved_at=RETRIEVED_AT)
 
 
+def test_parse_accepts_observed_auxiliary_member_counts_but_keeps_member_cap():
+    base_rows = [_bill("202520260AB12")]
+    history_rows = [_history("202520260AB12", "1001", "Read first time.", "1")]
+    for auxiliary_member_count in (102, 144):  # Two required tables make 104 and 146.
+        observed_shape = _zip(
+            base_rows,
+            history_rows,
+            members={f"BILL_VERSION_TBL_{index}.lob": b"x" for index in range(auxiliary_member_count)},
+        )
+        batch = adapter.parse_ca_official_actions_zip(
+            observed_shape,
+            source_url=adapter.ca_delta_url("Mon"),
+            retrieved_at=RETRIEVED_AT,
+        )
+        assert batch.event_count == 1
+
+    over_cap = _zip(
+        base_rows,
+        history_rows,
+        members={f"BILL_VERSION_TBL_{index}.lob": b"x" for index in range(255)},
+    )
+    with pytest.raises(adapter.OfficialCaActionsError, match="257 members; cap is 256"):
+        adapter.parse_ca_official_actions_zip(
+            over_cap,
+            source_url=adapter.ca_delta_url("Mon"),
+            retrieved_at=RETRIEVED_AT,
+        )
+
+
 def test_parse_rejects_zip_bomb_and_crc_failure_before_table_parsing():
     bomb = _zip(
         [_bill("202520260AB12")],
