@@ -65,6 +65,7 @@ CLI_TIMEOUT_SECONDS = float(os.environ.get("BILLCOMMONS_SERVICE_CLI_TIMEOUT_SECO
 EXPECTED_SERVICES = [
     "api",
     "mcp",
+    "official-worker",
     "worker",
     "scout-worker",
     "sync-worker",
