@@ -1,0 +1,204 @@
+{
+  "checked_at": "2026-09-08T06:57:28.008109+00:00",
+  "goal_status": "active; full autonomous 50-state semantic intelligence not complete",
+  "units": {
+    "api": {
+      "source_sha": "c05ae429bb1f70fe9656464eac71efbbf0f9b40e",
+      "deployment_id": "34230f24-3cc3-45fd-86ff-111bf02a1260",
+      "image_digest": "sha256:d4a7b3e7ed2540d81e5e63480e91605c2ab890da531141422499ddce732ba31f",
+      "archive_sha256": "e87652c353293139c6ea084689179ed56cf6097e39f176ac0f6cc849dd46af51"
+    },
+    "sync_worker": {
+      "source_sha": "c05ae429bb1f70fe9656464eac71efbbf0f9b40e",
+      "deployment_id": "2a8f43f3-912a-41c5-94c5-37374872ea3c",
+      "image_digest": "sha256:947a0452ab85e2643a6b597042d5410f8e132ed777ae6f0fb3fff7086c3ed677",
+      "archive_sha256": "e87652c353293139c6ea084689179ed56cf6097e39f176ac0f6cc849dd46af51"
+    },
+    "official_worker": {
+      "source_sha": "815be4a82fb3af370823f49f6ced9dbfb47981e1",
+      "deployment_id": "3490046e-3830-4dd4-8736-ebd6b3f9f7fb",
+      "image_digest": "sha256:5c542afd05166ee3d1a3205b93cfe6649dee2d54939b3f14e3cf979b36b7ea34",
+      "archive_sha256": "536dc3832d6f97e6d07544118a8fe0200d17eea97ae9a246fa424976af0bbe07"
+    },
+    "web": {
+      "source_sha": "3758f511428491a9b1da9ce6f605dd841dbedb42",
+      "deployment_id": "dpl_H7wqdC5NuYdB6y4saDeKSZCDvFT3",
+      "archive_sha256": "a0ae13c710c43cde2f82ae7afd1164fc176221f5a1a97cb3d5b704443c0ea148"
+    }
+  },
+  "migration": {
+    "pre_revision": "0025",
+    "post_revision": "0030",
+    "backup_bytes": 3211108251,
+    "backup_sha256": "1125ea521522c7034e13c1f8a267d79175992549339642f35190fc332632d0a6",
+    "restore_status": "complete"
+  },
+  "official_observations": {
+    "jurisdictions": 51,
+    "targets": 58,
+    "enabled": 58,
+    "latest_status_counts": {
+      "succeeded": 48,
+      "failed": 10
+    },
+    "remaining_failures": [
+      {
+        "jurisdiction": "CA",
+        "adapter": "ca_official_actions",
+        "url": "https://downloads.leginfo.legislature.ca.gov/pubinfo_Sun.zip",
+        "error_class": "OfficialCaActionsError",
+        "observation_id": "3725afe9-d99c-4ee3-8524-5b275a9231d3"
+      },
+      {
+        "jurisdiction": "CA",
+        "adapter": "official_link_discovery",
+        "url": "https://leginfo.legislature.ca.gov/",
+        "error_class": "robots_disallowed",
+        "observation_id": "d80b3cf3-0571-4a8d-8190-b0d592b12491"
+      },
+      {
+        "jurisdiction": "DE",
+        "adapter": "official_link_discovery",
+        "url": "https://legis.delaware.gov/",
+        "error_class": "SsrfRejected",
+        "observation_id": "4bd95a4c-ccd8-42fa-8494-c690276e0301"
+      },
+      {
+        "jurisdiction": "HI",
+        "adapter": "official_link_discovery",
+        "url": "https://www.capitol.hawaii.gov/",
+        "error_class": "robots_unavailable",
+        "observation_id": "2987c55d-511b-45c2-8a11-9a07932066a2"
+      },
+      {
+        "jurisdiction": "ID",
+        "adapter": "official_link_discovery",
+        "url": "https://legislature.idaho.gov/",
+        "error_class": "TimeoutFailure",
+        "observation_id": "586cc6fa-d5f0-4088-9dac-287273ca047b"
+      },
+      {
+        "jurisdiction": "IN",
+        "adapter": "official_link_discovery",
+        "url": "https://iga.in.gov/",
+        "error_class": "javascript_rendering_required",
+        "observation_id": "e23cf454-0ddd-44b7-a8aa-eb830b41b9fc"
+      },
+      {
+        "jurisdiction": "MT",
+        "adapter": "official_link_discovery",
+        "url": "https://www.legmt.gov/",
+        "error_class": "TimeoutFailure",
+        "observation_id": "d477be31-6dbf-459f-9053-2a271b5044c7"
+      },
+      {
+        "jurisdiction": "NY",
+        "adapter": "official_link_discovery",
+        "url": "https://www.nysenate.gov/",
+        "error_class": "robots_unavailable",
+        "observation_id": "3a8f440d-5b95-4059-9268-bb52171472df"
+      },
+      {
+        "jurisdiction": "TN",
+        "adapter": "official_link_discovery",
+        "url": "https://www.capitol.tn.gov/",
+        "error_class": "robots_disallowed",
+        "observation_id": "6ed5656b-8e34-429b-86ad-e5ca18ee6166"
+      },
+      {
+        "jurisdiction": "WY",
+        "adapter": "official_link_discovery",
+        "url": "https://www.wyoleg.gov/",
+        "error_class": "TimeoutFailure",
+        "observation_id": "4cde7103-1e7a-46b9-89d6-c17e181b3978"
+      }
+    ],
+    "ca_bill_archive_comparisons": {
+      "Mon": 275,
+      "Tue": 123,
+      "Wed": 402,
+      "Fri": 244,
+      "Thu": 346,
+      "Sat": 28
+    },
+    "ca_comparison_total": 1418,
+    "ca_canary_observation_id": "8589d72e-7061-4d77-985c-ab61658bd487",
+    "ca_public_hashes_and_sample_comparisons_replayed": true,
+    "scope": "Bounded landing-page discovery and six CA weekday action-delta comparisons; archive pairs are not unique bills or corpus updates"
+  },
+  "health": {
+    "api_15_minute_samples": 16,
+    "latest_health_status": "passed",
+    "latest_defects_by_severity": {
+      "critical": 0,
+      "error": 0,
+      "warning": 17,
+      "info": 17
+    },
+    "web_browser_errors": 0,
+    "web_http_errors": 0,
+    "official_post_activation_cycles": 2
+  },
+  "commercial": {
+    "checked_at": "2026-09-08T06:21:27.788364+00:00",
+    "customer_rows": 2,
+    "customer_rows_linked_to_stripe": 0,
+    "usable_live_keys": 1,
+    "free_developer_keys": 1,
+    "paid_plan_keys": 0,
+    "usage_window": "current UTC date plus previous six calendar dates",
+    "metered_requests": 3,
+    "keys_with_metered_use": 1,
+    "heavy_requests": 0,
+    "metered_mcp_calls": 0,
+    "subscription_rows": 0,
+    "active_or_dunning_subscriptions": 0,
+    "stripe_event_rows": 0,
+    "limits": [
+      "customer rows do not establish organic users",
+      "application billing records do not audit the Stripe account itself",
+      "no customer identities or key material selected"
+    ]
+  },
+  "discovery_and_analytics": {
+    "vercel_plan": "Pro",
+    "analytics_enabled_reported": true,
+    "sdk_script_loaded": true,
+    "event_ingestion_verified": false,
+    "indexing_verified": false,
+    "google_console_ownership": "not established by this release",
+    "bing_console_ownership": "not established by this release",
+    "sitemap_submitted_by_this_release": false
+  },
+  "remaining_release_gates": {
+    "tx_nested_repair": {
+      "status": "held",
+      "source_sha": "8570cdd16d4fe277ede2fa31fd8829dbec8bac3a",
+      "reason": "Required full-diff DeepSeek review ended DEAD/HALT after bounded recovery and retry",
+      "enabled": false
+    },
+    "generic_worker": {
+      "status": "previous artifact running; explicit one-time replacement approval requested",
+      "deployment_id": "4b2d27b4-8767-4874-9472-bf0dd4b72a7c",
+      "image_digest": "sha256:2550f81a4b36caef8fd535bbc751a07cb031bc90c08d8de183ec3708f4c0660a",
+      "reason": "No deployed claim-pause control or graceful shutdown handler; active claim transaction crosses HTTP"
+    }
+  },
+  "repair_flags": {
+    "tls": false,
+    "tx": false
+  },
+  "full_objective_gaps": [
+    "State-specific semantic freshness and completeness beyond limited CA archives",
+    "Autonomous fixture-based parser repair proposal/promotion workflow",
+    "Controlled discrepancy-driven corpus repair",
+    "Deep FL/CA Scout discovery and complete evidence graph/search/saved monitoring workflow",
+    "Historical backfill and 50-state factual benchmark",
+    "Full generic-worker forward evidence rollout"
+  ],
+  "test_isolation_incident": {
+    "status": "documented; ambient database fallback is now blocked by test guards",
+    "scope": "An early legacy test teardown could have removed synthetic ZZ_/ZQ_ jurisdiction rows on production. Before/after jurisdiction totals matched; transient synthetic deletion cannot be established or excluded. That test result is rejected.",
+    "detail": "docs/operations/autonomous-intelligence.md#test-isolation-incident"
+  }
+}

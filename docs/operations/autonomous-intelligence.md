@@ -13,46 +13,48 @@ in the original checkout are preserved. The canonical inventory covers 50 states
 plus DC. Generic website observation is never treated as proof of statewide
 semantic freshness or completeness.
 
-## Acceptance and present limits
+## Acceptance and present limits — 2026-09-08 06:53 UTC
 
-| Requirement | Implemented locally | Remaining acceptance gap |
+The deployed and hash-bound release status is recorded in
+[data-reliability-control-plane.md](data-reliability-control-plane.md) and its
+[sanitized deployment summary](evidence/reliability-20260908/deployment-summary.json).
+API and sync run `c05ae42`; web runs the data-only `3758f51`; the recurring
+official worker runs the separately accepted CA cap fix `815be4a` on `c05ae42`.
+The additive migrations through `0030` are applied, and the initial UTC-day
+source budget was conservatively seeded at its full 225-request allowance.
+
+| Requirement | Current evidence | Remaining acceptance gap |
 | --- | --- | --- |
-| Detect stale data | Canonical 51-jurisdiction report, bounded history queries, sync cadence/queue/provenance defects, fail-closed report cache; durable official observation status | Semantic freshness adapters beyond the limited CA archive |
-| Repair failures | Existing retry queues, shared durable request quotas, official-worker backoff/deadlines/checkpoints, reviewed missing-intermediate TLS repair for five hosts | Fixture-replayed parser repair and controlled promotion; discrepancy-driven corpus repair |
-| Discover official material | Robots-first official landing-page checks for all 51 jurisdictions, bounded same-origin links, exact retained response bytes | State-specific parsing of discovered facts; remaining explicit source-access failures |
-| Prove updates | Atomic Open States API, document extraction and local derived-status before/after records with retained inputs, hashes, versions and download APIs; offline CA comparison replay | Historical updates have no retroactive proof; external session-activity and survivor-status snapshots remain explicit inputs |
-| Operate autonomously | Dedicated recurring worker, explicit registration/enablement, durable target schedule and transaction deadline; resumable 500-bill CA pages | Production activation and measured recurring cycles |
-| Deploy | Pinned first-stage source, restored production backup, safe local checks | Canonical review, staged rollout and post-deploy proof |
+| Detect stale data | Live 51-jurisdiction report, 17 overdue sync warnings, explicit source outcomes and future retry eligibility | Semantic freshness/completeness adapters beyond bounded CA archives; finer worker cadence |
+| Repair failures | Shared quota/backoff, bounded observation transactions; confirmed CA parser cap repaired and five failed targets retried successfully | Autonomous fixture-based parser-repair proposal/promotion; discrepancy-driven corpus repair; TX gate below |
+| Discover official material | 58 enabled targets across 51 jurisdictions, every target attempted, 48 latest successes and 10 explicit failures | State-specific facts beyond landing pages; remaining source-access failures; deeper FL/CA Scout |
+| Prove updates | Public exact-byte/hash APIs and versioned comparison/update ledgers; 1,418 completed CA bill/archive comparisons with sampled public replay | Generic-worker forward evidence rollout; no retroactive proof for untracked historical updates; declared external snapshot inputs |
+| Operate autonomously | Dedicated recurring worker, durable schedule/backoff, 300-second hard observation deadline, real claim pause and graceful shutdown; two post-activation cycles | Broader semantic state coverage, automatic discrepancy remediation, durable saved-topic product workflow |
+| Deploy | API, web, sync and official worker deployed with immutable source/archive/image bindings, restored backup and post-deploy runtime/browser proof | Generic-worker cutover and held TX repair; the full objective remains active |
 
-## Release ownership and gates
+## Current release gates
 
-- Owner: Codex executing Alberto's authorized session. No new approval is needed
-  for the scoped deployment. Stop at a failed required check or unsafe cutover.
-- First-stage source: `bdd5b61194b018b29af59f8bb18157126de1c41c` in
-  `billcommons-control-plane-fixed-20260908`. Initial rollout is API plus dedicated
-  sync worker; no new schema or official worker in that stage. Web follows its
-  applicable checks.
-- First-stage aggregate review: `c3ec3c5`, exact binary diff from baseline
-  `26e99e2` checked against the release source. Canonical nine-family run:
-  `/home/alberto/verify-runs/20260908T031416Z-c3ec3c5` (completed: eight SHIP,
-  one BLOCK, zero dead families; owner adjudication below).
-- Earlier reviews found real case-normalization, undated-run ordering,
-  quota-delayed queue age, canonical-inventory, bounded-query, cache and test
-  routing defects. These are repaired and have focused regression coverage.
-  Earlier BLOCK verdicts are not represented as passes.
-- Production project `92e10559-88b7-49ec-ae77-b0dc72b12752`, environment
-  `78036c32-1cac-4fae-9a22-ef81c6f99772`. Last observed successful API artifact:
-  `5828ea8b-6a85-4ca6-b453-f76e604ad374`; sync:
-  `568fcd62-89b9-4e1c-bdb1-77c4ebae4759`. Both have one replica.
-- Re-read provider artifact/config and live work state immediately before each
-  cutover. No invented drain: the sync service is changed only at its observed
-  idle boundary. Hold on failed review, repeated 5xx/503, unhealthy database,
-  active-work risk or missing artifact evidence. Roll back the affected app
-  artifact; preserve database rows and evidence.
-- Follow-on schema revisions `0026`–`0030` are additive and currently undeployed.
-  Controlled migration requires the exact revision acknowledgement. Before the
-  shared Open States quota is activated, seed current-day consumption
-  conservatively so the new ledger cannot reset the upstream day's allowance.
+Codex owns this authorized deployment. The old generic crawl worker has no
+existing drain control or graceful shutdown handler and holds its job claim
+transaction across outbound work. It remains running; a one-time replacement
+approval has been requested rather than inventing a drain or forcing a cutover.
+
+The TX nested-path candidate `8570cdd` remains held. Its required full-diff
+DeepSeek review ended DEAD/HALT after a concrete bounded recovery and the
+canonical automatic retry. A passing small ASCII-fix review does not replace
+that full-diff result. Both cloud document-repair flags remain off. The separate
+five-family CA-only review of `815be4a` passed and does not waive the TX gate.
+
+The initial observer pass and cap repair preserve source failure evidence.
+Robots restrictions, unavailable robots, a denied redirect, JavaScript-only
+content and three timeouts remain explicit; a CA Sunday capture has no retained
+archive. These do not establish source agreement or statewide completeness.
+
+## Historical preflight, implementation and review record
+
+The dated sections below preserve the earlier evidence, decisions and test
+isolation incident. Their old pending/deployment statements are superseded by
+the current release status above; they are not current release gates.
 
 ## Recovery and live evidence
 
@@ -132,14 +134,22 @@ That test result is rejected. A fail-closed conftest gate and runner guards now
 reject ambient targets and service/host overrides before database helpers load;
 normal verification uses disposable `pg_virtualenv` clusters.
 
-## Next actions
+## Next actions for the full objective
 
-Finish rendered UI checks and the derived-update audit. Complete the first-stage
-canonical review and deploy only the accepted source with bounded health proof.
-Then run canonical review on the complete follow-on diff, migrate exact revisions,
-activate quotas/observation targets, deploy the recurring worker and establish
-production evidence. Semantic state adapters and controlled discrepancy repair
-remain explicit work until their required evidence exists.
+1. Resolve the generic-worker handoff and the separate TX review gate without
+   weakening either requirement or repeating blind verifier calls.
+2. Build the fixture-based parser failure diagnosis, bounded patch proposal,
+   sample replay and controlled promotion workflow; retain failed inputs and
+   actionable safe error classifications.
+3. Turn CA comparisons into bounded discrepancy-repair proposals with before/
+   after proof, then deepen FL and CA Scout beyond landing-page links.
+4. Expand semantic source adapters and a factual cross-state benchmark; preserve
+   official occurrence identities, ambiguity, lineage and scope.
+5. Productize saved issue monitoring and evidence-backed team/CRM workflows for
+   the intended government-technology buyer. Current usage is not proof of demand.
+
+The full evidence graph, richer search, historical consistency/backfill work and
+50-state semantic freshness remain in scope and are not marked complete.
 
 ## Integration check — 2026-09-08 03:10 UTC
 
