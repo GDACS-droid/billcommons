@@ -64,12 +64,38 @@ def test_parses_public_captured_detail_fixture_with_fact_and_location_evidence()
         ("https://www.flsenate.gov/Session/Bill/2025/7031?StartTab=BillHistory", "exact https"),
         ("https://www.flsenate.gov/Session/Bill/2025/07031", "exact https"),
         ("https://www.flsenate.gov/Session/Bill/2025/7031/", "exact https"),
+        ("\nhttps://www.flsenate.gov/Session/Bill/2025/7031", "canonical detail URL"),
+        ("https://[::1", "could not be parsed"),
+        ("https://www.flsenate.gov:99999/Session/Bill/2025/7031", "could not be parsed"),
         ("https://www.flsenate.gov/Session/Bill/2024/7031", "title disagrees"),
     ],
 )
 def test_rejects_unscoped_or_page_scope_disagreeing_urls(source_url: str, message: str):
     with pytest.raises(adapter.OfficialFloridaSenateActionsError, match=message):
         adapter.parse_florida_senate_bill_history(_raw(), source_url=source_url)
+
+
+def test_rejects_source_url_over_whole_string_cap():
+    overlong = SOURCE_URL + ("x" * adapter.MAX_SOURCE_URL_CHARS)
+    with pytest.raises(adapter.OfficialFloridaSenateActionsError, match="length cap"):
+        adapter.parse_florida_senate_bill_history(_raw(), source_url=overlong)
+
+
+def test_enforces_dom_depth_before_recursive_extraction():
+    boundary = adapter._BoundedTreeBuilder()
+    boundary.feed("<div>" * adapter.MAX_DOM_DEPTH + "</div>" * adapter.MAX_DOM_DEPTH)
+    boundary.close()
+
+    overbound = adapter._BoundedTreeBuilder()
+    with pytest.raises(adapter.OfficialFloridaSenateActionsError, match="DOM depth cap"):
+        overbound.feed("<div>" * (adapter.MAX_DOM_DEPTH + 1))
+
+    # The historic regression wrapped a real, valid detail page.  The parser
+    # must report a bounded source-contract failure before its recursive
+    # extraction helpers walk that synthetic depth.
+    wrapped = (b"<div>" * adapter.MAX_DOM_DEPTH) + _raw() + (b"</div>" * adapter.MAX_DOM_DEPTH)
+    with pytest.raises(adapter.OfficialFloridaSenateActionsError, match="DOM depth cap"):
+        adapter.parse_florida_senate_bill_history(wrapped, source_url=SOURCE_URL)
 
 
 @pytest.mark.parametrize(
@@ -106,6 +132,10 @@ def test_rejects_duplicate_history_tables_and_last_action_mismatch():
     )
     with pytest.raises(adapter.OfficialFloridaSenateActionsError, match="Last Action field disagrees"):
         adapter.parse_florida_senate_bill_history(mismatched, source_url=SOURCE_URL)
+
+    future_dated_history = raw.replace(b"4/2/2025", b"6/19/2026", 1)
+    with pytest.raises(adapter.OfficialFloridaSenateActionsError, match="does not equal the latest"):
+        adapter.parse_florida_senate_bill_history(future_dated_history, source_url=SOURCE_URL)
 
 
 def test_rejects_malformed_date_and_bounded_input():

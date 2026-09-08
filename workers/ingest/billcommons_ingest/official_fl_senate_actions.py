@@ -23,7 +23,9 @@ from urllib.parse import urlsplit
 ADAPTER_VERSION = "fl-senate-bill-history/1"
 FL_SENATE_HOST = "www.flsenate.gov"
 MAX_HTML_BYTES = 2 * 1024 * 1024
+MAX_SOURCE_URL_CHARS = 1024
 MAX_DOM_NODES = 20_000
+MAX_DOM_DEPTH = 128
 MAX_HISTORY_ROWS = 500
 MAX_ACTIONS = 5_000
 MAX_ACTION_TEXT_CHARS = 16 * 1024
@@ -108,6 +110,11 @@ class _BoundedTreeBuilder(HTMLParser):
         node = _Node(normalized_tag, {key.casefold(): value or "" for key, value in attrs}, [])
         self._stack[-1].children.append(node)
         if normalized_tag not in _VOID_ELEMENTS:
+            # `_text` and `_descendants` deliberately use simple recursive
+            # walks.  Bound the source tree while it is still being built so
+            # adversarial nesting cannot turn extraction into a RecursionError.
+            if len(self._stack) - 1 >= MAX_DOM_DEPTH:
+                raise OfficialFloridaSenateActionsError("Florida Senate page exceeds DOM depth cap")
             self._stack.append(node)
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -175,13 +182,20 @@ def _only(values: Iterable[_Node], what: str) -> _Node:
 def _canonical_source_url(source_url: str) -> tuple[str, str, str]:
     if not isinstance(source_url, str):
         raise OfficialFloridaSenateActionsError("Florida Senate source URL must be a string")
-    parsed = urlsplit(source_url)
-    match = _DETAIL_PATH.fullmatch(parsed.path)
+    if not 1 <= len(source_url) <= MAX_SOURCE_URL_CHARS:
+        raise OfficialFloridaSenateActionsError("Florida Senate source URL violates length cap")
+    try:
+        parsed = urlsplit(source_url)
+        match = _DETAIL_PATH.fullmatch(parsed.path)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise OfficialFloridaSenateActionsError("Florida Senate source URL could not be parsed") from exc
     if (
         parsed.scheme != "https"
-        or parsed.hostname != FL_SENATE_HOST
+        or hostname != FL_SENATE_HOST
         or parsed.netloc != FL_SENATE_HOST
-        or parsed.port is not None
+        or port is not None
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -192,7 +206,15 @@ def _canonical_source_url(source_url: str) -> tuple[str, str, str]:
             "Florida Senate source URL must be an exact https://www.flsenate.gov/Session/Bill/<year>/<number> detail URL"
         )
     session_year, bill_number = match.groups()
-    return f"https://{FL_SENATE_HOST}/Session/Bill/{session_year}/{bill_number}", session_year, bill_number
+    canonical_url = f"https://{FL_SENATE_HOST}/Session/Bill/{session_year}/{bill_number}"
+    # urlsplit() intentionally strips leading C0 control characters and
+    # whitespace.  Preserve the source-observation contract by accepting only
+    # the original, byte-for-byte canonical string.
+    if source_url != canonical_url:
+        raise OfficialFloridaSenateActionsError(
+            "Florida Senate source URL must equal its exact canonical detail URL"
+        )
+    return canonical_url, session_year, bill_number
 
 
 def _parse_source_date(value: str, field: str) -> date:
@@ -333,6 +355,8 @@ def parse_florida_senate_bill_history(raw_html: bytes, *, source_url: str) -> Pa
     final_action = actions[-1]
     if (final_action.action_date, final_action.chamber, final_action.description) != last_action:
         raise OfficialFloridaSenateActionsError("Florida Senate Last Action field disagrees with final Bill History action")
+    if final_action.action_date != max(action.action_date for action in actions):
+        raise OfficialFloridaSenateActionsError("Florida Senate Last Action day does not equal the latest Bill History action day")
     return ParsedFloridaSenateBillHistory(
         source_url=canonical_url,
         source_sha256=hashlib.sha256(raw_html).hexdigest(),
