@@ -495,6 +495,110 @@ class SourceRecord(UUIDPkMixin, TimestampMixin, Base):
     __table_args__ = (Index("ix_source_records_entity", "entity_type", "entity_id"),)
 
 
+class OfficialRawBlob(Base):
+    """Exact corpus-owned source, local-snapshot or comparison bytes.
+
+    Separate from customer-owned Scout evidence. Content addressing allows
+    repeated observations of an unchanged official archive to share bytes.
+    """
+
+    __tablename__ = "official_raw_blobs"
+
+    sha256: Mapped[str] = mapped_column(Text, primary_key=True)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    content_type: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="ck_official_blob_hash"),
+        CheckConstraint("length(data) BETWEEN 1 AND 8388608", name="ck_official_blob_size"),
+    )
+
+
+class OfficialSourceTarget(UUIDPkMixin, TimestampMixin, Base):
+    """Reviewed official adapter target and durable retry schedule.
+
+    A worker locks this row for its bounded observation transaction. A crash
+    rolls back the claim and schedule together; no age-based takeover of an
+    independently committed running flag is necessary.
+    """
+
+    __tablename__ = "official_source_targets"
+
+    jurisdiction_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("jurisdictions.id"), nullable=False)
+    adapter_name: Mapped[str] = mapped_column(Text, nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    scope: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    cadence_seconds: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("3600"))
+    next_check_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    __table_args__ = (
+        UniqueConstraint("adapter_name", "source_url", name="uq_official_target_adapter_url"),
+        CheckConstraint("cadence_seconds BETWEEN 300 AND 604800", name="ck_official_target_cadence"),
+        CheckConstraint("consecutive_failures >= 0", name="ck_official_target_failures"),
+        CheckConstraint("octet_length(scope::text) <= 65536", name="ck_official_target_scope_size"),
+        Index("ix_official_targets_due", "next_check_at", postgresql_where=text("enabled")),
+    )
+
+
+class OfficialSourceObservation(UUIDPkMixin, Base):
+    """Immutable retrieval/parse outcome, scoped to a reviewed source target."""
+
+    __tablename__ = "official_source_observations"
+
+    target_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("official_source_targets.id"), nullable=False)
+    adapter_name: Mapped[str] = mapped_column(Text, nullable=False)
+    adapter_version: Mapped[str] = mapped_column(Text, nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    scope: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    upstream_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    raw_sha256: Mapped[str | None] = mapped_column(Text, ForeignKey("official_raw_blobs.sha256"), nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    error_class: Mapped[str | None] = mapped_column(Text, nullable=True)
+    record_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('succeeded','failed','invalid')", name="ck_official_observation_status"),
+        CheckConstraint("status <> 'succeeded' OR (raw_sha256 IS NOT NULL AND record_count IS NOT NULL AND error_class IS NULL)", name="ck_official_observation_success"),
+        CheckConstraint("record_count IS NULL OR record_count >= 0", name="ck_official_observation_count"),
+        CheckConstraint("http_status IS NULL OR http_status BETWEEN 100 AND 599", name="ck_official_observation_http"),
+        CheckConstraint("octet_length(scope::text) <= 65536", name="ck_official_observation_scope_size"),
+        Index("ix_official_observations_target_time", "target_id", "retrieved_at"),
+    )
+
+
+class OfficialReconciliationRun(UUIDPkMixin, Base):
+    """Immutable per-bill comparison with replayable local input and diff."""
+
+    __tablename__ = "official_reconciliation_runs"
+
+    observation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("official_source_observations.id"), nullable=False)
+    bill_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("bills.id"), nullable=True)
+    official_bill_id: Mapped[str] = mapped_column(Text, nullable=False)
+    local_snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    comparator_version: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    local_snapshot_sha256: Mapped[str | None] = mapped_column(Text, ForeignKey("official_raw_blobs.sha256"), nullable=True)
+    diff_sha256: Mapped[str | None] = mapped_column(Text, ForeignKey("official_raw_blobs.sha256"), nullable=True)
+    error_class: Mapped[str | None] = mapped_column(Text, nullable=True)
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('completed','partial','failed')", name="ck_official_run_status"),
+        CheckConstraint("status <> 'completed' OR (local_snapshot_sha256 IS NOT NULL AND diff_sha256 IS NOT NULL AND error_class IS NULL)", name="ck_official_run_complete"),
+        CheckConstraint("octet_length(summary::text) <= 65536", name="ck_official_run_summary_size"),
+        UniqueConstraint("observation_id", "official_bill_id", "local_snapshot_sha256", "comparator_version", name="uq_official_run_replay"),
+        Index("ix_official_runs_bill_time", "bill_id", "completed_at"),
+        Index("ix_official_runs_observation", "observation_id"),
+    )
+
+
 class IngestionRun(UUIDPkMixin, TimestampMixin, Base):
     """A single run of an ingestion job (bootstrap or incremental)."""
 
