@@ -4,7 +4,7 @@ import ScoutExperience from "@/components/scout/ScoutExperience";
 export const metadata: Metadata = {
   title: "Scout",
   description:
-    "Evidence-first research of official Florida legislative sources, with source-level provenance.",
+    "Research Florida official sources and retained California bill-action archives, with source evidence.",
   alternates: { canonical: "/scout" },
   robots: { index: false, follow: false },
 };

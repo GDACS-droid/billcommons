@@ -235,3 +235,26 @@ test("does not count pre-provider browser slots in terminal analytics", () => {
   });
   assert.deepEqual(scoutBrowserProviderUsage(mixedAggregate), { sessions: 1, runtimeSeconds: 2 });
 });
+
+
+test("California unavailable evidence remains partial and does not imply official absence", () => {
+  const job = normalizeScoutJob({ id: "ca-partial", jurisdiction: "CA", status: "partial", error_class: "retained_archive_unavailable", findings: [] });
+  assert.equal(job.status, "partial");
+  assert.deepEqual(job.findings, []);
+  assert.match(job.errors[0], /does not mean the bill has no official actions/);
+  const oversized = normalizeScoutJob({ jurisdiction: "CA", status: "partial", error_class: "retained_archive_exceeds_job_limit" });
+  assert.match(oversized.errors[0], /larger than this research job can attach/);
+  const unmatched = normalizeScoutJob({ jurisdiction: "CA", error_class: "unsupported_query" });
+  assert.match(unmatched.errors[0], /does not establish that the official bill is absent/);
+  assert.deepEqual(normalizeScoutJob({ jurisdiction: "FL", error_class: "unsupported_query" }).errors, ["unsupported_query"]);
+});
+
+test("California admission errors explain the exact session grammar", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  globalThis.fetch = async (_url, options) => {
+    assert.deepEqual(JSON.parse(options.body), { query: "AB 123", jurisdiction: "CA" });
+    return new Response(JSON.stringify({ detail: { code: "invalid_scout_request", message: "invalid_california_retained_query" } }), { status: 422 });
+  };
+  await assert.rejects(compiled.exports.createScoutJob("AB 123", "CA"), (error) => error.status === 422 && /AB 123 2025-2026/.test(error.message));
+});

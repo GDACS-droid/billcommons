@@ -343,7 +343,7 @@ export function normalizeScoutJob(payload: unknown): ScoutJob {
     sources: list(item.sources).map(normalizeSource),
     findings: list(item.findings).map(normalizeFinding),
     browserSessions,
-    errors,
+    errors: errors.map((error) => scoutServiceNote(error, optionalString(item.jurisdiction))),
   };
 }
 
@@ -457,8 +457,23 @@ async function responseJson(response: Response): Promise<unknown> {
   return response.json().catch(() => null);
 }
 
+/** Explain the bounded CA evidence outcomes without turning missing coverage into a factual claim. */
+function scoutServiceNote(value: string, jurisdiction?: string): string {
+  if (value === "unsupported_query" && jurisdiction === "CA") return "Scout could not match that California bill and session in Bill Commons. Check the bill number and session; this does not establish that the official bill is absent.";
+  const notes: Record<string, string> = {
+    retained_archive_exceeds_job_limit: "The retained California archive is larger than this research job can attach. No finding was created from that archive.",
+    retained_archive_integrity_failed: "Scout could not verify the retained California archive. No finding was created from unverified bytes.",
+    retained_archive_unavailable: "No usable matching action was found in the retained California archives checked. This does not mean the bill has no official actions.",
+  };
+  return notes[value] ?? value;
+}
+
 function apiError(response: Response, payload: unknown): ScoutApiError {
   const body = record(payload);
+  const structuredDetail = record(body?.detail);
+  if (response.status === 422 && structuredDetail?.message === "invalid_california_retained_query") {
+    return new ScoutApiError("For California, enter a bill and session, such as AB 123 2025-2026. Add Special Session 1 only for that session.", response.status);
+  }
   const detail = optionalString(body?.detail) ?? optionalString(body?.message);
   if (response.status === 401 || response.status === 403) {
     return new ScoutApiError("Sign in is required to start or view Scout research.", response.status);

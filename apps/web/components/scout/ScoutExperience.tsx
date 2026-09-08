@@ -17,12 +17,13 @@ import {
   scoutStatusSummary,
 } from "@/lib/scout";
 
-const JURISDICTIONS = [{ value: "FL", label: "Florida" }];
-const EXAMPLES = [
+const JURISDICTIONS = [{ value: "FL", label: "Florida" }, { value: "CA", label: "California" }];
+const FLORIDA_EXAMPLES = [
   "Research Florida legislation involving artificial intelligence.",
   "What changed recently for Florida SB 1344?",
   "Investigate Florida activity involving social media.",
 ];
+const CALIFORNIA_EXAMPLES = ["AB 123 2025-2026", "SB 1 2025-2026", "AB 1 2025-2026 Special Session 1"];
 // Scout evidence windows are bounded in the worker.  Preserve the original
 // retained excerpt while making a potentially bounded display unmistakable.
 const EXCERPT_CHARACTER_LIMIT = 500;
@@ -31,6 +32,7 @@ function label(value?: string | null): string {
 }
 
 function strategyLabel(value?: string | null): string {
+  if (value === "retained_official_archive") return "Retained official archive";
   if (value === "structured_first") return "Bill Commons first";
   if (value === "direct_first") return "Official source retrieval";
   if (value === "browser_fallback") return "Official source browser";
@@ -45,6 +47,8 @@ function eventLabel(value?: string | null): string {
     source_persisted: "Evidence retained",
     finding_persisted: "Finding verified",
     finished: "Research complete",
+    retained_official_archive_selected: "Matching California archive found",
+    retained_official_archive_unavailable: "California archive evidence unavailable",
   };
   return value ? labels[value] ?? label(value) : "Research update";
 }
@@ -100,7 +104,7 @@ function FindingCard({ finding, source }: { finding: ScoutFinding; source?: Scou
   const excerptMayBeTruncated = (finding.evidenceExcerpt?.length ?? 0) >= EXCERPT_CHARACTER_LIMIT;
   const evidenceLinkLabel = sourceType.includes("pdf")
     ? "Open official document"
-    : "Open official record";
+    : sourceType.includes("zip") ? "Open official archive" : "Open official record";
   return (
     <article className="border-t border-slate-200 py-5 first:border-t-0 first:pt-0">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -404,6 +408,8 @@ function JobDetails({ job, refreshError, onCancel, canceling }: { job: ScoutJob;
 export default function ScoutExperience({ enabled }: { enabled: boolean }) {
   const [query, setQuery] = useState("");
   const [jurisdiction, setJurisdiction] = useState("FL");
+  const california = jurisdiction === "CA";
+  const examples = california ? CALIFORNIA_EXAMPLES : FLORIDA_EXAMPLES;
   const [job, setJob] = useState<ScoutJob | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [canceling, setCanceling] = useState(false);
@@ -557,10 +563,10 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
         <p className="page-eyebrow">Scout</p>
         <div className="mt-2 flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2">
           <h1 className="text-2xl font-semibold tracking-[-0.025em] text-slate-950 sm:text-3xl">Research government activity</h1>
-          <p className="text-sm text-slate-600">Florida · official sources · evidence retained</p>
+          <p className="text-sm text-slate-600">Florida and California · official evidence</p>
         </div>
         <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-600">
-          Bill Commons is checked first. Scout then uses admitted official sources and keeps the record needed to assess each finding.
+          Scout researches Florida official sources and checks retained California bill-action archives. Each finding keeps its source evidence.
           <span className="ml-1">Research jobs are owner-scoped. <Link href="/account/login" className="font-medium text-blue-800 underline underline-offset-2">Account access</Link>.</span>
         </p>
       </div>
@@ -574,12 +580,12 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
       <form onSubmit={submit} className="mt-6 border-b border-slate-300 pb-5" aria-describedby="scout-help">
         <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_10rem_auto] md:items-end">
           <div>
-            <label htmlFor="scout-query" className="sr-only">Research question</label>
-            <input id="scout-query" required minLength={3} maxLength={500} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Research Florida legislation, an agency notice, or a committee action" className="w-full rounded-sm border border-slate-400 bg-white px-3 py-2.5 text-sm text-slate-950 placeholder:text-slate-400 focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/40" />
+            <label htmlFor="scout-query" className="mb-1.5 block text-xs font-semibold text-slate-700">Research question</label>
+            <input id="scout-query" required minLength={3} maxLength={500} value={query} onChange={(event) => setQuery(event.target.value)} aria-describedby={california ? "scout-ca-help" : undefined} placeholder={california ? "AB 123 2025-2026" : "Research Florida legislation, an agency notice, or a committee action"} className="w-full rounded-sm border border-slate-400 bg-white px-3 py-2.5 text-sm text-slate-950 placeholder:text-slate-500 focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/40" />
           </div>
           <div>
-            <label htmlFor="scout-jurisdiction" className="sr-only">Jurisdiction</label>
-            <select id="scout-jurisdiction" value={jurisdiction} onChange={(event) => setJurisdiction(event.target.value)} className="w-full rounded-sm border border-slate-400 bg-white px-3 py-2.5 text-sm text-slate-950 focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/40">
+            <label htmlFor="scout-jurisdiction" className="mb-1.5 block text-xs font-semibold text-slate-700">Jurisdiction</label>
+            <select id="scout-jurisdiction" value={jurisdiction} onChange={(event) => { setJurisdiction(event.target.value); setError(""); }} className="w-full rounded-sm border border-slate-400 bg-white px-3 py-2.5 text-sm text-slate-950 focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/40">
               {JURISDICTIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
             </select>
           </div>
@@ -587,15 +593,21 @@ export default function ScoutExperience({ enabled }: { enabled: boolean }) {
             {submitting ? "Starting…" : "Run research"}
           </button>
         </div>
+        {california ? (
+          <p id="scout-ca-help" className="mt-3 max-w-3xl text-sm leading-6 text-slate-600">
+            Enter a bill and its session, such as AB 123 2025-2026. Add “Special Session 1” when applicable.
+            California checks previously captured weekday archives. A matching action may be available; these archives do not establish a current or complete bill history.
+          </p>
+        ) : null}
         <div className="mt-3 flex flex-wrap items-baseline gap-x-4 gap-y-2 text-sm" aria-label="Example Scout questions">
           <span className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Suggested</span>
-          {EXAMPLES.map((example) => (
+          {examples.map((example) => (
             <button
               key={example}
               type="button"
               onClick={() => {
                 setQuery(example);
-                track("scout_example_selected", { jurisdiction: "FL" });
+                track("scout_example_selected", { jurisdiction });
               }}
               className="text-left text-sm text-blue-800 underline underline-offset-2 hover:text-blue-600"
             >
