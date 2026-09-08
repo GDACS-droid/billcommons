@@ -12,11 +12,11 @@ from billcommons_shared.ca_official_actions import (
 )
 
 
-def _archive() -> bytes:
+def _archive(compression: int = zipfile.ZIP_DEFLATED) -> bytes:
     def row(columns, values):
         return "\t".join(values.get(column, "") for column in columns).encode() + b"\n"
     output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(output, "w", compression=compression) as archive:
         archive.writestr("BILL_TBL.dat", row(BILL_COLUMNS, {
             "bill_id": "202520260AB123", "session_year": "20252026",
             "session_num": "0", "measure_type": "AB", "measure_num": "123",
@@ -27,6 +27,23 @@ def _archive() -> bytes:
             "trans_update_dt": "2026-01-15T12:00:00", "action_sequence": "1",
         }))
     return output.getvalue()
+
+
+@pytest.mark.parametrize("compression", [zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA])
+def test_parser_translates_corrupt_supported_zip_decoders(compression):
+    raw = bytearray(_archive(compression))
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        member = archive.getinfo("BILL_TBL.dat")
+    payload_start = member.header_offset + 30 + len(member.filename.encode()) + len(member.extra)
+    # Keep the ZIP framing valid while corrupting the actual decoder payload.
+    # LZMA uses a four-byte ZIP prefix before its properties/data.
+    corrupt_at = payload_start + (4 if compression == zipfile.ZIP_LZMA else 0)
+    raw[corrupt_at] ^= 0xFF
+    with pytest.raises(OfficialCaActionsError) as failure:
+        parse_ca_official_actions_zip(
+            bytes(raw), source_url=ca_delta_url("Mon"), retrieved_at=datetime.now(timezone.utc),
+        )
+    assert failure.value.diagnostic_code == "archive_crc_or_invalid_zip"
 
 
 def test_parser_translates_unsupported_compression_and_honors_deadline():
