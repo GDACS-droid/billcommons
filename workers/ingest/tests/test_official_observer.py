@@ -11,6 +11,7 @@ import io
 import json
 import zipfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -19,6 +20,7 @@ from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
 from billcommons_ingest import official_ca_actions as ca_actions
+from billcommons_ingest import official_discovery as discovery
 from billcommons_ingest import official_observer as observer
 from billcommons_schema.models import (
     Bill,
@@ -34,6 +36,8 @@ from billcommons_shared.db import get_engine
 from billcommons_shared.normalize import normalize_bill_number
 
 NOW = datetime(2026, 9, 7, 16, tzinfo=timezone.utc)
+FL_SOURCE_URL = "https://www.flsenate.gov/Session/Bill/2025/7031"
+FL_FIXTURE = Path(__file__).parent / "fixtures" / "fl_senate_detail_2025_7031.html"
 
 
 def _tsv(rows: list[list[str]]) -> bytes:
@@ -102,6 +106,46 @@ def _target(db_session, unique_abbr, *, due: datetime = NOW, scope=None, source_
     jurisdiction.abbreviation = "CA"
     db_session.flush()
     return jurisdiction, target
+
+
+def _fl_target(db_session, unique_abbr, *, due: datetime = NOW, scope=None):
+    jurisdiction = Jurisdiction(name="Test Florida", abbreviation=unique_abbr("ZZ_FL"), classification="state")
+    db_session.add(jurisdiction)
+    db_session.flush()
+    target = OfficialSourceTarget(
+        jurisdiction_id=jurisdiction.id,
+        adapter_name=observer.FL_ADAPTER_NAME,
+        source_url=FL_SOURCE_URL,
+        scope=scope if scope is not None else {
+            "jurisdiction": "FL",
+            "source_session_year": "2025",
+            "source_bill_number": "7031",
+            "coverage": "bounded_bill_history",
+        },
+        enabled=True,
+        cadence_seconds=300,
+        next_check_at=due,
+    )
+    db_session.add(target)
+    db_session.flush()
+    jurisdiction.abbreviation = "FL"
+    db_session.flush()
+    return jurisdiction, target
+
+
+def _fl_captured(raw: bytes | None, *, error_class: str | None = None, robots: bytes | None = b"not found", http_status: int | None = 200):
+    return discovery.OfficialDiscoveryCapture(
+        source_url=FL_SOURCE_URL,
+        retrieved_at=NOW,
+        http_status=http_status,
+        raw_bytes=raw,
+        content_type="text/html",
+        upstream_modified="Mon, 07 Sep 2026 15:30:00 GMT",
+        robots_url="https://www.flsenate.gov/robots.txt",
+        robots_status=404 if robots is not None else None,
+        robots_bytes=robots,
+        error_class=error_class,
+    )
 
 
 def _local_bill(db_session, jurisdiction: Jurisdiction, *, identifier="AB 12") -> Bill:
@@ -338,6 +382,173 @@ def test_invalid_target_is_observed_without_calling_external_capture(db_session,
     assert observation.status == "invalid"
     assert observation.error_class == "InvalidOfficialTarget"
     assert target.next_check_at == NOW + timedelta(seconds=300)
+
+
+def test_fl_detail_success_retains_one_bill_snapshot_without_local_mutation(db_session, unique_abbr, monkeypatch):
+    _, target = _fl_target(db_session, unique_abbr)
+    raw = FL_FIXTURE.read_bytes()
+    before_actions = db_session.scalar(select(func.count()).select_from(BillAction))
+    monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: _fl_captured(raw))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and (result.status, result.record_count, result.reconciliation_count) == ("succeeded", 46, 0)
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.adapter_name == observer.FL_ADAPTER_NAME
+    assert observation.adapter_version == observer.fl_actions.ADAPTER_VERSION
+    assert observation.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert observation.upstream_updated_at == datetime(2026, 9, 7, 15, 30, tzinfo=timezone.utc)
+    assert observation.scope["coverage"] == "bounded_bill_history"
+    assert observation.scope["semantic_label"] == "observed_bill_history_snapshot"
+    assert observation.scope["source_session_year"] == "2025"
+    assert observation.scope["source_bill_number"] == "7031"
+    assert "local_session" not in observation.scope
+    assert "freshness" not in observation.scope
+    snapshot = json.loads(db_session.get(OfficialRawBlob, observation.scope["parsed_snapshot_sha256"]).data)
+    assert snapshot["source_raw_sha256"] == observation.raw_sha256
+    assert snapshot["scope"] == {
+        "jurisdiction": "FL", "source_session_year": "2025", "source_bill_number": "7031",
+        "coverage": "bounded_bill_history",
+    }
+    assert len(snapshot["actions"]) == 46
+    assert snapshot["actions"][-1]["date"] == "2026-06-18"
+    assert "occurrence" in snapshot["interpretation"]
+    assert db_session.scalar(select(func.count()).select_from(BillAction)) == before_actions
+    assert target.consecutive_failures == 0
+    assert target.next_check_at == NOW + timedelta(seconds=300)
+
+
+def test_fl_robots_denial_retains_policy_and_backoff_without_parsing(db_session, unique_abbr, monkeypatch):
+    _, target = _fl_target(db_session, unique_abbr)
+    policy = b"User-agent: *\nDisallow: /\n"
+    monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: _fl_captured(None, error_class="robots_disallowed", robots=policy, http_status=None))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "failed"
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.raw_sha256 is None
+    assert observation.error_class == "robots_disallowed"
+    assert observation.scope["robots"]["raw_sha256"] == hashlib.sha256(policy).hexdigest()
+    assert observation.scope["failure"]["stage"] == "capture"
+    assert target.consecutive_failures == 1
+    assert target.next_check_at == NOW + timedelta(seconds=300)
+    assert db_session.get(OfficialRawBlob, hashlib.sha256(policy).hexdigest()).data == policy
+
+
+def test_fl_scope_mismatch_is_invalid_before_capture_and_backs_off(db_session, unique_abbr, monkeypatch):
+    _, target = _fl_target(
+        db_session,
+        unique_abbr,
+        scope={"jurisdiction": "FL", "source_session_year": "2025", "source_bill_number": "7031", "coverage": "bounded_bill_history", "extra": True},
+    )
+    monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: (_ for _ in ()).throw(AssertionError("scope mismatch must not fetch")))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "invalid"
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.error_class == "InvalidOfficialTarget"
+    assert observation.adapter_version == observer.fl_actions.ADAPTER_VERSION
+    assert db_session.scalar(select(func.count()).select_from(OfficialRawBlob)) == 0
+    assert target.consecutive_failures == 1
+    assert target.next_check_at == NOW + timedelta(seconds=300)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"<html>not a Florida bill detail page</html>",
+        FL_FIXTURE.read_bytes().replace(
+            b'<div class="tabbody " id="tabBodyBillHistory">',
+            b'<div class="tabbody " id="tabBodyBillHistory"><table><thead></thead><tbody></tbody></table>',
+            1,
+        ),
+        (b"<div>" * observer.fl_actions.MAX_DOM_DEPTH) + FL_FIXTURE.read_bytes() + (b"</div>" * observer.fl_actions.MAX_DOM_DEPTH),
+    ],
+)
+def test_fl_malformed_or_capped_parse_retains_raw_and_never_writes_actions(db_session, unique_abbr, monkeypatch, raw):
+    _, target = _fl_target(db_session, unique_abbr)
+    before_actions = db_session.scalar(select(func.count()).select_from(BillAction))
+    monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: _fl_captured(raw))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "invalid"
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert db_session.get(OfficialRawBlob, observation.raw_sha256).data == raw
+    assert observation.error_class == "OfficialFloridaSenateActionsError"
+    assert observation.scope["failure"]["stage"] == "parse"
+    assert "parsed_snapshot_sha256" not in observation.scope
+    assert db_session.scalar(select(func.count()).select_from(BillAction)) == before_actions
+    assert target.consecutive_failures == 1
+
+
+def test_fl_snapshot_storage_failure_escapes_and_rolls_back_claim(monkeypatch):
+    engine = get_engine()
+    seed = Session(engine, autoflush=False)
+    try:
+        jurisdiction = Jurisdiction(name="Atomic Florida", abbreviation="FL", classification="state")
+        seed.add(jurisdiction)
+        seed.flush()
+        target = OfficialSourceTarget(
+            jurisdiction_id=jurisdiction.id,
+            adapter_name=observer.FL_ADAPTER_NAME,
+            source_url=FL_SOURCE_URL,
+            scope={"jurisdiction": "FL", "source_session_year": "2025", "source_bill_number": "7031", "coverage": "bounded_bill_history"},
+            enabled=True,
+            cadence_seconds=300,
+            next_check_at=NOW,
+        )
+        seed.add(target)
+        seed.commit()
+        target_id, jurisdiction_id = target.id, jurisdiction.id
+    finally:
+        seed.close()
+
+    raw = FL_FIXTURE.read_bytes()
+    monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: _fl_captured(raw))
+    original_store = observer.store_official_raw_blob
+    calls = 0
+
+    def fail_snapshot(db, data, content_type):
+        nonlocal calls
+        calls += 1
+        if content_type == "application/json":
+            raise RuntimeError("injected snapshot storage outage")
+        return original_store(db, data, content_type)
+
+    monkeypatch.setattr(observer, "store_official_raw_blob", fail_snapshot)
+    transaction = Session(engine, autoflush=False)
+    try:
+        with pytest.raises(RuntimeError, match="injected snapshot storage outage"):
+            observer.observe_due_target(transaction, now=NOW)
+        transaction.rollback()
+    finally:
+        transaction.close()
+
+    check = Session(engine, autoflush=False)
+    try:
+        stored = check.get(OfficialSourceTarget, target_id)
+        assert calls == 3
+        assert stored.consecutive_failures == 0 and stored.next_check_at == NOW
+        assert check.scalar(select(func.count()).select_from(OfficialSourceObservation)) == 0
+        assert check.scalar(select(func.count()).select_from(OfficialRawBlob)) == 0
+        assert check.scalar(select(func.count()).select_from(BillAction)) == 0
+    finally:
+        check.close()
+        cleanup = Session(engine, autoflush=False)
+        try:
+            cleanup.execute(delete(OfficialSourceTarget).where(OfficialSourceTarget.id == target_id))
+            cleanup.execute(delete(Jurisdiction).where(Jurisdiction.id == jurisdiction_id))
+            cleanup.commit()
+        finally:
+            cleanup.close()
 
 
 def test_due_claim_uses_skip_locked_and_no_due_target_returns_none(db_session, unique_abbr):

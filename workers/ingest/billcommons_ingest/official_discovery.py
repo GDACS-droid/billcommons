@@ -209,22 +209,20 @@ def _maximum_crawl_delay_seconds(jurisdiction: str, source_url: str) -> int:
     return maximum
 
 
-def capture_official_landing_page(
+def _capture_reviewed_html(
     jurisdiction: str, source_url: str, *,
     fetch: Callable[[str, int], SafeResponse] = _fetch,
     budget: Callable[[str], None] = _budget,
     sleep: Callable[[float], None] = time.sleep,
     now: datetime | None = None,
 ) -> OfficialDiscoveryCapture:
-    """Read robots first, then one exact reviewed page; never follow redirects.
+    """Capture one already-authorized official HTML page after robots.
 
-    All source failures return structured evidence. Registry/config errors are
-    rejected before HTTP. The shared transport pins a vetted public address,
-    enforces TLS, and bounds every complete request to fifteen seconds.
+    The caller owns source authorization.  This private helper deliberately
+    shares the landing observer's robots, host budget, reviewed-TLS SafeHTTP,
+    and bounded response behavior with narrowly reviewed semantic adapters.
+    SafeHTTP rejects redirects; this helper never follows them.
     """
-    inventory = official_source_inventory()
-    if inventory.get(jurisdiction) != source_url:
-        raise ValueError("source URL is not the reviewed jurisdiction homepage")
     retrieved_at = now or datetime.now(timezone.utc)
     if retrieved_at.tzinfo is None:
         raise ValueError("retrieval timestamp must be timezone-aware")
@@ -273,3 +271,31 @@ def capture_official_landing_page(
         # Only a fixed class label survives; never a response body, DSN or URL
         # copied from exception text. Bytes already captured remain available.
         return OfficialDiscoveryCapture(**evidence, error_class=type(exc).__name__)
+
+
+def capture_official_landing_page(
+    jurisdiction: str, source_url: str, *,
+    fetch: Callable[[str, int], SafeResponse] = _fetch,
+    budget: Callable[[str], None] = _budget,
+    sleep: Callable[[float], None] = time.sleep,
+    now: datetime | None = None,
+) -> OfficialDiscoveryCapture:
+    """Read robots then one exact registry-authorized landing page.
+
+    Registry authorization remains public-wrapper-only: callers cannot use
+    this API to capture an arbitrary path on an inventory host.  The private
+    shared capture helper below is reserved for adapters that validate their
+    own separately reviewed, exact source contract before invoking it.
+    """
+
+    inventory = official_source_inventory()
+    if inventory.get(jurisdiction) != source_url:
+        raise ValueError("source URL is not the reviewed jurisdiction homepage")
+    return _capture_reviewed_html(
+        jurisdiction,
+        source_url,
+        fetch=fetch,
+        budget=budget,
+        sleep=sleep,
+        now=now,
+    )

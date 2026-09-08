@@ -36,6 +36,8 @@ from sqlalchemy.orm import Session as OrmSession
 from billcommons_ingest import official_ca_actions as ca_actions
 from billcommons_ingest import official_diagnostics
 from billcommons_ingest import official_discovery as discovery
+from billcommons_ingest import official_fl_senate_actions as fl_actions
+from billcommons_ingest import official_fl_senate_capture as fl_capture
 from billcommons_schema.models import (
     Bill,
     BillAction,
@@ -52,6 +54,9 @@ from billcommons_ingest.official_ca_reconciliation import COMPARATOR_VERSION, re
 
 ADAPTER_NAME = "ca_official_actions"
 CA_JURISDICTION = "CA"
+FL_ADAPTER_NAME = fl_capture.ADAPTER_NAME
+FL_JURISDICTION = fl_capture.JURISDICTION
+FL_COVERAGE = "bounded_bill_history"
 CA_HISTORY_PREFIX = "ca-history:"
 CA_HISTORY_NAMESPACE = "ca-leginfo-pubinfo-history"
 CA_SCOPE_SESSIONS = frozenset({"20252026 regular", "special1"})
@@ -188,6 +193,12 @@ def _parse_ca_response(captured):
     )
 
 
+def _capture_fl_senate_detail(source_url: str):
+    """Indirection retained for deterministic observer tests."""
+
+    return fl_capture.capture_florida_senate_bill_detail(source_url)
+
+
 def _target_day(target: OfficialSourceTarget, jurisdiction: Jurisdiction | None) -> str:
     if jurisdiction is None or jurisdiction.abbreviation != CA_JURISDICTION:
         raise InvalidOfficialTarget("target jurisdiction is not California")
@@ -210,6 +221,30 @@ def _target_day(target: OfficialSourceTarget, jurisdiction: Jurisdiction | None)
     if target.source_url != expected_url:
         raise InvalidOfficialTarget("target URL is not the reviewed CA delta URL")
     return day
+
+
+def _target_fl_senate_detail(
+    target: OfficialSourceTarget, jurisdiction: Jurisdiction | None,
+) -> fl_capture.FloridaSenateDetailScope:
+    """Validate the exact reviewed one-bill Florida target before HTTP."""
+
+    if jurisdiction is None or jurisdiction.abbreviation != FL_JURISDICTION:
+        raise InvalidOfficialTarget("target jurisdiction is not Florida")
+    if target.adapter_name != FL_ADAPTER_NAME:
+        raise InvalidOfficialTarget("target adapter is not the Florida Senate action adapter")
+    try:
+        source_scope = fl_capture.detail_scope(target.source_url)
+    except fl_actions.OfficialFloridaSenateActionsError as exc:
+        raise InvalidOfficialTarget("target source URL is not an exact Florida Senate detail URL") from exc
+    expected = {
+        "jurisdiction": FL_JURISDICTION,
+        "source_session_year": source_scope.source_session_year,
+        "source_bill_number": source_scope.source_bill_number,
+        "coverage": FL_COVERAGE,
+    }
+    if not isinstance(target.scope, Mapping) or target.scope != expected:
+        raise InvalidOfficialTarget("target scope is not the exact reviewed Florida bill-history scope")
+    return source_scope
 
 
 def _continuation_from_scope(scope: Mapping[str, Any]) -> _CaContinuation | None:
@@ -293,7 +328,12 @@ def _schedule_success(target: OfficialSourceTarget, now: datetime) -> None:
 def _observation_scope(target: OfficialSourceTarget) -> dict[str, Any]:
     # This exact adapter observes a weekday delta, not a full CA history.
     target_scope = dict(target.scope) if isinstance(target.scope, Mapping) else {}
-    coverage = "delta_only" if target.adapter_name == ADAPTER_NAME else "not_established"
+    if target.adapter_name == ADAPTER_NAME:
+        coverage = "delta_only"
+    elif target.adapter_name == FL_ADAPTER_NAME:
+        coverage = FL_COVERAGE
+    else:
+        coverage = "not_established"
     result = {**target_scope, "coverage": coverage}
     if len(_canonical_json_bytes(result)) > 60000:
         return {"coverage": coverage, "target_scope_retained_on_target": True}
@@ -612,6 +652,240 @@ def _resume_ca_continuation(
     return OfficialObservationResult(target.id, status, observation.record_count, progress.run_count)
 
 
+def _safe_capture_error_class(value: object) -> str:
+    """Persist only a bounded capture class label, never capture text."""
+
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,119}", value):
+        return value
+    return "CaptureFailure"
+
+
+def _captured_http_status(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599 else None
+
+
+def _fl_observation_scope(
+    source_scope: fl_capture.FloridaSenateDetailScope,
+    captured: discovery.OfficialDiscoveryCapture,
+    robots_sha256: str | None,
+) -> dict[str, Any]:
+    """Build bounded semantic evidence for exactly one observed bill page."""
+
+    return {
+        "jurisdiction": FL_JURISDICTION,
+        "source_session_year": source_scope.source_session_year,
+        "source_bill_number": source_scope.source_bill_number,
+        "coverage": FL_COVERAGE,
+        # This label is intentionally narrower than freshness or corpus
+        # coverage: one retained page says nothing about another FL bill.
+        "semantic_label": "observed_bill_history_snapshot",
+        "robots": {
+            "source_url": f"https://{fl_actions.FL_SENATE_HOST}/robots.txt",
+            "http_status": _captured_http_status(captured.robots_status),
+            "raw_sha256": robots_sha256,
+            "body_bytes": len(captured.robots_bytes) if isinstance(captured.robots_bytes, bytes) else None,
+        },
+    }
+
+
+def _fl_snapshot(
+    parsed: fl_actions.ParsedFloridaSenateBillHistory,
+    source_scope: fl_capture.FloridaSenateDetailScope,
+    raw_sha256: str,
+) -> bytes:
+    """Return canonical one-page fact evidence without a matching claim."""
+
+    snapshot = {
+        "schema_version": 1,
+        "adapter_version": fl_actions.ADAPTER_VERSION,
+        "source_url": parsed.source_url,
+        "source_raw_sha256": raw_sha256,
+        "scope": {
+            "jurisdiction": FL_JURISDICTION,
+            "source_session_year": source_scope.source_session_year,
+            "source_bill_number": source_scope.source_bill_number,
+            "coverage": FL_COVERAGE,
+        },
+        "bill": {"identifier": parsed.bill_identifier, "title": parsed.bill_title},
+        "actions": [action.as_evidence() for action in parsed.actions],
+        "interpretation": (
+            "Observed Bill History snapshot for one Florida Senate detail URL. "
+            "Source row and bullet positions are observation-local evidence, not action occurrence identities; "
+            "this snapshot makes no local-session, statewide freshness, or completeness claim."
+        ),
+    }
+    payload = _canonical_json_bytes(snapshot)
+    if not 1 <= len(payload) <= MAX_BLOB_BYTES:
+        raise ValueError("Florida Senate parsed snapshot violates evidence byte bounds")
+    return payload
+
+
+def _observe_fl_senate_target(
+    db: OrmSession,
+    target: OfficialSourceTarget,
+    jurisdiction: Jurisdiction | None,
+    observed_at: datetime,
+    started_at: float,
+) -> OfficialObservationResult:
+    """Observe one exact FL detail target; never find or mutate a local bill."""
+
+    try:
+        source_scope = _target_fl_senate_detail(target, jurisdiction)
+    except InvalidOfficialTarget as exc:
+        observation = _add_observation(
+            db,
+            target=target,
+            scope=_failure_scope(target, exc, stage="evidence_validation"),
+            retrieved_at=observed_at,
+            status="invalid",
+            error_class=_safe_error_class(exc),
+            adapter_name=FL_ADAPTER_NAME,
+            adapter_version=fl_actions.ADAPTER_VERSION,
+        )
+        _schedule_failure(target, observed_at)
+        return OfficialObservationResult(target.id, observation.status, None, 0)
+
+    try:
+        captured = _capture_fl_senate_detail(source_scope.source_url)
+        if captured.source_url != source_scope.source_url:
+            raise ValueError("captured Florida Senate response URL differs from target")
+        retrieved_at = _require_aware_utc(captured.retrieved_at)
+        _require_deadline(started_at)
+    except Exception as exc:
+        observation = _add_observation(
+            db,
+            target=target,
+            scope={**_observation_scope(target), "failure": official_diagnostics.failure_diagnosis(exc, stage="capture")},
+            retrieved_at=observed_at,
+            status="failed",
+            error_class=_safe_error_class(exc),
+            adapter_name=FL_ADAPTER_NAME,
+            adapter_version=fl_actions.ADAPTER_VERSION,
+            http_status=_observed_http_status(exc),
+        )
+        _schedule_failure(target, observed_at)
+        return OfficialObservationResult(target.id, observation.status, None, 0)
+
+    # Persist capture bytes before acting on response status or parser output.
+    # Storage failures intentionally remain outside outcome handlers so the
+    # caller rolls the target claim, raw evidence, and schedule back together.
+    raw_bytes = captured.raw_bytes
+    robots_bytes = captured.robots_bytes
+    try:
+        if raw_bytes is not None and (not isinstance(raw_bytes, bytes) or not 1 <= len(raw_bytes) <= MAX_BLOB_BYTES):
+            raise ValueError("Florida Senate raw response violates evidence byte bounds")
+        if robots_bytes is not None and (not isinstance(robots_bytes, bytes) or not 1 <= len(robots_bytes) <= MAX_BLOB_BYTES):
+            raise ValueError("Florida Senate robots response violates evidence byte bounds")
+    except (AttributeError, TypeError, ValueError) as exc:
+        observation = _add_observation(
+            db,
+            target=target,
+            scope={**_observation_scope(target), "failure": official_diagnostics.failure_diagnosis(exc, stage="capture")},
+            retrieved_at=retrieved_at,
+            status="invalid",
+            error_class=_safe_error_class(exc),
+            adapter_name=FL_ADAPTER_NAME,
+            adapter_version=fl_actions.ADAPTER_VERSION,
+            http_status=_captured_http_status(captured.http_status),
+            source_response_observed=_captured_http_status(captured.http_status) is not None,
+        )
+        _schedule_failure(target, observed_at)
+        return OfficialObservationResult(target.id, observation.status, None, 0)
+
+    raw_sha256 = store_official_raw_blob(db, raw_bytes, "text/html") if raw_bytes else None
+    robots_sha256 = store_official_raw_blob(db, robots_bytes, "text/plain") if robots_bytes else None
+    scope = _fl_observation_scope(source_scope, captured, robots_sha256)
+    http_status = _captured_http_status(captured.http_status)
+    if captured.error_class is not None:
+        scope["failure"] = {
+            "version": official_diagnostics.VERSION,
+            "stage": "capture",
+            "code": "adapter_failure",
+            "recommended_action": "inspect_adapter_failure",
+        }
+        observation = _add_observation(
+            db,
+            target=target,
+            scope=scope,
+            retrieved_at=retrieved_at,
+            status="failed",
+            raw_sha256=raw_sha256,
+            upstream_updated_at=_upstream_updated_at(captured.upstream_modified),
+            error_class=_safe_capture_error_class(captured.error_class),
+            adapter_name=FL_ADAPTER_NAME,
+            adapter_version=fl_actions.ADAPTER_VERSION,
+            http_status=http_status,
+            source_response_observed=http_status is not None,
+        )
+        _schedule_failure(target, observed_at)
+        return OfficialObservationResult(target.id, observation.status, None, 0)
+    if raw_bytes is None:
+        # A successful semantic observation cannot be constructed without the
+        # exact response bytes, even if an adapter implementation regresses.
+        observation = _add_observation(
+            db,
+            target=target,
+            scope={**scope, "failure": official_diagnostics.failure_diagnosis(ValueError(), stage="capture")},
+            retrieved_at=retrieved_at,
+            status="invalid",
+            error_class="CaptureFailure",
+            adapter_name=FL_ADAPTER_NAME,
+            adapter_version=fl_actions.ADAPTER_VERSION,
+            http_status=http_status,
+            source_response_observed=http_status is not None,
+        )
+        _schedule_failure(target, observed_at)
+        return OfficialObservationResult(target.id, observation.status, None, 0)
+
+    try:
+        parsed = fl_actions.parse_florida_senate_bill_history(raw_bytes, source_url=source_scope.source_url)
+        _require_deadline(started_at)
+        if (
+            parsed.source_url != source_scope.source_url
+            or parsed.source_sha256 != raw_sha256
+            or parsed.session_year != source_scope.source_session_year
+            or parsed.bill_number != source_scope.source_bill_number
+        ):
+            raise ValueError("parsed Florida Senate result differs from captured one-bill evidence")
+        snapshot = _fl_snapshot(parsed, source_scope, raw_sha256)
+    except (AttributeError, TypeError, ValueError, fl_actions.OfficialFloridaSenateActionsError, ObservationDeadlineExceeded) as exc:
+        observation = _add_observation(
+            db,
+            target=target,
+            scope={**scope, "failure": official_diagnostics.failure_diagnosis(exc, stage="parse")},
+            retrieved_at=retrieved_at,
+            status="invalid",
+            raw_sha256=raw_sha256,
+            upstream_updated_at=_upstream_updated_at(captured.upstream_modified),
+            error_class=_safe_error_class(exc),
+            adapter_name=FL_ADAPTER_NAME,
+            adapter_version=fl_actions.ADAPTER_VERSION,
+            http_status=http_status,
+            source_response_observed=http_status is not None,
+        )
+        _schedule_failure(target, observed_at)
+        return OfficialObservationResult(target.id, observation.status, None, 0)
+
+    snapshot_sha256 = store_official_raw_blob(db, snapshot, "application/json")
+    scope["parsed_snapshot_sha256"] = snapshot_sha256
+    observation = _add_observation(
+        db,
+        target=target,
+        scope=scope,
+        retrieved_at=retrieved_at,
+        status="succeeded",
+        raw_sha256=raw_sha256,
+        upstream_updated_at=_upstream_updated_at(captured.upstream_modified),
+        record_count=len(parsed.actions),
+        adapter_name=FL_ADAPTER_NAME,
+        adapter_version=fl_actions.ADAPTER_VERSION,
+        http_status=http_status,
+        source_response_observed=http_status is not None,
+    )
+    _schedule_success(target, observed_at)
+    return OfficialObservationResult(target.id, observation.status, observation.record_count, 0)
+
+
 def _observe_discovery_target(db, target, jurisdiction, observed_at) -> OfficialObservationResult:
     expected_scope = {
         "jurisdiction": jurisdiction.abbreviation if jurisdiction else None,
@@ -701,6 +975,8 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
     jurisdiction = db.get(Jurisdiction, target.jurisdiction_id)
     if target.adapter_name == discovery.ADAPTER_NAME:
         return _observe_discovery_target(db, target, jurisdiction, observed_at)
+    if target.adapter_name == FL_ADAPTER_NAME:
+        return _observe_fl_senate_target(db, target, jurisdiction, observed_at, started_at)
     try:
         day = _target_day(target, jurisdiction)
     except InvalidOfficialTarget as exc:
