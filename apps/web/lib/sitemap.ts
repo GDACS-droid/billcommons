@@ -79,6 +79,7 @@ export const STATIC_ROUTES = [
   "/topics/local-government",
   "/reports/2026-bill-mortality",
   "/coverage",
+  "/data-health",
   "/quality",
   "/changelog",
   "/methodology",

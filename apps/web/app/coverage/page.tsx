@@ -66,6 +66,11 @@ export default async function CoveragePage() {
         maxAgeSeconds={COVERAGE_REVALIDATE}
       />
 
+      <p className="my-5 text-sm text-slate-700">
+        For local ingestion history, sync backlog, and provenance gaps, inspect{" "}
+        <Link href="/data-health" className="text-blue-800 underline underline-offset-2">data health</Link>.
+      </p>
+
       <div className="surface-card overflow-x-auto">
         {!result.ok ? (
           <DataUnavailable message="Coverage data is temporarily unavailable." />

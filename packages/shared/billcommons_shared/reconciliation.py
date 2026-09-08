@@ -65,7 +65,7 @@ class NormalizedEvent:
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def _required_string(record: Mapping[str, Any], field: str) -> str | None:
@@ -103,7 +103,10 @@ def _source_url(record: Mapping[str, Any]) -> str | None:
 def _date_evidence(record: Mapping[str, Any]) -> DateEvidence:
     value = record.get("date")
     declared_precision = record.get("date_precision")
-    if declared_precision is not None and declared_precision not in {"day", "month", "year", "unknown"}:
+    if declared_precision is not None and (
+        not isinstance(declared_precision, str)
+        or declared_precision not in {"day", "month", "year", "unknown"}
+    ):
         raise ReconciliationInputError("date_precision must be day, month, year, unknown, or null")
     if value is None or value == "":
         if declared_precision not in {None, "unknown"}:
@@ -157,7 +160,7 @@ def _normalize_event(raw: Any) -> NormalizedEvent:
         raise ReconciliationInputError("every event must be a JSON object")
     try:
         raw_size = len(_canonical_json(raw).encode("utf-8"))
-    except (TypeError, ValueError) as exc:  # Defensive; parsed JSON normally cannot hit this.
+    except (TypeError, ValueError, RecursionError) as exc:
         raise ReconciliationInputError("event must contain JSON-compatible evidence") from exc
     if raw_size > MAX_EVENT_BYTES:
         raise ReconciliationInputError(
@@ -424,8 +427,11 @@ def load_fixture(path: Path) -> Any:
             raw = fixture.read(MAX_FIXTURE_BYTES + 1)
         if len(raw) > MAX_FIXTURE_BYTES:
             raise ReconciliationInputError(f"fixture exceeds the {MAX_FIXTURE_BYTES}-byte safety cap")
-        return json.loads(raw)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        def reject_constant(value: str):
+            raise ReconciliationInputError("fixture must not contain non-finite JSON numbers")
+
+        return json.loads(raw, parse_constant=reject_constant)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ReconciliationInputError("fixture is not readable JSON") from exc
 
 

@@ -24,11 +24,10 @@ This mirrors the one real year-round jurisdiction in the registry (DC:
 active=True, expected_adjournment=null) and is the only signal this schema
 version can support -- documented here rather than silently guessed at.
 
-Idempotent dispatch: `due_states` only returns (jurisdiction, kind) pairs
-whose last enqueue is older than the cadence interval, checked against the
-MOST RECENT `ingest_jobs` row of kind `api_sync` for that jurisdiction
-(payload->>'state') that is queued/running/done -- i.e. "don't enqueue a
-new one if the last one hasn't even had time to matter yet." This reuses
+Idempotent dispatch: a jurisdiction with any queued/running `api_sync`
+is never due, including a retry waiting on backoff or a pagination
+continuation. Otherwise its latest successful enqueue must be older than
+the cadence interval. This reuses
 the existing `ingest_jobs` table rather than adding a new state table (per
 the surgical-change principle -- one small query beats a new schema
 migration for what is fundamentally the same durable job history).
@@ -144,6 +143,26 @@ class ScheduleDecision:
     tier: str
     due: bool
     last_enqueued_at: datetime | None
+    pending_sync: bool = False
+
+
+def _has_pending_sync(db: OrmSession, state: str) -> bool:
+    """Backlog and retries must finish before another refresh is scheduled.
+
+    Check every outstanding row, not just the newest job: a newer completed
+    job can coexist with an older retry after a previous duplicate dispatch.
+    Stalled running jobs require operator recovery; scheduling duplicates
+    neither repairs their ownership nor safely resumes their checkpoint.
+    """
+    return db.execute(
+        select(IngestJob.id)
+        .where(
+            IngestJob.kind == API_SYNC_KIND,
+            IngestJob.payload["state"].astext == state,
+            IngestJob.status.in_(("queued", "running")),
+        )
+        .limit(1)
+    ).scalar_one_or_none() is not None
 
 
 def _last_enqueued_at(db: OrmSession, state: str) -> datetime | None:
@@ -186,13 +205,15 @@ def plan_schedule(db: OrmSession, *, now: datetime | None = None) -> list[Schedu
 
         tier = cadence_tier(active=session_row.active, end_date=session_row.end_date, now=now)
         last_enqueued_at = _last_enqueued_at(db, jurisdiction.abbreviation)
-        due = is_due(last_enqueued_at=last_enqueued_at, tier=tier, now=now)
+        pending_sync = _has_pending_sync(db, jurisdiction.abbreviation)
+        due = not pending_sync and is_due(last_enqueued_at=last_enqueued_at, tier=tier, now=now)
         decisions.append(
             ScheduleDecision(
                 jurisdiction_abbr=jurisdiction.abbreviation,
                 tier=tier,
                 due=due,
                 last_enqueued_at=last_enqueued_at,
+                pending_sync=pending_sync,
             )
         )
     return decisions

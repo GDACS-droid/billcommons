@@ -47,6 +47,11 @@ export default function SiteFooter() {
                 </Link>
               </li>
               <li>
+                <Link className="transition-colors hover:text-blue-800" href="/data-health">
+                  Data health
+                </Link>
+              </li>
+              <li>
                 <Link className="transition-colors hover:text-blue-800" href="/methodology">
                   Methodology
                 </Link>

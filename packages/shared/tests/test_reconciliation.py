@@ -13,6 +13,21 @@ from billcommons_shared.reconciliation import (
 )
 
 
+@pytest.mark.parametrize("precision", [[], {}, 5, False])
+def test_invalid_precision_type_is_controlled(precision):
+    with pytest.raises(ReconciliationInputError):
+        reconcile_events([event("id", date_precision=precision)], [])
+
+
+def test_non_finite_fixture_json_is_rejected(tmp_path, capsys):
+    official = tmp_path / "official.json"
+    local = tmp_path / "local.json"
+    official.write_text('[{"occurrence_id":"id","value":NaN}]')
+    local.write_text('[]')
+    assert main(["--official", str(official), "--local", str(local)]) == 2
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "invalid_reconciliation_input"
+
+
 def event(occurrence_id: str | None, **overrides):
     value = {
         "occurrence_id": occurrence_id,

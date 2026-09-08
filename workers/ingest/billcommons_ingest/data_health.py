@@ -28,19 +28,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    db = get_session()
+    db = None
     try:
+        db = get_session()
         # The report functions only issue SELECTs.  Do not commit here: this
         # command is safe to run while diagnosing a production incident.
-        db.execute(text("SET TRANSACTION READ ONLY"))
+        db.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
         db.execute(text("SET LOCAL statement_timeout = '5000ms'"))
         report = collect_report(db)
     except Exception as exc:  # noqa: BLE001 - a broken control plane must be visible to monitoring
         if not args.quiet:
-            print(f"[CHECK-FAILED] {type(exc).__name__}: {exc}", file=sys.stderr)
+            # Driver exceptions can contain connection details or SQL values.
+            # Diagnostics identify the failure class, never its raw contents.
+            print(f"[CHECK-FAILED] {type(exc).__name__}", file=sys.stderr)
         return 2
     finally:
-        db.close()
+        if db is not None:
+            db.close()
 
     if not args.quiet:
         print(json.dumps(report, indent=2, sort_keys=True) if args.json else render_text(report))

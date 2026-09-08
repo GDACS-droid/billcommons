@@ -237,9 +237,49 @@ def test_run_schedule_pass_reenqueues_once_active_cadence_elapses(db_session, sc
     db_session.flush()
 
     run_schedule_pass(db_session, now=now, lock_key=sched_lock_key)
+    job = db_session.execute(
+        select(IngestJob).where(
+            IngestJob.kind == API_SYNC_KIND,
+            IngestJob.payload["state"].astext == jurisdiction.abbreviation,
+        )
+    ).scalar_one()
+    queue_mod.complete_job(db_session, job)
     later = _real_now() + timedelta(minutes=31)
     second_pass = run_schedule_pass(db_session, now=later, lock_key=sched_lock_key)
     assert jurisdiction.abbreviation in second_pass
+
+
+@pytest.mark.parametrize("status", ["queued", "running"])
+def test_overdue_pending_sync_is_not_duplicated(db_session, sched_lock_key, status):
+    now = _real_now()
+    jurisdiction, _ = _make_jurisdiction_with_session(db_session, active=True, end_date=now.date())
+    job = queue_mod.enqueue(db_session, API_SYNC_KIND, {"state": jurisdiction.abbreviation})
+    job.status = status
+    job.created_at = now - timedelta(days=2)
+    # A quota-delayed retry is pending even though it cannot be claimed yet.
+    job.run_after = now + timedelta(days=1)
+    db_session.flush()
+    decision = next(d for d in plan_schedule(db_session, now=now)
+                    if d.jurisdiction_abbr == jurisdiction.abbreviation)
+    assert decision.pending_sync is True
+    assert decision.due is False
+    assert jurisdiction.abbreviation not in run_schedule_pass(
+        db_session, now=now, lock_key=sched_lock_key
+    )
+
+
+def test_older_pending_retry_is_not_hidden_by_newer_completed_job(db_session):
+    now = _real_now()
+    jurisdiction, _ = _make_jurisdiction_with_session(db_session, active=True, end_date=now.date())
+    retry = queue_mod.enqueue(db_session, API_SYNC_KIND, {"state": jurisdiction.abbreviation})
+    retry.created_at = now - timedelta(days=3)
+    completed = queue_mod.enqueue(db_session, API_SYNC_KIND, {"state": jurisdiction.abbreviation})
+    completed.created_at = now - timedelta(days=2)
+    queue_mod.complete_job(db_session, completed)
+    decision = next(d for d in plan_schedule(db_session, now=now)
+                    if d.jurisdiction_abbr == jurisdiction.abbreviation)
+    assert decision.pending_sync is True
+    assert decision.due is False
 
 
 def test_run_schedule_pass_skips_when_another_pass_holds_the_advisory_lock(db_session, sched_lock_key):

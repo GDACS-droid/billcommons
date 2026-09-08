@@ -1,0 +1,430 @@
+{
+  "report_version": 1,
+  "generated_at": "2026-09-08T00:47:39+00:00",
+  "scope": "read-only local ingestion reliability",
+  "honesty": {
+    "official_freshness": "unverified",
+    "official_freshness_reason": "This command performs no official-source fetch and local timestamps cannot prove source freshness.",
+    "official_reconciliation": "unavailable"
+  },
+  "summary": {
+    "jurisdiction_count": 52,
+    "defect_count": 20,
+    "defects_by_severity": {
+      "critical": 0,
+      "error": 0,
+      "warning": 20,
+      "info": 0
+    }
+  },
+  "defect_counts_by_code": {
+    "LOCAL_SYNC_OVERDUE": 17,
+    "MISSING_JURISDICTION_COVERAGE": 1,
+    "MISSING_PARSER_PROVENANCE": 1,
+    "MISSING_SOURCE_PROVENANCE": 1
+  },
+  "jurisdictions": [
+    {
+      "jurisdiction": "AK",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:45:13+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "AL",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:25:19+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "AR",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:26:08+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "AZ",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:45:14+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "CA",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:45:15+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "CO",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:27:43+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "CT",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:27:44+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "D6244E0F9",
+      "defect_codes": [
+        "MISSING_JURISDICTION_COVERAGE",
+        "MISSING_PARSER_PROVENANCE",
+        "MISSING_SOURCE_PROVENANCE"
+      ],
+      "last_successful_api_sync_at": "2026-09-05T05:25:13+00:00",
+      "coverage_scope": null,
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "DC",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:45:04+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "DE",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:45:03+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "FL",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:23:19+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "GA",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:23:20+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "HI",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:23:21+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "IA",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:40:27+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "ID",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:23:22+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "IL",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:45:06+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "IN",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:28:45+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "KS",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:30:21+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "KY",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:30:25+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "LA",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:40:06+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "MA",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:45:08+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "MD",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-04T05:20:46+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "ME",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:30:29+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "MI",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:46:30+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "MN",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:31:08+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "MO",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:32:30+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "MS",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:46:31+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "MT",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:32:32+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "NC",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:45:11+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "ND",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:25:15+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "NE",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:32:34+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "NH",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:39:03+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "NJ",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:46:33+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "NM",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:34:10+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "NV",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:32:35+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "NY",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:45:10+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "OH",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:45:16+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "OK",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:27:47+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "OR",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:27:48+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "PA",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:46:27+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "RI",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:28:41+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "SC",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:46:28+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "SD",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:28:43+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "TN",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:25:18+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "TX",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:30:31+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "UT",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:30:32+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "VA",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:46:29+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "VT",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:30:34+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "WA",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:34:11+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "WI",
+      "defect_codes": [
+        "LOCAL_SYNC_OVERDUE"
+      ],
+      "last_successful_api_sync_at": "2026-09-07T05:46:34+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "WV",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:34:12+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    },
+    {
+      "jurisdiction": "WY",
+      "defect_codes": [],
+      "last_successful_api_sync_at": "2026-09-05T05:34:15+00:00",
+      "coverage_scope": "session",
+      "official_reconciliation": "unavailable"
+    }
+  ]
+}
