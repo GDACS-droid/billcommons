@@ -232,3 +232,61 @@ def test_overview_refuses_silent_inventory_truncation(monkeypatch):
         official_evidence.overview()
     assert error.value.status_code == 503
     assert db.closed
+
+
+@pytest.mark.parametrize('path,scope', [
+    ('/official-evidence/observations', {'jurisdiction': 'CA'}),
+    ('/official-evidence/reconciliations', {'observation_id': str(uuid.uuid4())}),
+    ('/corpus-updates', {'bill_id': str(uuid.uuid4())}),
+    ('/corpus-updates/derived', {'bill_id': str(uuid.uuid4())}),
+])
+@pytest.mark.parametrize('offset,row_count,next_offset,limited', [
+    (0, 3, 2, False),
+    (9998, 3, 10000, False),
+    (9999, 3, None, True),
+    (10000, 3, None, True),
+    (10000, 2, None, False),
+    (10000, 0, None, False),
+])
+def test_http_pagination_always_has_fetchable_continuation_or_explicit_cap(
+    monkeypatch, path, scope, offset, row_count, next_offset, limited,
+):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from billcommons_api.routers import corpus_updates
+
+    now = datetime.now(timezone.utc)
+    row = dict.fromkeys((
+        'upstream_updated_at', 'error_class', 'causal_corpus_update_evidence_id',
+    ))
+    row.update({key: uuid.uuid4() for key in ('id', 'observation_id', 'bill_id')})
+    row.update({key: now for key in (
+        'retrieved_at', 'created_at', 'completed_at', 'local_snapshot_at', 'derived_at',
+    )})
+    row.update({key: 'a' * 64 for key in (
+        'raw_sha256', 'local_snapshot_sha256', 'diff_sha256', 'response_sha256',
+        'before_snapshot_sha256', 'after_snapshot_sha256', 'derivation_input_sha256',
+    )})
+    row.update(adapter_name='fixture', adapter_version='1', source_url='https://example.invalid',
+               scope={}, target_scope={}, http_status=200, status='succeeded', record_count=1,
+               official_bill_id='AB-1', comparator_version='fixture/1', summary={},
+               original_bill_upstream_id='fixture', source_name='fixture', request_scope={},
+               processing_version='fixture/1', mutation_kind='updated', changed_components=[])
+    db = _DB([row.copy() for _ in range(row_count)])
+    monkeypatch.setattr(official_evidence, 'get_session', lambda: db)
+    app = FastAPI()
+    app.include_router(official_evidence.router)
+    app.include_router(corpus_updates.router)
+    with TestClient(app) as client:
+        response = client.get(path, params={**scope, 'offset': offset, 'limit': 2})
+        assert response.status_code == 200
+        body = response.json()
+        assert body['has_more'] is (next_offset is not None)
+        assert body['next_offset'] == next_offset
+        assert body['pagination_limited'] is limited
+        assert len(body['items']) == min(row_count, 2)
+        assert db.calls[-1][1]['offset'] == offset
+        assert db.calls[-1][1]['limit'] == 3
+        assert db.closed
+        if next_offset is not None:
+            assert client.get(path, params={**scope, 'offset': next_offset, 'limit': 2}).status_code == 200

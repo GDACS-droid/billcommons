@@ -14,6 +14,7 @@ from billcommons_shared.db import get_session
 
 router = APIRouter(prefix="/official-evidence", tags=["official evidence"])
 _MAX_LIMIT = 100
+_MAX_OFFSET = 10000
 _MAX_BLOB_BYTES = 8 * 1024 * 1024
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _JURISDICTIONS = {
@@ -59,6 +60,17 @@ def _jurisdiction(value: str) -> str:
     if code not in _JURISDICTIONS:
         raise HTTPException(status_code=400, detail="jurisdiction must be a US state or DC")
     return code
+
+
+def _page_metadata(row_count: int, limit: int, offset: int) -> dict:
+    """Continuation is fetchable; pagination_limited discloses remaining rows at the cap."""
+    remaining = row_count > limit
+    can_continue = remaining and offset + limit <= _MAX_OFFSET
+    return {
+        "has_more": can_continue,
+        "next_offset": offset + limit if can_continue else None,
+        "pagination_limited": remaining and not can_continue,
+    }
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -134,7 +146,7 @@ def overview() -> dict:
 def observations(
     jurisdiction: str = Query(..., min_length=2, max_length=2),
     limit: int = Query(20, ge=1, le=_MAX_LIMIT),
-    offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+    offset: Annotated[int, Query(ge=0, le=_MAX_OFFSET)] = 0,
 ) -> dict:
     code = _jurisdiction(jurisdiction)
     db = None
@@ -157,8 +169,7 @@ def observations(
         ).mappings().all()
         return {
             "jurisdiction": code,
-            "has_more": len(rows) > limit,
-            "next_offset": offset + limit if len(rows) > limit and offset + limit <= 10000 else None,
+            **_page_metadata(len(rows), limit, offset),
             "items": [
                 {
                     "observation_id": str(row["id"]),
@@ -192,7 +203,7 @@ def observations(
 def reconciliations(
     observation_id: uuid.UUID = Query(...),
     limit: int = Query(20, ge=1, le=_MAX_LIMIT),
-    offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+    offset: Annotated[int, Query(ge=0, le=_MAX_OFFSET)] = 0,
 ) -> dict:
     db = None
     try:
@@ -212,8 +223,7 @@ def reconciliations(
         ).mappings().all()
         return {
             "observation_id": str(observation_id),
-            "has_more": len(rows) > limit,
-            "next_offset": offset + limit if len(rows) > limit and offset + limit <= 10000 else None,
+            **_page_metadata(len(rows), limit, offset),
             "items": [
                 {
                     "reconciliation_id": str(row["id"]),

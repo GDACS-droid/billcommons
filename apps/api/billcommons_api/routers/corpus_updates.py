@@ -7,7 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import text
 
-from billcommons_api.routers.official_evidence import _session, _close, _iso, _public_failure
+from billcommons_api.routers.official_evidence import _session, _close, _iso, _public_failure, _page_metadata, _MAX_OFFSET
 
 router = APIRouter(prefix='/corpus-updates', tags=['corpus update evidence'])
 
@@ -16,7 +16,7 @@ router = APIRouter(prefix='/corpus-updates', tags=['corpus update evidence'])
 def derived_updates(
     bill_id: uuid.UUID = Query(...),
     limit: int = Query(20, ge=1, le=100),
-    offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+    offset: Annotated[int, Query(ge=0, le=_MAX_OFFSET)] = 0,
 ) -> dict:
     db = None
     try:
@@ -48,8 +48,7 @@ def derived_updates(
             }
             items.append(item)
         return {
-            'bill_id': str(bill_id), 'items': items, 'has_more': len(rows) > limit,
-            'next_offset': offset + limit if len(rows) > limit and offset + limit <= 10000 else None,
+            'bill_id': str(bill_id), 'items': items, **_page_metadata(len(rows), limit, offset),
             'interpretation': 'Forward evidence for local status and relationship derivations. These are computed from retained local inputs, not newly fetched official assertions. Absence of records does not prove a bill has never changed.',
         }
     except HTTPException:
@@ -65,7 +64,7 @@ def derived_updates(
 def corpus_updates(
     bill_id: uuid.UUID = Query(...),
     limit: int = Query(20, ge=1, le=100),
-    offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+    offset: Annotated[int, Query(ge=0, le=_MAX_OFFSET)] = 0,
 ) -> dict:
     db = None
     try:
@@ -99,8 +98,7 @@ def corpus_updates(
             items.append(item)
         return {
             'bill_id': str(bill_id), 'items': items,
-            'has_more': len(rows) > limit,
-            'next_offset': offset + limit if len(rows) > limit and offset + limit <= 10000 else None,
+            **_page_metadata(len(rows), limit, offset),
             'interpretation': 'Forward mutation evidence only. Each source is labeled; aggregator responses are not direct official-source observations. Absence of records does not prove a bill has never changed.',
         }
     except HTTPException:

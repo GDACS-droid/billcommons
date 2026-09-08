@@ -259,3 +259,14 @@ responses, including German locale, deferred/info-only reporting, optional
 source failure, core report failure, filters and both bill evidence links.
 A stale browser assertion expected text without the new “Includes” prefix;
 inspection confirmed the intended text and the corrected assertion passed.
+
+### Evidence pagination contract
+
+The observations, reconciliations, corpus-updates and derived-updates endpoints
+accept offsets through 10,000 and return at most 100 items. `has_more` means
+`next_offset` is a fetchable continuation under the same filters and limit.
+If additional records exist beyond the allowed offset, the response instead
+sets `has_more: false`, `next_offset: null`, and `pagination_limited: true`.
+Clients must disclose that limit rather than interpret the page as a complete
+history. `pagination_limited: false` means the current page was not stopped by
+that offset cap; it does not establish historical evidence completeness.
