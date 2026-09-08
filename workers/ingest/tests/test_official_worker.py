@@ -2,6 +2,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
@@ -40,6 +41,26 @@ def test_registration_refuses_changed_reviewed_scope(db_session):
     seed_ca_targets(db_session)
     target = db_session.scalars(select(OfficialSourceTarget)).first()
     target.scope = {"day": "Mon", "sessions": ["20992000"]}
+    db_session.flush()
+    with pytest.raises(ValueError, match="differs from reviewed scope"):
+        seed_ca_targets(db_session, enable=True)
+
+
+def test_registration_preserves_valid_observation_continuation(db_session):
+    from billcommons_ingest.official_ca_actions import ADAPTER_VERSION
+
+    db_session.add(Jurisdiction(abbreviation="CA", name="California", classification="state"))
+    db_session.flush()
+    seed_ca_targets(db_session)
+    target = db_session.scalars(select(OfficialSourceTarget)).first()
+    cursor = {"observation_id": str(uuid4()), "raw_sha256": "a" * 64,
+              "next_bill_index": 500, "adapter_version": ADAPTER_VERSION}
+    target.scope = {**target.scope, "continuation": cursor}
+    db_session.flush()
+    assert seed_ca_targets(db_session, enable=True) == 7
+    assert target.scope["continuation"] == cursor
+    assert target.enabled is True
+    target.scope = {**target.scope, "continuation": None}
     db_session.flush()
     with pytest.raises(ValueError, match="differs from reviewed scope"):
         seed_ca_targets(db_session, enable=True)

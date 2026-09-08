@@ -28,13 +28,13 @@ semantic freshness or completeness.
 
 - Owner: Codex executing Alberto's authorized session. No new approval is needed
   for the scoped deployment. Stop at a failed required check or unsafe cutover.
-- First-stage source: `1a2277cb97f4fdf0219d8e5ce0c5d492340e5e40` in
+- First-stage source: `5f47ad2946c2073ffd61e1c15c7934e165a64d06` in
   `billcommons-control-plane-fixed-20260908`. Initial rollout is API plus dedicated
   sync worker; no new schema or official worker in that stage. Web follows its
   applicable checks.
-- First-stage aggregate review: `f8ea48c`, exact binary diff from baseline
+- First-stage aggregate review: `ff83068`, exact binary diff from baseline
   `26e99e2` checked against the release source. Canonical nine-family run:
-  `/home/alberto/verify-runs/20260908T023417Z-f8ea48c` (pending).
+  `/home/alberto/verify-runs/20260908T025146Z-ff83068` (pending).
 - Earlier reviews found real case-normalization, undated-run ordering,
   quota-delayed queue age, canonical-inventory, bounded-query, cache and test
   routing defects. These are repaired and have focused regression coverage.

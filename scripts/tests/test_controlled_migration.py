@@ -206,7 +206,7 @@ def test_target_specific_acknowledgement_rejects_wrong_revision_before_alembic()
         )
 
 
-@pytest.mark.parametrize("revision", ["0026", "0027", "0028"])
+@pytest.mark.parametrize("revision", ["0026", "0027", "0028", "0029", "0030"])
 def test_upgrade_uses_explicit_pinned_revision_and_checks_matching_post_revision(revision: str):
     calls: list[dict] = []
 

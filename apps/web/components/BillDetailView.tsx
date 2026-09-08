@@ -2,7 +2,7 @@ import Link from "next/link";
 import DataUnavailable from "@/components/DataUnavailable";
 import JsonLd from "@/components/JsonLd";
 import { BillStatusBadge } from "@/components/StatusBadge";
-import { SITE_URL } from "@/lib/config";
+import { API_BASE, SITE_URL } from "@/lib/config";
 import type { BillPageData } from "@/lib/bill";
 
 // Upstream relation vocabulary, rendered as something a reader understands.
@@ -398,6 +398,15 @@ export default function BillDetailView({
           {bill.source_name ? `Data from ${bill.source_name}` : "Source not provided."}
           {bill.retrieved_at ? `, retrieved ${bill.retrieved_at}` : ""}
         </p>
+        <p className="mt-3 text-sm text-slate-600">
+          Inspect retained evidence for changes recorded after evidence tracking began:
+        </p>
+        <div className="mt-2 flex flex-wrap gap-x-5 gap-y-2 text-sm">
+          <a href={new URL(`/api/v1/corpus-updates?bill_id=${encodeURIComponent(id)}`, API_BASE).toString()}
+            className="text-slate-700 underline hover:text-slate-900">Source and document changes</a>
+          <a href={new URL(`/api/v1/corpus-updates/derived?bill_id=${encodeURIComponent(id)}`, API_BASE).toString()}
+            className="text-slate-700 underline hover:text-slate-900">Status and relationship changes</a>
+        </div>
       </Section>
 
       <Section title="Use this data">

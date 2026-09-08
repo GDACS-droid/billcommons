@@ -61,6 +61,8 @@ def seed_ca_targets(db, *, enable: bool = False) -> int:
     validated, never silently replaced. Enabling requires the caller's explicit
     switch, and the existing next-check/backoff state survives another seed.
     """
+    from billcommons_ingest.official_observer import _target_day
+
     jurisdiction = db.execute(select(Jurisdiction).where(
         Jurisdiction.abbreviation == "CA")).scalar_one_or_none()
     if jurisdiction is None:
@@ -77,7 +79,14 @@ def seed_ca_targets(db, *, enable: bool = False) -> int:
             OfficialSourceTarget.adapter_name == "ca_official_actions",
             OfficialSourceTarget.source_url == url,
         ).with_for_update()).scalar_one()
-        if target.jurisdiction_id != jurisdiction.id or target.scope != scope:
+        try:
+            valid_scope = _target_day(target, jurisdiction) == day
+        except ValueError:
+            valid_scope = False
+        # The continuation is operational state owned by the observer, not a
+        # change to the reviewed day/session policy. Validate and preserve it
+        # so repeating registration during a resumed archive remains safe.
+        if target.jurisdiction_id != jurisdiction.id or not valid_scope:
             raise ValueError("existing California target differs from reviewed scope")
         if enable:
             target.enabled = True
