@@ -21,7 +21,7 @@ from billcommons_shared.safe_http import SafeHttpError, SsrfRejected, new_safe_h
 from billcommons_shared.scout import (
     BrowserCapture, BrowserRequest, ResearchBrowserProvider, ScoutPolicyError,
     ScoutSettings, browser_required, canonicalize_url, classify_direct_response,
-    content_hash, discover_florida_senate_related_documents,
+    content_hash, discover_florida_senate_related_documents, discover_florida_senate_vote_records,
     extract_florida_bill_identifier, summarize_content_change,
     is_pdf_attachment_payload, topical_search_terms,
 )
@@ -87,6 +87,16 @@ def describe_related_document(
     similarly named official attachments.
     """
     display_text = _SPACE_RE.sub(" ", text).strip()
+    if artifact_type == "vote record":
+        # The URL establishes only a one-hop official vote-record attachment.
+        # Do not transform its path, the parent page, or a later PDF header
+        # into a chamber, tally, member-vote, or corpus-action assertion.
+        return RelatedDocumentDescription(
+            title=f"{identifier}: official vote record",
+            what_happened=f"Official vote record retrieved for {identifier}.",
+            relevant_date=None,
+            confidence="medium",
+        )
     # A chamber name mentioned deep in the document can be a quotation or a
     # cross-reference. Restrict attribution to the document header area.
     header_text = display_text[:1_000]
@@ -697,6 +707,9 @@ class ScoutRunner:
             if job is None or self._canceled(db, job, cancel_version, token):
                 return 0, 0, False
             maximum = self._job_limit(job, "max_related_documents", self.settings.max_related_documents)
+            vote_maximum = min(1, self._job_limit(
+                job, "max_related_vote_records", self.settings.max_related_vote_records,
+            ))
             max_direct_bytes = self._job_limit(job, "max_direct_bytes", self.settings.max_direct_bytes)
         related = discover_florida_senate_related_documents(
             parent_url, parent_body, maximum=maximum, max_html_bytes=max_direct_bytes
@@ -707,9 +720,21 @@ class ScoutRunner:
                     db.add(ScoutJobEvent(job_id=job_id, kind="related_sources_discovered", detail={"count": len(related)}))
                     db.commit()
 
+        # This is a separate lane rather than another item in the ordinary
+        # document cap. Existing jobs retain their analysis/amendment budget;
+        # one deterministic vote record follows only after that lane.
+        vote_records = discover_florida_senate_vote_records(
+            parent_url, parent_body, maximum=vote_maximum, max_html_bytes=max_direct_bytes
+        )
+        if vote_records:
+            with self.sessions() as db:
+                if self._fenced(db, job_id, token) is not None:
+                    db.add(ScoutJobEvent(job_id=job_id, kind="vote_records_discovered", detail={"count": len(vote_records)}))
+                    db.commit()
+
         successes = 0
         failures = 0
-        for document in related:
+        for document in (*related, *vote_records):
             if document.canonical_url in seen_urls:
                 continue
             seen_urls.add(document.canonical_url)
@@ -928,7 +953,7 @@ class ScoutRunner:
                     exact_raw_ref = None
             mime_base = (mime or "").split(";", 1)[0].lower()
             related_artifact_type = metadata.get("related_artifact_type")
-            if related_artifact_type not in {"committee analysis", "amendment"}:
+            if related_artifact_type not in {"committee analysis", "amendment", "vote record"}:
                 related_artifact_type = None
             evidence: tuple[str, int, int] | None = None
             related_description: RelatedDocumentDescription | None = None

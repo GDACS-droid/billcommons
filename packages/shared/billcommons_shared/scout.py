@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Callable, Literal, Protocol
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 from billcommons_shared.safe_http import SsrfRejected, admit_url
 
@@ -64,9 +64,11 @@ _FLORIDA_SENATE_BILL_PATH = re.compile(
 )
 _FLORIDA_SENATE_RELATED_PATH = re.compile(
     r"^/Session/Bill/(?P<session>\d{4})/(?P<bill>\d{1,6})/"
-    r"(?P<kind>Analyses|Amendment)/(?P<document>[A-Za-z0-9._-]+)(?:/PDF)?$",
+    r"(?:(?P<kind>Analyses|Amendment)/(?P<document>(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+)(?:/PDF)?"
+    r"|Vote/(?P<vote_document>(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+\.PDF))$",
     re.I,
 )
+_INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 class _HrefParser(HTMLParser):
@@ -90,7 +92,7 @@ class FloridaRelatedDocument:
     """A safe, bill-scoped primary document discovered on a Senate bill page."""
 
     canonical_url: str
-    artifact_type: Literal["committee analysis", "amendment"]
+    artifact_type: Literal["committee analysis", "amendment", "vote record"]
 
 
 class ScoutPolicyError(ValueError):
@@ -112,6 +114,9 @@ class ScoutSettings:
     # A primary bill page can surface many attachments. Scout P0 inspects a
     # small, useful subset rather than turning one bill request into a crawl.
     max_related_documents: int = 2
+    # A vote record is independently capped so one rich bill page cannot use
+    # its document allowance to crowd out every action-level primary source.
+    max_related_vote_records: int = 1
     max_retries: int = 1
     cache_ttl_seconds: int = 3600
     max_pdf_pages: int = 20
@@ -356,6 +361,63 @@ def discover_florida_senate_related_documents(
     shared HTTPS/private-network policy, restricted to the same Senate host,
     and required to carry the exact session and bill number from the parent.
     """
+    return _discover_florida_senate_attachments(
+        bill_page_url,
+        body,
+        maximum=maximum,
+        max_html_bytes=max_html_bytes,
+        allowed_kinds=frozenset({"analyses", "amendment"}),
+    )
+
+
+def discover_florida_senate_vote_records(
+    bill_page_url: str,
+    body: bytes,
+    *,
+    maximum: int = 1,
+    max_html_bytes: int = 256 * 1024,
+) -> tuple[FloridaRelatedDocument, ...]:
+    """Find only bounded, bill-scoped Florida Senate vote-record PDFs.
+
+    This remains a deterministic one-hop link extractor. It deliberately does
+    not turn a vote page into a chamber, tally, member-vote, or corpus-action
+    claim; those facts must come from retained PDF content downstream.
+    """
+    return _discover_florida_senate_attachments(
+        bill_page_url,
+        body,
+        maximum=maximum,
+        max_html_bytes=max_html_bytes,
+        allowed_kinds=frozenset({"vote"}),
+    )
+
+
+def _safe_attachment_document(value: str) -> bool:
+    """Accept one canonical encoded path segment, never another path layer."""
+
+    try:
+        decoded = unquote(value, errors="strict")
+    except UnicodeDecodeError:
+        return False
+    # The matcher permits valid percent escapes for official filenames such as
+    # ``Conference%20Report``. Keep the decoded filename to the old ASCII
+    # filename alphabet plus a literal space: no decoded separator, query,
+    # fragment, control byte, or dot-segment can become a route layer.
+    return bool(decoded) and all(
+        character.isascii() and (character.isalnum() or character in " ._~-")
+        for character in decoded
+    ) and decoded not in {".", ".."}
+
+
+def _discover_florida_senate_attachments(
+    bill_page_url: str,
+    body: bytes,
+    *,
+    maximum: int,
+    max_html_bytes: int,
+    allowed_kinds: frozenset[str],
+) -> tuple[FloridaRelatedDocument, ...]:
+    """Extract one reviewed attachment category after URL admission."""
     if maximum <= 0 or max_html_bytes <= 0 or len(body) > max_html_bytes:
         return ()
     try:
@@ -387,8 +449,17 @@ def discover_florida_senate_related_documents(
     discovered: list[FloridaRelatedDocument] = []
     seen: set[tuple[str, str, str, str]] = set()
     for href in parser.hrefs:
+        raw_candidate = urljoin(parent, href)
+        # Invalid escapes must not become a different accepted filename after
+        # canonicalization renders the literal percent sign as ``%25``.
         try:
-            candidate = canonicalize_url(urljoin(parent, href))
+            raw_path = urlsplit(raw_candidate).path
+        except ValueError:
+            continue
+        if _INVALID_PERCENT_ESCAPE.search(raw_path):
+            continue
+        try:
+            candidate = canonicalize_url(raw_candidate)
         except ScoutPolicyError:
             continue
         candidate_parts = urlsplit(candidate)
@@ -409,31 +480,39 @@ def discover_florida_senate_related_documents(
         related_match = _FLORIDA_SENATE_RELATED_PATH.match(candidate_parts.path)
         if related_match is None:
             continue
+        kind = related_match.group("kind")
+        route_kind = kind.casefold() if kind is not None else "vote"
+        document = related_match.group("document") or related_match.group("vote_document")
         if (
-            related_match.group("session") != parent_session
+            route_kind not in allowed_kinds
+            or document is None
+            or not _safe_attachment_document(document)
+            or related_match.group("session") != parent_session
             or str(int(related_match.group("bill"))) != parent_bill
             or (
                 related_match.group("session"),
                 str(int(related_match.group("bill"))),
-                related_match.group("kind").casefold(),
-                related_match.group("document").casefold(),
+                route_kind,
+                document.casefold(),
             ) in seen
         ):
             continue
-        kind = related_match.group("kind").casefold()
-        artifact_type: Literal["committee analysis", "amendment"] = (
-            "committee analysis" if kind == "analyses" else "amendment"
+        artifact_type: Literal["committee analysis", "amendment", "vote record"] = (
+            "committee analysis" if route_kind == "analyses"
+            else "amendment" if route_kind == "amendment"
+            else "vote record"
         )
         discovered.append(FloridaRelatedDocument(candidate, artifact_type))
         seen.add((
             related_match.group("session"),
             str(int(related_match.group("bill"))),
-            related_match.group("kind").casefold(),
-            related_match.group("document").casefold(),
+            route_kind,
+            document.casefold(),
         ))
 
-    # Senate markup order is presentation, not an importance contract. Favor a
-    # staff/committee analysis, then an amendment, and keep ties stable by URL.
+    # Senate markup order is presentation, not an importance contract. Preserve
+    # the existing analysis-before-amendment lane and use URL order only within
+    # an independently selected attachment category.
     discovered.sort(key=lambda item: (item.artifact_type != "committee analysis", item.canonical_url))
     return tuple(discovered[:maximum])
 
