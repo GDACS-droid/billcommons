@@ -8,11 +8,20 @@ actions.  It never applies a reconciliation result to corpus records.
 which keeps the ``FOR UPDATE SKIP LOCKED`` claim, raw evidence, observation,
 reconciliation records, and retry schedule atomic.  A process crash therefore
 leaves the target due for another worker instead of stranding it as running.
+
+California archives can contain more bills than one transaction may compare.
+While that happens, the target's otherwise-reviewed ``scope`` carries one
+strictly validated ``continuation`` object.  It binds an observation, raw
+archive hash, parser version, and deterministic bill cursor; it is cleared
+only after every archived bill has a run.  This narrowly scoped state avoids a
+new schema table while ensuring continuation replays retained bytes rather
+than fetching a potentially changed archive.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -54,6 +63,9 @@ DB_STATEMENT_TIMEOUT_MS = 10_000
 DB_LOCK_TIMEOUT_MS = 5_000
 DB_IDLE_TRANSACTION_TIMEOUT_MS = 240_000
 UNKNOWN_ADAPTER_VERSION = "unknown"
+CONTINUATION_KEY = "continuation"
+_CONTINUATION_FIELDS = frozenset({"observation_id", "raw_sha256", "next_bill_index", "adapter_version"})
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class InvalidOfficialTarget(ValueError):
@@ -62,6 +74,21 @@ class InvalidOfficialTarget(ValueError):
 
 class ObservationDeadlineExceeded(RuntimeError):
     """One claimed target exceeded its bounded end-to-end observation window."""
+
+
+@dataclass(frozen=True)
+class _CaContinuation:
+    observation_id: uuid.UUID
+    raw_sha256: str
+    next_bill_index: int
+    adapter_version: str
+
+
+@dataclass(frozen=True)
+class _ReconciliationProgress:
+    next_bill_index: int
+    run_count: int
+    deadline_reached: bool = False
 
 
 @dataclass(frozen=True)
@@ -148,8 +175,10 @@ def _target_day(target: OfficialSourceTarget, jurisdiction: Jurisdiction | None)
         raise InvalidOfficialTarget("target jurisdiction is not California")
     if target.adapter_name != ADAPTER_NAME:
         raise InvalidOfficialTarget("target adapter is not the CA action adapter")
-    if not isinstance(target.scope, Mapping) or set(target.scope) != {"day", "sessions"}:
+    if not isinstance(target.scope, Mapping) or set(target.scope) - {"day", "sessions", CONTINUATION_KEY}:
         raise InvalidOfficialTarget("target scope is not the reviewed CA delta scope")
+    if CONTINUATION_KEY in target.scope:
+        _continuation_from_scope(target.scope)
     day = target.scope.get("day")
     sessions = target.scope.get("sessions")
     if not isinstance(day, str) or not isinstance(sessions, list) or not all(isinstance(item, str) for item in sessions):
@@ -163,6 +192,53 @@ def _target_day(target: OfficialSourceTarget, jurisdiction: Jurisdiction | None)
     if target.source_url != expected_url:
         raise InvalidOfficialTarget("target URL is not the reviewed CA delta URL")
     return day
+
+
+def _continuation_from_scope(scope: Mapping[str, Any]) -> _CaContinuation | None:
+    """Validate the sole mutable field permitted alongside reviewed policy."""
+
+    raw = scope.get(CONTINUATION_KEY)
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping) or set(raw) != _CONTINUATION_FIELDS:
+        raise InvalidOfficialTarget("CA continuation state has an invalid shape")
+    observation_id, raw_sha256, next_bill_index, adapter_version = (
+        raw["observation_id"], raw["raw_sha256"], raw["next_bill_index"], raw["adapter_version"]
+    )
+    if (
+        not isinstance(observation_id, str)
+        or not isinstance(raw_sha256, str)
+        or _SHA256_RE.fullmatch(raw_sha256) is None
+        or not isinstance(next_bill_index, int)
+        or isinstance(next_bill_index, bool)
+        or next_bill_index < 0
+        or adapter_version != ca_actions.ADAPTER_VERSION
+    ):
+        raise InvalidOfficialTarget("CA continuation state has invalid values")
+    try:
+        parsed_id = uuid.UUID(observation_id)
+    except ValueError as exc:
+        raise InvalidOfficialTarget("CA continuation observation ID is invalid") from exc
+    return _CaContinuation(parsed_id, raw_sha256, next_bill_index, adapter_version)
+
+
+def _set_continuation(target: OfficialSourceTarget, observation: OfficialSourceObservation, raw_sha256: str, next_bill_index: int) -> None:
+    """Persist only an opaque replay cursor; policy fields remain unchanged."""
+
+    target.scope = {
+        "day": target.scope["day"],
+        "sessions": list(target.scope["sessions"]),
+        CONTINUATION_KEY: {
+            "observation_id": str(observation.id),
+            "raw_sha256": raw_sha256,
+            "next_bill_index": next_bill_index,
+            "adapter_version": ca_actions.ADAPTER_VERSION,
+        },
+    }
+
+
+def _clear_continuation(target: OfficialSourceTarget) -> None:
+    target.scope = {"day": target.scope["day"], "sessions": list(target.scope["sessions"])}
 
 
 def store_official_raw_blob(db: OrmSession, data: bytes, content_type: str) -> str:
@@ -341,30 +417,6 @@ def _add_partial_run(db: OrmSession, observation: OfficialSourceObservation, off
     )
 
 
-def _add_remaining_partial_run(
-    db: OrmSession,
-    observation: OfficialSourceObservation,
-    now: datetime,
-    *,
-    reason: str,
-    remaining_official_bills: int,
-) -> None:
-    """Record a bounded, explicit account of unprocessed bill comparisons."""
-
-    db.add(
-        OfficialReconciliationRun(
-            observation_id=observation.id,
-            bill_id=None,
-            official_bill_id="__remaining_unreconciled_ca_bills__",
-            local_snapshot_at=now,
-            comparator_version=COMPARATOR_VERSION,
-            status="partial",
-            summary={"reason": reason, "remaining_official_bills": remaining_official_bills},
-            error_class=None,
-        )
-    )
-
-
 def _reconcile_batch(
     db: OrmSession,
     *,
@@ -373,32 +425,22 @@ def _reconcile_batch(
     batch,
     now: datetime,
     started_at: float,
-) -> int:
+    start_bill_index: int = 0,
+) -> _ReconciliationProgress:
     run_count = 0
     scoped_bill_ids = batch.scoped_bill_ids
-    for index, official_bill_id in enumerate(scoped_bill_ids):
-        if index >= MAX_RECONCILIATIONS_PER_OBSERVATION:
-            _add_remaining_partial_run(
-                db,
-                observation,
-                now,
-                reason="comparison_cap_exceeded",
-                remaining_official_bills=len(scoped_bill_ids) - index,
-            )
-            run_count += 1
-            break
+    if tuple(scoped_bill_ids) != tuple(sorted(scoped_bill_ids)):
+        raise ValueError("CA parser did not return deterministic official bill ordering")
+    if not 0 <= start_bill_index <= len(scoped_bill_ids):
+        raise ValueError("CA continuation cursor is outside the parsed archive")
+    stop_bill_index = min(start_bill_index + MAX_RECONCILIATIONS_PER_OBSERVATION, len(scoped_bill_ids))
+    for index in range(start_bill_index, stop_bill_index):
+        official_bill_id = scoped_bill_ids[index]
         try:
             _require_deadline(started_at)
         except ObservationDeadlineExceeded:
-            _add_remaining_partial_run(
-                db,
-                observation,
-                now,
-                reason="observation_deadline_exceeded",
-                remaining_official_bills=len(scoped_bill_ids) - index,
-            )
-            run_count += 1
-            break
+            db.flush()
+            return _ReconciliationProgress(index, run_count, deadline_reached=True)
         run_count += 1
         try:
             mapping = ca_actions.map_official_bill_id(official_bill_id)
@@ -440,7 +482,105 @@ def _reconcile_batch(
                 )
             )
     db.flush()
-    return run_count
+    return _ReconciliationProgress(stop_bill_index, run_count)
+
+
+def _finish_or_continue_ca_observation(
+    target: OfficialSourceTarget,
+    observation: OfficialSourceObservation,
+    raw_sha256: str,
+    progress: _ReconciliationProgress,
+    total_bills: int,
+    observed_at: datetime,
+) -> str:
+    """Advance the cursor atomically with its page's reconciliation writes."""
+
+    if progress.next_bill_index < total_bills:
+        _set_continuation(target, observation, raw_sha256, progress.next_bill_index)
+        # A page limit is not a successful cadence completion. Resume without
+        # refetching the immutable archive; transient transaction errors still
+        # roll the cursor back with this page.
+        if progress.deadline_reached:
+            # The cursor is durable but the local work budget was exhausted;
+            # avoid a hot loop while retaining the exact replay point.
+            _schedule_failure(target, observed_at)
+        else:
+            target.next_check_at = observed_at
+            target.consecutive_failures = 0
+        return "continuing"
+    _clear_continuation(target)
+    _schedule_success(target, observed_at)
+    return "succeeded"
+
+
+def _resume_ca_continuation(
+    db: OrmSession,
+    *,
+    target: OfficialSourceTarget,
+    continuation: _CaContinuation,
+    observed_at: datetime,
+    started_at: float,
+) -> OfficialObservationResult:
+    """Replay retained bytes from a durable cursor without an upstream request."""
+
+    observation = db.get(OfficialSourceObservation, continuation.observation_id)
+    raw_blob = db.get(OfficialRawBlob, continuation.raw_sha256)
+    try:
+        if (
+            observation is None
+            or observation.target_id != target.id
+            or observation.status != "succeeded"
+            or observation.adapter_name != ADAPTER_NAME
+            or observation.adapter_version != continuation.adapter_version
+            or observation.source_url != target.source_url
+            or observation.raw_sha256 != continuation.raw_sha256
+            or raw_blob is None
+            or hashlib.sha256(raw_blob.data).hexdigest() != continuation.raw_sha256
+        ):
+            raise InvalidOfficialTarget("CA continuation evidence does not bind to its target")
+        _require_deadline(started_at)
+        batch = ca_actions.parse_ca_official_actions_zip(
+            raw_blob.data,
+            source_url=target.source_url,
+            retrieved_at=observation.retrieved_at,
+            upstream_modified=None,
+        )
+        if batch.sha256 != continuation.raw_sha256 or batch.adapter_version != continuation.adapter_version:
+            raise InvalidOfficialTarget("CA continuation parser identity differs from retained evidence")
+        progress = _reconcile_batch(
+            db,
+            target=target,
+            observation=observation,
+            batch=batch,
+            now=observed_at,
+            started_at=started_at,
+            start_bill_index=continuation.next_bill_index,
+        )
+    except (InvalidOfficialTarget, ValueError, TypeError, ca_actions.OfficialCaActionsError, ObservationDeadlineExceeded) as exc:
+        # Preserve the cursor and retained archive for a bounded retry. This
+        # separate observation records why the original source is not yet
+        # fully reconciled without changing its immutable evidence.
+        failure = _add_observation(
+            db,
+            target=target,
+            scope=_observation_scope(target),
+            retrieved_at=observed_at,
+            status="failed",
+            raw_sha256=continuation.raw_sha256 if raw_blob is not None else None,
+            error_class=_safe_error_class(exc),
+        )
+        _schedule_failure(target, observed_at)
+        return OfficialObservationResult(target.id, failure.status, None, 0)
+
+    status = _finish_or_continue_ca_observation(
+        target,
+        observation,
+        continuation.raw_sha256,
+        progress,
+        len(batch.scoped_bill_ids),
+        observed_at,
+    )
+    return OfficialObservationResult(target.id, status, observation.record_count, progress.run_count)
 
 
 def _observe_discovery_target(db, target, jurisdiction, observed_at) -> OfficialObservationResult:
@@ -548,6 +688,16 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
         _schedule_failure(target, observed_at)
         return OfficialObservationResult(target.id, observation.status, None, 0)
 
+    continuation = _continuation_from_scope(target.scope)
+    if continuation is not None:
+        return _resume_ca_continuation(
+            db,
+            target=target,
+            continuation=continuation,
+            observed_at=observed_at,
+            started_at=started_at,
+        )
+
     try:
         captured = _capture_ca_response(day)
     except Exception as exc:
@@ -623,7 +773,7 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
         upstream_updated_at=_upstream_updated_at(parsed.upstream_modified),
         record_count=parsed.event_count,
     )
-    reconciliation_count = _reconcile_batch(
+    progress = _reconcile_batch(
         db,
         target=target,
         observation=observation,
@@ -631,5 +781,12 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
         now=observed_at,
         started_at=started_at,
     )
-    _schedule_success(target, observed_at)
-    return OfficialObservationResult(target.id, observation.status, parsed.event_count, reconciliation_count)
+    status = _finish_or_continue_ca_observation(
+        target,
+        observation,
+        raw_sha256,
+        progress,
+        len(parsed.scoped_bill_ids),
+        observed_at,
+    )
+    return OfficialObservationResult(target.id, status, parsed.event_count, progress.run_count)

@@ -54,6 +54,23 @@ def _archive(*, official_bill_id: str = "202520260AB12", history_id: str = "101"
     return out.getvalue()
 
 
+def _archive_many(count: int) -> bytes:
+    bills = []
+    history = []
+    for number in range(1, count + 1):
+        bill_id = f"202520260AB{number}"
+        bills.append([bill_id, "20252026", "0", "AB", str(number)] + [""] * 14)
+        history.append([
+            bill_id, str(number), "2026-09-01 00:00:00", "Read first time.", "src",
+            "2026-09-01 12:00:00", "1", "x", "x", "x", "x", "x", "x",
+        ])
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("BILL_TBL.dat", _tsv(bills))
+        archive.writestr("BILL_HISTORY_TBL.dat", _tsv(history))
+    return out.getvalue()
+
+
 def _captured(raw: bytes):
     return ca_actions.CapturedCaOfficialActionsResponse(
         source_url=ca_actions.ca_delta_url("Mon"),
@@ -360,7 +377,7 @@ def test_unknown_adapter_identity_is_preserved_on_invalid_target(db_session, uni
 
 
 def test_storage_failure_propagates_so_the_claim_can_roll_back(db_session, unique_abbr, monkeypatch):
-    _, _ = _target(db_session, unique_abbr)
+    _, target = _target(db_session, unique_abbr)
     raw = _archive()
     monkeypatch.setattr(observer, "_capture_ca_response", lambda day: _captured(raw))
 
@@ -372,11 +389,11 @@ def test_storage_failure_propagates_so_the_claim_can_roll_back(db_session, uniqu
         observer.observe_due_target(db_session, now=NOW)
 
 
-def test_comparison_cap_records_one_explicit_partial_remainder(db_session, unique_abbr, monkeypatch):
+def test_comparison_cap_records_durable_continuation(db_session, unique_abbr, monkeypatch):
     _, _ = _target(db_session, unique_abbr)
     raw = b"x"
     captured = _captured(raw)
-    bill_ids = tuple(f"202520260AB{number}" for number in range(1, observer.MAX_RECONCILIATIONS_PER_OBSERVATION + 2))
+    bill_ids = tuple(sorted(f"202520260AB{number}" for number in range(1, observer.MAX_RECONCILIATIONS_PER_OBSERVATION + 2)))
     batch = SimpleNamespace(
         source_url=captured.source_url,
         raw_bytes=raw,
@@ -393,12 +410,13 @@ def test_comparison_cap_records_one_explicit_partial_remainder(db_session, uniqu
     result = observer.observe_due_target(db_session, now=NOW)
     db_session.flush()
 
-    assert result and result.reconciliation_count == observer.MAX_RECONCILIATIONS_PER_OBSERVATION + 1
+    assert result and result.status == "continuing"
+    assert result.reconciliation_count == observer.MAX_RECONCILIATIONS_PER_OBSERVATION
     runs = list(db_session.execute(select(OfficialReconciliationRun).order_by(OfficialReconciliationRun.official_bill_id)).scalars())
-    assert len(runs) == observer.MAX_RECONCILIATIONS_PER_OBSERVATION + 1
-    remainder = next(run for run in runs if run.official_bill_id == "__remaining_unreconciled_ca_bills__")
-    assert remainder.status == "partial"
-    assert remainder.summary == {"reason": "comparison_cap_exceeded", "remaining_official_bills": 1}
+    assert len(runs) == observer.MAX_RECONCILIATIONS_PER_OBSERVATION
+    target_scope = db_session.execute(select(OfficialSourceTarget.scope)).scalar_one()
+    assert target_scope
+    assert target_scope["continuation"]["next_bill_index"] == observer.MAX_RECONCILIATIONS_PER_OBSERVATION
 
 
 def test_non_ca_local_action_is_retained_as_unpaired_snapshot_evidence(db_session, unique_abbr, monkeypatch):
@@ -428,8 +446,8 @@ def test_non_ca_local_action_is_retained_as_unpaired_snapshot_evidence(db_sessio
     assert report["summary"]["ambiguous_identities"] == 1
 
 
-def test_total_deadline_stops_before_the_next_bill_and_records_remainder(db_session, unique_abbr, monkeypatch):
-    _, _ = _target(db_session, unique_abbr)
+def test_total_deadline_preserves_a_durable_continuation_cursor(db_session, unique_abbr, monkeypatch):
+    _, target = _target(db_session, unique_abbr)
     raw = b"x"
     captured = _captured(raw)
     bill_id = "202520260AB1"
@@ -451,7 +469,125 @@ def test_total_deadline_stops_before_the_next_bill_and_records_remainder(db_sess
     result = observer.observe_due_target(db_session, now=NOW)
     db_session.flush()
 
-    assert result and result.status == "succeeded" and result.reconciliation_count == 1
-    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
-    assert run.status == "partial"
-    assert run.summary == {"reason": "observation_deadline_exceeded", "remaining_official_bills": 1}
+    assert result and result.status == "continuing" and result.reconciliation_count == 0
+    assert db_session.execute(select(func.count()).select_from(OfficialReconciliationRun)).scalar_one() == 0
+    assert db_session.execute(select(OfficialSourceTarget.scope)).scalar_one()["continuation"]["next_bill_index"] == 0
+    assert target.consecutive_failures == 1
+    assert target.next_check_at == NOW + timedelta(seconds=300)
+
+
+def test_continuation_replays_exact_archive_after_rollback_without_refetching(monkeypatch):
+    """A committed cursor resumes each official bill exactly once after rollback."""
+
+    engine = get_engine()
+    seed = Session(engine, autoflush=False)
+    try:
+        jurisdiction = Jurisdiction(name="Continuation California", abbreviation="CA", classification="state")
+        seed.add(jurisdiction)
+        seed.flush()
+        target = OfficialSourceTarget(
+            jurisdiction_id=jurisdiction.id,
+            adapter_name=observer.ADAPTER_NAME,
+            source_url=ca_actions.ca_delta_url("Mon"),
+            scope={"day": "Mon", "sessions": ["20252026 regular", "special1"]},
+            enabled=True,
+            cadence_seconds=300,
+            next_check_at=NOW,
+        )
+        seed.add(target)
+        session = SessionModel(jurisdiction_id=jurisdiction.id, identifier=ca_actions.REGULAR_SESSION_IDENTIFIER)
+        seed.add(session)
+        seed.flush()
+        bill = Bill(
+            jurisdiction_id=jurisdiction.id,
+            session_id=session.id,
+            identifier="AB 1",
+            identifier_norm=normalize_bill_number("AB 1"),
+            title="Cursor proof bill",
+        )
+        seed.add(bill)
+        seed.flush()
+        seed.add(BillAction(
+            bill_id=bill.id,
+            description="Read first time.",
+            action_date=NOW.date() - timedelta(days=6),
+            upstream_id="ca-history:1",
+        ))
+        seed.commit()
+        target_id, jurisdiction_id, session_id, bill_id = target.id, jurisdiction.id, session.id, bill.id
+    finally:
+        seed.close()
+
+    raw = _archive_many(observer.MAX_RECONCILIATIONS_PER_OBSERVATION + 1)
+    fetches: list[str] = []
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: (fetches.append(day), _captured(raw))[1])
+    original_partial = observer._add_partial_run
+    try:
+        first = Session(engine, autoflush=False)
+        try:
+            result = observer.observe_due_target(first, now=NOW)
+            assert result and result.status == "continuing"
+            first.commit()
+        finally:
+            first.close()
+
+        check = Session(engine, autoflush=False)
+        try:
+            stored_target = check.get(OfficialSourceTarget, target_id)
+            source_observation = check.execute(select(OfficialSourceObservation)).scalar_one()
+            assert stored_target.scope["continuation"]["next_bill_index"] == observer.MAX_RECONCILIATIONS_PER_OBSERVATION
+            assert stored_target.scope["continuation"]["raw_sha256"] == source_observation.raw_sha256
+            assert check.get(OfficialRawBlob, source_observation.raw_sha256).data == raw
+        finally:
+            check.close()
+
+        monkeypatch.setattr(observer, "_add_partial_run", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("injected rollback")))
+        failed = Session(engine, autoflush=False)
+        try:
+            with pytest.raises(RuntimeError, match="injected rollback"):
+                observer.observe_due_target(failed, now=NOW + timedelta(seconds=1))
+            failed.rollback()
+        finally:
+            failed.close()
+        monkeypatch.setattr(observer, "_add_partial_run", original_partial)
+
+        retry = Session(engine, autoflush=False)
+        try:
+            stored_target = retry.get(OfficialSourceTarget, target_id)
+            assert stored_target.scope["continuation"]["next_bill_index"] == observer.MAX_RECONCILIATIONS_PER_OBSERVATION
+            result = observer.observe_due_target(retry, now=NOW + timedelta(seconds=2))
+            assert result and result.status == "succeeded" and result.reconciliation_count == 1
+            retry.commit()
+        finally:
+            retry.close()
+
+        verify = Session(engine, autoflush=False)
+        try:
+            target_after = verify.get(OfficialSourceTarget, target_id)
+            runs = list(verify.execute(select(OfficialReconciliationRun)).scalars())
+            assert "continuation" not in target_after.scope
+            assert len(runs) == observer.MAX_RECONCILIATIONS_PER_OBSERVATION + 1
+            assert {run.official_bill_id for run in runs} == {
+                f"202520260AB{number}" for number in range(1, observer.MAX_RECONCILIATIONS_PER_OBSERVATION + 2)
+            }
+            completed = next(run for run in runs if run.official_bill_id == "202520260AB1")
+            assert completed.status == "completed"
+            assert completed.local_snapshot_sha256 and completed.diff_sha256
+            assert verify.get(OfficialRawBlob, completed.local_snapshot_sha256)
+            assert verify.get(OfficialRawBlob, completed.diff_sha256)
+            assert fetches == ["Mon"]
+        finally:
+            verify.close()
+    finally:
+        cleanup = Session(engine, autoflush=False)
+        try:
+            cleanup.execute(delete(OfficialReconciliationRun).where(OfficialReconciliationRun.observation_id.in_(select(OfficialSourceObservation.id).where(OfficialSourceObservation.target_id == target_id))))
+            cleanup.execute(delete(OfficialSourceObservation).where(OfficialSourceObservation.target_id == target_id))
+            cleanup.execute(delete(BillAction).where(BillAction.bill_id == bill_id))
+            cleanup.execute(delete(Bill).where(Bill.id == bill_id))
+            cleanup.execute(delete(SessionModel).where(SessionModel.id == session_id))
+            cleanup.execute(delete(OfficialSourceTarget).where(OfficialSourceTarget.id == target_id))
+            cleanup.execute(delete(Jurisdiction).where(Jurisdiction.id == jurisdiction_id))
+            cleanup.commit()
+        finally:
+            cleanup.close()
