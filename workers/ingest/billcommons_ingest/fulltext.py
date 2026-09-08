@@ -1126,8 +1126,8 @@ def persist_extraction_outcome(
                     "retrieved_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
-        except OSError as exc:  # e.g. ENOSPC — never fail extraction over archival
-            print(f"fulltext: raw archival skipped for {document.id}: {exc}", flush=True)
+        except OSError as exc:  # e.g. ENOSPC in the optional filesystem cache
+            print(f"fulltext: raw archival skipped for {document.id} ({type(exc).__name__})", flush=True)
 
     before_snapshot = document_update_evidence.snapshot_document(document)
     retrieved_at = datetime.now(timezone.utc)

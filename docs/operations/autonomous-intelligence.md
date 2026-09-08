@@ -175,3 +175,20 @@ repaired; the current exact aggregate is `c3ec3c5`. It has 89 worker/shared and
 info-only filtering and six intercepted malformed checkout responses. None
 created a payment, navigated, or emitted redirect success. Current review is
 pending; no production artifact has changed.
+
+### Live scope check — 2026-09-08 03:19 UTC
+
+Arizona now honors its reviewed, exact-source 120-second robots cadence. Its
+live probe waited 120.000 seconds, retained robots/page bytes and 25 links;
+root recomputed both hashes. Generic landing-page success is now 44/51.
+The remaining seven are CA/TN robots disallow, HI/NY robots denial, IN
+JavaScript rendering, DE robots redirect review, and MT timeout/backoff.
+These results do not establish statewide semantic completeness.
+
+The live corpus has zero dead fetch jobs retaining either exact missing-issuer
+TLS marker, and zero eligible documents for the narrow TLS repair. It is a
+capability for evidence-matched repairs, not a claim of recovered production
+text. Before deployment, read-only inventory still found revision `0025`,
+1,131 done API-sync jobs and no eligible/running API-sync jobs. The crawl
+worker continues processing document work; its safe cutover boundary is under
+separate release review.
