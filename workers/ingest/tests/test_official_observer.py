@@ -11,8 +11,10 @@ import io
 import json
 import zipfile
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
-from sqlalchemy import delete, func, select
+import pytest
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
 from billcommons_ingest import official_ca_actions as ca_actions
@@ -62,13 +64,13 @@ def _captured(raw: bytes):
     )
 
 
-def _target(db_session, unique_abbr, *, due: datetime = NOW, scope=None, source_url=None):
+def _target(db_session, unique_abbr, *, due: datetime = NOW, scope=None, source_url=None, adapter_name=observer.ADAPTER_NAME):
     jurisdiction = Jurisdiction(name="Test California", abbreviation=unique_abbr("ZZ_CA"), classification="state")
     db_session.add(jurisdiction)
     db_session.flush()
     target = OfficialSourceTarget(
         jurisdiction_id=jurisdiction.id,
-        adapter_name=observer.ADAPTER_NAME,
+        adapter_name=adapter_name,
         source_url=source_url or ca_actions.ca_delta_url("Mon"),
         scope=scope if scope is not None else {"day": "Mon", "sessions": ["special1", "20252026 regular"]},
         enabled=True,
@@ -142,11 +144,15 @@ def test_success_records_verified_raw_replayable_diff_and_never_mutates_actions(
     assert run.local_snapshot_sha256 and run.diff_sha256
     report = json.loads(db_session.get(OfficialRawBlob, run.diff_sha256).data)
     assert report["summary"]["matched"] == 1
-    assert report["summary"]["local_records"] == 1
+    assert report["summary"]["local_records"] == 2
+    assert report["summary"]["ambiguous_identities"] == 1
     assert db_session.get(BillAction, local.id).description == "Read first time."
     assert db_session.get(BillAction, ignored.id).description == "Other source fact"
     assert target.consecutive_failures == 0
     assert target.next_check_at == NOW + timedelta(seconds=300)
+    assert db_session.scalar(text("SHOW statement_timeout")) == "10s"
+    assert db_session.scalar(text("SHOW lock_timeout")) == "5s"
+    assert db_session.scalar(text("SHOW idle_in_transaction_session_timeout")) in {"240s", "4min"}
 
 
 def test_malformed_archive_retains_raw_invalid_observation_and_backoff(db_session, unique_abbr, monkeypatch):
@@ -321,3 +327,131 @@ def test_explicit_ca_history_identity_reports_unpaired_events_without_guessing(d
     assert report["summary"]["matched"] == 0
     assert report["summary"]["missing_from_local"] == 1
     assert report["summary"]["local_only_not_deletion"] == 1
+
+
+def test_nested_scope_values_are_invalid_not_a_worker_crash(db_session, unique_abbr, monkeypatch):
+    _, _ = _target(
+        db_session,
+        unique_abbr,
+        scope={"day": "Mon", "sessions": [["20252026 regular"], "special1"]},
+    )
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: (_ for _ in ()).throw(AssertionError("must not fetch")))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "invalid"
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.adapter_name == observer.ADAPTER_NAME
+    assert observation.adapter_version == observer.UNKNOWN_ADAPTER_VERSION
+
+
+def test_unknown_adapter_identity_is_preserved_on_invalid_target(db_session, unique_abbr, monkeypatch):
+    _, _ = _target(db_session, unique_abbr, adapter_name="future-reviewed-adapter")
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: (_ for _ in ()).throw(AssertionError("must not fetch")))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "invalid"
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.adapter_name == "future-reviewed-adapter"
+    assert observation.adapter_version == observer.UNKNOWN_ADAPTER_VERSION
+
+
+def test_storage_failure_propagates_so_the_claim_can_roll_back(db_session, unique_abbr, monkeypatch):
+    _, _ = _target(db_session, unique_abbr)
+    raw = _archive()
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: _captured(raw))
+
+    def storage_outage(db, data, content_type):
+        raise RuntimeError("database storage unavailable")
+
+    monkeypatch.setattr(observer, "store_official_raw_blob", storage_outage)
+    with pytest.raises(RuntimeError, match="database storage unavailable"):
+        observer.observe_due_target(db_session, now=NOW)
+
+
+def test_comparison_cap_records_one_explicit_partial_remainder(db_session, unique_abbr, monkeypatch):
+    _, _ = _target(db_session, unique_abbr)
+    raw = b"x"
+    captured = _captured(raw)
+    bill_ids = tuple(f"202520260AB{number}" for number in range(1, observer.MAX_RECONCILIATIONS_PER_OBSERVATION + 2))
+    batch = SimpleNamespace(
+        source_url=captured.source_url,
+        raw_bytes=raw,
+        sha256=captured.sha256,
+        retrieved_at=NOW,
+        upstream_modified=None,
+        event_count=0,
+        scoped_bill_ids=bill_ids,
+        events_by_official_bill_id={},
+    )
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: captured)
+    monkeypatch.setattr(observer, "_parse_ca_response", lambda captured: batch)
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.reconciliation_count == observer.MAX_RECONCILIATIONS_PER_OBSERVATION + 1
+    runs = list(db_session.execute(select(OfficialReconciliationRun).order_by(OfficialReconciliationRun.official_bill_id)).scalars())
+    assert len(runs) == observer.MAX_RECONCILIATIONS_PER_OBSERVATION + 1
+    remainder = next(run for run in runs if run.official_bill_id == "__remaining_unreconciled_ca_bills__")
+    assert remainder.status == "partial"
+    assert remainder.summary == {"reason": "comparison_cap_exceeded", "remaining_official_bills": 1}
+
+
+def test_non_ca_local_action_is_retained_as_unpaired_snapshot_evidence(db_session, unique_abbr, monkeypatch):
+    jurisdiction, _ = _target(db_session, unique_abbr)
+    bill = _local_bill(db_session, jurisdiction)
+    unknown = BillAction(
+        bill_id=bill.id,
+        description="Unidentified local event",
+        action_date=NOW.date(),
+        source_name="legacy-import",
+        upstream_id="legacy:17",
+    )
+    db_session.add(unknown)
+    raw = _archive()
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: _captured(raw))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "succeeded"
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    fixture = json.loads(db_session.get(OfficialRawBlob, run.local_snapshot_sha256).data)
+    local_event = fixture["events"][0]
+    assert local_event["occurrence_id"] is None
+    assert local_event["local_record_id"] == str(unknown.id)
+    report = json.loads(db_session.get(OfficialRawBlob, run.diff_sha256).data)
+    assert report["summary"]["ambiguous_identities"] == 1
+
+
+def test_total_deadline_stops_before_the_next_bill_and_records_remainder(db_session, unique_abbr, monkeypatch):
+    _, _ = _target(db_session, unique_abbr)
+    raw = b"x"
+    captured = _captured(raw)
+    bill_id = "202520260AB1"
+    batch = SimpleNamespace(
+        source_url=captured.source_url,
+        raw_bytes=raw,
+        sha256=captured.sha256,
+        retrieved_at=NOW,
+        upstream_modified=None,
+        event_count=0,
+        scoped_bill_ids=(bill_id,),
+        events_by_official_bill_id={},
+    )
+    ticks = iter((0.0, 0.0, 0.0, 0.0, observer.OBSERVATION_DEADLINE_SECONDS + 1.0))
+    monkeypatch.setattr(observer, "_monotonic", lambda: next(ticks))
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: captured)
+    monkeypatch.setattr(observer, "_parse_ca_response", lambda captured: batch)
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "succeeded" and result.reconciliation_count == 1
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    assert run.status == "partial"
+    assert run.summary == {"reason": "observation_deadline_exceeded", "remaining_official_bills": 1}

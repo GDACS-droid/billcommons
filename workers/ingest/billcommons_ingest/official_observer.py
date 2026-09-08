@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Mapping
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session as OrmSession
 
@@ -44,11 +45,22 @@ CA_HISTORY_PREFIX = "ca-history:"
 CA_HISTORY_NAMESPACE = "ca-leginfo-pubinfo-history"
 CA_SCOPE_SESSIONS = frozenset({"20252026 regular", "special1"})
 MAX_LOCAL_ACTIONS_PER_BILL = 1_000
+MAX_RECONCILIATIONS_PER_OBSERVATION = 500
 MAX_BACKOFF_SECONDS = 604_800
+MAX_BLOB_BYTES = 8 * 1024 * 1024
+OBSERVATION_DEADLINE_SECONDS = 300.0
+DB_STATEMENT_TIMEOUT_MS = 10_000
+DB_LOCK_TIMEOUT_MS = 5_000
+DB_IDLE_TRANSACTION_TIMEOUT_MS = 240_000
+UNKNOWN_ADAPTER_VERSION = "unknown"
 
 
 class InvalidOfficialTarget(ValueError):
     """A persisted target is not an approved CA adapter target."""
+
+
+class ObservationDeadlineExceeded(RuntimeError):
+    """One claimed target exceeded its bounded end-to-end observation window."""
 
 
 @dataclass(frozen=True)
@@ -63,6 +75,10 @@ class OfficialObservationResult:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _monotonic() -> float:
+    return time.monotonic()
 
 
 def _require_aware_utc(value: datetime) -> datetime:
@@ -80,6 +96,19 @@ def _safe_error_class(error: BaseException) -> str:
 
     name = type(error).__name__
     return name[:120] if name else "UnknownError"
+
+
+def _require_deadline(started_at: float) -> None:
+    if _monotonic() - started_at > OBSERVATION_DEADLINE_SECONDS:
+        raise ObservationDeadlineExceeded("official observation exceeded total deadline")
+
+
+def _configure_transaction(db: OrmSession) -> None:
+    """Bound DB work and preserve the target claim across the 180s fetch."""
+
+    db.execute(text(f"SET LOCAL statement_timeout = '{DB_STATEMENT_TIMEOUT_MS}ms'"))
+    db.execute(text(f"SET LOCAL lock_timeout = '{DB_LOCK_TIMEOUT_MS}ms'"))
+    db.execute(text(f"SET LOCAL idle_in_transaction_session_timeout = '{DB_IDLE_TRANSACTION_TIMEOUT_MS}ms'"))
 
 
 def _upstream_updated_at(value: str | None) -> datetime | None:
@@ -122,7 +151,7 @@ def _target_day(target: OfficialSourceTarget, jurisdiction: Jurisdiction | None)
         raise InvalidOfficialTarget("target scope is not the reviewed CA delta scope")
     day = target.scope.get("day")
     sessions = target.scope.get("sessions")
-    if not isinstance(day, str) or not isinstance(sessions, list):
+    if not isinstance(day, str) or not isinstance(sessions, list) or not all(isinstance(item, str) for item in sessions):
         raise InvalidOfficialTarget("target scope has invalid CA delta fields")
     if len(sessions) != len(CA_SCOPE_SESSIONS) or set(sessions) != CA_SCOPE_SESSIONS:
         raise InvalidOfficialTarget("target scope has unsupported CA sessions")
@@ -138,8 +167,10 @@ def _target_day(target: OfficialSourceTarget, jurisdiction: Jurisdiction | None)
 def store_official_raw_blob(db: OrmSession, data: bytes, content_type: str) -> str:
     """Content-address bytes and verify the stored record before referencing it."""
 
-    if not isinstance(data, bytes) or not data:
-        raise ValueError("official evidence must be non-empty bytes")
+    if not isinstance(data, bytes) or not 1 <= len(data) <= MAX_BLOB_BYTES:
+        raise ValueError("official evidence must be non-empty bytes within the storage cap")
+    if not isinstance(content_type, str) or not content_type.strip():
+        raise ValueError("official evidence content type must be a non-empty string")
     sha256 = hashlib.sha256(data).hexdigest()
     db.execute(
         insert(OfficialRawBlob)
@@ -150,11 +181,6 @@ def store_official_raw_blob(db: OrmSession, data: bytes, content_type: str) -> s
     if stored is None or hashlib.sha256(stored.data).hexdigest() != sha256:
         raise RuntimeError("official raw blob integrity check failed")
     return sha256
-
-
-# Keep the implementation name available to narrowly-scoped tests while
-# discovery and later adapters use the explicit shared persistence helper.
-_store_blob = store_official_raw_blob
 
 
 def _schedule_failure(target: OfficialSourceTarget, now: datetime) -> None:
@@ -186,11 +212,13 @@ def _add_observation(
     upstream_updated_at: datetime | None = None,
     error_class: str | None = None,
     record_count: int | None = None,
+    adapter_name: str = ADAPTER_NAME,
+    adapter_version: str = ca_actions.ADAPTER_VERSION,
 ) -> OfficialSourceObservation:
     observation = OfficialSourceObservation(
         target_id=target.id,
-        adapter_name=ADAPTER_NAME,
-        adapter_version=ca_actions.ADAPTER_VERSION,
+        adapter_name=adapter_name,
+        adapter_version=adapter_version,
         source_url=target.source_url,
         scope=scope,
         retrieved_at=retrieved_at,
@@ -261,27 +289,35 @@ def _local_events(db: OrmSession, bill: Bill, mapping) -> list[dict[str, Any]]:
     actions = list(
         db.execute(
             select(BillAction)
-            .where(BillAction.bill_id == bill.id, BillAction.upstream_id.like(f"{CA_HISTORY_PREFIX}%"))
+            .where(BillAction.bill_id == bill.id)
             .order_by(BillAction.action_date.asc().nulls_first(), BillAction.upstream_id.asc())
             .limit(MAX_LOCAL_ACTIONS_PER_BILL + 1)
         ).scalars()
     )
     if len(actions) > MAX_LOCAL_ACTIONS_PER_BILL:
-        raise ValueError("local CA history action cap exceeded")
-    return [
-        {
-            "occurrence_id": action.upstream_id,
-            "source_identity": action.upstream_id,
-            "source_namespace": CA_HISTORY_NAMESPACE,
-            "jurisdiction": CA_JURISDICTION,
-            "session": mapping.session_identifier,
-            "bill_id": mapping.official_bill_id,
-            "description": action.description,
-            "date": action.action_date.isoformat() if action.action_date else None,
-            "date_precision": "day" if action.action_date else "unknown",
-        }
-        for action in actions
-    ]
+        raise ValueError("local bill action cap exceeded")
+    events: list[dict[str, Any]] = []
+    for action in actions:
+        is_ca_history = isinstance(action.upstream_id, str) and action.upstream_id.startswith(CA_HISTORY_PREFIX)
+        events.append(
+            {
+                # Only California's immutable history IDs may pair. Other
+                # local records remain inspectable ambiguous evidence rather
+                # than becoming a text/date match by accident.
+                "occurrence_id": action.upstream_id if is_ca_history else None,
+                "source_identity": action.upstream_id if is_ca_history else None,
+                "source_namespace": CA_HISTORY_NAMESPACE if is_ca_history else None,
+                "jurisdiction": CA_JURISDICTION,
+                "session": mapping.session_identifier,
+                "bill_id": mapping.official_bill_id,
+                "description": action.description,
+                "date": action.action_date.isoformat() if action.action_date else None,
+                "date_precision": "day" if action.action_date else "unknown",
+                "local_record_id": str(action.id),
+                "local_source_name": action.source_name,
+            }
+        )
+    return events
 
 
 def _add_partial_run(db: OrmSession, observation: OfficialSourceObservation, official_bill_id: str, now: datetime, reason: str) -> None:
@@ -299,6 +335,30 @@ def _add_partial_run(db: OrmSession, observation: OfficialSourceObservation, off
     )
 
 
+def _add_remaining_partial_run(
+    db: OrmSession,
+    observation: OfficialSourceObservation,
+    now: datetime,
+    *,
+    reason: str,
+    remaining_official_bills: int,
+) -> None:
+    """Record a bounded, explicit account of unprocessed bill comparisons."""
+
+    db.add(
+        OfficialReconciliationRun(
+            observation_id=observation.id,
+            bill_id=None,
+            official_bill_id="__remaining_unreconciled_ca_bills__",
+            local_snapshot_at=now,
+            comparator_version=COMPARATOR_VERSION,
+            status="partial",
+            summary={"reason": reason, "remaining_official_bills": remaining_official_bills},
+            error_class=None,
+        )
+    )
+
+
 def _reconcile_batch(
     db: OrmSession,
     *,
@@ -306,9 +366,33 @@ def _reconcile_batch(
     observation: OfficialSourceObservation,
     batch,
     now: datetime,
+    started_at: float,
 ) -> int:
     run_count = 0
-    for official_bill_id in batch.scoped_bill_ids:
+    scoped_bill_ids = batch.scoped_bill_ids
+    for index, official_bill_id in enumerate(scoped_bill_ids):
+        if index >= MAX_RECONCILIATIONS_PER_OBSERVATION:
+            _add_remaining_partial_run(
+                db,
+                observation,
+                now,
+                reason="comparison_cap_exceeded",
+                remaining_official_bills=len(scoped_bill_ids) - index,
+            )
+            run_count += 1
+            break
+        try:
+            _require_deadline(started_at)
+        except ObservationDeadlineExceeded:
+            _add_remaining_partial_run(
+                db,
+                observation,
+                now,
+                reason="observation_deadline_exceeded",
+                remaining_official_bills=len(scoped_bill_ids) - index,
+            )
+            run_count += 1
+            break
         run_count += 1
         try:
             mapping = ca_actions.map_official_bill_id(official_bill_id)
@@ -318,9 +402,9 @@ def _reconcile_batch(
                 continue
             official_fixture = {"events": _official_events(batch.events_by_official_bill_id[official_bill_id], mapping)}
             local_fixture = {"events": _local_events(db, bill, mapping)}
-            local_sha256 = _store_blob(db, _canonical_json_bytes(local_fixture), "application/json")
+            local_sha256 = store_official_raw_blob(db, _canonical_json_bytes(local_fixture), "application/json")
             report = reconcile_events(official_fixture, local_fixture)
-            diff_sha256 = _store_blob(db, _canonical_json_bytes(report), "application/json")
+            diff_sha256 = store_official_raw_blob(db, _canonical_json_bytes(report), "application/json")
             db.add(
                 OfficialReconciliationRun(
                     observation_id=observation.id,
@@ -362,7 +446,10 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
     back and another worker can retry it.
     """
 
+    started_at = _monotonic()
     observed_at = _require_aware_utc(now or _utc_now())
+    _configure_transaction(db)
+    _require_deadline(started_at)
     target = db.execute(
         select(OfficialSourceTarget)
         .where(OfficialSourceTarget.enabled.is_(True), OfficialSourceTarget.next_check_at <= observed_at)
@@ -384,6 +471,8 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
             retrieved_at=observed_at,
             status="invalid",
             error_class=_safe_error_class(exc),
+            adapter_name=target.adapter_name,
+            adapter_version=UNKNOWN_ADAPTER_VERSION,
         )
         _schedule_failure(target, observed_at)
         return OfficialObservationResult(target.id, observation.status, None, 0)
@@ -402,29 +491,51 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
         _schedule_failure(target, observed_at)
         return OfficialObservationResult(target.id, observation.status, None, 0)
 
-    # Validate the evidence identity independently of the adapter helper.
-    # This makes a changed injected capture contract fail closed in tests too.
+    # Validate capture metadata before a DB write. Database persistence
+    # failures intentionally propagate and roll back the target claim.
     try:
         if captured.source_url != target.source_url:
             raise ValueError("captured response URL does not match its target")
-        raw_sha256 = _store_blob(db, captured.raw_bytes, "application/zip")
-        if raw_sha256 != captured.sha256:
-            raise ValueError("captured response SHA-256 mismatch")
-        parsed = _parse_ca_response(captured)
         if (
-            parsed.source_url != target.source_url
-            or parsed.sha256 != raw_sha256
-            or parsed.raw_bytes != captured.raw_bytes
+            not isinstance(captured.raw_bytes, bytes)
+            or not 1 <= len(captured.raw_bytes) <= MAX_BLOB_BYTES
+            or not isinstance(captured.sha256, str)
+            or hashlib.sha256(captured.raw_bytes).hexdigest() != captured.sha256
         ):
-            raise ValueError("parsed response does not match captured evidence")
-    except Exception as exc:
+            raise ValueError("captured response SHA-256 mismatch")
+        _require_deadline(started_at)
+    except (AttributeError, TypeError, ValueError, ObservationDeadlineExceeded) as exc:
         observation = _add_observation(
             db,
             target=target,
             scope=_observation_scope(target),
             retrieved_at=getattr(captured, "retrieved_at", observed_at),
             status="invalid",
-            raw_sha256=raw_sha256 if "raw_sha256" in locals() else None,
+            error_class=_safe_error_class(exc),
+        )
+        _schedule_failure(target, observed_at)
+        return OfficialObservationResult(target.id, observation.status, None, 0)
+
+    raw_sha256 = store_official_raw_blob(db, captured.raw_bytes, "application/zip")
+    # Parsing malformed bytes is an expected durable invalid observation;
+    # storage and transaction errors remain outside this handler.
+    try:
+        parsed = _parse_ca_response(captured)
+        _require_deadline(started_at)
+        if (
+            parsed.source_url != target.source_url
+            or parsed.sha256 != raw_sha256
+            or parsed.raw_bytes != captured.raw_bytes
+        ):
+            raise ValueError("parsed response does not match captured evidence")
+    except (AttributeError, TypeError, ValueError, ca_actions.OfficialCaActionsError, ObservationDeadlineExceeded) as exc:
+        observation = _add_observation(
+            db,
+            target=target,
+            scope=_observation_scope(target),
+            retrieved_at=getattr(captured, "retrieved_at", observed_at),
+            status="invalid",
+            raw_sha256=raw_sha256,
             upstream_updated_at=_upstream_updated_at(getattr(captured, "upstream_modified", None)),
             error_class=_safe_error_class(exc),
         )
@@ -447,6 +558,7 @@ def observe_due_target(db: OrmSession, *, now: datetime | None = None) -> Offici
         observation=observation,
         batch=parsed,
         now=observed_at,
+        started_at=started_at,
     )
     _schedule_success(target, observed_at)
     return OfficialObservationResult(target.id, observation.status, parsed.event_count, reconciliation_count)
