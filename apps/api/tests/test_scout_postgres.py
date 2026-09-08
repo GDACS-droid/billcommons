@@ -66,6 +66,7 @@ from billcommons_shared.scout import BrowserCapture, ScoutSettings, canonicalize
 from billcommons_scout.providers import MockResearchBrowserProvider
 from billcommons_scout.providers import SolariResearchBrowserProvider
 from billcommons_scout.rawstore import PostgresScoutRawStore
+import billcommons_scout.runner as scout_runner_module
 from billcommons_scout.runner import ScoutRunner
 
 
@@ -1174,7 +1175,112 @@ def test_postgres_saved_monitor_scheduler_uses_admission_and_finalizes_hash_delt
             "previous_content_hash": "a" * 64,
             "content_hash": "b" * 64,
         }]
+        # The production sessionmaker has autoflush disabled.  This finding
+        # remained pending when _finish began, so its ID proves finalization
+        # flushed evidence before snapshotting the monitor run.
+        assert len(run.source_snapshot["sources"][0]["finding_ids"]) == 1
         assert "removed_sources" not in run.change_summary
+
+
+def test_postgres_cached_monitor_run_flushes_its_id_before_advancing_baseline(
+    pg_scout: PostgresScoutHarness, scout_api, tmp_path
+):
+    customer = pg_scout.customer("monitor-cached-baseline")
+    baseline = _terminal_monitor_baseline(pg_scout, customer)
+    headers = {"x-test-customer": str(customer.id)}
+    with pg_scout.sessions() as db:
+        stored = db.get(ScoutResearchJob, baseline.id)
+        stored.fresh_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        db.commit()
+    with TestClient(scout_api) as client:
+        saved = client.post(f"/api/v1/scout/jobs/{baseline.id}/monitor", json={}, headers=headers)
+        assert saved.status_code == 201
+        monitor_id = uuid.UUID(saved.json()["monitor"]["id"])
+    with pg_scout.sessions() as db:
+        monitor = db.get(ScoutMonitor, monitor_id)
+        monitor.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+    runner = ScoutRunner(
+        pg_scout.sessions, FilesystemRawStore(tmp_path / "monitor-cached-baseline"), MockResearchBrowserProvider(),
+        settings=ScoutSettings(enabled=True, allow_public_rollout=True),
+    )
+    assert runner.schedule_one_due_monitor() is True
+    with pg_scout.sessions() as db:
+        run = db.scalar(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.monitor_id == monitor_id, ScoutMonitorRun.execution_mode == "cached"
+        ))
+        monitor = db.get(ScoutMonitor, monitor_id)
+    assert run is not None and run.status == "completed"
+    assert monitor.last_completed_run_id == run.id
+
+
+def test_postgres_coalesced_monitor_run_reconciles_terminalization_before_commit(
+    monkeypatch, pg_scout: PostgresScoutHarness, scout_api, tmp_path
+):
+    """A terminalizer that misses an uncommitted coalesced run cannot strand it."""
+    customer = pg_scout.customer("monitor-coalesced-terminal-race")
+    baseline = _terminal_monitor_baseline(pg_scout, customer)
+    headers = {"x-test-customer": str(customer.id)}
+    with TestClient(scout_api) as client:
+        saved = client.post(f"/api/v1/scout/jobs/{baseline.id}/monitor", json={}, headers=headers)
+        assert saved.status_code == 201
+        monitor_id = uuid.UUID(saved.json()["monitor"]["id"])
+    token = "coalesced-terminal-race-token"
+    with pg_scout.sessions() as db:
+        db.add(ScoutResearchJob(
+            customer_id=customer.id,
+            original_query=baseline.original_query,
+            normalized_query=baseline.normalized_query,
+            jurisdiction=baseline.jurisdiction,
+            cache_key=baseline.cache_key,
+            status="running",
+            claim_token=token,
+            limits={}, usage={},
+        ))
+        db.flush()
+        active_id = db.scalar(select(ScoutResearchJob.id).where(
+            ScoutResearchJob.customer_id == customer.id,
+            ScoutResearchJob.cache_key == baseline.cache_key,
+            ScoutResearchJob.status == "running",
+        ))
+        monitor = db.get(ScoutMonitor, monitor_id)
+        monitor.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+    assert active_id is not None
+    admitted = threading.Event()
+    terminalized = threading.Event()
+    release_scheduler = threading.Event()
+    original_admit = scout_runner_module.admit_scout_job
+
+    def pause_after_active_admission(*args, **kwargs):
+        admission = original_admit(*args, **kwargs)
+        assert admission.coalesced is True and admission.cached is False and admission.job.id == active_id
+        admitted.set()
+        assert terminalized.wait(timeout=10)
+        assert release_scheduler.wait(timeout=10)
+        return admission
+
+    monkeypatch.setattr(scout_runner_module, "admit_scout_job", pause_after_active_admission)
+    runner = ScoutRunner(
+        pg_scout.sessions, FilesystemRawStore(tmp_path / "monitor-coalesced-terminal-race"), MockResearchBrowserProvider(),
+        settings=ScoutSettings(enabled=True, allow_public_rollout=True),
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(runner.schedule_one_due_monitor)
+        assert admitted.wait(timeout=10)
+        with pg_scout.sessions() as db:
+            active = db.execute(select(ScoutResearchJob).where(
+                ScoutResearchJob.id == active_id
+            ).with_for_update()).scalar_one()
+            runner._finish(db, active, token, "completed", None, False)
+        terminalized.set()
+        release_scheduler.set()
+        assert future.result(timeout=10) is True
+    with pg_scout.sessions() as db:
+        runs = db.scalars(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.monitor_id == monitor_id, ScoutMonitorRun.job_id == active_id
+        )).all()
+    assert len(runs) == 1 and runs[0].status == "completed"
 
 
 def test_postgres_saved_monitor_defers_when_shared_daily_admission_refuses(

@@ -81,6 +81,11 @@ def finalize_monitor_run(
     status: str,
     completed_at: datetime,
 ) -> None:
+    # The production sessionmaker deliberately uses ``autoflush=False``.
+    # A terminal worker can have just-added sources/findings, and a cached
+    # monitor run has no generated UUID until it is flushed.  Make both
+    # durable before the evidence snapshot and baseline pointer are derived.
+    db.flush()
     run.status = status
     run.completed_at = completed_at
     run.error_class = job.error_class
