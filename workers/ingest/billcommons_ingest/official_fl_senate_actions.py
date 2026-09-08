@@ -32,7 +32,7 @@ MAX_ACTION_TEXT_CHARS = 16 * 1024
 
 _DETAIL_PATH = re.compile(r"^/Session/Bill/(20\d{2})/([1-9]\d*)$")
 _PAGE_TITLE = re.compile(r"^(House|Senate) Bill ([1-9]\d*) \((20\d{2})\) - The Florida Senate$")
-_HEADING = re.compile(r"^(HB|SB) ([1-9]\d*): (.+)$")
+_HEADING = re.compile(r"^((?:CS/)*(?:HB|SB)) ([1-9]\d*): (.+)$")
 _LAST_ACTION = re.compile(
     r"^(\d{1,2}/\d{1,2}/\d{4})\s+(?:(House|Senate)\s*-\s*)?(.+)$"
 )
@@ -172,6 +172,19 @@ def _direct_children(node: _Node, tag: str) -> list[_Node]:
     return [child for child in node.children if isinstance(child, _Node) and child.tag == tag]
 
 
+def _line_parts(children: Iterable[object]) -> Iterable[str | None]:
+    """Preserve explicit source line breaks through inline formatting."""
+
+    for child in children:
+        if isinstance(child, str):
+            yield child
+        elif isinstance(child, _Node):
+            if child.tag == "br":
+                yield None
+            else:
+                yield from _line_parts(child.children)
+
+
 def _only(values: Iterable[_Node], what: str) -> _Node:
     found = list(values)
     if len(found) != 1:
@@ -243,7 +256,7 @@ def _page_scope(root: _Node, session_year: str, bill_number: str) -> tuple[str, 
         raise OfficialFloridaSenateActionsError("Florida Senate bill heading does not match the bill-detail contract")
     prefix, heading_number, bill_title = heading_match.groups()
     expected_prefix = "HB" if title_chamber == "House" else "SB"
-    if prefix != expected_prefix or heading_number != bill_number:
+    if prefix.rsplit("/", 1)[-1] != expected_prefix or heading_number != bill_number:
         raise OfficialFloridaSenateActionsError("Florida Senate bill heading disagrees with page title or source URL scope")
     normalized_title = _normalized_text(bill_title)
     if not normalized_title:
@@ -259,14 +272,11 @@ def _last_action(root: _Node) -> tuple[date, str | None, str]:
     label_index = parent.children.index(label)
     pieces: list[str] = []
     ended = False
-    for child in parent.children[label_index + 1:]:
-        if isinstance(child, _Node) and child.tag == "br":
+    for part in _line_parts(parent.children[label_index + 1:]):
+        if part is None:
             ended = True
             break
-        if isinstance(child, str):
-            pieces.append(child)
-        elif isinstance(child, _Node):
-            pieces.append(_text(child))
+        pieces.append(part)
     if not ended:
         raise OfficialFloridaSenateActionsError("Florida Senate Last Action field lacks a terminating line break")
     match = _LAST_ACTION.fullmatch(_normalized_text(" ".join(pieces)))
@@ -277,16 +287,32 @@ def _last_action(root: _Node) -> tuple[date, str | None, str]:
 
 
 def _action_bullets(cell: _Node, row_position: int) -> list[str]:
-    text = _text(cell)
-    if not text.startswith("•"):
-        raise OfficialFloridaSenateActionsError(f"Florida Senate history row {row_position} action cell lacks bullet facts")
-    values = [_normalized_text(value) for value in text.split("•")]
-    if values[0] or any(not value for value in values[1:]):
-        raise OfficialFloridaSenateActionsError(f"Florida Senate history row {row_position} has malformed bullet facts")
-    for value in values[1:]:
+    # The observed table separates facts with <br>, each beginning with a
+    # bullet. A bullet within a fact's text is content, not another action.
+    lines: list[str] = []
+    pieces: list[str] = []
+    for part in _line_parts(cell.children):
+        if part is None:
+            lines.append(_normalized_text(" ".join(pieces)))
+            pieces = []
+        else:
+            pieces.append(part)
+    lines.append(_normalized_text(" ".join(pieces)))
+    values: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        if not line.startswith("•"):
+            raise OfficialFloridaSenateActionsError(f"Florida Senate history row {row_position} action cell lacks bullet facts")
+        value = _normalized_text(line[1:])
+        if not value:
+            raise OfficialFloridaSenateActionsError(f"Florida Senate history row {row_position} has malformed bullet facts")
         if len(value) > MAX_ACTION_TEXT_CHARS:
             raise OfficialFloridaSenateActionsError("Florida Senate history action exceeds text cap")
-    return values[1:]
+        values.append(value)
+    if not values:
+        raise OfficialFloridaSenateActionsError(f"Florida Senate history row {row_position} action cell lacks bullet facts")
+    return values
 
 
 def _history_actions(root: _Node) -> tuple[int, tuple[FloridaSenateAction, ...]]:

@@ -543,27 +543,10 @@ def test_fl_malformed_robots_retains_independently_valid_page_raw_before_failure
 
 
 def test_fl_snapshot_storage_failure_escapes_and_rolls_back_claim(monkeypatch):
+    # Keep the seeded target inside an outer transaction. Session commits
+    # release savepoints only: no other worker can see an enabled fixture,
+    # and the connection rolls everything back even if any assertion fails.
     engine = get_engine()
-    seed = Session(engine, autoflush=False)
-    try:
-        jurisdiction = Jurisdiction(name="Atomic Florida", abbreviation="FL", classification="state")
-        seed.add(jurisdiction)
-        seed.flush()
-        target = OfficialSourceTarget(
-            jurisdiction_id=jurisdiction.id,
-            adapter_name=observer.FL_ADAPTER_NAME,
-            source_url=FL_SOURCE_URL,
-            scope={"jurisdiction": "FL", "source_session_year": "2025", "source_bill_number": "7031", "coverage": "bounded_bill_history"},
-            enabled=True,
-            cadence_seconds=300,
-            next_check_at=NOW,
-        )
-        seed.add(target)
-        seed.commit()
-        target_id, jurisdiction_id = target.id, jurisdiction.id
-    finally:
-        seed.close()
-
     raw = FL_FIXTURE.read_bytes()
     monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: _fl_captured(raw))
     original_store = observer.store_official_raw_blob
@@ -577,31 +560,39 @@ def test_fl_snapshot_storage_failure_escapes_and_rolls_back_claim(monkeypatch):
         return original_store(db, data, content_type)
 
     monkeypatch.setattr(observer, "store_official_raw_blob", fail_snapshot)
-    transaction = Session(engine, autoflush=False)
-    try:
-        with pytest.raises(RuntimeError, match="injected snapshot storage outage"):
-            observer.observe_due_target(transaction, now=NOW)
-        transaction.rollback()
-    finally:
-        transaction.close()
-
-    check = Session(engine, autoflush=False)
-    try:
-        stored = check.get(OfficialSourceTarget, target_id)
-        assert calls == 3
-        assert stored.consecutive_failures == 0 and stored.next_check_at == NOW
-        assert check.scalar(select(func.count()).select_from(OfficialSourceObservation)) == 0
-        assert check.scalar(select(func.count()).select_from(OfficialRawBlob)) == 0
-        assert check.scalar(select(func.count()).select_from(BillAction)) == 0
-    finally:
-        check.close()
-        cleanup = Session(engine, autoflush=False)
+    with engine.connect() as connection:
+        outer = connection.begin()
         try:
-            cleanup.execute(delete(OfficialSourceTarget).where(OfficialSourceTarget.id == target_id))
-            cleanup.execute(delete(Jurisdiction).where(Jurisdiction.id == jurisdiction_id))
-            cleanup.commit()
+            with Session(connection, join_transaction_mode="create_savepoint", autoflush=False) as seed:
+                jurisdiction = Jurisdiction(name="Atomic Florida", abbreviation="FL", classification="state")
+                seed.add(jurisdiction)
+                seed.flush()
+                target = OfficialSourceTarget(
+                    jurisdiction_id=jurisdiction.id,
+                    adapter_name=observer.FL_ADAPTER_NAME,
+                    source_url=FL_SOURCE_URL,
+                    scope={"jurisdiction": "FL", "source_session_year": "2025", "source_bill_number": "7031", "coverage": "bounded_bill_history"},
+                    enabled=True, cadence_seconds=300, next_check_at=NOW,
+                )
+                seed.add(target)
+                seed.commit()
+                target_id = target.id
+            with Session(engine) as unrelated_worker:
+                assert unrelated_worker.get(OfficialSourceTarget, target_id) is None
+            models = (OfficialSourceObservation, OfficialRawBlob, BillAction)
+            before = {model: connection.scalar(select(func.count()).select_from(model)) for model in models}
+            with Session(connection, join_transaction_mode="create_savepoint", autoflush=False) as transaction:
+                with pytest.raises(RuntimeError, match="injected snapshot storage outage"):
+                    observer.observe_due_target(transaction, now=NOW)
+                transaction.rollback()
+            with Session(connection, join_transaction_mode="create_savepoint", autoflush=False) as check:
+                stored = check.get(OfficialSourceTarget, target_id)
+                assert calls == 3
+                assert stored.consecutive_failures == 0 and stored.next_check_at == NOW
+                assert {model: check.scalar(select(func.count()).select_from(model)) for model in models} == before
+                assert check.scalar(select(OfficialSourceObservation.id).where(OfficialSourceObservation.target_id == target_id)) is None
         finally:
-            cleanup.close()
+            outer.rollback()
 
 
 def test_due_claim_uses_skip_locked_and_no_due_target_returns_none(db_session, unique_abbr):

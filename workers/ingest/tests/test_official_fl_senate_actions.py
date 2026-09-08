@@ -81,6 +81,32 @@ def test_rejects_source_url_over_whole_string_cap():
         adapter.parse_florida_senate_bill_history(_raw(), source_url=overlong)
 
 
+@pytest.mark.parametrize("prefix", ["CS/HB", "CS/CS/HB", "CS/CS/CS/CS/HB"])
+def test_preserves_committee_substitute_heading_and_base_scope(prefix):
+    changed = _raw().replace(b"<h2>HB 7031:", f"<h2>{prefix} 7031:".encode(), 1)
+    parsed = adapter.parse_florida_senate_bill_history(changed, source_url=SOURCE_URL)
+    assert parsed.bill_identifier == f"{prefix} 7031"
+    assert parsed.bill_number == "7031" and parsed.session_year == "2025"
+    assert parsed.actions == _parse().actions
+    wrong_chamber = changed.replace(f"<h2>{prefix} 7031:".encode(), b"<h2>CS/SB 7031:", 1)
+    with pytest.raises(adapter.OfficialFloridaSenateActionsError, match="heading disagrees"):
+        adapter.parse_florida_senate_bill_history(wrong_chamber, source_url=SOURCE_URL)
+
+
+def test_preserves_inline_bullet_content_and_nested_explicit_line_breaks():
+    changed = _raw().replace(b"&bull; Filed<br>", b"<span>&bull; Filed &bull; note<br></span>", 1)
+    parsed = adapter.parse_florida_senate_bill_history(changed, source_url=SOURCE_URL)
+    assert len(parsed.actions) == 46
+    assert parsed.actions[0].description == "Filed • note"
+    assert parsed.actions[1:] == _parse().actions[1:]
+    changed = _raw().replace(
+        b"Veto Message transmitted to Secretary of State<br>",
+        b"<span>Veto Message transmitted to Secretary of State<br></span>",
+        1,
+    )
+    assert adapter.parse_florida_senate_bill_history(changed, source_url=SOURCE_URL).actions == _parse().actions
+
+
 def test_enforces_dom_depth_before_recursive_extraction():
     boundary = adapter._BoundedTreeBuilder()
     boundary.feed("<div>" * adapter.MAX_DOM_DEPTH + "</div>" * adapter.MAX_DOM_DEPTH)
