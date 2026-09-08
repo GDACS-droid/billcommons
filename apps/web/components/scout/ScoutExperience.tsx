@@ -523,7 +523,7 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
   }, [job]);
 
   useEffect(() => {
-    if (!pollJobId || !pollJobStatus || isScoutTerminal(pollJobStatus)) return;
+    if (canceling || !pollJobId || !pollJobStatus || isScoutTerminal(pollJobStatus)) return;
     const generation = jobGeneration;
     let active = true;
     const controller = new AbortController();
@@ -557,7 +557,7 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
       if (timer !== undefined) window.clearTimeout(timer);
       controller.abort();
     };
-  }, [jobGeneration, pollJobId, pollJobStatus]);
+  }, [canceling, jobGeneration, pollJobId, pollJobStatus]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

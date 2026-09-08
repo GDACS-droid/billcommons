@@ -50,7 +50,8 @@ test("Scout polling only applies results from the active request generation", ()
   assert.match(source, /setJobGeneration\(generation\)/);
   assert.match(source, /const generation = jobGeneration/);
   assert.match(source, /jobRequest\.current\.generation !== generation/);
-  assert.match(source, /\[jobGeneration, pollJobId, pollJobStatus\]/);
+  assert.match(source, /if \(canceling \|\| !pollJobId \|\| !pollJobStatus \|\| isScoutTerminal\(pollJobStatus\)\) return;/);
+  assert.match(source, /\[canceling, jobGeneration, pollJobId, pollJobStatus\]/);
   assert.match(source, /const request = beginJobRequest\(\);\n    setJob\(null\);/);
 });
 
