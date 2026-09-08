@@ -10,6 +10,41 @@ from __future__ import annotations
 
 import os
 import uuid
+from urllib.parse import urlparse
+
+
+def _require_safe_test_database() -> None:
+    """Refuse to import database helpers unless the target is disposable."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not database_url:
+        raise RuntimeError(
+            "ingest tests require an explicit DATABASE_URL for a local test database"
+        )
+
+    try:
+        parsed = urlparse(database_url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+    except ValueError:
+        raise RuntimeError(
+            "ingest tests require DATABASE_URL to target a loopback PostgreSQL test database"
+        ) from None
+    database_name = parsed.path.rsplit("/", 1)[-1].lower()
+    if (
+        not (scheme == "postgres" or scheme == "postgresql" or scheme.startswith("postgresql+"))
+        or hostname not in {"localhost", "127.0.0.1", "::1"}
+        or not database_name.endswith(("_test", "_staging"))
+    ):
+        raise RuntimeError(
+            "ingest tests require DATABASE_URL to target a loopback PostgreSQL test database"
+        )
+    if os.environ.get("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE") != "1":
+        raise RuntimeError(
+            "ingest tests require BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE=1"
+        )
+
+
+_require_safe_test_database()
 
 # Label every connection this test process opens, BEFORE the engine is built.
 #
