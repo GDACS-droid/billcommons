@@ -42,6 +42,7 @@ from billcommons_schema.models import (
     Bill,
     BillAction,
     Jurisdiction,
+    Organization,
     OfficialRawBlob,
     OfficialReconciliationRun,
     OfficialSourceObservation,
@@ -51,6 +52,10 @@ from billcommons_schema.models import (
 from billcommons_shared.normalize import normalize_bill_number
 from billcommons_shared.reconciliation import ReconciliationInputError
 from billcommons_ingest.official_ca_reconciliation import COMPARATOR_VERSION, reconcile_ca_action_content
+from billcommons_ingest.official_fl_senate_reconciliation import (
+    COMPARATOR_VERSION as FL_COMPARATOR_VERSION,
+    reconcile_fl_senate_action_content,
+)
 
 ADAPTER_NAME = "ca_official_actions"
 CA_JURISDICTION = "CA"
@@ -61,6 +66,7 @@ CA_HISTORY_PREFIX = "ca-history:"
 CA_HISTORY_NAMESPACE = "ca-leginfo-pubinfo-history"
 CA_SCOPE_SESSIONS = frozenset({"20252026 regular", "special1"})
 MAX_LOCAL_ACTIONS_PER_BILL = 1_000
+FL_REGULAR_SESSION_SUFFIX = " Regular Session"
 MAX_RECONCILIATIONS_PER_OBSERVATION = 500
 MAX_BACKOFF_SECONDS = 604_800
 MAX_BLOB_BYTES = 8 * 1024 * 1024
@@ -727,6 +733,224 @@ def _fl_snapshot(
     return payload
 
 
+def _fl_regular_session_identifier(source_session_year: str) -> str:
+    """Return the only reviewed local session identity for a Senate source year."""
+
+    if not isinstance(source_session_year, str) or re.fullmatch(r"20\d{2}", source_session_year) is None:
+        raise ValueError("Florida Senate source session year is invalid")
+    return f"{source_session_year}{FL_REGULAR_SESSION_SUFFIX}"
+
+
+def _fl_official_bill_id(parsed: fl_actions.ParsedFloridaSenateBillHistory) -> str:
+    """Keep the source year and parsed bill identifier as the run identity."""
+
+    return f"fl-senate:{parsed.session_year}:{parsed.bill_identifier}"
+
+
+def _fl_official_events(
+    parsed: fl_actions.ParsedFloridaSenateBillHistory,
+    *,
+    session_identifier: str,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "jurisdiction": FL_JURISDICTION,
+            "session": session_identifier,
+            "bill_id": parsed.bill_identifier,
+            "date": action.action_date.isoformat(),
+            "date_precision": action.date_precision,
+            "description": action.description,
+            # These positions locate facts in this captured page only. The
+            # Florida comparator retains them as evidence and never uses them
+            # as an occurrence key across snapshots.
+            "chamber": action.chamber,
+            "source_row_position": action.source_row_position,
+            "source_bullet_position": action.source_bullet_position,
+        }
+        for action in parsed.actions
+    ]
+
+
+def _fl_local_identifier(parsed_bill_identifier: str) -> str:
+    """Map only the parser's anchored CS/ prefix form to the base local bill."""
+
+    match = re.fullmatch(r"(?:CS/)*(HB|SB) ([1-9]\d*)", parsed_bill_identifier)
+    if match is None:
+        raise ValueError("parsed Florida bill identifier has unsupported local mapping shape")
+    return f"{match.group(1)} {match.group(2)}"
+
+
+def _find_fl_local_bill(
+    db: OrmSession,
+    target: OfficialSourceTarget,
+    parsed: fl_actions.ParsedFloridaSenateBillHistory,
+) -> tuple[Bill | None, str | None, str]:
+    """Resolve only the reviewed regular-session identity; never fall back by bill number."""
+
+    session_identifier = _fl_regular_session_identifier(parsed.session_year)
+    sessions = list(
+        db.execute(
+            select(SessionModel).where(
+                SessionModel.jurisdiction_id == target.jurisdiction_id,
+                SessionModel.identifier == session_identifier,
+                SessionModel.classification == "regular",
+            )
+        ).scalars()
+    )
+    if len(sessions) != 1:
+        return None, "local_fl_regular_session_missing_or_ambiguous", session_identifier
+    try:
+        identifier_norm = normalize_bill_number(_fl_local_identifier(parsed.bill_identifier))
+    except ValueError:
+        return None, "official_fl_identifier_invalid", session_identifier
+    bills = list(
+        db.execute(
+            select(Bill).where(
+                Bill.jurisdiction_id == target.jurisdiction_id,
+                Bill.session_id == sessions[0].id,
+                Bill.identifier_norm == identifier_norm,
+            )
+        ).scalars()
+    )
+    if len(bills) != 1:
+        return None, "local_fl_bill_missing_or_ambiguous", session_identifier
+    return bills[0], None, session_identifier
+
+
+def _fl_local_events(
+    db: OrmSession,
+    bill: Bill,
+    *,
+    jurisdiction_id: uuid.UUID,
+    session_identifier: str,
+    bill_identifier: str,
+) -> list[dict[str, Any]]:
+    """Snapshot local actions and exact same-jurisdiction chamber evidence in one query."""
+
+    rows = list(
+        db.execute(
+            select(BillAction, Organization)
+            .outerjoin(Organization, BillAction.organization_id == Organization.id)
+            .where(BillAction.bill_id == bill.id)
+            .order_by(BillAction.action_date.asc().nulls_first(), BillAction.upstream_id.asc())
+            .limit(MAX_LOCAL_ACTIONS_PER_BILL + 1)
+        ).all()
+    )
+    if len(rows) > MAX_LOCAL_ACTIONS_PER_BILL:
+        raise ValueError("local bill action cap exceeded")
+    events: list[dict[str, Any]] = []
+    for action, organization in rows:
+        if action.organization_id is not None:
+            if organization is None:
+                raise ValueError("local Florida action organization is missing")
+            if organization.jurisdiction_id != jurisdiction_id:
+                raise ValueError("local Florida action organization belongs to another jurisdiction")
+            chamber = {("House", "lower"): "House", ("Senate", "upper"): "Senate"}.get(
+                (organization.name, organization.classification)
+            )
+        else:
+            chamber = None
+        events.append(
+            {
+                "jurisdiction": FL_JURISDICTION,
+                "session": session_identifier,
+                "bill_id": bill_identifier,
+                "date": action.action_date.isoformat() if action.action_date else None,
+                "date_precision": "day" if action.action_date else "unknown",
+                # Do not infer a chamber from the bill. A missing or
+                # non-chamber organization remains explicit ambiguous input.
+                "chamber": chamber,
+                "description": action.description,
+                "local_record_id": str(action.id),
+                "local_source_name": action.source_name,
+                "local_upstream_id": action.upstream_id,
+            }
+        )
+    return events
+
+
+def _reconcile_fl_history(
+    db: OrmSession,
+    *,
+    target: OfficialSourceTarget,
+    observation: OfficialSourceObservation,
+    parsed: fl_actions.ParsedFloridaSenateBillHistory,
+    now: datetime,
+    started_at: float,
+) -> int:
+    """Store one replayable Florida content comparison or an explicit partial run."""
+
+    official_bill_id = _fl_official_bill_id(parsed)
+    try:
+        _require_deadline(started_at)
+        bill, mapping_error, session_identifier = _find_fl_local_bill(db, target, parsed)
+        if mapping_error is not None:
+            _add_fl_partial_run(db, observation, official_bill_id, now, mapping_error)
+            return 1
+        assert bill is not None
+        official_fixture = {"events": _fl_official_events(parsed, session_identifier=session_identifier)}
+        local_fixture = {"events": _fl_local_events(
+            db, bill, jurisdiction_id=target.jurisdiction_id,
+            session_identifier=session_identifier, bill_identifier=parsed.bill_identifier,
+        )}
+        local_sha256 = store_official_raw_blob(db, _canonical_json_bytes(local_fixture), "application/json")
+        report = reconcile_fl_senate_action_content(
+            official_fixture,
+            local_fixture,
+            scope={"jurisdiction": FL_JURISDICTION, "session": session_identifier, "bill_id": parsed.bill_identifier},
+        )
+        _require_deadline(started_at)
+        diff_sha256 = store_official_raw_blob(db, _canonical_json_bytes(report), "application/json")
+        db.add(
+            OfficialReconciliationRun(
+                observation_id=observation.id,
+                bill_id=bill.id,
+                official_bill_id=official_bill_id,
+                local_snapshot_at=now,
+                comparator_version=FL_COMPARATOR_VERSION,
+                status="completed",
+                summary=report["summary"],
+                local_snapshot_sha256=local_sha256,
+                diff_sha256=diff_sha256,
+            )
+        )
+    except (ValueError, TypeError, ReconciliationInputError, ObservationDeadlineExceeded) as exc:
+        db.add(
+            OfficialReconciliationRun(
+                observation_id=observation.id,
+                bill_id=None,
+                official_bill_id=official_bill_id,
+                local_snapshot_at=now,
+                comparator_version=FL_COMPARATOR_VERSION,
+                status="failed",
+                summary={"reason": "comparison_failed"},
+                error_class=_safe_error_class(exc),
+            )
+        )
+    return 1
+
+
+def _add_fl_partial_run(
+    db: OrmSession,
+    observation: OfficialSourceObservation,
+    official_bill_id: str,
+    now: datetime,
+    reason: str,
+) -> None:
+    db.add(
+        OfficialReconciliationRun(
+            observation_id=observation.id,
+            bill_id=None,
+            official_bill_id=official_bill_id,
+            local_snapshot_at=now,
+            comparator_version=FL_COMPARATOR_VERSION,
+            status="partial",
+            summary={"reason": reason},
+            error_class=None,
+        )
+    )
+
+
 def _observe_fl_senate_target(
     db: OrmSession,
     target: OfficialSourceTarget,
@@ -916,8 +1140,16 @@ def _observe_fl_senate_target(
         http_status=http_status,
         source_response_observed=http_status is not None,
     )
+    reconciliation_count = _reconcile_fl_history(
+        db,
+        target=target,
+        observation=observation,
+        parsed=parsed,
+        now=observed_at,
+        started_at=started_at,
+    )
     _schedule_success(target, observed_at)
-    return OfficialObservationResult(target.id, observation.status, observation.record_count, 0)
+    return OfficialObservationResult(target.id, observation.status, observation.record_count, reconciliation_count)
 
 
 def _observe_discovery_target(db, target, jurisdiction, observed_at) -> OfficialObservationResult:

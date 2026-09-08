@@ -86,12 +86,22 @@ This laboratory is the shared foundation for state adapters. It does not claim
 that an official snapshot authorizes deleting local history: a source can be
 partial, revised, or unavailable.
 
-Florida bill-history snapshots are deliberately source-only until an adapter
-has explicit local-scope and occurrence-identity evidence. A retained Florida
-page can be useful provenance, but it is not a local fixture and must not be
-fed to this comparator merely because its text or dates resemble local actions.
-The current 2025 HB 7031 observation has no local association, comparison, or
-corpus mutation.
+Florida Senate bill-history observations always retain one exact source page
+and never mutate the corpus. A comparison is permitted only when the retained
+source year maps to the exact local session identifier ``YYYY Regular Session``
+with ``regular`` classification and exactly one normalized base ``HB``/``SB``
+bill in that session. A missing or ambiguous mapping is recorded as a partial
+run; it never falls back to the same bill number in another session. The
+Florida comparator compares a multiset of exact day, chamber, and normalized
+description. Source row and bullet positions, local record IDs, and upstream
+IDs remain evidence only, never occurrence identities. Local actions without
+a same-jurisdiction, exact House/Senate organization stay ambiguous, and a
+cross-jurisdiction organization rejects the comparison. Agreement does not
+prove an occurrence match, source completeness, statewide coverage, freshness,
+or authorize an insertion or deletion. Replay parses the retained page and
+uses the recorded local snapshot and diff only; it never reads current corpus
+actions. The current 2025 HB 7031 target remains a partial comparison until a
+matching ``2025 Regular Session`` local bill exists.
 
 ### Ambiguous-record shapes in schema version 1
 

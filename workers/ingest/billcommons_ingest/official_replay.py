@@ -1,4 +1,4 @@
-"""Read-only reproduction of one retained CA reconciliation, without HTTP.
+"""Read-only reproduction of one retained CA or Florida reconciliation, without HTTP.
 
 Run with an explicitly configured DATABASE_URL:
   python -m billcommons_ingest.official_replay RECONCILIATION_UUID
@@ -16,12 +16,18 @@ import uuid
 from sqlalchemy import text
 
 from billcommons_ingest import official_ca_actions as ca
+from billcommons_ingest import official_fl_senate_actions as fl
+from billcommons_ingest import official_fl_senate_capture as fl_capture
 from billcommons_ingest.official_observer import (
     ADAPTER_NAME, COMPARATOR_VERSION, MAX_BLOB_BYTES,
-    _canonical_json_bytes, _official_events,
+    _canonical_json_bytes, _fl_official_bill_id, _fl_official_events, _fl_regular_session_identifier, _official_events,
 )
 from billcommons_schema.models import OfficialRawBlob, OfficialReconciliationRun, OfficialSourceObservation
 from billcommons_shared.reconciliation import reconcile_events
+from billcommons_ingest.official_fl_senate_reconciliation import (
+    COMPARATOR_VERSION as FL_COMPARATOR_VERSION,
+    reconcile_fl_senate_action_content,
+)
 from billcommons_ingest.official_ca_reconciliation import reconcile_ca_action_content
 
 
@@ -41,20 +47,17 @@ def _load_blob(db, digest: str | None) -> bytes:
     return data
 
 
-def replay_reconciliation(db, reconciliation_id: uuid.UUID) -> dict:
-    """Use only immutable recorded inputs; never consult today's local actions."""
-    run = db.get(OfficialReconciliationRun, reconciliation_id)
-    if run is None or run.status != 'completed':
-        raise EvidenceReplayError('a completed reconciliation is required')
-    observation = db.get(OfficialSourceObservation, run.observation_id)
-    if (observation is None or observation.status != 'succeeded'
-            or observation.adapter_name != ADAPTER_NAME
-            or observation.adapter_version != ca.ADAPTER_VERSION
-            or run.comparator_version not in {"reconcile-events/1", COMPARATOR_VERSION}):
+def _replay_ca(
+    run: OfficialReconciliationRun,
+    observation: OfficialSourceObservation,
+    raw: bytes,
+    local_bytes: bytes,
+) -> tuple[dict, str]:
+    if (
+        observation.adapter_version != ca.ADAPTER_VERSION
+        or run.comparator_version not in {"reconcile-events/1", COMPARATOR_VERSION}
+    ):
         raise EvidenceReplayError('unsupported recorded adapter/comparator version or outcome')
-    raw = _load_blob(db, observation.raw_sha256)
-    local_bytes = _load_blob(db, run.local_snapshot_sha256)
-    stored_diff = _load_blob(db, run.diff_sha256)
     batch = ca.parse_ca_official_actions_zip(raw, source_url=observation.source_url,
                                             retrieved_at=observation.retrieved_at)
     events = batch.events_by_official_bill_id.get(run.official_bill_id)
@@ -63,14 +66,63 @@ def replay_reconciliation(db, reconciliation_id: uuid.UUID) -> dict:
     mapping = ca.map_official_bill_id(run.official_bill_id)
     official = {'events': _official_events(events, mapping)}
     if run.comparator_version == "reconcile-events/1":
-        # Preserve exact historical bytes even though the old CA identity
-        # assumption is now known to be unsuitable for cross-snapshot repair.
         reproduced = reconcile_events(official, json.loads(local_bytes))
     else:
         reproduced = reconcile_ca_action_content(official, json.loads(local_bytes), scope={
             "jurisdiction": "CA", "session": mapping.session_identifier,
             "bill_id": mapping.official_bill_id,
         })
+    interpretation = ('Exact historical replay; legacy CA identity differences do not establish missing actions.'
+                      if run.comparator_version == 'reconcile-events/1' else
+                      'Exact replay of retained content comparison; no occurrence or current-source freshness proof.')
+    return reproduced, interpretation
+
+
+def _replay_fl(
+    run: OfficialReconciliationRun,
+    observation: OfficialSourceObservation,
+    raw: bytes,
+    local_bytes: bytes,
+) -> tuple[dict, str]:
+    if observation.adapter_version != fl.ADAPTER_VERSION or run.comparator_version != FL_COMPARATOR_VERSION:
+        raise EvidenceReplayError('unsupported recorded adapter/comparator version or outcome')
+    try:
+        source_scope = fl_capture.detail_scope(observation.source_url)
+        parsed = fl.parse_florida_senate_bill_history(raw, source_url=source_scope.source_url)
+        session_identifier = _fl_regular_session_identifier(parsed.session_year)
+    except (TypeError, ValueError, fl.OfficialFloridaSenateActionsError) as exc:
+        raise EvidenceReplayError('retained Florida source bytes do not satisfy the recorded parser contract') from exc
+    if (
+        parsed.source_url != source_scope.source_url
+        or parsed.session_year != source_scope.source_session_year
+        or parsed.bill_number != source_scope.source_bill_number
+        or _fl_official_bill_id(parsed) != run.official_bill_id
+    ):
+        raise EvidenceReplayError('retained Florida source identity does not bind to the recorded run')
+    official = {'events': _fl_official_events(parsed, session_identifier=session_identifier)}
+    reproduced = reconcile_fl_senate_action_content(official, json.loads(local_bytes), scope={
+        'jurisdiction': 'FL', 'session': session_identifier, 'bill_id': parsed.bill_identifier,
+    })
+    return reproduced, 'Exact replay of retained Florida content comparison; no occurrence, current-source freshness, or completeness proof.'
+
+
+def replay_reconciliation(db, reconciliation_id: uuid.UUID) -> dict:
+    """Use only immutable recorded inputs; never consult today's local actions."""
+    run = db.get(OfficialReconciliationRun, reconciliation_id)
+    if run is None or run.status != 'completed':
+        raise EvidenceReplayError('a completed reconciliation is required')
+    observation = db.get(OfficialSourceObservation, run.observation_id)
+    if observation is None or observation.status != 'succeeded':
+        raise EvidenceReplayError('unsupported recorded adapter/comparator version or outcome')
+    raw = _load_blob(db, observation.raw_sha256)
+    local_bytes = _load_blob(db, run.local_snapshot_sha256)
+    stored_diff = _load_blob(db, run.diff_sha256)
+    if observation.adapter_name == ADAPTER_NAME:
+        reproduced, interpretation = _replay_ca(run, observation, raw, local_bytes)
+    elif observation.adapter_name == fl_capture.ADAPTER_NAME:
+        reproduced, interpretation = _replay_fl(run, observation, raw, local_bytes)
+    else:
+        raise EvidenceReplayError('unsupported recorded adapter/comparator version or outcome')
     reproduced_bytes = _canonical_json_bytes(reproduced)
     if reproduced_bytes != stored_diff or reproduced['summary'] != run.summary:
         raise EvidenceReplayError('recorded reconciliation does not reproduce')
@@ -81,9 +133,7 @@ def replay_reconciliation(db, reconciliation_id: uuid.UUID) -> dict:
             'raw_sha256': observation.raw_sha256,
             'local_snapshot_sha256': run.local_snapshot_sha256,
             'diff_sha256': run.diff_sha256, 'summary': reproduced['summary'],
-            'interpretation': ('Exact historical replay; legacy CA identity differences do not establish missing actions.'
-                               if run.comparator_version == 'reconcile-events/1' else
-                               'Exact replay of retained content comparison; no occurrence or current-source freshness proof.')}
+            'interpretation': interpretation}
 
 
 def main() -> int:

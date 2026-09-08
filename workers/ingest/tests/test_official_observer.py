@@ -29,6 +29,7 @@ from billcommons_schema.models import (
     OfficialRawBlob,
     OfficialReconciliationRun,
     OfficialSourceObservation,
+    Organization,
     OfficialSourceTarget,
     Session as SessionModel,
 )
@@ -393,7 +394,7 @@ def test_fl_detail_success_retains_one_bill_snapshot_without_local_mutation(db_s
     result = observer.observe_due_target(db_session, now=NOW)
     db_session.flush()
 
-    assert result and (result.status, result.record_count, result.reconciliation_count) == ("succeeded", 46, 0)
+    assert result and (result.status, result.record_count, result.reconciliation_count) == ("succeeded", 46, 1)
     observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
     assert observation.adapter_name == observer.FL_ADAPTER_NAME
     assert observation.adapter_version == observer.fl_actions.ADAPTER_VERSION
@@ -405,6 +406,11 @@ def test_fl_detail_success_retains_one_bill_snapshot_without_local_mutation(db_s
     assert observation.scope["source_bill_number"] == "7031"
     assert "local_session" not in observation.scope
     assert "freshness" not in observation.scope
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    assert run.status == "partial"
+    assert run.bill_id is None
+    assert run.comparator_version == "fl-senate-action-content-multiset/1"
+    assert run.summary == {"reason": "local_fl_regular_session_missing_or_ambiguous"}
     snapshot = json.loads(db_session.get(OfficialRawBlob, observation.scope["parsed_snapshot_sha256"]).data)
     assert snapshot["source_raw_sha256"] == observation.raw_sha256
     assert snapshot["scope"] == {
@@ -417,6 +423,199 @@ def test_fl_detail_success_retains_one_bill_snapshot_without_local_mutation(db_s
     assert db_session.scalar(select(func.count()).select_from(BillAction)) == before_actions
     assert target.consecutive_failures == 0
     assert target.next_check_at == NOW + timedelta(seconds=300)
+
+
+def _fl_local_bill(db_session, jurisdiction: Jurisdiction, *, session_identifier: str = "2025 Regular Session", classification: str = "regular") -> Bill:
+    session = SessionModel(
+        jurisdiction_id=jurisdiction.id,
+        identifier=session_identifier,
+        classification=classification,
+        active=True,
+    )
+    db_session.add(session)
+    db_session.flush()
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session.id,
+        identifier="HB 7031",
+        identifier_norm=normalize_bill_number("HB 7031"),
+        title="Taxation",
+    )
+    db_session.add(bill)
+    db_session.flush()
+    return bill
+
+
+def _fl_chamber(db_session, jurisdiction: Jurisdiction, chamber: str) -> Organization:
+    expected = {"House": "lower", "Senate": "upper"}
+    organization = Organization(jurisdiction_id=jurisdiction.id, name=chamber, classification=expected[chamber])
+    db_session.add(organization)
+    db_session.flush()
+    return organization
+
+
+def test_fl_exact_regular_session_and_bill_produce_content_comparison(db_session, unique_abbr, monkeypatch):
+    jurisdiction, _ = _fl_target(db_session, unique_abbr)
+    bill = _fl_local_bill(db_session, jurisdiction)
+    parsed = observer.fl_actions.parse_florida_senate_bill_history(FL_FIXTURE.read_bytes(), source_url=FL_SOURCE_URL)
+    action = parsed.actions[0]
+    local = BillAction(
+        bill_id=bill.id,
+        organization_id=_fl_chamber(db_session, jurisdiction, action.chamber).id,
+        description=action.description,
+        action_date=action.action_date,
+        source_name="retained-import",
+        upstream_id="unrelated-local-id",
+    )
+    db_session.add(local)
+    db_session.flush()
+    monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: _fl_captured(FL_FIXTURE.read_bytes()))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and (result.status, result.record_count, result.reconciliation_count) == ("succeeded", 46, 1)
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    assert run.status == "completed" and run.bill_id == bill.id
+    assert run.official_bill_id == "fl-senate:2025:HB 7031"
+    local_fixture = json.loads(db_session.get(OfficialRawBlob, run.local_snapshot_sha256).data)
+    report = json.loads(db_session.get(OfficialRawBlob, run.diff_sha256).data)
+    assert local_fixture["events"][0]["session"] == "2025 Regular Session"
+    assert report["scope"] == {"jurisdiction": "FL", "session": "2025 Regular Session", "bill_id": "HB 7031"}
+    assert report["summary"]["content_agreement"] == 1
+    assert report["content_agreement"][0]["occurrence_proof"] is False
+    assert db_session.get(BillAction, local.id).description == action.description
+
+
+def test_fl_cs_prefixed_heading_maps_only_to_the_base_bill_in_same_exact_session(db_session, unique_abbr, monkeypatch):
+    jurisdiction, _ = _fl_target(db_session, unique_abbr)
+    bill = _fl_local_bill(db_session, jurisdiction)
+    raw = FL_FIXTURE.read_bytes().replace(b"HB 7031: Taxation", b"CS/CS/HB 7031: Taxation", 1)
+    parsed = observer.fl_actions.parse_florida_senate_bill_history(raw, source_url=FL_SOURCE_URL)
+    assert parsed.bill_identifier == "CS/CS/HB 7031"
+    assert observer._fl_local_identifier(parsed.bill_identifier) == "HB 7031"
+    action = parsed.actions[0]
+    db_session.add(BillAction(
+        bill_id=bill.id,
+        organization_id=_fl_chamber(db_session, jurisdiction, action.chamber).id,
+        description=action.description,
+        action_date=action.action_date,
+    ))
+    monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: _fl_captured(raw))
+
+    observer.observe_due_target(db_session, now=NOW)
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    assert run.status == "completed" and run.bill_id == bill.id
+    assert run.official_bill_id == "fl-senate:2025:CS/CS/HB 7031"
+
+
+def test_fl_source_year_never_substitutes_a_same_number_bill_in_another_session(db_session, unique_abbr, monkeypatch):
+    jurisdiction, _ = _fl_target(db_session, unique_abbr)
+    wrong_year_bill = _fl_local_bill(db_session, jurisdiction, session_identifier="2026 Regular Session")
+    monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: _fl_captured(FL_FIXTURE.read_bytes()))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.reconciliation_count == 1
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    assert run.status == "partial" and run.bill_id is None
+    assert run.summary == {"reason": "local_fl_regular_session_missing_or_ambiguous"}
+    assert db_session.get(Bill, wrong_year_bill.id) is not None
+
+
+def test_fl_same_day_same_text_in_different_chambers_stays_distinct_content(db_session, unique_abbr, monkeypatch):
+    jurisdiction, _ = _fl_target(db_session, unique_abbr)
+    bill = _fl_local_bill(db_session, jurisdiction)
+    house = _fl_chamber(db_session, jurisdiction, "House")
+    senate = _fl_chamber(db_session, jurisdiction, "Senate")
+    # The fixture's first House action is deliberately duplicated locally as
+    # Senate content. It must not be counted as an agreement merely by text.
+    parsed = observer.fl_actions.parse_florida_senate_bill_history(FL_FIXTURE.read_bytes(), source_url=FL_SOURCE_URL)
+    action = parsed.actions[0]
+    db_session.add_all((
+        BillAction(bill_id=bill.id, organization_id=house.id, description=action.description, action_date=action.action_date),
+        BillAction(bill_id=bill.id, organization_id=senate.id, description=action.description, action_date=action.action_date),
+    ))
+    monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: _fl_captured(FL_FIXTURE.read_bytes()))
+
+    observer.observe_due_target(db_session, now=NOW)
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    report = json.loads(db_session.get(OfficialRawBlob, run.diff_sha256).data)
+    same_content = [item for item in report["local_only_content"] if item["content"]["description"] == action.description.casefold()]
+    assert len(same_content) == 1
+    assert same_content[0]["content"] == {
+        "date": action.action_date.isoformat(), "chamber": "Senate", "description": action.description.casefold(),
+    }
+    assert same_content[0]["official_count"] == 0
+    assert same_content[0]["local_count"] == same_content[0]["unmatched_count"] == 1
+
+
+def test_fl_unknown_local_chamber_is_ambiguous_not_filled_from_bill(db_session, unique_abbr, monkeypatch):
+    jurisdiction, _ = _fl_target(db_session, unique_abbr)
+    bill = _fl_local_bill(db_session, jurisdiction)
+    parsed = observer.fl_actions.parse_florida_senate_bill_history(FL_FIXTURE.read_bytes(), source_url=FL_SOURCE_URL)
+    action = parsed.actions[0]
+    db_session.add(BillAction(bill_id=bill.id, description=action.description, action_date=action.action_date))
+    monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: _fl_captured(FL_FIXTURE.read_bytes()))
+
+    observer.observe_due_target(db_session, now=NOW)
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    report = json.loads(db_session.get(OfficialRawBlob, run.diff_sha256).data)
+    assert report["summary"]["content_agreement"] == 0
+    assert any(item["side"] == "local" and item["reason"] == "missing_chamber" for item in report["ambiguous_insufficient_evidence"])
+
+
+def test_fl_cross_jurisdiction_organization_rejects_comparison(db_session, unique_abbr, monkeypatch):
+    jurisdiction, _ = _fl_target(db_session, unique_abbr)
+    bill = _fl_local_bill(db_session, jurisdiction)
+    foreign = Jurisdiction(name="Foreign", abbreviation=unique_abbr("ZZ_ORG"), classification="state")
+    db_session.add(foreign)
+    db_session.flush()
+    organization = Organization(jurisdiction_id=foreign.id, name="House", classification="lower")
+    db_session.add(organization)
+    db_session.flush()
+    parsed = observer.fl_actions.parse_florida_senate_bill_history(FL_FIXTURE.read_bytes(), source_url=FL_SOURCE_URL)
+    action = parsed.actions[0]
+    db_session.add(BillAction(bill_id=bill.id, organization_id=organization.id, description=action.description, action_date=action.action_date))
+    monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: _fl_captured(FL_FIXTURE.read_bytes()))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    assert result and result.reconciliation_count == 1
+    assert run.status == "failed" and run.summary == {"reason": "comparison_failed"}
+    assert run.error_class == "ValueError"
+
+
+def test_fl_comparison_deadline_creates_a_failed_run_without_corpus_mutation(db_session, unique_abbr, monkeypatch):
+    jurisdiction, _ = _fl_target(db_session, unique_abbr)
+    bill = _fl_local_bill(db_session, jurisdiction)
+    parsed = observer.fl_actions.parse_florida_senate_bill_history(FL_FIXTURE.read_bytes(), source_url=FL_SOURCE_URL)
+    action = parsed.actions[0]
+    local = BillAction(
+        bill_id=bill.id,
+        organization_id=_fl_chamber(db_session, jurisdiction, action.chamber).id,
+        description=action.description,
+        action_date=action.action_date,
+    )
+    db_session.add(local)
+    monkeypatch.setattr(observer, "_capture_fl_senate_detail", lambda source_url: _fl_captured(FL_FIXTURE.read_bytes()))
+    calls = {"count": 0}
+    original = observer._require_deadline
+
+    def expire_after_initial_check(started_at):
+        calls["count"] += 1
+        if calls["count"] >= 5:
+            raise observer.ObservationDeadlineExceeded("fixture deadline")
+        return original(started_at)
+
+    monkeypatch.setattr(observer, "_require_deadline", expire_after_initial_check)
+    result = observer.observe_due_target(db_session, now=NOW)
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    assert result and result.status == "succeeded" and result.reconciliation_count == 1
+    assert run.status == "failed" and run.summary == {"reason": "comparison_failed"}
+    assert run.error_class == "ObservationDeadlineExceeded"
+    assert db_session.get(BillAction, local.id).description == action.description
 
 
 def test_fl_robots_denial_retains_policy_and_backoff_without_parsing(db_session, unique_abbr, monkeypatch):
