@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import Link from "next/link";
+import OfficialSourceChecks, { sourceNeedsAttention, type OfficialSourceOverview } from "@/components/OfficialSourceChecks";
 
 interface Run {
   source_name: string;
@@ -62,7 +63,10 @@ function cadence(minutes: number | null) {
   return `${minutes} minutes`;
 }
 
-export default function DataHealthReport({ report }: { report: DataHealthData }) {
+export default function DataHealthReport({ report, officialSources }: {
+  report: DataHealthData;
+  officialSources?: OfficialSourceOverview | null;
+}) {
   const [query, setQuery] = useState("");
   const [attentionOnly, setAttentionOnly] = useState(false);
   const byJurisdiction = useMemo(() => {
@@ -72,24 +76,36 @@ export default function DataHealthReport({ report }: { report: DataHealthData })
     }
     return grouped;
   }, [report.defects]);
+  const officialByJurisdiction = useMemo(() => new Map(
+    (officialSources?.items ?? []).map((item) => [item.jurisdiction, item]),
+  ), [officialSources]);
+  function issueCount(code: string) {
+    return (byJurisdiction.get(code)?.length ?? 0)
+      + (officialByJurisdiction.get(code)?.targets.filter(sourceNeedsAttention).length ?? 0);
+  }
   const rows = report.jurisdictions.filter((row) => {
     const matches = `${row.jurisdiction} ${row.name}`.toLowerCase().includes(query.trim().toLowerCase());
-    return matches && (!attentionOnly || (byJurisdiction.get(row.jurisdiction)?.length ?? 0) > 0);
+    return matches && (!attentionOnly || issueCount(row.jurisdiction) > 0);
   });
-  const affectedCount = report.jurisdictions.filter((row) => byJurisdiction.has(row.jurisdiction)).length;
+  const affectedCount = report.jurisdictions.filter((row) => issueCount(row.jurisdiction) > 0).length;
 
   return (
     <section aria-label="Jurisdiction data health">
       <div className="border-y border-slate-200 py-5 text-sm leading-6 text-slate-700">
         <p>
           <strong className="font-semibold text-slate-950">{report.summary.jurisdiction_count} jurisdictions observed.</strong>{" "}
-          {affectedCount} have reported ingestion or provenance issues.
+          {affectedCount} have reported ingestion, source-access, or provenance issues.
         </p>
         <p className="mt-1 text-xs text-slate-600">
           Observation: <time dateTime={report.generated_at}>{timestamp(report.generated_at)}</time>.
           {" "}Reports refresh at most once every five minutes.
         </p>
       </div>
+
+      {!officialSources && <p className="mt-4 text-sm leading-6 text-slate-700">
+        Official-source checks are unavailable right now. Local ingestion records remain visible;
+        reload this page to retry the source overview.
+      </p>}
 
       <div className="flex flex-col gap-4 py-6 sm:flex-row sm:items-end sm:justify-between">
         <div className="w-full sm:max-w-xs">
@@ -123,6 +139,8 @@ export default function DataHealthReport({ report }: { report: DataHealthData })
           {rows.map((row) => {
             const defects = byJurisdiction.get(row.jurisdiction) ?? [];
             const success = row.local_ingestion.last_successful_api_sync;
+            const issues = issueCount(row.jurisdiction);
+            const targets = officialByJurisdiction.get(row.jurisdiction)?.targets ?? [];
             return (
               <article key={row.jurisdiction} className="py-6">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -131,8 +149,8 @@ export default function DataHealthReport({ report }: { report: DataHealthData })
                       {row.name}
                     </Link>{" "}<span className="text-sm font-normal text-slate-600">{row.jurisdiction}</span>
                   </h2>
-                  <p className={`text-sm font-medium ${defects.length ? "text-amber-900" : "text-slate-600"}`}>
-                    {defects.length ? `${defects.length} reported issue${defects.length === 1 ? "" : "s"}` : "No local issues reported"}
+                  <p className={`text-sm font-medium ${issues ? "text-amber-900" : "text-slate-600"}`}>
+                    {issues ? `${issues} reported issue${issues === 1 ? "" : "s"}` : "No local issues reported"}
                   </p>
                 </div>
                 <dl className="mt-4 grid gap-x-8 gap-y-4 text-sm sm:grid-cols-2 lg:grid-cols-4">
@@ -151,6 +169,7 @@ export default function DataHealthReport({ report }: { report: DataHealthData })
                   </summary>
                   <div className="mt-3 max-w-3xl space-y-4 leading-6 text-slate-700">
                     <p>{row.official_reconciliation.reason}</p>
+                    {officialSources && <OfficialSourceChecks jurisdiction={row.jurisdiction} targets={targets} />}
                     <p>Stored bills: <span className="tabular-nums">{row.parser_health.bill_count.toLocaleString("en-US")}</span>.
                       {" "}Missing source links: {row.parser_health.missing_source_url.toLocaleString("en-US")}.
                       {" "}Missing parser versions: {row.parser_health.missing_parser_version.toLocaleString("en-US")}.

@@ -1,157 +1,136 @@
 # Autonomous legislative intelligence — active implementation
 
-## Authoritative objective
+## Objective and scope
 
-Turn Bill Commons from a large legislative database into an autonomous 50-state
-legislative intelligence system that detects stale data, repairs ingestion
-failures, discovers missing official material, and explains/proves every update.
-Alberto explicitly authorized deployment in this session on 2026-09-08. The
-objective remains active; the first control-plane release is not completion.
+Turn Bill Commons into an autonomous 50-state legislative intelligence system
+that detects stale data, repairs ingestion failures, discovers official material,
+and explains/proves updates. Alberto explicitly authorized deployment in this
+session on 2026-09-08. The objective remains active. A control-plane deployment
+alone does not satisfy the full objective.
 
-## Acceptance evidence required
+Implementation is isolated in `mission-reliability-20260908`; pre-existing changes
+in the original checkout are preserved. The canonical inventory covers 50 states
+plus DC. Generic website observation is never treated as proof of statewide
+semantic freshness or completeness.
 
-| Requirement | Required proof | Current state |
+## Acceptance and present limits
+
+| Requirement | Implemented locally | Remaining acceptance gap |
 | --- | --- | --- |
-| All 50 states | Versioned source/adapter capability inventory and live, bounded per-state checks | Open States imports exist; official adapters incomplete |
-| Detect stale data | Durable observations, per-source freshness policy, discrepancy history and failure visibility | Local-sync report implemented; official observations pending |
-| Repair failures | Bounded retries, shared upstream quotas, crash recovery, fixture-replayed parser repair evidence and controlled promotion | Existing retries; durable quota and repair laboratory pending |
-| Discover official material | Retained primary responses and tested extraction of missing actions/documents with explicit scope | FL Scout and CA repair are separate, limited paths |
-| Explain every update | Immutable raw evidence, parser/comparator versions, occurrence identity and before/after records | Entity provenance exists; cross-source observation ledger pending |
-| Operate autonomously | Recurring scheduling, durable checkpoints, bounded resource use and observable terminal outcomes | Nightly incremental loop; official reconciliation not recurring |
-| Deploy | Pinned artifacts, applicable migration/backup gates, staged health and recovery proof | Explicit authority granted; first release review running |
+| Detect stale data | Canonical 51-jurisdiction report, bounded history queries, sync cadence/queue/provenance defects, fail-closed report cache; durable official observation status | Semantic freshness adapters beyond the limited CA archive |
+| Repair failures | Existing retry queues, shared durable request quotas, official-worker backoff/deadlines/checkpoints, reviewed missing-intermediate TLS repair for five hosts | Fixture-replayed parser repair and controlled promotion; discrepancy-driven corpus repair |
+| Discover official material | Robots-first official landing-page checks for all 51 jurisdictions, bounded same-origin links, exact retained response bytes | State-specific parsing of discovered facts; remaining explicit source-access failures |
+| Prove updates | Atomic Open States API and document extraction before/after records with source bytes, hashes, versions and download API; offline CA comparison replay | Derived-status path audit; historical updates have no retroactive proof |
+| Operate autonomously | Dedicated recurring worker, explicit registration/enablement, durable target schedule and transaction deadline; resumable 500-bill CA pages | Production activation and measured recurring cycles |
+| Deploy | Pinned first-stage source, restored production backup, safe local checks | Canonical review, staged rollout and post-deploy proof |
 
-## Current release arc
+## Release ownership and gates
 
-- First release source: `3f37ff8615d2bf865dbb86c7b9aa408b7b380130`.
-- Exact aggregate review: `1171a6e4765f00bf2033a2476d71b1df8bf6adbf`,
-  whose full binary diff from `26e99e2` equals the source diff.
-- Initial rollout scope: API and dedicated sync worker; web follows its
-  applicable checks. This stage changes no billing routes or database schema.
+- Owner: Codex executing Alberto's authorized session. No new approval is needed
+  for the scoped deployment. Stop at a failed required check or unsafe cutover.
+- First-stage source: `1a2277cb97f4fdf0219d8e5ce0c5d492340e5e40` in
+  `billcommons-control-plane-fixed-20260908`. Initial rollout is API plus dedicated
+  sync worker; no new schema or official worker in that stage. Web follows its
+  applicable checks.
+- First-stage aggregate review: `f8ea48c`, exact binary diff from baseline
+  `26e99e2` checked against the release source. Canonical nine-family run:
+  `/home/alberto/verify-runs/20260908T023417Z-f8ea48c` (pending).
+- Earlier reviews found real case-normalization, undated-run ordering,
+  quota-delayed queue age, canonical-inventory, bounded-query, cache and test
+  routing defects. These are repaired and have focused regression coverage.
+  Earlier BLOCK verdicts are not represented as passes.
 - Production project `92e10559-88b7-49ec-ae77-b0dc72b12752`, environment
-  `78036c32-1cac-4fae-9a22-ef81c6f99772`, independently re-read this session.
-- Existing API artifact `5828ea8b-6a85-4ca6-b453-f76e604ad374`; sync artifact
-  `568fcd62-89b9-4e1c-bdb1-77c4ebae4759`. Both provider manifests specify
-  one replica and the corresponding checked-in Dockerfile.
-- Release and rollback owner: Codex executing Alberto's authorized session.
-  Roll out during this active session only; recheck state immediately before
-  each change. Hold a stage on failing review, repeated 5xx/503, unhealthy DB,
-  unsafe active-work cutover, or absent artifact evidence. Roll back only the
-  affected application artifact; preserve database rows and raw evidence.
+  `78036c32-1cac-4fae-9a22-ef81c6f99772`. Last observed successful API artifact:
+  `5828ea8b-6a85-4ca6-b453-f76e604ad374`; sync:
+  `568fcd62-89b9-4e1c-bdb1-77c4ebae4759`. Both have one replica.
+- Re-read provider artifact/config and live work state immediately before each
+  cutover. No invented drain: the sync service is changed only at its observed
+  idle boundary. Hold on failed review, repeated 5xx/503, unhealthy database,
+  active-work risk or missing artifact evidence. Roll back the affected app
+  artifact; preserve database rows and evidence.
+- Follow-on schema revisions `0026`–`0028` are additive and currently undeployed.
+  Controlled migration requires the exact revision acknowledgement. Before the
+  shared Open States quota is activated, seed current-day consumption
+  conservatively so the new ledger cannot reset the upstream day's allowance.
 
-## Test isolation incident and correction
+## Recovery and live evidence
 
-During read-only exploration, an agent invoked three ingestion registry tests
-without selecting a disposable database. The legacy ingestion conftest used
-its local fallback connection, which an independent redacted check confirmed
-was the known production target. Test bodies used rollback transactions, but
-the session teardown also executed its fixture cleanup routine. That routine
-can delete jurisdictions matching `ZZ_%` or `ZQ_%` and their related records.
-It must never be treated as read-only or acceptable autonomous verification.
-
-The post-incident read-only census found 52 jurisdiction rows, 51 with two-letter
-codes, and no rows matching the cleanup patterns. The earlier census also had
-52 jurisdictions. This does not prove whether any transient synthetic rows were
-removed; there is no pre-test cleanup-pattern census. No restoration or further
-production cleanup was attempted. The affected registry-test result is not
-accepted as safe verification. The fail-closed test-target gate is now committed. Eleven subprocess cases
-prove rejection before database-helper imports, including service/host overrides,
-and the safe disposable harness passes. Normal checks use `pg_virtualenv`.
-
-## Next implementation
-
-The shared upstream quota and corpus-owned observation/reconciliation ledger
-are implemented locally, with additive migrations `0026` and `0027`. The
-official worker has a five-minute transaction deadline, target row locking,
-durable retry schedules and graceful stop between claims. It registers seven
-California daily-action delta targets and 51 reviewed official landing-page
-targets. Registration and enablement are explicit operator switches.
-
-California comparisons retain the exact archive, local action input and diff.
-Each observation compares at most 500 bills and records an explicit partial
-remainder when that limit is reached. That remainder still needs resumable
-processing before claiming exhaustive reconciliation. Generic discovery retains
-robots and page bytes plus a replayable, bounded same-origin link comparison;
-it does not parse legislative facts or establish statewide freshness.
-
-Next: complete staged deployment and health proof; make comparison remainders
-resumable; retain before/after and source-response evidence on the existing
-all-state incremental/document mutation paths; extend source-specific semantic
-adapters and bounded repair workflows. The full user objective remains active.
-
-## Implementation and release checkpoint — 2026-09-08 02:03 UTC
-
-- Main integration branch: `mission-reliability-20260908`, implementation
-  through `baaf830`. Original user worktree remains separate.
-- The second canonical nine-family review of aggregate `1171a6e` completed
-  with seven SHIP and two BLOCK verdicts. The BLOCKs were substantive:
-  missing/empty canonical jurisdictions, undated successful syncs, wrong age
-  for quota-delayed queues, unbounded historical ORM materialization, and no
-  cooldown after failed public report scans. These were repaired and tested.
-- Revised first-stage source: `5fc1b07e725c0f92c4e77939f65018bd0e90e8f3`.
-  Aggregate `4590b5fcef61b67470d0ae0f0e929795378df55d` has the exact same full
-  binary diff from `26e99e2`. Its canonical review is running at
-  `/home/alberto/verify-runs/20260908T015852Z-4590b5f`.
-- First-stage checkout independently passed 80 worker/shared and 8 API tests
-  on disposable PostgreSQL 16. Main integration independently passed 206
-  worker/shared and 17 API tests, including real PostgreSQL evidence pagination,
-  exact-byte HTTP retrieval, failure cleanup, lock contention and deadline tests.
-  The existing Starlette/httpx deprecation warning remains.
-- Live read-only recheck at 02:03:38 UTC: revision `0025`, 51 public
-  jurisdictions, 17 warnings, no critical/error defects, and no pending
-  API-sync jobs. This report is local ingestion evidence, not proof of official
-  source freshness. Recheck immediately before production cutover.
-- No production deployment or migration has occurred in this implementation arc.
-
-## Retained all-state source probe
-
-One bounded read-only probe completed at 01:57:18 UTC: all 51 jurisdictions,
-85 HTTP requests, 30 observable pages and 547 candidate links. The remaining
-outcomes were 10 rejected redirects, 5 TLS failures, 2 robots denials,
-2 unavailable robots policies, 1 slow crawl-policy restriction and 1 JavaScript
-requirement. No production database was accessed. Exact public page/policy
-bytes and hashes are retained in restricted local evidence storage at
-`/home/alberto/.local/share/billcommons/official-inventory-probe-20260908`.
-
-The checked-in override registry corrects Kansas and Indiana destinations only
-after following their primary government endpoints: the
-[Kansas legislature](https://www.kslegislature.org/) redirects to its `.gov`
-session site, and [Indiana's state legislature link](https://www.in.gov/legislative/)
-redirects to `iga.in.gov`. Other rejected redirects remain visible failures;
-the transport does not follow unreviewed destinations or weaken TLS.
-
-## Backup proof in progress
-
-The snapshot-consistent PostgreSQL 18 dump completed at 01:56:38 UTC:
-3,211,108,251 bytes, mode `0600`, catalog valid, SHA-256
+The snapshot-consistent PostgreSQL 18 dump finished at 01:56:38 UTC on
+2026-09-08: 3,211,108,251 bytes, mode `0600`, SHA-256
 `1125ea521522c7034e13c1f8a267d79175992549339642f35190fc332632d0a6`.
-Snapshot counts include 210,504 bills, 1,673,590 actions, 741,902 documents and
-10 Scout raw blobs. Restore verification is still running and is not yet a pass.
+The isolated PG18 restore completed at 02:14:04 UTC. All 13 snapshot counts,
+revision `0025`, all ten Scout raw hashes and actual API health/readiness/search
+checks passed. Evidence is in
+`~/.local/share/billcommons/reliability-release-20260908/restore-evidence.json`.
+The temporary server and its owned data directory were removed; existing system
+clusters were not restarted. Matching server binaries came from a privately
+unpacked official PGDG package; no system package installation was required.
 
-The host had PostgreSQL 18 clients but no matching server. An official PGDG
-18.6 server package and its liburing dependency were unpacked into private
-task storage; no system package installation or existing cluster restart was
-needed. The restore runs in a disposable loopback-only server and will check
-snapshot counts, Alembic revision, every Scout raw hash and actual API reads.
+At 02:22:27 UTC production was still revision `0025`, approximately 14.4 GB,
+with no queued/running/dead API-sync jobs. Public health, readiness, bill read,
+NC website and MCP probes passed at approximately 02:23 UTC. These are preflight
+observations, not post-deploy evidence. Provider volume backups dated August 29
+and July 24 existed, but no scheduled volume backups were configured.
 
-## Live release preflight evidence
+## Evidence implementation
 
-At 2026-09-08 01:29 UTC: production PostgreSQL 18.6, revision `0025`, approximately
-14.4 GB; 46 connections, one active connection, one idle-in-transaction connection.
-No queued/running API-sync jobs and no active Scout jobs were visible. Queue-table
-locks also serve other workers, so their count alone is not a sync activity proof.
-The sync service's latest completed cycle is timestamped 2026-09-07 05:46:37 UTC.
-API health/ready, one bill read, the NC web page and an MCP tool call all passed
-in under 0.4 seconds each. Revalidate immediately before the cutover.
+- Corpus-owned raw blobs and official target/observation/reconciliation tables
+  are separate from owner-scoped Scout data. Blobs are SHA-256 addressed and
+  bounded to 8 MiB; an empty successful document response is valid evidence.
+- CA action archives retain exact raw, canonical local input and comparison
+  bytes with versions. A validated observation/hash/version/index cursor resumes
+  the same archive across bounded 500-bill pages without refetching. Cursor and
+  comparison records commit together. Offline replay checks hashes, versions,
+  exact diff bytes and summary without HTTP or current action reads.
+- The source overview includes missing targets, failures, overdue observations,
+  next retry and exact evidence pointers for all 51 canonical jurisdictions.
+- API-sync retains the exact Open States response before JSON decoding. Actual
+  core/child changes retain bounded before/after snapshots in the same transaction.
+  No-op updates add no evidence. Open States is labeled as an aggregator.
+- Ordinary and browser-assisted successful extraction share the evidence tail.
+  Database evidence failure rolls back semantic document changes. Optional
+  filesystem archival remains a best-effort compatibility cache.
+- Reviewed redirect destinations are explicit registry data. CT, MI, MS, OH and
+  VT use four fingerprint-pinned public intermediates only for their exact hosts,
+  with certifi roots, hostname/expiry validation, no partial-chain trust, pinned
+  public-IP connections, original-host SNI, TLS 1.2 minimum and HTTP/1.1 ALPN.
+  Publisher rotations deliberately fail closed until reviewed.
 
-The current provider backup query found snapshots dated 2026-08-29 and
-2026-07-24, but **zero configured volume backup schedules**. A fresh,
-snapshot-consistent PostgreSQL 18 portable backup is running in restricted
-local storage; it is not accepted until dump exit, catalog/hash and disposable
-restore proof all pass. The existing 2026-09-01 restore evidence remains the
-previous known-good recovery record.
+## Verification completed locally
 
-The first expanded quota/sync test run found four assertions comparing timezone
-spellings of the same instant. The watermark behavior was correct; assertions
-now compare parsed instants. Fixture clients also use a no-wait limiter because
-their transport never sends HTTP. Shared pacing has separate real-PostgreSQL
-concurrency and UTC-boundary coverage; production pacing is unchanged.
+- Main combined disposable PostgreSQL 16 harness: **385 worker/shared tests and
+  28 API tests passed**, migrations through `0028`. Covers continuation beyond
+  500 bills, rollback/retry, raw byte downloads, evidence atomicity, quota
+  concurrency, report boundaries and failure paths.
+- Transport/TLS and test-runner guards: **71 passed** in the integration checkout.
+  The transport test server printed a handled connection teardown exception;
+  pytest reported no failed tests. Existing Starlette/httpx deprecation remains.
+- First-stage isolated checkout: **85 worker/shared + 10 API tests**, plus four
+  runner-guard tests passed.
+- Web TypeScript/lint and optimized production build passed. Rendered desktop/mobile evidence view, filters, clear action, raw link, optional/core
+  API failure states and de-DE hydration passed against explicit source fixtures.
+  Hosting-provided Vercel analytics was stubbed in this local run after tracing
+  its expected local 404; no other browser errors or failed responses remained.
+  This is not a live official-source verdict.
+
+## Test isolation incident
+
+An earlier read-only exploration agent invoked legacy registry tests without a
+selected disposable database. The fallback was independently confirmed as the
+production target. Test bodies rolled back, but fixture teardown could delete
+synthetic `ZZ_%`/`ZQ_%` jurisdictions and related rows. The later read-only census
+found 52 total jurisdictions, 51 public two-letter codes and no matching synthetic
+rows; the earlier census also had 52. This cannot prove whether any transient
+synthetic records were removed. No production cleanup/restoration was attempted.
+That test result is rejected. A fail-closed conftest gate and runner guards now
+reject ambient targets and service/host overrides before database helpers load;
+normal verification uses disposable `pg_virtualenv` clusters.
+
+## Next actions
+
+Finish rendered UI checks and the derived-update audit. Complete the first-stage
+canonical review and deploy only the accepted source with bounded health proof.
+Then run canonical review on the complete follow-on diff, migrate exact revisions,
+activate quotas/observation targets, deploy the recurring worker and establish
+production evidence. Semantic state adapters and controlled discrepancy repair
+remain explicit work until their required evidence exists.

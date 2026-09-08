@@ -3,6 +3,7 @@ import Link from "next/link";
 import PageHeader from "@/components/PageHeader";
 import DataUnavailable from "@/components/DataUnavailable";
 import DataHealthReport, { type DataHealthData } from "@/components/DataHealthReport";
+import type { OfficialSourceOverview } from "@/components/OfficialSourceChecks";
 import { apiGet } from "@/lib/api";
 import { API_BASE } from "@/lib/config";
 
@@ -17,7 +18,10 @@ export const metadata: Metadata = {
 export const dynamic = "force-dynamic";
 
 export default async function DataHealthPage() {
-  const result = await apiGet<DataHealthData>("/api/v1/data-health");
+  const [result, sources] = await Promise.all([
+    apiGet<DataHealthData>("/api/v1/data-health"),
+    apiGet<OfficialSourceOverview>("/api/v1/official-evidence/overview"),
+  ]);
   const supported = result.ok && result.data.report_version === 1;
   return <div className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
     <PageHeader title="Data health" description={<p>
@@ -34,7 +38,7 @@ export default async function DataHealthPage() {
         <a href={new URL("/api/v1/data-health", API_BASE).toString()} className="underline underline-offset-2">Read the JSON report</a>
       </nav>
     </div>
-    {supported && result.ok ? <DataHealthReport report={result.data} /> : <DataUnavailable
+    {supported && result.ok ? <DataHealthReport report={result.data} officialSources={sources.ok ? sources.data : null} /> : <DataUnavailable
       message="The data-health report is unavailable."
       detail="No health verdict is available right now. Try reloading shortly, or check service status above." />}
   </div>;

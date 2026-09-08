@@ -1110,12 +1110,10 @@ def persist_extraction_outcome(
     ``ok_browser`` provenance while retaining the ordinary extractor,
     archival, event, and retry-reset behavior.
     """
-    # Raw-byte archival is best-effort. The full-document corpus (~730k docs)
-    # far exceeds a single Railway volume, so archival must never block text
-    # extraction: on a full/failed volume we keep extracted_text + source_url +
-    # checksum (sufficient, re-fetchable provenance) and move on. Set
-    # FULLTEXT_ARCHIVE_RAW=0 to skip archival entirely (recommended at scale;
-    # full raw archival belongs in S3-compatible object storage).
+    # The optional filesystem archive is a best-effort compatibility cache.
+    # FULLTEXT_ARCHIVE_RAW=0 skips that cache. Exact raw bytes and before/after
+    # snapshots are required in the database evidence ledger below; failure
+    # to retain that evidence aborts the semantic document update.
     raw_ref: str | None = None
     if _env_flag("FULLTEXT_ARCHIVE_RAW", default=False):
         try:
