@@ -113,6 +113,34 @@ def test_duplicate_explicit_identity_is_ambiguous_not_paired_by_text_or_position
     assert report["summary"]["matched"] == 0
 
 
+def test_duplicate_official_identity_is_ambiguous_when_local_counterpart_is_absent():
+    first = event("official:action:100", ordinal=1)
+    second = event("official:action:100", ordinal=2)
+    report = reconcile_events([first, second], [])
+
+    assert report["summary"]["ambiguous_identities"] == 1
+    assert report["summary"]["missing_from_local"] == 0
+    assert report["missing_from_local"] == []
+    ambiguity = report["ambiguous_identities"][0]
+    assert ambiguity["reason"] == "duplicate_explicit_identity"
+    assert len(ambiguity["official"]) == 2
+    assert ambiguity["local"] == []
+
+
+def test_duplicate_local_identity_is_ambiguous_when_official_counterpart_is_absent():
+    first = event("local:action:200", ordinal=1)
+    second = event("local:action:200", ordinal=2)
+    report = reconcile_events([], [first, second])
+
+    assert report["summary"]["ambiguous_identities"] == 1
+    assert report["summary"]["local_only_not_deletion"] == 0
+    assert report["local_only_not_deletion"] == []
+    ambiguity = report["ambiguous_identities"][0]
+    assert ambiguity["reason"] == "duplicate_explicit_identity"
+    assert ambiguity["official"] == []
+    assert len(ambiguity["local"]) == 2
+
+
 def test_missing_and_local_only_are_reported_without_a_deletion_instruction():
     official_only = event("official:action:100")
     local_only = event("official:action:200")

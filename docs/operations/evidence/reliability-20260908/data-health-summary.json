@@ -1,6 +1,6 @@
 {
   "report_version": 1,
-  "generated_at": "2026-09-08T00:47:39+00:00",
+  "generated_at": "2026-09-08T01:11:03+00:00",
   "scope": "read-only local ingestion reliability",
   "honesty": {
     "official_freshness": "unverified",
@@ -8,20 +8,17 @@
     "official_reconciliation": "unavailable"
   },
   "summary": {
-    "jurisdiction_count": 52,
-    "defect_count": 20,
+    "jurisdiction_count": 51,
+    "defect_count": 17,
     "defects_by_severity": {
       "critical": 0,
       "error": 0,
-      "warning": 20,
+      "warning": 17,
       "info": 0
     }
   },
   "defect_counts_by_code": {
-    "LOCAL_SYNC_OVERDUE": 17,
-    "MISSING_JURISDICTION_COVERAGE": 1,
-    "MISSING_PARSER_PROVENANCE": 1,
-    "MISSING_SOURCE_PROVENANCE": 1
+    "LOCAL_SYNC_OVERDUE": 17
   },
   "jurisdictions": [
     {
@@ -77,17 +74,6 @@
       "defect_codes": [],
       "last_successful_api_sync_at": "2026-09-05T05:27:44+00:00",
       "coverage_scope": "session",
-      "official_reconciliation": "unavailable"
-    },
-    {
-      "jurisdiction": "D6244E0F9",
-      "defect_codes": [
-        "MISSING_JURISDICTION_COVERAGE",
-        "MISSING_PARSER_PROVENANCE",
-        "MISSING_SOURCE_PROVENANCE"
-      ],
-      "last_successful_api_sync_at": "2026-09-05T05:25:13+00:00",
-      "coverage_scope": null,
       "official_reconciliation": "unavailable"
     },
     {

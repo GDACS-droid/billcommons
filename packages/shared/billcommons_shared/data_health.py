@@ -32,6 +32,19 @@ REPORT_VERSION = 1
 RECONCILIATION_UNAVAILABLE = "unavailable"
 API_SYNC_SOURCE = "openstates_api_sync"
 
+# The public control plane has a fixed 51-jurisdiction contract.  The set is
+# derived from data/registry/sessions-2026.json (50 states plus DC), kept here
+# as package data rather than a runtime file read because API-only images must
+# not depend on the ingestion tree being installed.
+PUBLIC_JURISDICTION_CODES = frozenset(
+    {
+        "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL", "GA", "HI", "ID",
+        "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO",
+        "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA",
+        "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    }
+)
+
 # These values mirror the documented refresh policy.  They live here rather
 # than importing the ingestion scheduler so API-only images can expose the
 # report without installing worker code.  The session fields are the same
@@ -139,6 +152,17 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
     defects: list[Defect] = []
     bills = evidence.bills
     jurisdiction = evidence.abbreviation
+
+    if evidence.cadence_minutes is None:
+        defects.append(
+            Defect(
+                "error",
+                "MISSING_REFRESH_CONFIGURATION",
+                jurisdiction,
+                "No session is available to derive a local refresh cadence.",
+                {"cadence_tier": evidence.cadence_tier},
+            )
+        )
 
     if bills.bill_count and evidence.latest_successful_run is None:
         defects.append(
@@ -469,7 +493,11 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
     makes no external request, which keeps the CLI safe for incident use.
     """
     now = _utc(now) or datetime.now(timezone.utc)
-    jurisdictions = db.execute(select(Jurisdiction)).scalars().all()
+    jurisdictions = [
+        jurisdiction
+        for jurisdiction in db.execute(select(Jurisdiction)).scalars().all()
+        if jurisdiction.abbreviation.upper() in PUBLIC_JURISDICTION_CODES
+    ]
     targets = _session_targets(db.execute(select(SessionModel)).scalars().all(), now=now)
 
     bill_rows = db.execute(
@@ -523,7 +551,7 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
         rows = db.execute(
             statement.distinct(IngestionRun.jurisdiction_id).order_by(
                 IngestionRun.jurisdiction_id,
-                run_time.desc(),
+                run_time.desc().nulls_last(),
                 IngestionRun.id.desc(),
             )
         ).all()
@@ -568,7 +596,9 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
             IngestJob.status,
             func.count(IngestJob.id).label("count"),
             func.min(IngestJob.created_at).label("oldest_created_at"),
-            func.min(IngestJob.locked_at).label("oldest_locked_at"),
+            func.min(func.coalesce(IngestJob.locked_at, IngestJob.created_at)).label(
+                "oldest_running_at"
+            ),
         )
         .where(
             IngestJob.kind == "api_sync",
@@ -577,7 +607,7 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
         .group_by(job_state, IngestJob.status)
     ).all():
         if row.state:
-            oldest_at = row.oldest_locked_at if row.status == "running" else row.oldest_created_at
+            oldest_at = row.oldest_running_at if row.status == "running" else row.oldest_created_at
             jobs_by_state[str(row.state).upper()][row.status] = (int(row.count), oldest_at)
 
     result = []

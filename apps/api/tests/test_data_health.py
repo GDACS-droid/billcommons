@@ -107,3 +107,23 @@ def test_database_snapshot_is_read_only_and_closed(monkeypatch):
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
         "SET LOCAL statement_timeout = '5s'", "rollback", "close",
     ]
+
+
+def test_rollback_failure_still_closes_session(monkeypatch):
+    closed = []
+
+    class Session:
+        def execute(self, stmt):
+            pass
+
+        def rollback(self):
+            raise RuntimeError("private rollback failure")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(module, "get_session", Session)
+    monkeypatch.setattr(module, "collect_report", lambda db: {})
+    with pytest.raises(RuntimeError):
+        module._load_report()
+    assert closed == [True]

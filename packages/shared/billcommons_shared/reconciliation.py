@@ -355,13 +355,11 @@ def reconcile_events(official_fixture: Any, local_fixture: Any) -> dict[str, Any
         official_group = official_groups.get(key, [])
         local_group = local_groups.get(key, [])
         identity = {"kind": key[0], "value": key[1]}
-        if not official_group:
-            local_only_not_deletion.extend(_sorted_reports(local_group))
-            continue
-        if not local_group:
-            missing_from_local.extend(_sorted_reports(official_group))
-            continue
-        if len(official_group) != 1 or len(local_group) != 1:
+        # Classify duplicated explicit identities before an absent counterpart.
+        # A duplicated record is ambiguous even if the other fixture has no
+        # record at all; otherwise a malformed side would be misreported as a
+        # proven missing/local-only occurrence.
+        if len(official_group) > 1 or len(local_group) > 1:
             ambiguous_identities.append(
                 {
                     "identity": identity,
@@ -370,6 +368,12 @@ def reconcile_events(official_fixture: Any, local_fixture: Any) -> dict[str, Any
                     "local": _sorted_reports(local_group),
                 }
             )
+            continue
+        if not official_group:
+            local_only_not_deletion.extend(_sorted_reports(local_group))
+            continue
+        if not local_group:
+            missing_from_local.extend(_sorted_reports(official_group))
             continue
 
         official_event, local_event = official_group[0], local_group[0]

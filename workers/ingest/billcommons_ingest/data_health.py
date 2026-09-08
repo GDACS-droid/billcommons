@@ -35,7 +35,11 @@ def main(argv: list[str] | None = None) -> int:
         # command is safe to run while diagnosing a production incident.
         db.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
         db.execute(text("SET LOCAL statement_timeout = '5000ms'"))
-        report = collect_report(db)
+        try:
+            report = collect_report(db)
+        finally:
+            db.close()
+            db = None
     except Exception as exc:  # noqa: BLE001 - a broken control plane must be visible to monitoring
         if not args.quiet:
             # Driver exceptions can contain connection details or SQL values.
@@ -44,7 +48,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     finally:
         if db is not None:
-            db.close()
+            try:
+                db.close()
+            except Exception:
+                pass  # The original failure was already redacted above.
 
     if not args.quiet:
         print(json.dumps(report, indent=2, sort_keys=True) if args.json else render_text(report))

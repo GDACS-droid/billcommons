@@ -41,3 +41,19 @@ def test_query_failure_closes_read_only_session(monkeypatch, capsys):
         "SET LOCAL statement_timeout = '5000ms'", "close",
     ]
     assert "private-query-value" not in capsys.readouterr().err
+
+
+def test_close_failure_is_controlled_and_redacted(monkeypatch, capsys):
+    class Session:
+        def execute(self, stmt):
+            pass
+
+        def close(self):
+            raise RuntimeError("private close value")
+
+    monkeypatch.setattr(data_health, "get_session", Session)
+    monkeypatch.setattr(data_health, "collect_report", lambda db: {})
+    assert data_health.main(["--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "[CHECK-FAILED] RuntimeError\n"

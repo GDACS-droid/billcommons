@@ -104,6 +104,16 @@ def test_fail_on_only_fails_at_or_above_its_requested_threshold():
     assert exit_code(report, "warning") == 1
 
 
+def test_missing_session_cadence_is_an_explicit_operational_defect():
+    report = build_report([_evidence(cadence_tier=None, cadence_minutes=None)], now=NOW)
+
+    assert [row["code"] for row in report["defects"]] == ["MISSING_REFRESH_CONFIGURATION"]
+    assert report["jurisdictions"][0]["refresh_target"] == {
+        "cadence_tier": None,
+        "target_minutes": None,
+    }
+
+
 def test_one_off_success_does_not_hide_an_overdue_incremental_sync():
     report = build_report(
         [

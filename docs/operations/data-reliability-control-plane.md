@@ -55,10 +55,11 @@ bill provenance counts describe the local corpus, not source completeness.
 
 ## Production observation, read-only
 
-At **2026-09-08 00:47:39 UTC**, the repaired collector observed 52 jurisdictions
-and 20 operational/provenance warnings: 17 overdue incremental-sync checks,
-one missing relevant coverage check, one missing parser-provenance check, and
-one missing source-provenance check. No critical/error-level defect was found
+At **2026-09-08 01:11:03 UTC**, the corrected collector observed 51 jurisdictions
+(50 states plus DC) and 17 overdue incremental-sync warnings. Review caught
+an unsupported test jurisdiction inflating the earlier count; the public
+collector now restricts its scope to the canonical registry codes, without
+changing production rows. No critical/error-level defect was found
 by this implemented check set. This is not a general production-health verdict.
 
 The aggregate, per-jurisdiction evidence is retained in
@@ -103,8 +104,10 @@ credential change, or payment configuration update was performed.
 Web Analytics is now reported enabled. The Vercel CLI command used during the
 audit (`project web-analytics`) is an enable operation and may have enabled it;
 prior enablement was not independently established. No plan was upgraded.
-Custom-event ingestion and plan eligibility remain unverified; Vercel currently
-limits custom events to [Pro and Enterprise](https://vercel.com/docs/analytics/custom-events).
+A subsequent authenticated GET of `/v9/projects/billcommons-web` and `/v2/teams`
+confirmed the owning team's **Pro** plan and enabled Analytics with no disabled
+marker. Custom-event ingestion remains unverified; the observed plan is
+eligible under Vercel's [Pro/Enterprise custom-event requirement](https://vercel.com/docs/analytics/custom-events).
 
 New funnel events distinguish accepted magic-link requests, checkout intent,
 created checkout redirects, and API-key reveal operations. Their property
@@ -136,18 +139,47 @@ npm run lint -- --quiet
 npm run build
 ```
 
-The integration run passed 69 shared/ingest tests and 6 API tests. The API tests
+The final integration run passed 74 shared/ingest tests and 7 API tests. The API tests
 include cache expiry, single-flight behavior, redacted failure, endpoint
 registration, read-only SQL, and connection cleanup. The 22 targeted web tests,
 lint, TypeScript and production build passed. The installed Starlette test
 client reports a dependency deprecation warning; it is not suppressed.
 
 Local Chromium interactions exercised the production-observation fixture:
-52-row rendering, state search, evidence expansion, issue filtering, no-match
+51-row rendering, state search, evidence expansion, issue filtering, no-match
 and clear-filter behavior, a 390px viewport without horizontal overflow,
 upstream 503 unavailable state, and recovery. No JavaScript page error occurred.
 Screenshots in `evidence/reliability-20260908` are local development renders,
 not proof of deployment. The Impeccable detector returned no findings.
+
+## Independent review and adjudication
+
+One canonical `verify-ship` pass reviewed aggregate commit
+`8c0eb4cf6503c2b8c250ecb1854096cdfb754fad`, byte-equivalent to the mission diff
+through integration commit `2047c4b`. Its verdict was **HALT**: Codex, Opus and
+DeepSeek returned BLOCK, and OX was unavailable after its built-in retry.
+The advocate phase was skipped. The final repaired revision has not received
+a passing multi-model verdict; no second fan-out was started.
+
+Confirmed issues were repaired and the affected deterministic checks rerun:
+missing refresh configuration now produces an error; unsupported jurisdiction
+rows are excluded; missing job lock timestamps fall back to creation time;
+null run timestamps sort last; duplicated identities stay ambiguous even with
+an empty counterpart; database cleanup errors remain redacted and sessions are
+closed after rollback failure; the existing feedback sitemap route is retained.
+
+The reported crash-orphan concern was checked against the actual execution
+path. `queue.claim_job` only flushes; `cmd_sync_worker` commits the claim, sync
+writes, continuation and completion together. A crash rolls that transaction
+back to queued. Therefore this path does not leave a committed running row on
+crash. A historical/manually committed running row can still suppress new work
+and needs explicit owner-death investigation; age never authorizes a duplicate.
+The current deployment remains single-replica.
+
+The busy-cache 503 is deliberate and tested: it bounds database demand without
+serving expired success. The login event's fixed surface matches its sole
+current caller, and API link configuration uses the existing absolute-base-URL
+contract. These observations do not replace the missing independent verdict.
 
 ## Release preflight
 
@@ -155,6 +187,13 @@ Verdict: **INSUFFICIENT EVIDENCE for production release**. Implementation and
 local validation do not supply production authorization or resolve the
 pre-existing billing activation gate. No production deployment, migration,
 bulk ingest, official sweep, notification, or outreach was performed.
+
+An independent release-guard pass reached **NOT READY** for the executable
+release decision: it requires a release owner/window, refreshed artifact and
+health evidence, applicable backup/restore proof, the checkout-specific Stripe
+gate, and an actual safe sync-worker boundary. A nightly worker's complete-cycle
+proof does not fit inside a 45-minute session without a separately authorized,
+bounded cycle. This is a release hold, not a claim that deployment occurred.
 
 Affected release units are API (shared report and new route), Vercel web, and
 sync worker (scheduler). MCP, Scout and other workers need no rollout for this

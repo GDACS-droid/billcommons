@@ -60,8 +60,10 @@ def _load_report() -> dict:
         db.execute(text("SET LOCAL statement_timeout = '5s'"))
         return collect_report(db)
     finally:
-        db.rollback()
-        db.close()
+        try:
+            db.rollback()
+        finally:
+            db.close()
 
 
 @router.get("")

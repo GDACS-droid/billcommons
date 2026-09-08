@@ -84,6 +84,7 @@ export const STATIC_ROUTES = [
   "/changelog",
   "/methodology",
   "/about",
+  "/feedback",
   "/pricing",
   "/docs/api",
   "/docs/api-keys",
