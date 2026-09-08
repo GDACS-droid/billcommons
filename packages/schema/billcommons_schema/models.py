@@ -711,7 +711,7 @@ class DerivedStatusEvidence(UUIDPkMixin, Base):
 
 
 class TlsFulltextRepair(UUIDPkMixin, TimestampMixin, Base):
-    """One explicitly approved, bounded retry after a verified TLS repair.
+    """One explicitly approved, bounded retry after a verified repair.
 
     This is not the ordinary fetch queue.  It records why a document exhausted
     normal retries can receive a narrowly scoped retry without clearing its
@@ -745,7 +745,12 @@ class TlsFulltextRepair(UUIDPkMixin, TimestampMixin, Base):
         UniqueConstraint(
             "document_id", "reason", "remediation_version", name="uq_tls_repair_document_reason_version"
         ),
-        CheckConstraint("reason = 'missing_tls_intermediate'", name="ck_tls_repair_reason"),
+        # Historical table name is retained for compatibility.  Each accepted
+        # reason is an independently reviewed, narrowly pinned remediation.
+        CheckConstraint(
+            "reason IN ('missing_tls_intermediate','tx_ftp_witness_url')",
+            name="ck_tls_repair_reason",
+        ),
         CheckConstraint(
             "status IN ('planned','reserved','succeeded','exhausted','expired','skipped')",
             name="ck_tls_repair_status",

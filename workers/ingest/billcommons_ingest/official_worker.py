@@ -31,6 +31,7 @@ DEFAULT_CADENCE_SECONDS = 86400
 MAX_OBSERVATION_SECONDS = 300
 TLS_REPAIR_CYCLE_LIMIT = 2
 TLS_REPAIR_ENABLED_ENV = "OFFICIAL_TLS_REPAIR_ENABLED"
+TX_REPAIR_ENABLED_ENV = "OFFICIAL_TX_FTP_REPAIR_ENABLED"
 
 
 class ObservationDeadlineExceeded(BaseException):
@@ -181,13 +182,39 @@ def _tls_repair_enabled_from_env() -> bool:
     return os.environ.get(TLS_REPAIR_ENABLED_ENV) == "1"
 
 
+def _tx_repair_enabled_from_env() -> bool:
+    """TX FTP witness repair is opt-in independently of TLS repair."""
+    return os.environ.get(TX_REPAIR_ENABLED_ENV) == "1"
+
+
+def _run_tx_repair_cycle(*, session_factory: Callable, fetcher, rawstore, limit: int = TLS_REPAIR_CYCLE_LIMIT) -> dict[str, int]:
+    if not 1 <= limit <= TLS_REPAIR_CYCLE_LIMIT:
+        raise ValueError(f"TX repair limit must be between 1 and {TLS_REPAIR_CYCLE_LIMIT}")
+    db = session_factory()
+    try:
+        planned = tls_repair.seed_tx_candidates(db, limit=limit)
+        db.commit()
+    except BaseException:
+        db.rollback(); raise
+    finally:
+        db.close()
+    result = tls_repair.run_due_repairs(
+        session_factory=session_factory, fetcher=fetcher, rawstore=rawstore,
+        limit=limit, reason=tls_repair.TX_REPAIR_REASON,
+    )
+    return {"planned": planned, "succeeded": result.succeeded, "failed": result.failed,
+            "skipped": result.skipped, "expired": result.expired}
+
+
 def run_cycle(*, stop: threading.Event, max_observations: int,
               session_factory: Callable = get_session, observer: Callable | None = None,
               emit: Callable[[dict], None] | None = None,
               tls_repair_enabled: bool = False,
               tls_repair_fetcher: fulltext.FullTextFetcher | None = None,
               tls_repair_rawstore: RawStore | None = None,
-              tls_repair_runner: Callable | None = None) -> int:
+              tls_repair_runner: Callable | None = None,
+              tx_repair_enabled: bool = False,
+              tx_repair_runner: Callable | None = None) -> int:
     """Observe due targets, then optionally run an isolated tiny TLS batch."""
     if not 1 <= max_observations <= 100:
         raise ValueError("max_observations must be between 1 and 100")
@@ -237,6 +264,19 @@ def run_cycle(*, stop: threading.Event, max_observations: int,
             emit({"event": "official_tls_repair_failed", "error_class": type(exc).__name__})
         else:
             emit({"event": "official_tls_repair_cycle", **counts})
+    if tx_repair_enabled and not stop.is_set():
+        runner = tx_repair_runner or _run_tx_repair_cycle
+        try:
+            counts = runner(
+                session_factory=session_factory,
+                fetcher=tls_repair_fetcher or fulltext.FullTextFetcher(),
+                rawstore=tls_repair_rawstore or FilesystemRawStore(),
+                limit=TLS_REPAIR_CYCLE_LIMIT,
+            )
+        except Exception as exc:
+            emit({"event": "official_tx_ftp_repair_failed", "error_class": type(exc).__name__})
+        else:
+            emit({"event": "official_tx_ftp_repair_cycle", **counts})
     return processed
 
 
@@ -271,10 +311,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--enable-seeded requires --seed-ca or --seed-discovery")
     stop = threading.Event()
     tls_repair_enabled = _tls_repair_enabled_from_env()
+    tx_repair_enabled = _tx_repair_enabled_from_env()
     # Construct once per process so the repair path retains its rate limiter,
     # robots cache, AIA cache, and optional filesystem archive across cycles.
-    tls_repair_fetcher = fulltext.FullTextFetcher() if tls_repair_enabled else None
-    tls_repair_rawstore = FilesystemRawStore() if tls_repair_enabled else None
+    tls_repair_fetcher = fulltext.FullTextFetcher() if tls_repair_enabled or tx_repair_enabled else None
+    tls_repair_rawstore = FilesystemRawStore() if tls_repair_enabled or tx_repair_enabled else None
     previous = {}
     for signum in (signal.SIGTERM, signal.SIGINT):
         previous[signum] = signal.signal(signum, lambda *_: stop.set())
@@ -304,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
                     tls_repair_enabled=tls_repair_enabled,
                     tls_repair_fetcher=tls_repair_fetcher,
                     tls_repair_rawstore=tls_repair_rawstore,
+                    tx_repair_enabled=tx_repair_enabled,
                 )
                 failures = 0
                 _emit({"event": "official_cycle_complete", "observations": processed})

@@ -28,8 +28,11 @@ from sqlalchemy.orm import Session
 
 from billcommons_ingest import fulltext
 from billcommons_schema.models import (
+    Bill,
     BillDocument,
+    BillVersion,
     IngestJob,
+    Jurisdiction,
     TlsFulltextRepair,
     TlsFulltextRepairAttempt,
 )
@@ -39,6 +42,8 @@ from billcommons_shared.rawstore import FilesystemRawStore, RawStore
 
 REPAIR_REASON = "missing_tls_intermediate"
 REMEDIATION_VERSION = "tls-intermediate-aia-v1"
+TX_REPAIR_REASON = "tx_ftp_witness_url"
+TX_REMEDIATION_VERSION = "tx-ftp-tlodocs-v1"
 MAX_REPAIR_ATTEMPTS = 2
 MAX_CYCLE_LIMIT = 100
 DEFAULT_CYCLE_LIMIT = 20
@@ -161,6 +166,38 @@ def _is_exact_missing_issuer_error(error: str | None) -> bool:
     return _CERT_VERIFY_MARKER in normalized and _MISSING_ISSUER_MARKER in normalized
 
 
+def _tx_witness_candidate(url: str | None) -> str | None:
+    """Return only the reviewed TX resolver output for the three evidence eras."""
+    if not url:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "ftp"
+        or parsed.hostname != "ftp.legis.state.tx.us"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in (None, 21)
+        or not parsed.path.startswith(("/bills/89R/witlistbill/html/", "/bills/891/witlistbill/html/", "/bills/892/witlistbill/html/"))
+    ):
+        return None
+    # The resolver is deliberately owned separately; this repair merely uses
+    # its pure reviewed candidate as a witness, never inventing a TX URL.
+    from billcommons_ingest import url_resolvers
+
+    resolver = getattr(url_resolvers, "tx_ftp_tlodocs_candidate", None)
+    if not callable(resolver):
+        return None
+    candidate = resolver(url)
+    return candidate if isinstance(candidate, str) and candidate else None
+
+
+def _is_tx_redirect_error(error: str | None) -> bool:
+    return bool(error and fulltext.STATUS_UNSUPPORTED_REDIRECT_SCHEME in error)
+
+
 def _active_normal_fetch_job_exists(db: Session, document_id: object) -> bool:
     return bool(
         db.execute(
@@ -175,15 +212,36 @@ def _active_normal_fetch_job_exists(db: Session, document_id: object) -> bool:
     )
 
 
-def _document_remains_repairable(db: Session, document: BillDocument) -> bool:
+def _document_remains_repairable(
+    db: Session, document: BillDocument, *, reason: str = REPAIR_REASON
+) -> bool:
     """Recheck all mutable eligibility while holding the document row lock."""
-    return (
+    common = (
         document.extracted_text is None
-        and _valid_reviewed_url(document.url)
-        and _status(document.license_note) == fulltext.STATUS_PERMANENTLY_FAILED
-        and (document.fetch_attempts or 0) >= fulltext.MAX_FETCH_ATTEMPTS
         and not _active_normal_fetch_job_exists(db, document.id)
     )
+    if reason == REPAIR_REASON:
+        return (
+            common
+            and _valid_reviewed_url(document.url)
+            and _status(document.license_note) == fulltext.STATUS_PERMANENTLY_FAILED
+            and (document.fetch_attempts or 0) >= fulltext.MAX_FETCH_ATTEMPTS
+        )
+    if reason == TX_REPAIR_REASON:
+        jurisdiction = db.scalar(
+            select(Jurisdiction.abbreviation)
+            .join(Bill, Bill.jurisdiction_id == Jurisdiction.id)
+            .join(BillVersion, BillVersion.bill_id == Bill.id)
+            .where(BillVersion.id == document.bill_version_id)
+        )
+        return (
+            common
+            and jurisdiction == "TX"
+            and _tx_witness_candidate(document.url) is not None
+            and _status(document.license_note) == fulltext.STATUS_UNSUPPORTED_REDIRECT_SCHEME
+            and (document.fetch_attempts or 0) == 0
+        )
+    return False
 
 
 def _matching_dead_jobs():
@@ -268,6 +326,67 @@ def discover_candidates(db: Session, *, limit: int = DEFAULT_CYCLE_LIMIT) -> lis
     return candidates
 
 
+def discover_tx_candidates(db: Session, *, limit: int = DEFAULT_CYCLE_LIMIT) -> list[RepairCandidate]:
+    """Find only the historically recorded TX FTP redirect failures.
+
+    The table name is historical TLS compatibility storage; this function is
+    intentionally an explicit second admission path, not a policy framework.
+    """
+    limit = _bounded_limit(limit)
+    _set_db_timeouts(db)
+    document_id = IngestJob.payload["document_id"].astext.label("document_id")
+    dead = (
+        select(
+            IngestJob.id.label("source_dead_job_id"), document_id,
+            IngestJob.last_error.label("last_error"),
+            func.row_number().over(
+                partition_by=document_id,
+                order_by=(IngestJob.created_at.desc(), IngestJob.id.desc()),
+            ).label("latest_rank"),
+        )
+        .where(
+            IngestJob.kind == FETCH_TEXT_KIND,
+            IngestJob.status == "dead",
+            func.lower(IngestJob.last_error).contains(fulltext.STATUS_UNSUPPORTED_REDIRECT_SCHEME),
+        ).subquery()
+    )
+    active = exists().where(
+        IngestJob.kind == FETCH_TEXT_KIND,
+        IngestJob.status.in_(("queued", "running")),
+        IngestJob.payload["document_id"].astext == cast(BillDocument.id, Text),
+    )
+    existing = exists().where(
+        TlsFulltextRepair.document_id == BillDocument.id,
+        TlsFulltextRepair.reason == TX_REPAIR_REASON,
+        TlsFulltextRepair.remediation_version == TX_REMEDIATION_VERSION,
+    )
+    stmt = (
+        select(BillDocument.id, dead.c.source_dead_job_id, dead.c.last_error)
+        .join(dead, dead.c.document_id == cast(BillDocument.id, Text))
+        .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
+        .join(Bill, Bill.id == BillVersion.bill_id)
+        .join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id)
+        .where(
+            dead.c.latest_rank == 1,
+            Jurisdiction.abbreviation == "TX",
+            BillDocument.extracted_text.is_(None),
+            BillDocument.fetch_attempts == 0,
+            fulltext.license_note_matches_status(
+                BillDocument.license_note, (fulltext.STATUS_UNSUPPORTED_REDIRECT_SCHEME,)
+            ),
+            BillDocument.url.like("ftp://ftp.legis.state.tx.us/%"),
+            ~active, ~existing,
+        ).order_by(BillDocument.id).limit(limit)
+    )
+    return [
+        RepairCandidate(document_id=row[0], source_dead_job_id=row[1],
+                        source_error_sha256=hashlib.sha256(row[2].encode("utf-8")).hexdigest())
+        for row in db.execute(stmt)
+        if _is_tx_redirect_error(row[2])
+        and _tx_witness_candidate(db.get(BillDocument, row[0]).url) is not None
+    ]
+
+
 def seed_candidates(
     db: Session,
     *,
@@ -325,6 +444,37 @@ def seed_candidates(
     return created
 
 
+def seed_tx_candidates(db: Session, *, now: datetime | None = None, limit: int = DEFAULT_CYCLE_LIMIT) -> int:
+    """Persist TX witness plans once; callers still own the outer commit."""
+    current = _utc(now)
+    created = 0
+    for candidate in discover_tx_candidates(db, limit=limit):
+        document = db.get(BillDocument, candidate.document_id, with_for_update=True)
+        if document is None or not _document_remains_repairable(db, document, reason=TX_REPAIR_REASON):
+            continue
+        repair = TlsFulltextRepair(
+            document_id=document.id, reason=TX_REPAIR_REASON,
+            remediation_version=TX_REMEDIATION_VERSION,
+            source_dead_job_id=candidate.source_dead_job_id,
+            source_error_sha256=candidate.source_error_sha256,
+            status="planned", attempts=0, max_attempts=MAX_REPAIR_ATTEMPTS,
+            next_attempt_at=current, expires_at=current + REPAIR_LIFETIME,
+        )
+        try:
+            with db.begin_nested():
+                db.add(repair); db.flush()
+        except IntegrityError:
+            if db.scalar(select(TlsFulltextRepair.id).where(
+                TlsFulltextRepair.document_id == document.id,
+                TlsFulltextRepair.reason == TX_REPAIR_REASON,
+                TlsFulltextRepair.remediation_version == TX_REMEDIATION_VERSION,
+            )) is None:
+                raise
+        else:
+            created += 1
+    return created
+
+
 def _append_attempt_event(
     db: Session,
     repair: TlsFulltextRepair,
@@ -363,7 +513,9 @@ def _complete_without_fetch(
     return "expired" if status == "expired" else "skipped"
 
 
-def reserve_one_due_repair(db: Session, *, now: datetime | None = None) -> RepairReservation | str | None:
+def reserve_one_due_repair(
+    db: Session, *, now: datetime | None = None, reason: str = REPAIR_REASON
+) -> RepairReservation | str | None:
     """Commit-safe admission before any outbound request.
 
     A reservation consumes one of the two allowed repair attempts and remains
@@ -378,6 +530,7 @@ def reserve_one_due_repair(db: Session, *, now: datetime | None = None) -> Repai
         .where(
             TlsFulltextRepair.status == "planned",
             TlsFulltextRepair.next_attempt_at <= current,
+            TlsFulltextRepair.reason == reason,
         )
         .order_by(TlsFulltextRepair.next_attempt_at, TlsFulltextRepair.created_at)
         .limit(1)
@@ -425,7 +578,11 @@ def _source_evidence_still_matches(db: Session, repair: TlsFulltextRepair) -> bo
         and hmac.compare_digest(
             hashlib.sha256(source.last_error.encode("utf-8")).hexdigest(), repair.source_error_sha256
         )
-        and _is_exact_missing_issuer_error(source.last_error)
+        and (
+            _is_exact_missing_issuer_error(source.last_error)
+            if repair.reason == REPAIR_REASON
+            else repair.reason == TX_REPAIR_REASON and _is_tx_redirect_error(source.last_error)
+        )
     )
 
 
@@ -482,9 +639,14 @@ def execute_reserved_repair(
 
     document = db.get(BillDocument, repair.document_id, with_for_update=True)
     before_status = _status(document.license_note) if document is not None else None
+    approved_record = (
+        (repair.reason == REPAIR_REASON and repair.remediation_version == REMEDIATION_VERSION)
+        or (repair.reason == TX_REPAIR_REASON and repair.remediation_version == TX_REMEDIATION_VERSION)
+    )
     if (
-        document is None
-        or not _document_remains_repairable(db, document)
+        not approved_record
+        or document is None
+        or not _document_remains_repairable(db, document, reason=repair.reason)
         or not _source_evidence_still_matches(db, repair)
     ):
         repair.status = "skipped"
@@ -608,6 +770,7 @@ def run_due_repairs(
     fetcher: fulltext.FullTextFetcher | None = None,
     rawstore: RawStore | None = None,
     limit: int = DEFAULT_CYCLE_LIMIT,
+    reason: str = REPAIR_REASON,
 ) -> RepairCycleResult:
     """Reserve, commit, then run at most ``limit`` bounded repairs."""
     limit = _bounded_limit(limit)
@@ -617,7 +780,7 @@ def run_due_repairs(
     for _ in range(limit):
         reserve_db = session_factory()
         try:
-            reservation = reserve_one_due_repair(reserve_db)
+            reservation = reserve_one_due_repair(reserve_db, reason=reason)
             reserve_db.commit()
         except Exception:
             reserve_db.rollback()

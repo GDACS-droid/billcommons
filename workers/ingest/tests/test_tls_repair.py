@@ -338,3 +338,56 @@ def test_success_mutation_and_outcome_rollback_together(db_session, monkeypatch)
     assert repair.status == "reserved"
     assert repair.attempts == 1
     assert _outcomes(db_session) == ["admitted"]
+
+
+def _tx_document(db, *, url="ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/SB00001.htm"):
+    document = _document(db, url=url, status=f"fulltext_status={fulltext.STATUS_UNSUPPORTED_REDIRECT_SCHEME}", attempts=0)
+    bill = db.scalar(select(Bill).join(BillVersion, BillVersion.bill_id == Bill.id).where(BillVersion.id == document.bill_version_id))
+    jurisdiction = db.get(Jurisdiction, bill.jurisdiction_id)
+    jurisdiction.abbreviation = "TX"
+    return document
+
+
+def _enable_tx_witness(monkeypatch):
+    from billcommons_ingest import url_resolvers
+    monkeypatch.setattr(url_resolvers, "tx_ftp_tlodocs_candidate", lambda url: "https://capitol.texas.gov/tlodocs/89R/witlistbill/html/SB00001.htm", raising=False)
+
+
+def test_tx_witness_requires_exact_tx_status_url_and_latest_dead_source(db_session, monkeypatch):
+    _enable_tx_witness(monkeypatch)
+    eligible = _tx_document(db_session)
+    source = _dead_tls_job(db_session, eligible, error="fulltext_status=unsupported_redirect_scheme")
+    assert tls_repair.discover_tx_candidates(db_session) == [
+        tls_repair.RepairCandidate(eligible.id, source.id, hashlib.sha256(source.last_error.encode()).hexdigest())
+    ]
+    assert tls_repair.seed_tx_candidates(db_session, now=NOW) == 1
+    assert tls_repair.seed_tx_candidates(db_session, now=NOW) == 0
+
+
+def test_tx_source_drift_revalidates_before_fetch(db_session, monkeypatch):
+    _enable_tx_witness(monkeypatch)
+    document = _tx_document(db_session)
+    source = _dead_tls_job(db_session, document, error="fulltext_status=unsupported_redirect_scheme")
+    assert tls_repair.seed_tx_candidates(db_session, now=NOW) == 1
+    reservation = tls_repair.reserve_one_due_repair(db_session, now=NOW, reason=tls_repair.TX_REPAIR_REASON)
+    source.last_error = "changed"
+    monkeypatch.setattr(fulltext, "process_fetch_text_job", lambda *_a, **_k: pytest.fail("stale TX source fetched"))
+    assert tls_repair.execute_reserved_repair(db_session, reservation, fetcher=object(), rawstore=object(), now=NOW) == "skipped"
+
+
+def test_tx_success_uses_shared_fulltext_tail_and_ledger(db_session, monkeypatch):
+    _enable_tx_witness(monkeypatch)
+    document = _tx_document(db_session)
+    _dead_tls_job(db_session, document, error="fulltext_status=unsupported_redirect_scheme")
+    assert tls_repair.seed_tx_candidates(db_session, now=NOW) == 1
+    reservation = tls_repair.reserve_one_due_repair(db_session, now=NOW, reason=tls_repair.TX_REPAIR_REASON)
+    def success(db, document_id, **_kwargs):
+        stored = db.get(BillDocument, document_id)
+        stored.extracted_text = "official witness text"
+        stored.license_note = "fulltext_status=ok url_resolver=tx_ftp_tlodocs"
+        return fulltext.FetchTextResult(document_id=str(stored.id), status=fulltext.STATUS_OK, extracted_chars=21)
+    monkeypatch.setattr(fulltext, "process_fetch_text_job", success)
+    assert tls_repair.execute_reserved_repair(db_session, reservation, fetcher=object(), rawstore=object(), now=NOW) == "succeeded"
+    repair = db_session.scalar(select(TlsFulltextRepair).where(TlsFulltextRepair.reason == tls_repair.TX_REPAIR_REASON))
+    assert repair.status == "succeeded"
+    assert _outcomes(db_session)[-2:] == ["admitted", "succeeded"]

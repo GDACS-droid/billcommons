@@ -38,7 +38,7 @@ def upgrade() -> None:
         "id UUID DEFAULT gen_random_uuid() NOT NULL, "
         "PRIMARY KEY (id), "
         "CONSTRAINT uq_tls_repair_document_reason_version UNIQUE (document_id, reason, remediation_version), "
-        "CONSTRAINT ck_tls_repair_reason CHECK (reason = 'missing_tls_intermediate'), "
+        "CONSTRAINT ck_tls_repair_reason CHECK (reason IN ('missing_tls_intermediate','tx_ftp_witness_url')), "
         "CONSTRAINT ck_tls_repair_status CHECK (status IN ('planned','reserved','succeeded','exhausted','expired','skipped')), "
         "CONSTRAINT ck_tls_repair_attempts CHECK (attempts BETWEEN 0 AND max_attempts), "
         "CONSTRAINT ck_tls_repair_max_attempts CHECK (max_attempts BETWEEN 1 AND 2), "
