@@ -62,6 +62,10 @@ CADENCE_YEAR_ROUND_MINUTES = 60
 CADENCE_RECENTLY_ADJOURNED_MINUTES = 24 * 60
 CADENCE_DORMANT_MINUTES = 7 * 24 * 60
 RECENTLY_ADJOURNED_WINDOW_DAYS = 30
+# Ingestion runs and report reads normally use the same database clock. Keep a
+# small allowance for clock propagation or a report captured across a boundary,
+# but surface a materially future local success rather than treating it as fresh.
+MAX_FUTURE_SYNC_SKEW_MINUTES = 5
 
 SEVERITY_ORDER = {"critical": 0, "error": 1, "warning": 2, "info": 3}
 FAIL_ON_ORDER = {"critical": 0, "error": 1, "warning": 2}
@@ -157,6 +161,8 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
     No condition here concludes that an official source is fresh or stale.
     ``LOCAL_SYNC_OVERDUE`` is solely a scheduling/liveness signal: the local
     run history is older than the cadence configured for this jurisdiction.
+    ``FUTURE_SUCCESSFUL_API_SYNC_TIME`` is a local timestamp-integrity signal,
+    not a statement about official-source freshness.
     """
     defects: list[Defect] = []
     bills = evidence.bills
@@ -327,7 +333,22 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
         observed_at = _utc(evidence.latest_successful_api_sync.observed_at)
         if observed_at is not None:
             age_minutes = (now - observed_at).total_seconds() / 60
-            if age_minutes > evidence.cadence_minutes:
+            if age_minutes < -MAX_FUTURE_SYNC_SKEW_MINUTES:
+                defects.append(
+                    Defect(
+                        "error",
+                        "FUTURE_SUCCESSFUL_API_SYNC_TIME",
+                        jurisdiction,
+                        "The last successful local API sync timestamp is materially in the future.",
+                        {
+                            "last_successful_local_api_sync_at": _timestamp(observed_at),
+                            "ahead_minutes": round(-age_minutes, 1),
+                            "allowed_clock_skew_minutes": MAX_FUTURE_SYNC_SKEW_MINUTES,
+                            "cadence_tier": evidence.cadence_tier,
+                        },
+                    )
+                )
+            elif age_minutes > evidence.cadence_minutes:
                 defects.append(
                     Defect(
                         "warning",

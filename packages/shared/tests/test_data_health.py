@@ -196,6 +196,42 @@ def test_empty_local_corpus_is_an_error_without_claiming_source_freshness():
     assert exit_code(empty_corpus, "error") == 1
 
 
+def test_future_successful_api_sync_is_an_error_after_small_clock_skew_tolerance():
+    future_sync = RunEvidence(
+        "openstates_api_sync", "success", NOW + timedelta(minutes=6), NOW + timedelta(minutes=6)
+    )
+    report = build_report(
+        [_evidence(latest_api_sync_run=future_sync, latest_successful_api_sync=future_sync)], now=NOW
+    )
+
+    assert report["defects"] == [
+        {
+            "severity": "error",
+            "code": "FUTURE_SUCCESSFUL_API_SYNC_TIME",
+            "jurisdiction": "AA",
+            "message": "The last successful local API sync timestamp is materially in the future.",
+            "evidence": {
+                "last_successful_local_api_sync_at": "2026-09-08T12:06:00+00:00",
+                "ahead_minutes": 6.0,
+                "allowed_clock_skew_minutes": 5,
+                "cadence_tier": "active",
+            },
+        }
+    ]
+    assert exit_code(report, "error") == 1
+
+
+def test_successful_api_sync_within_clock_skew_tolerance_does_not_create_a_defect():
+    tolerated_sync = RunEvidence(
+        "openstates_api_sync", "success", NOW + timedelta(minutes=5), NOW + timedelta(minutes=5)
+    )
+    report = build_report(
+        [_evidence(latest_api_sync_run=tolerated_sync, latest_successful_api_sync=tolerated_sync)], now=NOW
+    )
+
+    assert report["defects"] == []
+
+
 def test_successful_api_sync_without_any_timestamp_is_an_error_not_freshness():
     unknown_time = RunEvidence("openstates_api_sync", "success", None, None)
     report = build_report(
