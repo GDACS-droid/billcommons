@@ -145,9 +145,9 @@ _TX_WITNESS_LIST_PATH_RE = re.compile(
 _TX_WITNESS_LIST_BUCKET_PATH_RE = re.compile(
     r"^/bills/(?P<session>89R|891|892)/witlistbill/html/"
     r"(?P<collection>house_bills|senate_bills)/"
-    r"(?P<bucket_prefix>HB|SB)(?P<bucket_start>\d{5})_"
-    r"(?P=bucket_prefix)(?P<bucket_end>\d{5})/"
-    r"(?P<filename>(?P<filename_prefix>HB|SB)(?P<file_number>\d{5})"
+    r"(?P<bucket_prefix>HB|SB)(?P<bucket_start>[0-9]{5})_"
+    r"(?P=bucket_prefix)(?P<bucket_end>[0-9]{5})/"
+    r"(?P<filename>(?P<filename_prefix>HB|SB)(?P<file_number>[0-9]{5})"
     r"[A-Za-z0-9._-]*\.(?i:html?))$"
 )
 _TX_WITNESS_BUCKET_PREFIXES = {"house_bills": "HB", "senate_bills": "SB"}

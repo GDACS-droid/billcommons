@@ -139,6 +139,8 @@ def test_tx_resolver_preserves_the_original_ftp_url_before_the_https_candidate()
         "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/house_bills/HB00500_HB00599/HB00499H.htm",
         "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/senate_bills/SB00099_SB00001/SB00015S.HTM",
         "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/house_resolutions/HR00001_HR00099/HR00051H.htm",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/house_bills/HB٠٠٥٠٠_HB٠٠٥٩٩/HB٠٠٥٧٦H.htm",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/house_bills/HB００５００_HB００５９９/HB００５７６H.htm",
     ],
 )
 def test_tx_ftp_tlodocs_candidate_rejects_unreviewed_or_unsafe_source_shape(source_url):
