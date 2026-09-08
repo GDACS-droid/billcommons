@@ -1309,6 +1309,7 @@ def test_status_derivation_records_relation_only_change_when_status_is_already_c
     assert after["substitution_relations"] == [
         {
             "id": after["substitution_relations"][0]["id"],
+            "created_at": after["substitution_relations"][0]["created_at"],
             "related_bill_id": None,
             "related_identifier": "HB 9999",
             "relation_type": "substituted-by",
@@ -1408,15 +1409,11 @@ def test_status_derivation_replays_saved_substitution_decision(db_session):
     assert decision["text_derived_identifier"] == "HB 10"
     assert decision["selected_survivor_bill_id"] == str(survivor.id)
     assert survivor_input["status"] == "enacted"
-    # Relation lookup itself is not replayed here. The saved decision records
-    # its exact selected survivor, and the pure terminal propagation rule
-    # reproduces the persisted result from that bounded input.
-    replayed_status = (
-        survivor_input["status"]
-        if survivor_input["status"] in status_mod.TERMINAL_STATUSES
-        else status_mod.SUBSTITUTED
-    )
-    assert replayed_status == after["bill"]["status"] == "enacted"
+    # The retained v2 record performs the lookup and reconciliation without
+    # opening a database session; the survivor status is an explicit external
+    # snapshot rather than a recursive whole-corpus claim.
+    replayed = status_evidence_mod.assert_replay_matches_after(inputs, _read_evidence_blob(db_session, record.before_snapshot_sha256), after)
+    assert replayed["bill"]["status"] == "enacted"
 
 
 def test_status_derivation_evidence_failure_rolls_back_stamp_event(db_session, monkeypatch):
@@ -1463,3 +1460,109 @@ def test_status_derivation_rejects_causal_evidence_for_another_bill(db_session):
             )
     assert db_session.get(Bill, target_bill.id).status is None
     assert _derived_evidence(db_session) == []
+
+
+def _offline_replay_record(*, bill_id="bill-1", description="Introduced", classification="introduction", as_of=date(2026, 1, 1), end_date=None, active=True, relations=None, jurisdiction="NJ", ranks=None, selected_id=None, survivor_status=None):
+    relations = relations or []
+    actions = [{
+        "id": "action-1", "action_date": "2026-01-01", "classification": classification,
+        "description": description, "organization_id": None, "order": 1, "source_name": "fixture",
+    }]
+    action_rows = [status_mod.ActionRow(action_date=date(2026, 1, 1), classification=classification, description=description, organization_id=None, order=1, source_name="fixture")]
+    base = status_mod.apply_session_outcome(status_mod.derive_status(action_rows), end_date, today=as_of, session_active=active, session_has_recent_activity=False)
+    text_target = status_mod.substitution_target(description)
+    selected_identifier = text_target
+    final = survivor_status if survivor_status in status_mod.TERMINAL_STATUSES else (status_mod.SUBSTITUTED if selected_identifier is not None or selected_id is not None else base)
+    resolved = None if selected_identifier is None and selected_id is None else {"bill_id": selected_id, "identifier": selected_identifier, "status": survivor_status}
+    return {
+        "replay_input_version": status_evidence_mod.REPLAY_INPUT_VERSION,
+        "algorithm_version": status_evidence_mod.ALGORITHM_VERSION,
+        "algorithm_source_sha256": status_evidence_mod.algorithm_source_sha256(),
+        "as_of_date": as_of.isoformat(),
+        "bill_id": bill_id,
+        "session": {"id": "session-1", "end_date": end_date.isoformat() if end_date else None, "active": active, "has_recent_chamber_activity": False},
+        "actions": actions,
+        "consulted_substitution_relations": relations,
+        "resolved_survivor": resolved,
+        "substitution_decision": {
+            "base_status": base, "text_derived_identifier": text_target,
+            "selected_identifier": selected_identifier, "selected_survivor_bill_id": selected_id,
+            "selected_survivor_identifier": selected_identifier if selected_id else None, "final_status": final,
+        },
+        "substitution_lookup": {
+            "version": "substitution-lookup/1",
+            "jurisdiction": {"id": "jurisdiction-1", "abbreviation": jurisdiction, "print_suffix": jurisdiction == "NY"},
+            "ranks": ranks or [],
+        },
+        "external_snapshots": {
+            "session_activity": {"version": status_evidence_mod.SESSION_ACTIVITY_SNAPSHOT_VERSION, "as_of_date": as_of.isoformat(), "window_days": 30, "classification_patterns": [], "has_recent_chamber_activity": False},
+            "survivor_status": {"version": status_evidence_mod.SURVIVOR_STATUS_SNAPSHOT_VERSION, "bill_id": selected_id, "status": survivor_status},
+        },
+    }
+
+
+def _offline_before(bill_id="bill-1", status=None, relations=None):
+    return {"bill": {"id": bill_id, "status": status}, "substitution_relations": relations or []}
+
+
+def test_offline_replay_parses_nj_reprint_and_reconciles_new_relation():
+    input_data = _offline_replay_record(
+        description="Substituted by A1516 (1R)", classification=None, jurisdiction="NJ",
+        ranks=[{"identifier": "A 1516", "candidates": [{"source": "database", "bill_id": "survivor-1", "identifier": "A 1516"}]}],
+        selected_id="survivor-1", survivor_status="enacted",
+    )
+    before = _offline_before()
+    after = {"bill": {"id": "bill-1", "status": "enacted"}, "substitution_relations": [{
+        "id": "new-row", "created_at": "2026-01-01T00:00:00+00:00", "related_bill_id": "survivor-1",
+        "related_identifier": "A 1516", "relation_type": "substituted-by",
+    }]}
+    assert status_evidence_mod.assert_replay_matches_after(input_data, before, after)["bill"]["status"] == "enacted"
+
+
+def test_offline_replay_uses_ny_exact_candidate_before_print_suffix_fallback():
+    input_data = _offline_replay_record(
+        description="SUBSTITUTED BY A10008C", classification=None, jurisdiction="NY",
+        ranks=[
+            {"identifier": "A 10008C", "candidates": [{"source": "database", "bill_id": "exact-out-of-chunk", "identifier": "A 10008C"}]},
+            {"identifier": "A 10008", "candidates": [{"source": "chunk", "bill_id": "stripped-in-chunk", "identifier": "A 10008"}]},
+        ], selected_id="exact-out-of-chunk", survivor_status="enacted",
+    )
+    before = _offline_before()
+    after = {"bill": {"id": "bill-1", "status": "enacted"}, "substitution_relations": [{
+        "id": "new-row", "created_at": "2026-01-01T00:00:00+00:00", "related_bill_id": "exact-out-of-chunk",
+        "related_identifier": "A 10008C", "relation_type": "substituted-by",
+    }]}
+    assert status_evidence_mod.assert_replay_matches_after(input_data, before, after)["substitution_relations"][0]["related_bill_id"] == "exact-out-of-chunk"
+
+
+def test_offline_replay_preserves_newest_resolved_duplicate_relation():
+    relations = [
+        {"id": "older", "created_at": "2026-01-01T00:00:00+00:00", "related_bill_id": "survivor-old", "related_identifier": "HB10", "relation_type": "substituted-by"},
+        {"id": "newer", "created_at": "2026-01-02T00:00:00+00:00", "related_bill_id": "survivor-new", "related_identifier": "HB 10", "relation_type": "substituted-by"},
+    ]
+    input_data = _offline_replay_record(description="SUBSTITUTED BY HB10", classification=None, relations=relations, selected_id="survivor-new", survivor_status="enacted")
+    before = _offline_before(relations=relations)
+    after = {"bill": {"id": "bill-1", "status": "enacted"}, "substitution_relations": [relations[1]]}
+    assert status_evidence_mod.assert_replay_matches_after(input_data, before, after)["substitution_relations"] == [{"related_bill_id": "survivor-new", "related_identifier": "HB 10", "relation_type": "substituted-by"}]
+
+
+def test_offline_replay_uses_retained_historical_effective_date():
+    input_data = _offline_replay_record(as_of=date(2026, 1, 1), end_date=date(2026, 1, 1), active=False)
+    before = _offline_before()
+    after = {"bill": {"id": "bill-1", "status": "introduced"}, "substitution_relations": []}
+    assert status_evidence_mod.assert_replay_matches_after(input_data, before, after)["bill"]["status"] == "introduced"
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda value: value["substitution_lookup"]["ranks"][0]["candidates"].__setitem__(0, {"source": "database", "bill_id": "tampered", "identifier": "A 1516"}),
+    lambda value: value["external_snapshots"].pop("session_activity"),
+])
+def test_offline_replay_rejects_tampered_or_missing_required_input(mutate):
+    input_data = _offline_replay_record(
+        description="Substituted by A1516 (1R)", classification=None, jurisdiction="NJ",
+        ranks=[{"identifier": "A 1516", "candidates": [{"source": "database", "bill_id": "survivor-1", "identifier": "A 1516"}]}],
+        selected_id="survivor-1", survivor_status="enacted",
+    )
+    mutate(input_data)
+    with pytest.raises(status_evidence_mod.DerivedStatusReplayError):
+        status_evidence_mod.replay_derivation(input_data, _offline_before())

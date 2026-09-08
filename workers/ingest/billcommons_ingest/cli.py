@@ -1545,6 +1545,7 @@ def recompute_status_for_bills(
     session_active = {}
     bill_session = {}
     bill_jurisdiction: dict = {}
+    bill_jurisdiction_abbreviation: dict = {}
     bill_identifier_norm: dict = {}
     for r in db.execute(
         select(
@@ -1555,14 +1556,17 @@ def recompute_status_for_bills(
             Bill.identifier_norm,
             SessionModel.end_date,
             SessionModel.active,
+            Jurisdiction.abbreviation,
         )
         .join(SessionModel, SessionModel.id == Bill.session_id)
+        .join(Jurisdiction, Jurisdiction.id == Bill.jurisdiction_id)
         .where(Bill.id.in_(bill_ids))
     ).all():
         current[r.id] = r.status
         session_end[r.id] = r.end_date
         session_active[r.id] = bool(r.active)
         bill_jurisdiction[r.id] = r.jurisdiction_id
+        bill_jurisdiction_abbreviation[r.id] = r.abbreviation
         bill_identifier_norm[r.id] = r.identifier_norm
         bill_session[r.id] = r.session_id
     # Evidence uses exactly the state this local computation can overwrite.
@@ -1672,6 +1676,7 @@ def recompute_status_for_bills(
         derived_status[bid] = status_mod.apply_session_outcome(
             status_mod.derive_status(actions_by_bill[bid]),
             session_end.get(bid),
+            today=today_date,
             session_active=session_active.get(bid, False),
             session_has_recent_activity=(
                 bill_session.get(bid) in sessions_with_recent_activity
@@ -1718,6 +1723,7 @@ def recompute_status_for_bills(
     related_rows = db.execute(
         select(
             RelatedBill.id,
+            RelatedBill.created_at,
             RelatedBill.bill_id,
             RelatedBill.related_bill_id,
             RelatedBill.related_identifier,
@@ -1756,6 +1762,7 @@ def recompute_status_for_bills(
         records.append(
             {
                 "id": str(row.id),
+                "created_at": row.created_at.astimezone(timezone.utc).isoformat() if row.created_at.tzinfo else row.created_at.replace(tzinfo=timezone.utc).isoformat(),
                 "related_bill_id": str(row.related_bill_id) if row.related_bill_id else None,
                 "related_identifier": row.related_identifier,
                 "relation_type": row.relation_type,
@@ -1811,6 +1818,22 @@ def recompute_status_for_bills(
                 pass
 
     resolved_survivor_by_bill: dict[object, dict] = {}
+    # This trace records every candidate the live resolver can select, in the
+    # exact rank/source/order considered. It makes later replay independent of
+    # the current bills table while preserving the external survivor status as
+    # an explicitly labelled snapshot below.
+    substitution_lookup_by_bill: dict[object, dict] = {
+        bid: {
+            "version": "substitution-lookup/1",
+            "jurisdiction": {
+                "id": str(bill_jurisdiction.get(bid)) if bill_jurisdiction.get(bid) else None,
+                "abbreviation": bill_jurisdiction_abbreviation.get(bid),
+                "print_suffix": (bill_jurisdiction_abbreviation.get(bid) or "").upper() == "NY",
+            },
+            "ranks": [],
+        }
+        for bid in bill_ids
+    }
     substitution_candidates = set(survivor_identifier) | set(survivor_bill_id)
     if substitution_candidates:
         # Resolve identifier-only survivors to a bill id within the same
@@ -1845,6 +1868,11 @@ def recompute_status_for_bills(
                 )
                 for bid, ident in needs_lookup.items()
             }
+            for bid, candidates in candidates_by_bid.items():
+                substitution_lookup_by_bill[bid]["ranks"] = [
+                    {"identifier": candidate, "candidates": []}
+                    for candidate in candidates
+                ]
 
             in_chunk_by_key = {
                 (bill_jurisdiction.get(other), bill_session.get(other), bill_identifier_norm.get(other)): other
@@ -1866,6 +1894,10 @@ def recompute_status_for_bills(
                     candidate = candidates_by_bid[bid][rank]
                     key = (bill_jurisdiction.get(bid), bill_session.get(bid), candidate)
                     match = in_chunk_by_key.get(key)
+                    if match is not None:
+                        substitution_lookup_by_bill[bid]["ranks"][rank]["candidates"].append(
+                            {"source": "chunk", "bill_id": str(match), "identifier": candidate}
+                        )
                     if match is not None and match != bid:
                         survivor_bill_id[bid] = match
                         survivor_bill_id_identifier[bid] = needs_lookup[bid]
@@ -1891,7 +1923,7 @@ def recompute_status_for_bills(
                         Bill.jurisdiction_id.in_({bill_jurisdiction.get(bid) for bid in still_needed}),
                         Bill.session_id.in_({bill_session.get(bid) for bid in still_needed}),
                         Bill.identifier_norm.in_(rank_candidates),
-                    )
+                    ).order_by(Bill.id)
                 ).all()
                 rows_by_key: dict = {}
                 for row in rows:
@@ -1901,6 +1933,10 @@ def recompute_status_for_bills(
                 for bid in still_needed:
                     candidate = candidates_by_bid[bid][rank]
                     key = (bill_jurisdiction.get(bid), bill_session.get(bid), candidate)
+                    substitution_lookup_by_bill[bid]["ranks"][rank]["candidates"].extend(
+                        {"source": "database", "bill_id": str(row.id), "identifier": candidate}
+                        for row in rows_by_key.get(key, ())
+                    )
                     match = next(
                         (row for row in rows_by_key.get(key, ()) if row.id != bid), None
                     )
@@ -2135,6 +2171,19 @@ def recompute_status_for_bills(
             consulted_relations=consulted_relations_by_bill.get(bid, []),
             resolved_survivor=resolved_survivor_by_bill.get(bid),
             substitution_decision=substitution_decision_by_bill.get(bid),
+            substitution_lookup=substitution_lookup_by_bill[bid],
+            session_activity_snapshot={
+                "version": status_evidence_mod.SESSION_ACTIVITY_SNAPSHOT_VERSION,
+                "as_of_date": today_date.isoformat(),
+                "window_days": SESSION_ACTIVITY_WINDOW_DAYS,
+                "classification_patterns": list(CHAMBER_ACTIVITY_PATTERNS),
+                "has_recent_chamber_activity": bill_session.get(bid) in sessions_with_recent_activity,
+            },
+            survivor_status_snapshot={
+                "version": status_evidence_mod.SURVIVOR_STATUS_SNAPSHOT_VERSION,
+                "bill_id": resolved_survivor_by_bill.get(bid, {}).get("bill_id"),
+                "status": resolved_survivor_by_bill.get(bid, {}).get("status"),
+            },
         )
         for bid in before_evidence
     }
