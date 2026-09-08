@@ -135,6 +135,7 @@ def test_candidates_choose_current_session_and_dedupe_topical_identifiers(tmp_pa
             {"id": str(uuid.uuid4()), "jurisdiction": str(jurisdiction), "session": str(old), "identifier": "HB 12", "norm": "HB 12", "title": "Clean energy", "description": "clean energy", "url": "https://www.flsenate.gov/old", "updated": datetime(2026, 1, 1)},
             {"id": str(uuid.uuid4()), "jurisdiction": str(jurisdiction), "session": str(current), "identifier": "HB 12", "norm": "HB 12", "title": "Clean energy", "description": "clean energy", "url": "https://www.flsenate.gov/current", "updated": datetime(2026, 1, 2)},
             {"id": str(uuid.uuid4()), "jurisdiction": str(jurisdiction), "session": str(current), "identifier": "HB 13", "norm": "HB 13", "title": "Clean energy storage", "description": "clean energy", "url": "https://www.flsenate.gov/other", "updated": datetime(2026, 1, 3)},
+            {"id": str(uuid.uuid4()), "jurisdiction": str(jurisdiction), "session": str(current), "identifier": "HB 7031", "norm": "HB 7031", "title": "Mismatched source year", "description": "mismatched source year", "url": "https://www.flsenate.gov/Session/Bill/2025/07031", "updated": datetime(2026, 1, 3)},
             {"id": str(uuid.uuid4()), "jurisdiction": str(jurisdiction), "session": str(undated), "identifier": "HB 12", "norm": "HB 12", "title": "Clean energy", "description": "clean energy", "url": "https://www.flsenate.gov/placeholder", "updated": datetime(2026, 1, 4)},
             {"id": str(uuid.uuid4()), "jurisdiction": str(jurisdiction), "session": str(undated), "identifier": "HB 14", "norm": "HB 14", "title": "Clean energy", "description": "clean energy", "url": None, "updated": datetime(2026, 1, 5)},
         ])
@@ -146,6 +147,10 @@ def test_candidates_choose_current_session_and_dedupe_topical_identifiers(tmp_pa
         job.original_query = "HB 14"
         assert runner._candidates(db, job) == []
         assert runner._has_structured_match_without_source(db, job)
+        job.original_query = "HB 7031"
+        assert runner._candidates(db, job) == []
+        db.execute(text("UPDATE bills SET source_url = 'https://www.flsenate.gov/Session/Bill/2026/07031' WHERE identifier_norm = 'HB 7031'"))
+        assert runner._candidates(db, job)[0][0] == "https://www.flsenate.gov/Session/Bill/2026/07031"
     assert [candidate[0] for candidate in topical] == ["https://www.flsenate.gov/other", "https://www.flsenate.gov/current"]
     assert all(candidate[4]["session_identifier"] == "2026" for candidate in topical)
 
@@ -642,7 +647,12 @@ def test_florida_vote_record_rejects_pdf_masquerade_without_a_finding(tmp_path):
             return 200, "text/html", b"<html>HB 625 document unavailable</html>"
         raise AssertionError(f"unexpected fetch {url}")
 
-    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), fetcher, limits={"max_retries": 0})
+    runner, sessions, job_id = _runner(
+        tmp_path,
+        MockResearchBrowserProvider(),
+        fetcher,
+        limits={"max_related_vote_records": 1, "max_retries": 0},
+    )
     runner._candidates = lambda _db, _job: [_candidate(url=bill_url, title="HB 625", status="Filed")]
     runner.process(job_id)
 
@@ -653,7 +663,7 @@ def test_florida_vote_record_rejects_pdf_masquerade_without_a_finding(tmp_path):
         assert db.get(ScoutResearchJob, job_id).status == "partial"
 
 
-def test_old_scout_job_without_vote_limit_uses_safe_default_after_document_lane(tmp_path):
+def test_old_scout_job_without_vote_limit_does_not_grant_vote_fetches(tmp_path):
     bill_url = "https://www.flsenate.gov/Session/Bill/2026/625/ByCategory"
     analysis_url = "https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF"
     vote_url = "https://www.flsenate.gov/Session/Bill/2026/625/Vote/HouseVote_h0625__063.PDF"
@@ -671,7 +681,7 @@ def test_old_scout_job_without_vote_limit_uses_safe_default_after_document_lane(
             return 200, "text/html", bill_page
         if url in {analysis_url, vote_url}:
             return 200, "application/pdf", _pdf_with_text("HB 625 official attachment")
-        raise AssertionError(f"old-job fallback should prevent {url}")
+        raise AssertionError(f"old job must not fetch {url}")
 
     runner, _sessions, job_id = _runner(
         tmp_path,
@@ -683,7 +693,23 @@ def test_old_scout_job_without_vote_limit_uses_safe_default_after_document_lane(
     )
     runner._candidates = lambda _db, _job: [_candidate(url=bill_url, title="HB 625", status="Filed")]
     runner.process(job_id)
-    assert calls == [bill_url, analysis_url, vote_url]
+    assert calls == [bill_url, analysis_url]
+
+
+@pytest.mark.parametrize(
+    ("limits", "expected"),
+    [
+        ({}, 0),
+        ({"max_related_vote_records": 0}, 0),
+        ({"max_related_vote_records": 1}, 1),
+        ({"max_related_vote_records": 2}, 1),
+        ({"max_related_vote_records": True}, 0),
+        ({"max_related_vote_records": -1}, 0),
+        ({"max_related_vote_records": "1"}, 0),
+    ],
+)
+def test_vote_record_limit_requires_an_explicit_valid_immutable_limit(limits, expected):
+    assert ScoutRunner._vote_record_limit(types.SimpleNamespace(limits=limits)) == expected
 
 
 def test_scout_vote_record_lane_never_exceeds_one_even_if_legacy_scope_is_malformed(tmp_path):
