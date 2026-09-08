@@ -80,6 +80,26 @@ material discovery remain acceptance gaps.
 
 ## Current release gates
 
+### Missing production revision marker — 2026-09-08 13:37 UTC
+
+The earlier successful migration record above is historical. A later read-only
+precheck found `public.alembic_version` empty, with no saved-monitor tables.
+The schema-only comparison at 13:37 UTC matched the verified `0030` backup
+exactly after removing dump comments, blank lines and random restriction tokens:
+SHA-256 `8db8e8e05d62bd7e4e393b0ee66f48555b2236c0c09ec86686e3e72f4dd7511c`.
+Public health, readiness and bill reads passed during the incident checks.
+This proves schema agreement at that time; it does not explain the missing row.
+
+Saved monitors and the combined Florida bill-text candidate `e415bc7` remain
+undeployed. Marker restoration and the `0031` migration are held until the
+concurrent-operator question is resolved. The prepared recovery requires fresh
+target/schema/session checks, a durable intent, an exclusive table lock and an
+empty-state assertion before inserting the single literal `0030` marker. An
+ambiguous commit requires read-only reconciliation, never an automatic retry.
+No marker repair has been executed. The restricted release evidence directory
+contains `empty-alembic-schema-comparison.json` and
+`revision-marker-recovery-plan.md`; neither is a deployment approval.
+
 Codex owns this authorized deployment. The old generic crawl worker has no
 existing drain control or graceful shutdown handler and holds its job claim
 transaction across outbound work. It remains running; a one-time replacement
