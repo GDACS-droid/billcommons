@@ -135,6 +135,7 @@ class ScoutSettings:
     max_pdf_extract_seconds: int = 3
     max_pdf_extract_memory_bytes: int = 256 * 1024 * 1024
     max_pdf_extract_cpu_seconds: int = 2
+    max_ca_parse_seconds: int = 5
     staging_retention_seconds: int = 24 * 60 * 60
     lease_seconds: int = 90
     max_pages: int = 4
@@ -270,6 +271,7 @@ class ScoutSettings:
             max_pdf_extract_cpu_seconds=positive(
                 "BILLCOMMONS_SCOUT_MAX_PDF_EXTRACT_CPU_SECONDS", 2
             ),
+            max_ca_parse_seconds=positive("BILLCOMMONS_SCOUT_MAX_CA_PARSE_SECONDS", 5),
             staging_retention_seconds=positive(
                 "BILLCOMMONS_SCOUT_STAGING_RETENTION_SECONDS", 24 * 60 * 60
             ),

@@ -493,6 +493,7 @@ def create_job(
                 "max_pdf_extract_seconds": settings.max_pdf_extract_seconds,
                 "max_pdf_extract_memory_bytes": settings.max_pdf_extract_memory_bytes,
                 "max_pdf_extract_cpu_seconds": settings.max_pdf_extract_cpu_seconds,
+                "max_ca_parse_seconds": settings.max_ca_parse_seconds,
                 "max_routed_requests": settings.max_browser_routed_requests,
                 "max_retries": settings.max_retries,
                 "daily_jobs": settings.per_customer_daily_jobs,

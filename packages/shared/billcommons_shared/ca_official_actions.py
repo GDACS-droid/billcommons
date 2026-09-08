@@ -16,7 +16,9 @@ import csv
 import hashlib
 import io
 import re
+import time
 import zipfile
+import zlib
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -74,7 +76,7 @@ _SAFE_CODES = frozenset({
     "archive_encrypted_member", "archive_member_size_limit_exceeded",
     "archive_total_size_limit_exceeded", "archive_invalid_compressed_size",
     "archive_compression_ratio_limit_exceeded", "archive_member_size_changed",
-    "archive_crc_or_invalid_zip",
+    "archive_parse_deadline_exceeded", "archive_crc_or_invalid_zip",
 })
 
 
@@ -307,7 +309,16 @@ def map_official_bill_id(official_bill_id: str) -> OfficialBillMapping:
     )
 
 
-def _validate_zip(archive: zipfile.ZipFile) -> None:
+def _check_parse_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise OfficialCaActionsError(
+            "official CA archive parse exceeded its deadline",
+            code="archive_parse_deadline_exceeded",
+        )
+
+
+def _validate_zip(archive: zipfile.ZipFile, *, deadline: float | None = None) -> None:
+    _check_parse_deadline(deadline)
     members = archive.infolist()
     if len(members) > MAX_ZIP_MEMBERS:
         raise OfficialCaActionsError(
@@ -359,9 +370,11 @@ def _validate_zip(archive: zipfile.ZipFile) -> None:
     # Force decompression and CRC verification before parsing.  Bytes are not
     # retained for unrelated members, and metadata caps above bound this work.
     for member in members:
+        _check_parse_deadline(deadline)
         consumed = 0
         with archive.open(member) as stream:
             for chunk in iter(lambda: stream.read(64 * 1024), b""):
+                _check_parse_deadline(deadline)
                 consumed += len(chunk)
                 if consumed > MAX_MEMBER_UNCOMPRESSED_BYTES:
                     raise OfficialCaActionsError(
@@ -377,7 +390,7 @@ def _validate_zip(archive: zipfile.ZipFile) -> None:
             )
 
 
-def _table_rows(archive: zipfile.ZipFile, member_name: str, columns: tuple[str, ...]) -> Iterable[tuple[int, dict[str, str]]]:
+def _table_rows(archive: zipfile.ZipFile, member_name: str, columns: tuple[str, ...], *, deadline: float | None = None) -> Iterable[tuple[int, dict[str, str]]]:
     try:
         raw = archive.open(member_name)
     except KeyError as exc:
@@ -386,6 +399,7 @@ def _table_rows(archive: zipfile.ZipFile, member_name: str, columns: tuple[str, 
         try:
             reader = csv.reader(stream, delimiter="\t", quotechar="`", strict=True)
             for line_number, values in enumerate(reader, start=1):
+                _check_parse_deadline(deadline)
                 if len(values) != len(columns):
                     raise OfficialCaActionsError(
                         f"{member_name}:{line_number} has {len(values)} fields; expected {len(columns)}"
@@ -400,6 +414,7 @@ def parse_ca_pubinfo_action_archive(
     *,
     strict_current_scope: bool,
     reject_duplicate_history_ids: bool,
+    deadline: float | None = None,
 ) -> dict[str, tuple[ParsedHistoryAction, ...]]:
     """Parse the two action tables from an already validated ZIP archive.
 
@@ -409,7 +424,7 @@ def parse_ca_pubinfo_action_archive(
     """
 
     bill_ids: set[str] = set()
-    for line_number, row in _table_rows(archive, "BILL_TBL.dat", BILL_COLUMNS):
+    for line_number, row in _table_rows(archive, "BILL_TBL.dat", BILL_COLUMNS, deadline=deadline):
         official_bill_id = row["bill_id"].strip()
         if not official_bill_id:
             raise OfficialCaActionsError(f"BILL_TBL.dat:{line_number} has blank bill ID")
@@ -439,7 +454,7 @@ def parse_ca_pubinfo_action_archive(
 
     actions: dict[str, list[ParsedHistoryAction]] = defaultdict(list)
     history_ids: set[str] = set()
-    for line_number, row in _table_rows(archive, "BILL_HISTORY_TBL.dat", HISTORY_COLUMNS):
+    for line_number, row in _table_rows(archive, "BILL_HISTORY_TBL.dat", HISTORY_COLUMNS, deadline=deadline):
         official_bill_id = row["bill_id"].strip()
         if official_bill_id not in bill_ids:
             # Official archives can retain history-only rows from a different
@@ -475,6 +490,7 @@ def parse_ca_official_actions_zip(
     source_url: str,
     retrieved_at: datetime,
     upstream_modified: str | None = None,
+    deadline: float | None = None,
 ) -> ParsedCaOfficialActionsBatch:
     """Purely validate and parse one exact official CA delta response."""
 
@@ -491,13 +507,14 @@ def parse_ca_official_actions_zip(
         raise TypeError("upstream_modified must be a string or None")
     try:
         with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
-            _validate_zip(archive)
+            _validate_zip(archive, deadline=deadline)
             parsed = parse_ca_pubinfo_action_archive(
                 archive,
                 strict_current_scope=True,
                 reject_duplicate_history_ids=True,
+                deadline=deadline,
             )
-    except zipfile.BadZipFile as exc:
+    except (zipfile.BadZipFile, EOFError, NotImplementedError, zlib.error) as exc:
         raise OfficialCaActionsError(
             "official CA response is not a valid ZIP archive",
             code="archive_crc_or_invalid_zip",

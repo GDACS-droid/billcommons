@@ -33,6 +33,7 @@ from billcommons_scout.providers import SolariProviderError
 from billcommons_scout.providers import SolariResearchBrowserProvider
 from billcommons_scout.providers import resolve_solari_api_key
 from billcommons_scout.runner import ScoutRunner, _bounded_call, describe_related_document, safe_direct_fetch
+import billcommons_scout.runner as scout_runner_module
 import billcommons_scout.__main__ as scout_cli
 
 
@@ -203,6 +204,193 @@ def test_california_retained_archive_over_job_cap_is_truthful_partial_and_not_co
     # not issue the separate blob-value query once the newest archive is over
     # the job's cap.
     assert not any(re.search(r"SELECT\s+official_raw_blobs\.data\s+FROM", statement) for statement in statements)
+
+
+def test_california_retained_parse_budget_exhaustion_is_truthful_partial(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _seed_ca_retained_archive(sessions, raw)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw), "max_ca_parse_seconds": 0}
+        db.commit()
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert (job.status, job.error_class, job.partial_success) == (
+            "partial", "retained_archive_unavailable", False,
+        )
+        assert db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalars().all() == []
+
+
+def test_california_retained_missing_newest_raw_is_integrity_partial_without_older_copy(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _bill_id, _observation_id, observed_at = _seed_ca_retained_archive(sessions, raw)
+    engine = sessions.kw["bind"]
+    with engine.begin() as conn:
+        target_id = conn.execute(text("SELECT id FROM official_source_targets")).scalar_one()
+        conn.execute(
+            text("INSERT INTO official_source_observations (id, target_id, adapter_name, status, raw_sha256, source_url, retrieved_at, http_status) VALUES (:id, :target_id, 'ca_official_actions', 'succeeded', :sha256, :source_url, :retrieved_at, 200)"),
+            {
+                "id": str(uuid.uuid4()), "target_id": target_id, "sha256": "f" * 64,
+                "source_url": ca_delta_url("Tue"), "retrieved_at": observed_at + timedelta(minutes=1),
+            },
+        )
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert (job.status, job.error_class, job.partial_success) == (
+            "partial", "retained_archive_integrity_failed", False,
+        )
+        assert db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalars().all() == []
+        assert db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalars().all() == []
+
+
+def test_california_retained_parse_starts_after_candidate_transaction_commits(tmp_path, monkeypatch):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _seed_ca_retained_archive(sessions, raw)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    committed = False
+    @event.listens_for(sessions.kw["bind"], "commit")
+    def record_commit(_connection):
+        nonlocal committed
+        committed = True
+
+    real_parse = scout_runner_module.parse_ca_official_actions_zip
+    def parse_after_commit(*args, **kwargs):
+        assert committed
+        return real_parse(*args, **kwargs)
+    monkeypatch.setattr(scout_runner_module, "parse_ca_official_actions_zip", parse_after_commit)
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        assert db.get(ScoutResearchJob, job_id).status == "completed"
+
+
+def test_california_retained_capacity_failure_remains_failed_once(tmp_path, monkeypatch):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _seed_ca_retained_archive(sessions, raw)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    monkeypatch.setattr(runner.rawstore, "put", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("scout_rawstore_capacity_exceeded")))
+    runner.process(job_id, "initial-claim")
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        events = db.execute(select(ScoutJobEvent).where(
+            ScoutJobEvent.job_id == job_id,
+            ScoutJobEvent.kind == "rawstore_capacity_exceeded",
+        )).scalars().all()
+        assert (job.status, job.error_class, job.partial_success) == (
+            "failed", "rawstore_capacity_exceeded", False,
+        )
+        assert len(events) == 1
+
+
+def test_california_retained_final_commit_failure_reclaim_creates_one_finding(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _seed_ca_retained_archive(sessions, raw)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    engine = sessions.kw["bind"]
+    fail_once = True
+    @event.listens_for(engine, "before_cursor_execute")
+    def fail_terminal_update(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal fail_once
+        if fail_once and "UPDATE scout_research_jobs SET status" in statement:
+            fail_once = False
+            raise RuntimeError("simulated crash before CA final commit")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert job.status == "running"
+        assert db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalars().all() == []
+        job.claim_token = "reclaimed-claim"
+        job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        db.commit()
+
+    runner.process(job_id, "reclaimed-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        final_sources = db.execute(select(ScoutSource).where(
+            ScoutSource.job_id == job_id,
+            ScoutSource.retrieval_mechanism == "official_retained_archive",
+        )).scalars().all()
+        findings = db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalars().all()
+        assert job.status == "completed"
+        assert len(final_sources) == len(findings) == 1
+
+
+def test_california_retained_fence_loss_keeps_unverified_raw_reference(tmp_path, monkeypatch):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _seed_ca_retained_archive(sessions, raw)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    real_put = runner.rawstore.put
+    def cancel_after_put(body, metadata):
+        raw_ref = real_put(body, metadata)
+        with sessions() as db:
+            job = db.get(ScoutResearchJob, job_id)
+            job.status = "canceled"
+            job.claim_token = None
+            db.commit()
+        return raw_ref
+    monkeypatch.setattr(runner.rawstore, "put", cancel_after_put)
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        source = db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalar_one()
+        assert job.status == "canceled"
+        assert (source.official, source.retrieval_mechanism, source.raw_ref) == (
+            False, "staged", content_hash(raw),
+        )
+        assert db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalars().all() == []
 
 
 def test_california_retained_archive_rejects_topical_or_ambiguous_queries_without_network(tmp_path):
