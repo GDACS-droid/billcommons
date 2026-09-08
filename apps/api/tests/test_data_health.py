@@ -153,3 +153,33 @@ def test_rollback_failure_still_closes_session(monkeypatch):
     with pytest.raises(RuntimeError):
         module._load_report()
     assert closed == [True]
+
+
+def test_cache_publishes_payload_and_expiry_as_one_generation():
+    now = [0.0]
+    cache = module.ReportCache(clock=lambda: now[0])
+    old = {'generated_at': 'old'}
+    fresh = {'generated_at': 'fresh'}
+    cache.get(lambda: old)
+    now[0] = 301
+    replaced = [False]
+
+    def clock_with_concurrent_publication():
+        if not replaced[0]:
+            replaced[0] = True
+            cache.entry = (fresh, 601.0)
+        return now[0]
+
+    cache.clock = clock_with_concurrent_publication
+    result = cache.get(lambda: pytest.fail('new cache generation should be reused'))
+    assert result is fresh
+
+
+def test_actual_postgres_report_route_reads_snapshot(client, monkeypatch):
+    # Exercise SQLAlchemy autobegin + SET TRANSACTION on actual PostgreSQL.
+    monkeypatch.setattr(module, '_cache', module.ReportCache())
+    response = client.get('/api/v1/data-health')
+    assert response.status_code == 200
+    body = response.json()
+    assert body['summary']['jurisdiction_count'] == 51
+    assert response.headers['cache-control'] == 'no-store'

@@ -789,3 +789,18 @@ def test_plan_validation_puts_never_validated_jurisdictions_first(db_session):
     candidates = plan_validation(db_session, batch=100, now=now)
     abbrs = [c.jurisdiction_abbr for c in candidates]
     assert abbrs.index(never.abbreviation) < abbrs.index(once.abbreviation)
+
+
+@pytest.mark.parametrize('status', ['queued', 'running', 'done'])
+def test_lowercase_job_state_obeys_same_pending_and_cadence_rules(db_session, status):
+    now = _real_now()
+    jurisdiction, _ = _make_jurisdiction_with_session(db_session, active=True, end_date=now.date())
+    job = queue_mod.enqueue(db_session, API_SYNC_KIND, {'state': jurisdiction.abbreviation.lower()})
+    job.status = status
+    job.created_at = now
+    db_session.flush()
+    decision = next(d for d in plan_schedule(db_session, now=now)
+                    if d.jurisdiction_abbr == jurisdiction.abbreviation)
+    assert decision.pending_sync is (status != 'done')
+    assert decision.last_enqueued_at == now
+    assert decision.due is False

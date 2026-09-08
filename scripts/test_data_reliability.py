@@ -23,7 +23,10 @@ def main() -> int:
             or not os.environ.get("PGPORT", "").isdigit()
             or os.environ.get("PGPORT") == "5432"
             or not os.environ.get("PGPASSWORD")
-            or not os.environ.get("PGUSER")):
+            or not os.environ.get("PGUSER")
+            or os.environ.get("PGHOSTADDR")
+            or os.environ.get("PGSERVICE")
+            or os.environ.get("PGSERVICEFILE")):
         print("REFUSING: run this script under pg_virtualenv on its disposable local cluster.", file=sys.stderr)
         return 2
     root = Path(__file__).resolve().parents[1]

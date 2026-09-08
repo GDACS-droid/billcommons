@@ -37,7 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest import queue as queue_mod
@@ -158,7 +158,7 @@ def _has_pending_sync(db: OrmSession, state: str) -> bool:
         select(IngestJob.id)
         .where(
             IngestJob.kind == API_SYNC_KIND,
-            IngestJob.payload["state"].astext == state,
+            func.upper(IngestJob.payload["state"].astext) == state.upper(),
             IngestJob.status.in_(("queued", "running")),
         )
         .limit(1)
@@ -175,7 +175,7 @@ def _last_enqueued_at(db: OrmSession, state: str) -> datetime | None:
         select(IngestJob)
         .where(
             IngestJob.kind == API_SYNC_KIND,
-            IngestJob.payload["state"].astext == state,
+            func.upper(IngestJob.payload["state"].astext) == state.upper(),
             IngestJob.status.in_(("queued", "running", "done")),
         )
         .order_by(IngestJob.created_at.desc())

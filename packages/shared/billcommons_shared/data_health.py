@@ -610,7 +610,12 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
     # run for each required source/status combination per jurisdiction.
     # Reading every old run would become an unbounded incident-time query as
     # a 30-minute scheduler accumulates history.
-    run_time = func.coalesce(IngestionRun.finished_at, IngestionRun.started_at)
+    # Creation time is ordering evidence only, never a substitute for a sync
+    # completion timestamp. A newer malformed run must not disappear behind
+    # old dated history before UNKNOWN_SYNC_TIME/latest-failure checks run.
+    run_time = func.coalesce(
+        IngestionRun.finished_at, IngestionRun.started_at, IngestionRun.created_at
+    )
     run_columns = (
         IngestionRun.jurisdiction_id,
         IngestionRun.source_name,

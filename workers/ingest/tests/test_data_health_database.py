@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 
+import pytest
+
 from billcommons_schema.models import (
     Bill,
     IngestJob,
@@ -307,3 +309,23 @@ def test_selected_session_query_ignores_historical_coverage_rows(db_session):
     assert row["coverage"]["session_identifier"] == current.identifier
     assert row["additional_jurisdiction_coverage_signal"] is None
     assert "COVERAGE_BLOCKED" not in codes
+
+
+@pytest.mark.parametrize('status,expected', [
+    ('success', 'UNKNOWN_SYNC_TIME'), ('failed', 'LATEST_API_SYNC_FAILED'),
+])
+def test_newer_undated_run_is_not_hidden_by_dated_history(db_session, status, expected):
+    jurisdiction, _ = _seed_current_session(db_session, 'CO')
+    db_session.add_all([
+        IngestionRun(jurisdiction_id=jurisdiction.id, source_name='openstates_api_sync',
+            status='success', started_at=NOW - timedelta(minutes=10),
+            finished_at=NOW - timedelta(minutes=5), created_at=NOW - timedelta(minutes=10)),
+        IngestionRun(jurisdiction_id=jurisdiction.id, source_name='openstates_api_sync',
+            status=status, started_at=None, finished_at=None, created_at=NOW),
+    ])
+    db_session.flush()
+    report = collect_report(db_session, now=NOW)
+    row = _report_row(report, 'CO')
+    assert row['local_ingestion']['last_api_sync']['status'] == status
+    assert row['local_ingestion']['last_api_sync']['finished_at'] is None
+    assert expected in {d['code'] for d in report['defects'] if d['jurisdiction'] == 'CO'}

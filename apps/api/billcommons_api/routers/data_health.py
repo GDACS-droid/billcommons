@@ -26,8 +26,9 @@ class ReportCache:
     def __init__(self, *, clock: Callable[[], float] = time.monotonic):
         self.clock = clock
         self.lock = threading.Lock()
-        self.report: dict | None = None
-        self.expires_at = 0.0
+        # Publish the report and expiry together; readers never combine two
+        # refresh generations or return a concurrently cleared attribute.
+        self.entry: tuple[dict, float] | None = None
         self.retry_at = 0.0
 
     def _check_retry(self) -> None:
@@ -40,8 +41,9 @@ class ReportCache:
             )
 
     def get(self, loader: Callable[[], dict]) -> dict:
-        if self.report is not None and self.clock() < self.expires_at:
-            return self.report
+        entry = self.entry
+        if entry is not None and self.clock() < entry[1]:
+            return entry[0]
         self._check_retry()
         if not self.lock.acquire(blocking=False):
             raise HTTPException(
@@ -51,20 +53,20 @@ class ReportCache:
             )
         try:
             # A refresh could have completed between the first read and lock.
-            if self.report is not None and self.clock() < self.expires_at:
-                return self.report
+            entry = self.entry
+            if entry is not None and self.clock() < entry[1]:
+                return entry[0]
             self._check_retry()
             try:
                 report = loader()
             except Exception:
                 # Failed scans are also single-flight over time. Public
                 # traffic cannot immediately restart a timed-out scan.
-                self.report = None
+                self.entry = None
                 self.retry_at = self.clock() + FAILURE_RETRY_SECONDS
                 raise
-            self.report = report
+            self.entry = (report, self.clock() + REPORT_TTL_SECONDS)
             self.retry_at = 0.0
-            self.expires_at = self.clock() + REPORT_TTL_SECONDS
             return report
         finally:
             self.lock.release()
