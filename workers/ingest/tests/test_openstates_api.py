@@ -116,6 +116,43 @@ def test_search_bills_omits_optional_filters_by_default():
     assert "identifier" not in captured["params"]
 
 
+def test_retained_bill_response_keeps_entity_bytes_and_excludes_credentials_from_metadata():
+    raw = b'{\n  "results": [], "pagination": {"max_page": 1}\n}'
+
+    def handler(request):
+        return httpx.Response(200, content=raw, headers={"content-type": "application/json"})
+
+    transport = httpx.MockTransport(handler)
+    http_client = httpx.Client(
+        transport=transport,
+        base_url="https://ignored.invalid",
+    )
+    client = OpenStatesClient(
+        base_url="https://user:secret@v3.openstates.org/api?api_key=not-recorded",
+        client=http_client,
+        api_key="test-key",
+        consume_budget=lambda: None,
+    )
+
+    response = client.search_bills_with_response(
+        jurisdiction="nc", page=3, per_page=7, updated_since="2026-09-01T00:00:00+00:00", include=["actions"]
+    )
+
+    assert response.is_retained_response is True
+    assert response.raw_bytes == raw
+    assert response.payload == {"results": [], "pagination": {"max_page": 1}}
+    assert response.source_url == "https://v3.openstates.org/api/bills"
+    assert response.request_scope == {
+        "jurisdiction": "nc",
+        "session": None,
+        "identifier": None,
+        "page": 3,
+        "per_page": 7,
+        "updated_since": "2026-09-01T00:00:00+00:00",
+        "includes": ["actions"],
+    }
+
+
 def test_iter_bills_paginates_across_pages():
     pages = {
         1: {"results": [{"id": "a"}], "pagination": {"max_page": 2}},

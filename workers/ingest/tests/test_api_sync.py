@@ -10,6 +10,8 @@ incremental sync actually did.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
@@ -34,10 +36,12 @@ from billcommons_schema.models import (
     BillAction,
     BillDocument,
     BillVersion,
+    CorpusUpdateEvidence,
     IngestJob,
     IngestionRun,
     Jurisdiction,
     JurisdictionCoverage,
+    OfficialRawBlob,
     Session as SessionModel,
     Sponsorship,
 )
@@ -106,6 +110,160 @@ def _client_with_pages(pages: dict) -> OpenStatesClient:
     transport = httpx.MockTransport(handler)
     http_client = httpx.Client(transport=transport, base_url="https://v3.openstates.org")
     return OpenStatesClient(client=http_client, api_key="test-key", consume_budget=lambda: None, rate_limiter=_FixtureRateLimiter())
+
+
+def _client_with_raw_page(raw: bytes) -> OpenStatesClient:
+    def handler(request):
+        return httpx.Response(200, content=raw, headers={"content-type": "application/json"})
+
+    transport = httpx.MockTransport(handler)
+    http_client = httpx.Client(transport=transport, base_url="https://v3.openstates.org")
+    return OpenStatesClient(client=http_client, api_key="test-key", consume_budget=lambda: None, rate_limiter=_FixtureRateLimiter())
+
+
+def _evidence_snapshots(db_session, evidence):
+    before = (
+        json.loads(db_session.get(OfficialRawBlob, evidence.before_snapshot_sha256).data)
+        if evidence.before_snapshot_sha256
+        else None
+    )
+    after = json.loads(db_session.get(OfficialRawBlob, evidence.after_snapshot_sha256).data)
+    return before, after
+
+
+def test_sync_state_records_exact_openstates_response_bytes_for_a_mutation(db_session):
+    jurisdiction, _ = _make_jurisdiction_with_active_session(db_session)
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/evidence-exact-bytes",
+        identifier="HB 901",
+        title="Evidence bytes",
+    )
+    # Deliberately noncanonical spacing/key order: stored evidence must equal
+    # the upstream entity body, not a serializer's recreation of its payload.
+    raw = json.dumps(
+        {"pagination": {"max_page": 1}, "results": [payload]}, indent=2, separators=(",", ": ")
+    ).encode("utf-8")
+
+    sync_state(db_session, jurisdiction, client=_client_with_raw_page(raw))
+
+    evidence = db_session.execute(select(CorpusUpdateEvidence)).scalar_one()
+    stored_response = db_session.get(OfficialRawBlob, evidence.response_sha256)
+    before, after = _evidence_snapshots(db_session, evidence)
+
+    assert evidence.source_name == "openstates_v3_api"
+    assert evidence.original_bill_upstream_id == "ocd-bill/evidence-exact-bytes"
+    assert evidence.response_sha256 == hashlib.sha256(raw).hexdigest()
+    assert stored_response.data == raw
+    assert evidence.source_url == "https://v3.openstates.org/bills"
+    assert evidence.request_scope == {
+        "jurisdiction": jurisdiction.abbreviation.lower(),
+        "session": None,
+        "identifier": None,
+        "page": 1,
+        "per_page": 20,
+        "updated_since": None,
+        "includes": ["sponsorships", "actions", "sources", "versions", "documents", "abstracts"],
+    }
+    assert "test-key" not in json.dumps(evidence.request_scope)
+    assert before is None
+    assert after["bill"]["identifier"] == "HB 901"
+    assert after["actions"] and after["sponsorships"]
+
+
+def test_sync_state_records_child_only_before_after_evidence(db_session):
+    jurisdiction, _ = _make_jurisdiction_with_active_session(db_session)
+    first_payload = _v3_bill_payload(
+        openstates_id="ocd-bill/evidence-children",
+        identifier="HB 902",
+        title="Stable core",
+    )
+    sync_state(
+        db_session,
+        jurisdiction,
+        client=_client_with_pages({1: {"results": [first_payload], "pagination": {"max_page": 1}}}),
+    )
+
+    child_only = _v3_bill_payload(
+        openstates_id="ocd-bill/evidence-children",
+        identifier="HB 902",
+        title="Stable core",
+        actions=[
+            {"description": "Introduced", "date": "2026-01-05", "classification": ["introduction"]},
+            {"description": "Referred to committee", "date": "2026-01-04", "classification": ["referral"]},
+        ],
+        versions=[
+            {
+                "note": "Introduced version",
+                "date": "2026-01-01",
+                "links": [{"url": "https://example.invalid/902-introduced.pdf", "media_type": "application/pdf"}],
+            }
+        ],
+        documents=[
+            {"links": [{"url": "https://example.invalid/902-standalone.pdf", "media_type": "application/pdf"}]}
+        ],
+    )
+    child_only["sponsorships"].append(
+        {"name": "John Roe", "classification": "cosponsor", "primary": False}
+    )
+
+    sync_state(
+        db_session,
+        jurisdiction,
+        client=_client_with_pages({1: {"results": [child_only], "pagination": {"max_page": 1}}}),
+    )
+
+    evidence = db_session.execute(
+        select(CorpusUpdateEvidence).where(CorpusUpdateEvidence.mutation_kind == "updated")
+    ).scalar_one()
+    before, after = _evidence_snapshots(db_session, evidence)
+
+    assert evidence.mutation_kind == "updated"
+    assert evidence.changed_components == ["actions", "sponsorships", "versions", "documents"]
+    assert before["bill"] == after["bill"]
+    assert len(after["actions"]) == len(before["actions"]) + 1
+    assert len(after["sponsorships"]) == len(before["sponsorships"]) + 1
+    assert len(after["versions"]) == len(before["versions"]) + 2
+    assert len(after["documents"]) == len(before["documents"]) + 2
+
+
+def test_sync_state_noop_records_no_extra_blobs_or_evidence(db_session):
+    jurisdiction, _ = _make_jurisdiction_with_active_session(db_session)
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/evidence-noop", identifier="HB 903", title="No-op evidence"
+    )
+    first_client = _client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}})
+    sync_state(db_session, jurisdiction, client=first_client)
+    first_evidence_count = db_session.execute(select(CorpusUpdateEvidence)).scalars().all()
+    first_blob_count = db_session.execute(select(OfficialRawBlob)).scalars().all()
+
+    sync_state(
+        db_session,
+        jurisdiction,
+        client=_client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}}),
+    )
+
+    assert len(db_session.execute(select(CorpusUpdateEvidence)).scalars().all()) == len(first_evidence_count)
+    assert len(db_session.execute(select(OfficialRawBlob)).scalars().all()) == len(first_blob_count)
+
+
+def test_sync_state_rolls_back_local_mutation_when_evidence_storage_fails(db_session, monkeypatch):
+    jurisdiction, _ = _make_jurisdiction_with_active_session(db_session)
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/evidence-rollback", identifier="HB 904", title="Rollback evidence"
+    )
+    client = _client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}})
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("evidence storage unavailable")
+
+    monkeypatch.setattr("billcommons_ingest.corpus_update_evidence._store_blob", unavailable)
+    with pytest.raises(RuntimeError, match="evidence storage unavailable"):
+        with db_session.begin_nested():
+            sync_state(db_session, jurisdiction, client=client)
+
+    assert db_session.execute(select(Bill).where(Bill.jurisdiction_id == jurisdiction.id)).scalars().all() == []
+    assert db_session.execute(select(CorpusUpdateEvidence)).scalars().all() == []
+    assert db_session.execute(select(OfficialRawBlob)).scalars().all() == []
 
 
 def test_sync_state_creates_new_bill(db_session):

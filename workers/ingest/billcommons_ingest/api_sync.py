@@ -45,9 +45,10 @@ from datetime import date, datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 
-from billcommons_ingest.openstates_api import OpenStatesClient
+from billcommons_ingest.openstates_api import OpenStatesClient, RetainedOpenStatesResponse
 from billcommons_ingest.openstates_bulk import _parse_date_field
 from billcommons_ingest.session_match import MatchPath, SessionCandidate, resolve_session
+from billcommons_ingest import corpus_update_evidence
 from billcommons_schema.models import (
     Bill,
     BillAction,
@@ -398,7 +399,10 @@ def sync_state(
             search_kwargs["session"] = session
         if identifier is not None:
             search_kwargs["identifier"] = identifier
-        payload = client.search_bills(**search_kwargs)
+        response = client.search_bills_with_response(**search_kwargs)
+        if not isinstance(response, RetainedOpenStatesResponse) or not response.is_retained_response:
+            raise ValueError("api-sync requires a retained OpenStates HTTP response")
+        payload = response.payload
         result.pages_fetched += 1
         pages_fetched_this_call += 1
         pagination = payload.get("pagination", {})
@@ -461,6 +465,14 @@ def sync_state(
                 continue
             if bill is None and session_row is not None:
                 bill = bill_by_session_and_identifier_norm.get((session_row.id, identifier_norm))
+
+            # Take the complete local view before any core or child upsert.
+            # The evidence serializer will compare this to a post-upsert view;
+            # unchanged payloads therefore retain neither blob nor ledger row.
+            before = corpus_update_evidence.snapshot_bill(db, bill) if bill is not None else None
+            original_bill_upstream_id = (
+                (bill.upstream_id or bill.openstates_id) if bill is not None else openstates_id
+            )
 
             if bill is None:
                 bill = Bill(
@@ -540,6 +552,16 @@ def sync_state(
             )
             _upsert_actions(db, bill, bill_payload.get("actions") or [], result, retrieved_at)
             _upsert_sponsorships(db, bill, bill_payload.get("sponsorships") or [], result, retrieved_at)
+            db.flush()
+            corpus_update_evidence.record_update_evidence(
+                db,
+                bill=bill,
+                original_bill_upstream_id=original_bill_upstream_id,
+                response=response,
+                before=before,
+                after=corpus_update_evidence.snapshot_bill(db, bill),
+                retrieved_at=retrieved_at,
+            )
 
         if page >= upstream_max_page:
             result.next_page = None

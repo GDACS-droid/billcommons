@@ -27,11 +27,13 @@ explicitly inject a local admission function; production has no local fallback.
 from __future__ import annotations
 
 import os
+import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -73,11 +75,48 @@ class OpenStatesBudgetUnavailable(OpenStatesAPIError):
     """The shared ledger cannot safely admit another upstream request."""
 
 
+_RETAINED_RESPONSE_MARKER = object()
+
+
+@dataclass(frozen=True)
+class RetainedOpenStatesResponse:
+    """A parsed payload tied to the exact successful HTTP response bytes.
+
+    This is intentionally constructed only by :class:`OpenStatesClient`.
+    Callers which need mutation provenance must require this object rather
+    than accepting a fixture's independently generated ``dict`` as if it
+    were the upstream response.
+    """
+
+    payload: dict
+    raw_bytes: bytes
+    source_url: str
+    request_scope: dict
+    _marker: object = field(repr=False, compare=False, default=None)
+
+    @property
+    def is_retained_response(self) -> bool:
+        return self._marker is _RETAINED_RESPONSE_MARKER
+
+
 # utc_date.isoformat() -> requests sent so far today, this process only.
 # Guarded by _budget_lock; resets implicitly whenever the UTC date advances
 # (a new date is simply a key this dict hasn't seen yet).
 _daily_request_counts: dict[str, int] = {}
 _budget_lock = threading.Lock()
+
+
+def _safe_endpoint_url(base_url: str, path: str) -> str:
+    """Return a replay endpoint with credentials, query, and fragment removed."""
+    parsed = urlsplit(base_url)
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError("OpenStates base URL must include a scheme and host")
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = hostname if parsed.port is None else f"{hostname}:{parsed.port}"
+    base_path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme, netloc, f"{base_path}{path}", "", ""))
 
 
 def _daily_budget() -> int:
@@ -161,7 +200,9 @@ class OpenStatesClient:
             )
         return key
 
-    def _request(self, method: str, path: str, *, params: dict | None = None) -> dict:
+    def _request_with_raw(
+        self, method: str, path: str, *, params: dict | None = None
+    ) -> tuple[dict, bytes]:
         api_key = self._resolve_api_key()
         headers = {"X-API-KEY": api_key}
 
@@ -203,7 +244,22 @@ class OpenStatesClient:
                 raise OpenStatesAPIError(
                     f"{method} {path} failed: {response.status_code} {response.text[:500]}"
                 )
-            return response.json()
+            # Retain the received entity bytes before parsing.  In particular,
+            # do not call ``response.json()`` first: a page that later drives
+            # a local mutation must be evidence-backed by these exact bytes.
+            raw_bytes = bytes(response.content)
+            try:
+                payload = json.loads(raw_bytes)
+            except (TypeError, ValueError) as exc:
+                raise OpenStatesAPIError(f"{method} {path} returned invalid JSON") from exc
+            if not isinstance(payload, dict):
+                raise OpenStatesAPIError(f"{method} {path} returned a non-object JSON response")
+            return payload, raw_bytes
+
+    def _request(self, method: str, path: str, *, params: dict | None = None) -> dict:
+        """Return parsed JSON for established non-provenance callers."""
+        payload, _ = self._request_with_raw(method, path, params=params)
+        return payload
 
     def get_jurisdictions(self, *, classification: str | None = None) -> dict:
         params = {}
@@ -244,6 +300,32 @@ class OpenStatesClient:
         """List/search bills. `include` mirrors v3's repeated `include=`
         query params (e.g. sponsorships, abstracts, actions, sources,
         versions, documents, votes)."""
+        return self.search_bills_with_response(
+            jurisdiction=jurisdiction,
+            session=session,
+            identifier=identifier,
+            updated_since=updated_since,
+            include=include,
+            page=page,
+            per_page=per_page,
+        ).payload
+
+    def search_bills_with_response(
+        self,
+        *,
+        jurisdiction: str | None = None,
+        session: str | None = None,
+        identifier: str | None = None,
+        updated_since: str | None = None,
+        include: list[str] | None = None,
+        page: int = 1,
+        per_page: int = 20,
+    ) -> RetainedOpenStatesResponse:
+        """Search bills and retain the exact successful response for audit.
+
+        The recorded scope deliberately contains query semantics only.  It
+        never includes request headers or the API key used for authentication.
+        """
         params: dict = {"page": page, "per_page": per_page}
         if jurisdiction:
             params["jurisdiction"] = jurisdiction
@@ -255,7 +337,22 @@ class OpenStatesClient:
             params["updated_since"] = updated_since
         if include:
             params["include"] = include
-        return self._request("GET", "/bills", params=params)
+        payload, raw_bytes = self._request_with_raw("GET", "/bills", params=params)
+        return RetainedOpenStatesResponse(
+            payload=payload,
+            raw_bytes=raw_bytes,
+            source_url=_safe_endpoint_url(self.base_url, "/bills"),
+            request_scope={
+                "jurisdiction": jurisdiction,
+                "session": session,
+                "identifier": identifier,
+                "page": page,
+                "per_page": per_page,
+                "updated_since": updated_since,
+                "includes": list(include or []),
+            },
+            _marker=_RETAINED_RESPONSE_MARKER,
+        )
 
     def get_bill(self, openstates_id: str, *, include: list[str] | None = None) -> dict:
         params = {"include": include} if include else None

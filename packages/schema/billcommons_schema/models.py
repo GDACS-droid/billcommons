@@ -599,6 +599,69 @@ class OfficialReconciliationRun(UUIDPkMixin, Base):
     )
 
 
+class CorpusUpdateEvidence(UUIDPkMixin, Base):
+    """Replayable source-response evidence for a local corpus mutation.
+
+    ``official_raw_blobs`` is a corpus-owned content-addressed byte ledger,
+    despite its historical name.  This table labels each source explicitly;
+    it does not make an official-source claim for aggregator responses.
+    """
+
+    __tablename__ = "corpus_update_evidence"
+
+    bill_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bills.id"), nullable=False
+    )
+    original_bill_upstream_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_name: Mapped[str] = mapped_column(Text, nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    request_scope: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    response_sha256: Mapped[str] = mapped_column(
+        Text, ForeignKey("official_raw_blobs.sha256"), nullable=False
+    )
+    before_snapshot_sha256: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("official_raw_blobs.sha256"), nullable=True
+    )
+    after_snapshot_sha256: Mapped[str] = mapped_column(
+        Text, ForeignKey("official_raw_blobs.sha256"), nullable=False
+    )
+    processing_version: Mapped[str] = mapped_column(Text, nullable=False)
+    mutation_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    changed_components: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "source_name IN ('openstates_v3_api','official_document_fetch')",
+            name="ck_corpus_update_evidence_source",
+        ),
+        CheckConstraint(
+            "mutation_kind IN ('created','updated')", name="ck_corpus_update_evidence_kind"
+        ),
+        CheckConstraint(
+            "(mutation_kind = 'created') = (before_snapshot_sha256 IS NULL)",
+            name="ck_corpus_update_evidence_before",
+        ),
+        CheckConstraint(
+            "octet_length(request_scope::text) <= 65536",
+            name="ck_corpus_update_evidence_scope_size",
+        ),
+        CheckConstraint(
+            "octet_length(changed_components::text) <= 65536",
+            name="ck_corpus_update_evidence_components_size",
+        ),
+        Index("ix_corpus_update_evidence_bill_time", "bill_id", "retrieved_at"),
+        Index("ix_corpus_update_evidence_response", "response_sha256"),
+    )
+
+
 class IngestionRun(UUIDPkMixin, TimestampMixin, Base):
     """A single run of an ingestion job (bootstrap or incremental)."""
 
