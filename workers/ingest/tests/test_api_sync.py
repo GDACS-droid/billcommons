@@ -20,6 +20,7 @@ import pytest
 from sqlalchemy import select, text
 
 from billcommons_ingest import cli as cli_mod
+from billcommons_ingest import corpus_update_evidence
 from billcommons_ingest.status import ActionRow, PASSED_BOTH, derive_status
 from billcommons_ingest.api_sync import (
     ApiSyncResult,
@@ -262,6 +263,49 @@ def test_sync_state_rolls_back_local_mutation_when_evidence_storage_fails(db_ses
             sync_state(db_session, jurisdiction, client=client)
 
     assert db_session.execute(select(Bill).where(Bill.jurisdiction_id == jurisdiction.id)).scalars().all() == []
+    assert db_session.execute(select(CorpusUpdateEvidence)).scalars().all() == []
+    assert db_session.execute(select(OfficialRawBlob)).scalars().all() == []
+
+
+def test_snapshot_child_cap_fails_closed_without_mutation_or_evidence(db_session, monkeypatch):
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 905",
+        identifier_norm="HB905",
+        title="Before cap failure",
+        openstates_id="ocd-bill/evidence-cap",
+        upstream_id="ocd-bill/evidence-cap",
+        checksum="preexisting-checksum",
+    )
+    db_session.add(bill)
+    db_session.flush()
+    db_session.add_all(
+        [
+            Sponsorship(bill_id=bill.id, name="One", classification="primary", primary=True),
+            Sponsorship(bill_id=bill.id, name="Two", classification="cosponsor", primary=False),
+        ]
+    )
+    db_session.flush()
+    monkeypatch.setattr(corpus_update_evidence, "MAX_CHILD_RECORDS_PER_COMPONENT", 1)
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/evidence-cap",
+        identifier="HB 905",
+        title="Must not be written",
+    )
+
+    with pytest.raises(corpus_update_evidence.SnapshotRecordLimitExceeded) as raised:
+        with db_session.begin_nested():
+            sync_state(
+                db_session,
+                jurisdiction,
+                client=_client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}}),
+            )
+
+    assert (raised.value.component, raised.value.cap) == ("sponsorships", 1)
+    db_session.refresh(bill)
+    assert bill.title == "Before cap failure"
     assert db_session.execute(select(CorpusUpdateEvidence)).scalars().all() == []
     assert db_session.execute(select(OfficialRawBlob)).scalars().all() == []
 

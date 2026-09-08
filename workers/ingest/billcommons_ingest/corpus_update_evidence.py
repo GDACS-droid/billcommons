@@ -30,6 +30,20 @@ from billcommons_schema.models import (
 SOURCE_NAME = "openstates_v3_api"
 PROCESSING_VERSION = "openstates_api_sync_evidence/1"
 MAX_BLOB_BYTES = 8 * 1024 * 1024
+# An evidence snapshot must be bounded before materializing ORM rows.  The
+# official-action reconciliation path uses the same 1,000-record ceiling.
+MAX_CHILD_RECORDS_PER_COMPONENT = 1_000
+
+
+class SnapshotRecordLimitExceeded(RuntimeError):
+    """A child collection cannot be captured safely within the evidence cap."""
+
+    def __init__(self, component: str, cap: int):
+        self.component = component
+        self.cap = cap
+        # Do not include bill identity, URLs, or child content in an error
+        # which may reach worker logs or a persisted ingestion-run failure.
+        super().__init__(f"corpus evidence snapshot {component} exceeds configured record cap {cap}")
 
 
 def _timestamp(value: datetime | None) -> str | None:
@@ -66,23 +80,39 @@ def _store_blob(db: OrmSession, data: bytes, *, content_type: str) -> str:
     return sha256
 
 
+def _bounded_rows(db: OrmSession, statement, *, component: str) -> list:
+    """Materialize at most one record above the cap to detect overflow."""
+    rows = db.execute(statement.limit(MAX_CHILD_RECORDS_PER_COMPONENT + 1)).scalars().all()
+    if len(rows) > MAX_CHILD_RECORDS_PER_COMPONENT:
+        raise SnapshotRecordLimitExceeded(component, MAX_CHILD_RECORDS_PER_COMPONENT)
+    return rows
+
+
 def snapshot_bill(db: OrmSession, bill: Bill) -> dict[str, Any]:
     """Serialize every api-sync-managed bill field and child deterministically."""
-    actions = list(
-        db.execute(select(BillAction).where(BillAction.bill_id == bill.id)).scalars()
+    actions = _bounded_rows(
+        db,
+        select(BillAction).where(BillAction.bill_id == bill.id).order_by(BillAction.id),
+        component="actions",
     )
-    sponsorships = list(
-        db.execute(select(Sponsorship).where(Sponsorship.bill_id == bill.id)).scalars()
+    sponsorships = _bounded_rows(
+        db,
+        select(Sponsorship).where(Sponsorship.bill_id == bill.id).order_by(Sponsorship.id),
+        component="sponsorships",
     )
-    versions = list(
-        db.execute(select(BillVersion).where(BillVersion.bill_id == bill.id)).scalars()
+    versions = _bounded_rows(
+        db,
+        select(BillVersion).where(BillVersion.bill_id == bill.id).order_by(BillVersion.id),
+        component="versions",
     )
-    version_ids = [version.id for version in versions]
-    documents = list(
-        db.execute(
-            select(BillDocument).where(BillDocument.bill_version_id.in_(version_ids))
-        ).scalars()
-    ) if version_ids else []
+    documents = _bounded_rows(
+        db,
+        select(BillDocument)
+        .join(BillVersion, BillVersion.id == BillDocument.bill_version_id)
+        .where(BillVersion.bill_id == bill.id)
+        .order_by(BillDocument.id),
+        component="documents",
+    )
 
     return {
         "bill": {
