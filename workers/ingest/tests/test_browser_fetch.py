@@ -13,10 +13,19 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import pytest
+from sqlalchemy import select
 
 from billcommons_ingest import browser_fetch, fulltext
 from billcommons_ingest.cli import build_parser, cmd_browser_fetch
-from billcommons_schema.models import Bill, BillDocument, BillVersion, Jurisdiction, Session as SessionModel
+from billcommons_schema.models import (
+    Bill,
+    BillDocument,
+    BillVersion,
+    CorpusUpdateEvidence,
+    Jurisdiction,
+    OfficialRawBlob,
+    Session as SessionModel,
+)
 from billcommons_shared.rawstore import FilesystemRawStore
 
 
@@ -140,6 +149,12 @@ def test_200_pdf_writes_text_with_ok_browser_status(db_session, tmp_path, monkey
     assert document.extracted_text == "Section 1. Browser-fetched public record."
     assert document.license_note == f"fulltext_status={fulltext.STATUS_OK_BROWSER} via=browser"
     assert document.fetch_attempts == 0
+    evidence = db_session.execute(select(CorpusUpdateEvidence)).scalar_one()
+    assert evidence.source_name == "official_document_fetch"
+    assert evidence.request_scope["document_id"] == str(document.id)
+    assert evidence.request_scope["resolver"] == "browser"
+    assert evidence.request_scope["authority"] == "retrieved_document_not_authority_verified"
+    assert db_session.get(OfficialRawBlob, evidence.response_sha256).data == pdf
 
 
 def test_tunnel_down_exits_without_opening_a_database_session(capsys):

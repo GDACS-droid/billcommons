@@ -12,6 +12,7 @@ robots-cache -- no real network calls in this file.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import uuid
@@ -66,7 +67,16 @@ from billcommons_ingest.fulltext import (
 )
 from billcommons_ingest.queue import claim_job, enqueue
 from billcommons_ingest.url_resolvers import MaDocumentUrl, ma_api_url, ma_docket_from_url
-from billcommons_schema.models import Bill, BillDocument, BillVersion, IngestJob, Jurisdiction, Session as SessionModel
+from billcommons_schema.models import (
+    Bill,
+    BillDocument,
+    BillVersion,
+    CorpusUpdateEvidence,
+    IngestJob,
+    Jurisdiction,
+    OfficialRawBlob,
+    Session as SessionModel,
+)
 from billcommons_shared.db import get_session
 
 
@@ -782,6 +792,20 @@ def test_process_fetch_text_job_html_end_to_end(db_session, rawstore, monkeypatc
     assert rawstore.get(document.raw_ref) == body
     assert document.checksum is not None
     assert document.parser_version == "fulltext/1"
+    evidence = db_session.execute(select(CorpusUpdateEvidence)).scalar_one()
+    assert evidence.source_name == "official_document_fetch"
+    assert evidence.bill_id == db_session.get(BillVersion, document.bill_version_id).bill_id
+    assert evidence.changed_components == ["documents"]
+    assert evidence.request_scope == {
+        "document_id": str(document.id),
+        "resolver": None,
+        "authority": "retrieved_document_not_authority_verified",
+    }
+    assert db_session.get(OfficialRawBlob, evidence.response_sha256).data == body
+    before = json.loads(db_session.get(OfficialRawBlob, evidence.before_snapshot_sha256).data)
+    after = json.loads(db_session.get(OfficialRawBlob, evidence.after_snapshot_sha256).data)
+    assert before["document"]["extracted_text"] is None
+    assert "Hello legislature." in after["document"]["extracted_text"]
 
 
 def test_process_fetch_text_job_extracts_without_archival_by_default(db_session, rawstore):
@@ -799,6 +823,93 @@ def test_process_fetch_text_job_extracts_without_archival_by_default(db_session,
     assert "No archival needed." in (document.extracted_text or "")
     assert document.raw_ref is None
     assert document.checksum is not None
+
+
+def test_metadata_only_refetch_records_no_extra_document_evidence(db_session, rawstore):
+    """A changed retrieval timestamp alone is crawler bookkeeping, not a corpus mutation."""
+    document = _make_bill_document(db_session, url="https://example-legislature.gov/evidence-noop.html")
+    body = b"<html><body><p>Stable document text.</p></body></html>"
+    client = _robots_client("User-agent: *\nAllow: /\n", doc_body=body, doc_content_type="text/html")
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+    first = db_session.execute(select(CorpusUpdateEvidence)).scalars().all()
+    process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    assert len(first) == 1
+    assert db_session.execute(select(CorpusUpdateEvidence)).scalars().all() == first
+
+
+def test_document_evidence_sanitizes_fetched_url(db_session, rawstore):
+    """Evidence must not retain URL credentials, query values, or fragments."""
+    document = _make_bill_document(db_session, url="https://example-legislature.gov/original.html")
+    raw = b"Section 1. Sanitized fetched document."
+    fulltext_mod.persist_extraction_outcome(
+        db_session,
+        document,
+        raw=raw,
+        content_type="text/plain",
+        url="https://user:password@example-legislature.gov/fetched.html?token=secret#section",
+        outcome=fulltext_mod.ExtractionOutcome(
+            status=STATUS_OK,
+            extracted_text=raw.decode(),
+            checksum=hashlib.sha256(raw).hexdigest(),
+        ),
+        rawstore=rawstore,
+        resolver="test_resolver",
+    )
+
+    evidence = db_session.execute(select(CorpusUpdateEvidence)).scalar_one()
+    assert evidence.source_url == "https://example-legislature.gov/fetched.html"
+    assert evidence.request_scope["resolver"] == "test_resolver"
+    assert "password" not in evidence.source_url
+    assert "secret" not in evidence.source_url
+
+
+def test_oversized_document_response_rolls_back_semantic_update(db_session, rawstore):
+    """A response beyond the corpus blob cap cannot create an unproven document update."""
+    document = _make_bill_document(db_session, url="https://example-legislature.gov/evidence-cap.html")
+    raw = b"x" * (fulltext_mod.document_update_evidence.MAX_BLOB_BYTES + 1)
+    with pytest.raises(ValueError, match="storage cap"):
+        with db_session.begin_nested():
+            fulltext_mod.persist_extraction_outcome(
+                db_session,
+                document,
+                raw=raw,
+                content_type="text/plain",
+                url=document.url,
+                outcome=fulltext_mod.ExtractionOutcome(
+                    status=STATUS_OK,
+                    extracted_text="The oversized response must not persist.",
+                    checksum=hashlib.sha256(raw).hexdigest(),
+                ),
+                rawstore=rawstore,
+            )
+
+    db_session.expire_all()
+    assert db_session.get(BillDocument, document.id).extracted_text is None
+    assert db_session.execute(select(CorpusUpdateEvidence)).scalars().all() == []
+
+
+def test_document_mutation_rolls_back_when_evidence_storage_fails(db_session, rawstore, monkeypatch):
+    """An evidence outage must not leave changed corpus text without its ledger row."""
+    document = _make_bill_document(db_session, url="https://example-legislature.gov/evidence-rollback.html")
+    body = b"<html><body><p>Atomic evidence test.</p></body></html>"
+    client = _robots_client("User-agent: *\nAllow: /\n", doc_body=body, doc_content_type="text/html")
+    fetcher = FullTextFetcher(client=client, robots_cache=RobotsCache(client=client))
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("evidence storage unavailable")
+
+    monkeypatch.setattr("billcommons_ingest.document_update_evidence._store_blob", unavailable)
+    with pytest.raises(RuntimeError, match="evidence storage unavailable"):
+        with db_session.begin_nested():
+            process_fetch_text_job(db_session, str(document.id), fetcher=fetcher, rawstore=rawstore)
+
+    db_session.expire_all()
+    restored = db_session.get(BillDocument, document.id)
+    assert restored.extracted_text is None
+    assert db_session.execute(select(CorpusUpdateEvidence)).scalars().all() == []
 
 
 # ---------------------------------------------------------------------------

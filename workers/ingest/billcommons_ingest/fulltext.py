@@ -43,6 +43,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest import events
+from billcommons_ingest import document_update_evidence
 from billcommons_ingest import host_auth as host_auth_mod
 from billcommons_ingest.url_resolvers import (
     MaDocumentUrl,
@@ -1123,18 +1124,20 @@ def persist_extraction_outcome(
                 meta={
                     "source_name": SOURCE_NAME,
                     "document_id": str(document.id),
-                    "url": url,
+                    "url": document_update_evidence.sanitize_source_url(url),
                     "retrieved_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
         except OSError as exc:  # e.g. ENOSPC — never fail extraction over archival
             print(f"fulltext: raw archival skipped for {document.id}: {exc}", flush=True)
 
+    before_snapshot = document_update_evidence.snapshot_document(document)
+    retrieved_at = datetime.now(timezone.utc)
     had_text_before = bool(document.extracted_text)
     document.extracted_text = outcome.extracted_text
     document.media_type = document.media_type or content_type
     document.source_name = SOURCE_NAME
-    document.retrieved_at = datetime.now(timezone.utc)
+    document.retrieved_at = retrieved_at
     document.raw_ref = raw_ref
     document.checksum = outcome.checksum
     document.parser_version = PARSER_VERSION
@@ -1149,6 +1152,20 @@ def persist_extraction_outcome(
         robots_exempt=robots_exempt,
     )
     db.flush()
+    # The relational document mutation and its content-addressed evidence
+    # share the caller's transaction. Filesystem archival above remains an
+    # optional compatibility cache; a storage failure here deliberately
+    # aborts the semantic document update.
+    document_update_evidence.record_document_update_evidence(
+        db,
+        document=document,
+        before=before_snapshot,
+        raw=raw,
+        content_type=content_type,
+        fetched_url=url,
+        resolver=resolver or provenance,
+        retrieved_at=retrieved_at,
+    )
 
     # A bill going from "we have no text" to "text available" is the moment it
     # becomes searchable and diffable -- for a policy tracker, usually the most
