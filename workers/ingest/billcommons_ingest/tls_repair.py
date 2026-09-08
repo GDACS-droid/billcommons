@@ -22,7 +22,7 @@ from time import monotonic
 from typing import Callable
 from urllib.parse import urlsplit
 
-from sqlalchemy import Text, cast, exists, func, or_, select, text
+from sqlalchemy import Integer, Text, and_, cast, exists, func, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -54,6 +54,27 @@ FETCH_TEXT_KIND = fulltext.FETCH_TEXT_KIND
 DB_STATEMENT_TIMEOUT_MS = 5_000
 DB_LOCK_TIMEOUT_MS = 1_000
 ATTEMPT_WALL_TIMEOUT_SECONDS = 90
+
+# This mirrors the nested legacy directory shape independently witnessed for
+# the three reviewed sessions.  Keep it in SQL before LIMIT so malformed rows
+# cannot starve a later repairable document; url_resolvers repeats the stricter
+# bucket-range check before a candidate is admitted.
+_TX_WITNESS_URL_SQL_RE = (
+    r"^ftp://ftp[.]legis[.]state[.]tx[.]us/bills/(89R|891|892)/witlistbill/html/"
+    r"("
+    r"[A-Za-z0-9][A-Za-z0-9._-]*[.][hH][tT][mM]([lL])?"
+    r"|house_bills/HB[0-9]{5}_HB[0-9]{5}/HB[0-9]{5}[A-Za-z0-9._-]*[.][hH][tT][mM]([lL])?"
+    r"|senate_bills/SB[0-9]{5}_SB[0-9]{5}/SB[0-9]{5}[A-Za-z0-9._-]*[.][hH][tT][mM]([lL])?"
+    r")$"
+)
+_TX_BUCKET_START_RE = r"^.*/(house_bills|senate_bills)/(HB|SB)([0-9]{5})_.*$"
+_TX_BUCKET_END_RE = (
+    r"^.*/(house_bills|senate_bills)/(HB|SB)[0-9]{5}_(HB|SB)([0-9]{5})/.*$"
+)
+_TX_FILE_NUMBER_RE = (
+    r"^.*/(house_bills|senate_bills)/(HB|SB)[0-9]{5}_(HB|SB)[0-9]{5}/"
+    r"(HB|SB)([0-9]{5})[A-Za-z0-9._-]*[.][hH][tT][mM]([lL])?$"
+)
 
 # These hosts were independently verified to recover only after their public
 # issuer certificate was supplied. Membership is still insufficient on its
@@ -184,6 +205,28 @@ def _tx_witness_candidate(url: str | None) -> str | None:
 
 def _is_tx_redirect_error(error: str | None) -> bool:
     return bool(error and fulltext.STATUS_UNSUPPORTED_REDIRECT_SCHEME in error.casefold())
+
+
+def _tx_witness_url_sql() -> object:
+    """Match the resolver's stable nested-path checks before applying LIMIT."""
+    url = BillDocument.url
+    bucket_start = cast(
+        func.nullif(func.regexp_replace(url, _TX_BUCKET_START_RE, r"\3"), url), Integer
+    )
+    bucket_end = cast(
+        func.nullif(func.regexp_replace(url, _TX_BUCKET_END_RE, r"\4"), url), Integer
+    )
+    file_number = cast(
+        func.nullif(func.regexp_replace(url, _TX_FILE_NUMBER_RE, r"\5"), url), Integer
+    )
+    return and_(
+        url.op("~")(_TX_WITNESS_URL_SQL_RE),
+        # Flat paths have no bucket and remain accepted for compatibility.
+        or_(
+            and_(~url.like("%/house_bills/%"), ~url.like("%/senate_bills/%")),
+            and_(bucket_start <= file_number, file_number <= bucket_end),
+        ),
+    )
 
 
 def _active_normal_fetch_job_exists(db: Session, document_id: object) -> bool:
@@ -364,10 +407,7 @@ def discover_tx_candidates(db: Session, *, limit: int = DEFAULT_CYCLE_LIMIT) -> 
             ),
             # Exclude stable malformed/unreviewed paths before LIMIT; an
             # earlier invalid row must not starve a later eligible document.
-            BillDocument.url.op("~")(
-                r"^ftp://ftp[.]legis[.]state[.]tx[.]us/bills/(89R|891|892)/"
-                r"witlistbill/html/[A-Za-z0-9][A-Za-z0-9._-]*[.][hH][tT][mM]([lL])?$"
-            ),
+            _tx_witness_url_sql(),
             ~active, ~existing,
         ).order_by(BillDocument.id).limit(limit)
     )

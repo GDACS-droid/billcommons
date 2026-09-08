@@ -34,9 +34,10 @@ from billcommons_ingest.url_resolvers import (
 MA_DOCKET_URL = "https://malegislature.gov/Bills/194/HD177.pdf"
 MA_ALREADY_BILL_STYLE_URL = "https://malegislature.gov/Bills/194/H177.pdf"
 IA_STALE_URL = "https://www.legis.iowa.gov/docs/publications/LGEG/91/attachments/SF397.html"
-TX_FTP_89R_URL = "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm"
-TX_FTP_892_URL = "ftp://ftp.legis.state.tx.us/bills/892/witlistbill/html/HB00027H.htm"
-TX_FTP_891_URL = "ftp://ftp.legis.state.tx.us/bills/891/witlistbill/html/SB00015S.HTM"
+TX_FTP_89R_URL = "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/house_bills/HB00500_HB00599/HB00576H.htm"
+TX_FTP_892_URL = "ftp://ftp.legis.state.tx.us/bills/892/witlistbill/html/house_bills/HB00001_HB00099/HB00027H.htm"
+TX_FTP_891_URL = "ftp://ftp.legis.state.tx.us/bills/891/witlistbill/html/senate_bills/SB00001_SB00099/SB00015S.HTM"
+TX_FTP_FLAT_89R_URL = "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm"
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +105,7 @@ def test_resolve_fetch_url_never_duplicates_a_candidate_equal_to_the_original():
         (TX_FTP_89R_URL, "https://capitol.texas.gov/tlodocs/89R/witlistbill/html/HB00576H.htm"),
         (TX_FTP_892_URL, "https://capitol.texas.gov/tlodocs/892/witlistbill/html/HB00027H.htm"),
         (TX_FTP_891_URL, "https://capitol.texas.gov/tlodocs/891/witlistbill/html/SB00015S.HTM"),
+        (TX_FTP_FLAT_89R_URL, "https://capitol.texas.gov/tlodocs/89R/witlistbill/html/HB00576H.htm"),
     ],
 )
 def test_tx_ftp_tlodocs_candidate_maps_only_the_verified_sessions(source_url, expected):
@@ -133,6 +135,10 @@ def test_tx_resolver_preserves_the_original_ftp_url_before_the_https_candidate()
         "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm#section",
         "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/%2e%2e/HB00576H.htm",
         "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm;other",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/house_bills/SB00001_SB00099/SB00015S.HTM",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/house_bills/HB00500_HB00599/HB00499H.htm",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/senate_bills/SB00099_SB00001/SB00015S.HTM",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/house_resolutions/HR00001_HR00099/HR00051H.htm",
     ],
 )
 def test_tx_ftp_tlodocs_candidate_rejects_unreviewed_or_unsafe_source_shape(source_url):

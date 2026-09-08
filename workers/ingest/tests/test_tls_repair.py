@@ -348,7 +348,7 @@ def test_success_mutation_and_outcome_rollback_together(db_session, monkeypatch)
     assert _outcomes(db_session) == ["admitted"]
 
 
-def _tx_document(db, *, url="ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/SB00001.htm", document_id=None):
+def _tx_document(db, *, url="ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/senate_bills/SB00001_SB00099/SB00001S.HTM", document_id=None):
     document = _document(db, url=url, status=f"fulltext_status={fulltext.STATUS_UNSUPPORTED_REDIRECT_SCHEME}", attempts=0, document_id=document_id)
     bill = db.scalar(select(Bill).join(BillVersion, BillVersion.bill_id == Bill.id).where(BillVersion.id == document.bill_version_id))
     jurisdiction = db.get(Jurisdiction, bill.jurisdiction_id)
@@ -378,6 +378,22 @@ def test_tx_witness_requires_exact_tx_status_url_and_latest_dead_source(db_sessi
     ]
     assert tls_repair.seed_tx_candidates(db_session, now=NOW) == 1
     assert tls_repair.seed_tx_candidates(db_session, now=NOW) == 0
+
+
+def test_tx_flat_witness_path_remains_seedable(db_session):
+    document = _tx_document(
+        db_session,
+        url="ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/SB00001S.HTM",
+    )
+    source = _dead_tls_job(db_session, document, error="unsupported_redirect_scheme")
+
+    assert tls_repair.discover_tx_candidates(db_session) == [
+        tls_repair.RepairCandidate(
+            document.id,
+            source.id,
+            hashlib.sha256(source.last_error.encode()).hexdigest(),
+        )
+    ]
 
 
 def test_tx_source_drift_revalidates_before_fetch(db_session, monkeypatch):
@@ -411,8 +427,20 @@ def test_tx_success_uses_shared_fulltext_tail_and_ledger(db_session, monkeypatch
 
 def test_tx_invalid_earlier_path_does_not_starve_valid_candidate(db_session):
     invalid = _tx_document(db_session, url="ftp://ftp.legis.state.tx.us/bills/90R/witlistbill/html/SB1.htm", document_id=uuid.UUID(int=1))
-    valid = _tx_document(db_session, document_id=uuid.UUID(int=2))
+    wrong_bucket = _tx_document(
+        db_session,
+        url="ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/house_bills/SB00001_SB00099/SB00001S.HTM",
+        document_id=uuid.UUID(int=2),
+    )
+    out_of_range = _tx_document(
+        db_session,
+        url="ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/house_bills/HB00500_HB00599/HB00499H.htm",
+        document_id=uuid.UUID(int=3),
+    )
+    valid = _tx_document(db_session, document_id=uuid.UUID(int=4))
     _dead_tls_job(db_session, invalid, error="unsupported_redirect_scheme")
+    _dead_tls_job(db_session, wrong_bucket, error="unsupported_redirect_scheme")
+    _dead_tls_job(db_session, out_of_range, error="unsupported_redirect_scheme")
     source = _dead_tls_job(db_session, valid, error="unsupported_redirect_scheme")
     candidates = tls_repair.discover_tx_candidates(db_session, limit=1)
     assert [(row.document_id, row.source_dead_job_id) for row in candidates] == [(valid.id, source.id)]
@@ -431,7 +459,7 @@ def test_repair_deadline_escapes_generic_extraction_error_handler():
 
 
 def test_tx_repair_real_resolver_extraction_and_retained_evidence(db_session, rawstore):
-    source_url = "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm"
+    source_url = "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/house_bills/HB00500_HB00599/HB00576H.htm"
     target_url = "https://capitol.texas.gov/tlodocs/89R/witlistbill/html/HB00576H.htm"
     document = _tx_document(db_session, url=source_url)
     source = _dead_tls_job(db_session, document, error="unsupported_redirect_scheme")
