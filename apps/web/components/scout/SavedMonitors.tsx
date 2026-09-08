@@ -72,6 +72,7 @@ function RunSummary({ run }: { run: ScoutMonitorRun }) {
       ) : (
         <div className="mt-3 text-sm leading-6 text-slate-700">
           {comparison === "available" ? <p>{newSources} new · {changedSources} changed · {unchanged} unchanged observed sources.</p> : null}
+          {comparison === "available" ? <p className="mt-1 text-slate-600">Compared with the previous observed result. Previously seen sources can reappear after an incomplete run.</p> : null}
           {comparison === "pending" ? <p>Comparison is pending. Source-change counts are not available yet.</p> : null}
           {comparison === "unavailable" ? <p>Comparison is unavailable for this run.</p> : null}
           {comparison === "missing" ? <p>Comparison counts were not returned for this run.</p> : null}
