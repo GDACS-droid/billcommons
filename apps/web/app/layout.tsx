@@ -6,6 +6,12 @@ import SiteHeader from "@/components/SiteHeader";
 import SiteFooter from "@/components/SiteFooter";
 import { SITE_URL } from "@/lib/config";
 
+// These tokens are public by design: both verification services require a
+// <meta> tag that their crawler can read. Keeping them server-only prevents
+// the values from being copied into every client bundle unnecessarily.
+const googleSiteVerification = process.env.GOOGLE_SITE_VERIFICATION;
+const bingSiteVerification = process.env.BING_SITE_VERIFICATION;
+
 const inter = Inter({
   variable: "--font-inter",
   subsets: ["latin"],
@@ -32,6 +38,12 @@ export const metadata: Metadata = {
     title: "Bill Commons",
     description:
       "Free, open-source, nonpartisan legislative search for all 50 states and DC.",
+  },
+  verification: {
+    google: googleSiteVerification,
+    ...(bingSiteVerification
+      ? { other: { "msvalidate.01": bingSiteVerification } }
+      : {}),
   },
 };
 

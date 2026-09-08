@@ -128,7 +128,7 @@ export default async function HomePage() {
       </section>
 
       <section className="mx-auto max-w-6xl px-4 pb-4 sm:px-6">
-        <div className="rounded-md border border-slate-200 border-l-2 border-l-blue-700 bg-white px-5 py-5 text-sm leading-6 text-slate-600">
+        <div className="rounded-md border border-slate-200 bg-white px-5 py-5 text-sm leading-6 text-slate-600">
           <span className="font-semibold text-slate-950">
             Building something with this?
           </span>{" "}
@@ -151,7 +151,41 @@ export default async function HomePage() {
         </div>
       </section>
 
-      <section className="mx-auto max-w-6xl px-4 pb-20 pt-10 sm:px-6">
+      <section className="mx-auto max-w-6xl px-4 pb-16 pt-8 sm:px-6">
+        <div className="max-w-3xl">
+          <h2 className="text-xl font-semibold tracking-tight text-slate-950">
+            A citable legislative record for your team
+          </h2>
+          <p className="mt-3 text-sm leading-6 text-slate-600">
+            Policy, public-affairs, and government-technology teams can search
+            across jurisdictions, inspect source links and freshness details,
+            then connect the public API or MCP server to their own research
+            workflow.
+          </p>
+          <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 text-sm font-medium">
+            <Link
+              href="/coverage"
+              className="text-blue-800 underline underline-offset-2 hover:text-blue-700"
+            >
+              Inspect data quality
+            </Link>
+            <Link
+              href="/docs/api"
+              className="text-blue-800 underline underline-offset-2 hover:text-blue-700"
+            >
+              Explore the API
+            </Link>
+            <Link
+              href="/docs/agents"
+              className="text-blue-800 underline underline-offset-2 hover:text-blue-700"
+            >
+              Connect an AI agent
+            </Link>
+          </div>
+        </div>
+      </section>
+
+      <section className="mx-auto max-w-6xl px-4 pb-20 pt-2 sm:px-6">
         <div className="flex items-baseline justify-between">
           <h2 className="text-xl font-semibold tracking-tight text-slate-950">
             Active sessions
