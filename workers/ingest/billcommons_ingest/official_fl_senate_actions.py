@@ -279,7 +279,7 @@ def _last_action(root: _Node) -> tuple[date, str | None, str]:
         pieces.append(part)
     if not ended:
         raise OfficialFloridaSenateActionsError("Florida Senate Last Action field lacks a terminating line break")
-    match = _LAST_ACTION.fullmatch(_normalized_text(" ".join(pieces)))
+    match = _LAST_ACTION.fullmatch(_normalized_text("".join(pieces)))
     if match is None:
         raise OfficialFloridaSenateActionsError("Florida Senate Last Action field has an invalid shape")
     raw_date, chamber, description = match.groups()
@@ -293,11 +293,11 @@ def _action_bullets(cell: _Node, row_position: int) -> list[str]:
     pieces: list[str] = []
     for part in _line_parts(cell.children):
         if part is None:
-            lines.append(_normalized_text(" ".join(pieces)))
+            lines.append(_normalized_text("".join(pieces)))
             pieces = []
         else:
             pieces.append(part)
-    lines.append(_normalized_text(" ".join(pieces)))
+    lines.append(_normalized_text("".join(pieces)))
     values: list[str] = []
     for line in lines:
         if not line:

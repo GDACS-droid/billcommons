@@ -107,6 +107,18 @@ def test_preserves_inline_bullet_content_and_nested_explicit_line_breaks():
     assert adapter.parse_florida_senate_bill_history(changed, source_url=SOURCE_URL).actions == _parse().actions
 
 
+def test_inline_nodes_do_not_invent_spaces_in_source_action_facts():
+    changed = _raw().replace(
+        b"&bull; Filed<br>",
+        b"&bull; <span>pre</span><b>filed</b>; Chapter <a>No. 2025-1</a>.<br>",
+        1,
+    ).replace(b"6/18/2026 House -", b"6/18/2026 Ho<b>use</b> -", 1)
+    parsed = adapter.parse_florida_senate_bill_history(changed, source_url=SOURCE_URL)
+    assert parsed.actions[0].description == "prefiled; Chapter No. 2025-1."
+    assert parsed.actions[1:] == _parse().actions[1:]
+    assert parsed.actions[-1].chamber == "House"
+
+
 def test_enforces_dom_depth_before_recursive_extraction():
     boundary = adapter._BoundedTreeBuilder()
     boundary.feed("<div>" * adapter.MAX_DOM_DEPTH + "</div>" * adapter.MAX_DOM_DEPTH)

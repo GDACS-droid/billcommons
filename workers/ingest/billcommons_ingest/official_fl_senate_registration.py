@@ -119,6 +119,7 @@ def _lock_registry(db: Session) -> None:
 def _jurisdictions_by_abbreviation(db: Session, abbreviations: set[str]) -> dict[str, Jurisdiction]:
     rows = db.scalars(
         select(Jurisdiction).where(Jurisdiction.abbreviation.in_(tuple(abbreviations)))
+        .execution_options(populate_existing=True)
     ).all()
     jurisdictions = {row.abbreviation: row for row in rows}
     if len(rows) != len(jurisdictions) or set(jurisdictions) != abbreviations:
@@ -134,7 +135,10 @@ def _validate_inventory(
         florida_key, florida_value = _expected_florida_target()
         expected[florida_key] = florida_value
 
-    targets = db.scalars(select(OfficialSourceTarget)).all()
+    # Preserve caller edits before refreshing an identity map that may predate
+    # the registry lock. A database SELECT alone does not refresh ORM objects.
+    db.flush()
+    targets = db.scalars(select(OfficialSourceTarget).execution_options(populate_existing=True)).all()
     actual_keys = Counter((target.adapter_name, target.source_url) for target in targets)
     expected_keys = Counter(expected.keys())
     if len(targets) != len(expected) or actual_keys != expected_keys:
@@ -235,11 +239,16 @@ def activate_reviewed_fl_senate_target(
         select(OfficialSourceTarget)
         .where(OfficialSourceTarget.id == target_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if target is None:
         raise FloridaSenateActivationError("reviewed Florida target disappeared before activation")
     if target.enabled:
         raise FloridaSenateActivationError("reviewed Florida target is already enabled")
+    if (target.adapter_name != florida_key[0] or target.source_url != florida_key[1]
+            or target.jurisdiction_id != _jurisdictions["FL"].id
+            or target.scope != FLORIDA_SCOPE or target.cadence_seconds != CADENCE_SECONDS):
+        raise FloridaSenateActivationError("reviewed Florida target changed before activation")
     try:
         _require_unobserved(db, target)
     except FloridaSenateRegistrationError as exc:

@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import delete, event, select
+from sqlalchemy import event, select, update
 from sqlalchemy.orm import Session
 
 from billcommons_ingest import official_discovery as discovery
@@ -198,38 +198,68 @@ def test_activation_rolls_back_and_locks_only_the_florida_target(db_session):
 
 def test_second_activation_transaction_loses_the_advisory_lock():
     engine = get_engine()
-    setup = Session(engine)
-    first = second = check = cleanup = None
-    target_ids = jurisdiction_ids = ()
-    try:
-        jurisdictions = _seed_reviewed_initial_inventory(setup)
-        registered = registration.register_reviewed_fl_senate_target(setup)
-        target_ids = tuple(setup.scalars(select(OfficialSourceTarget.id)).all())
-        jurisdiction_ids = tuple(jurisdiction.id for jurisdiction in jurisdictions.values())
-        setup.commit()
-
-        first = Session(engine)
-        second = Session(engine)
-        registration.activate_reviewed_fl_senate_target(first, now=NOW)
-        with pytest.raises(registration.FloridaSenateRegistrationError, match="advisory lock"):
-            registration.activate_reviewed_fl_senate_target(second, now=NOW)
-        second.rollback()
-        first.rollback()
-
-        check = Session(engine)
-        target = check.get(OfficialSourceTarget, registered.target_id)
-        assert target.enabled is False
-    finally:
-        for session in (second, first, check, setup):
-            if session is not None:
-                session.close()
-        cleanup = Session(engine)
+    with engine.connect() as connection:
+        outer = connection.begin()
         try:
-            cleanup.execute(delete(OfficialSourceTarget).where(OfficialSourceTarget.id.in_(target_ids)))
-            cleanup.execute(delete(Jurisdiction).where(Jurisdiction.id.in_(jurisdiction_ids)))
-            cleanup.commit()
+            with Session(connection, join_transaction_mode="create_savepoint") as setup:
+                _seed_reviewed_initial_inventory(setup)
+                registered = registration.register_reviewed_fl_senate_target(setup)
+                setup.commit()
+            with Session(connection, join_transaction_mode="create_savepoint") as first:
+                registration.activate_reviewed_fl_senate_target(first, now=NOW)
+                with Session(engine) as second:
+                    # The second call must fail on the lock before it reads the
+                    # inventory, so the fixture need not become globally visible.
+                    assert second.get(OfficialSourceTarget, registered.target_id) is None
+                    with pytest.raises(registration.FloridaSenateRegistrationError, match="advisory lock"):
+                        registration.activate_reviewed_fl_senate_target(second, now=NOW)
+                first.rollback()
+            with Session(connection, join_transaction_mode="create_savepoint") as check:
+                assert check.get(OfficialSourceTarget, registered.target_id).enabled is False
         finally:
-            cleanup.close()
+            outer.rollback()
+
+
+@pytest.mark.parametrize("action", ["register", "activate"])
+def test_registry_refreshes_previously_cached_target_state(db_session, action):
+    _seed_reviewed_initial_inventory(db_session)
+    registration.register_reviewed_fl_senate_target(db_session)
+    cached = _florida_target(db_session)
+    scheduled = NOW + timedelta(days=2)
+    # Bypass the identity map as an independently committed write would, while
+    # keeping all fixture rows inside the disposable test transaction.
+    db_session.connection().execute(update(OfficialSourceTarget).where(
+        OfficialSourceTarget.id == cached.id
+    ).values(enabled=True, next_check_at=scheduled))
+    assert cached.enabled is False
+    if action == "register":
+        with pytest.raises(registration.FloridaSenateRegistrationError, match="disabled"):
+            registration.register_reviewed_fl_senate_target(db_session)
+    else:
+        with pytest.raises(registration.FloridaSenateActivationError, match="already enabled"):
+            registration.activate_reviewed_fl_senate_target(db_session, now=NOW)
+    db_session.refresh(cached)
+    assert cached.enabled is True and cached.next_check_at == scheduled
+
+
+def test_activation_revalidates_scope_after_acquiring_row_lock(db_session, monkeypatch):
+    _seed_reviewed_initial_inventory(db_session)
+    registered = registration.register_reviewed_fl_senate_target(db_session)
+    validate = registration._validate_inventory
+
+    def drift_after_inventory(db, **kwargs):
+        result = validate(db, **kwargs)
+        db.connection().execute(update(OfficialSourceTarget).where(
+            OfficialSourceTarget.id == registered.target_id
+        ).values(scope={**registration.FLORIDA_SCOPE, "coverage": "unreviewed"}))
+        return result
+
+    monkeypatch.setattr(registration, "_validate_inventory", drift_after_inventory)
+    with pytest.raises(registration.FloridaSenateActivationError, match="changed before activation"):
+        registration.activate_reviewed_fl_senate_target(db_session, now=NOW)
+    target = _florida_target(db_session)
+    db_session.refresh(target)
+    assert target.enabled is False and target.scope["coverage"] == "unreviewed"
 
 
 def test_activation_refuses_previously_observed_or_naive_time(db_session):
