@@ -662,6 +662,54 @@ class CorpusUpdateEvidence(UUIDPkMixin, Base):
     )
 
 
+class DerivedStatusEvidence(UUIDPkMixin, Base):
+    """Replayable local inputs and state for a status/relation derivation.
+
+    This records a deterministic local computation.  It is deliberately not a
+    source-response ledger: ``causal_corpus_update_evidence_id`` is optional
+    because a backfill can derive a change without a newly fetched response.
+    """
+
+    __tablename__ = "derived_status_evidence"
+
+    bill_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bills.id"), nullable=False
+    )
+    causal_corpus_update_evidence_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("corpus_update_evidence.id"), nullable=True
+    )
+    derivation_input_sha256: Mapped[str] = mapped_column(
+        Text, ForeignKey("official_raw_blobs.sha256"), nullable=False
+    )
+    before_snapshot_sha256: Mapped[str] = mapped_column(
+        Text, ForeignKey("official_raw_blobs.sha256"), nullable=False
+    )
+    after_snapshot_sha256: Mapped[str] = mapped_column(
+        Text, ForeignKey("official_raw_blobs.sha256"), nullable=False
+    )
+    processing_version: Mapped[str] = mapped_column(Text, nullable=False)
+    changed_components: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    derived_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "jsonb_typeof(changed_components) = 'array' AND jsonb_array_length(changed_components) > 0",
+            name="ck_derived_status_evidence_components",
+        ),
+        CheckConstraint(
+            "octet_length(changed_components::text) <= 65536",
+            name="ck_derived_status_evidence_components_size",
+        ),
+        Index("ix_derived_status_evidence_bill_time", "bill_id", "derived_at"),
+        Index("ix_derived_status_evidence_causal", "causal_corpus_update_evidence_id"),
+    )
+
+
 class IngestionRun(UUIDPkMixin, TimestampMixin, Base):
     """A single run of an ingestion job (bootstrap or incremental)."""
 

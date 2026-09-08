@@ -11,15 +11,22 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 
+import hashlib
+import json
 import uuid
 
+import pytest
 from sqlalchemy import select
 
+from billcommons_ingest import derived_status_evidence as status_evidence_mod
 from billcommons_ingest.cli import recompute_status_for_bills
 from billcommons_schema.models import (
     Bill,
     BillAction,
+    CorpusUpdateEvidence,
+    DerivedStatusEvidence,
     Jurisdiction,
+    OfficialRawBlob,
     RelatedBill,
     Session as SessionModel,
 )
@@ -1159,3 +1166,199 @@ def test_substitution_off_spec_relation_type_row_is_not_survivor_evidence(db_ses
     assert counts.get("_related_removed", 0) == 0
     db_session.refresh(substituted)
     assert substituted.status != "vetoed"
+
+
+
+def _blob(db_session, data: bytes) -> str:
+    digest = hashlib.sha256(data).hexdigest()
+    db_session.add(OfficialRawBlob(sha256=digest, data=data, content_type="application/json"))
+    db_session.flush()
+    return digest
+
+
+def _corpus_evidence(db_session, bill_id):
+    evidence = CorpusUpdateEvidence(
+        bill_id=bill_id,
+        source_name="openstates_v3_api",
+        source_url="https://v3.openstates.org/bills/example",
+        request_scope={"state": "ZQ"},
+        response_sha256=_blob(db_session, b'{"response":true}'),
+        before_snapshot_sha256=_blob(db_session, b'{"before":true}'),
+        after_snapshot_sha256=_blob(db_session, b'{"after":true}'),
+        processing_version="api_sync/1",
+        mutation_kind="updated",
+        changed_components=["actions"],
+        retrieved_at=datetime.now(timezone.utc),
+    )
+    db_session.add(evidence)
+    db_session.flush()
+    return evidence
+
+
+def _derived_evidence(db_session):
+    return db_session.execute(select(DerivedStatusEvidence)).scalars().all()
+
+
+def _read_evidence_blob(db_session, digest):
+    return json.loads(db_session.get(OfficialRawBlob, digest).data)
+
+
+def test_status_derivation_records_replayable_status_change_with_causal_source_evidence(db_session):
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    bill = _bill(db_session, jurisdiction, session_row, "HB 1")
+    db_session.add(
+        BillAction(
+            bill_id=bill.id,
+            action_date=date(2026, 2, 3),
+            description="Signed by Governor",
+            classification="executive-signature",
+            source_name="openstates_v3_api",
+        )
+    )
+    source_evidence = _corpus_evidence(db_session, bill.id)
+
+    changed, cleared, related = recompute_status_for_bills(
+        db_session,
+        [bill.id],
+        stamp=False,
+        causal_evidence_by_bill={bill.id: source_evidence.id},
+    )
+    db_session.flush()
+
+    assert (changed, cleared, related) == (1, 0, 0)
+    evidence = _derived_evidence(db_session)
+    assert len(evidence) == 1
+    record = evidence[0]
+    assert record.bill_id == bill.id
+    assert record.causal_corpus_update_evidence_id == source_evidence.id
+    assert record.processing_version == status_evidence_mod.PROCESSING_VERSION
+    assert record.changed_components == ["status"]
+
+    inputs = _read_evidence_blob(db_session, record.derivation_input_sha256)
+    before = _read_evidence_blob(db_session, record.before_snapshot_sha256)
+    after = _read_evidence_blob(db_session, record.after_snapshot_sha256)
+    assert inputs["bill_id"] == str(bill.id)
+    assert inputs["actions"] == [
+        {
+            "action_date": "2026-02-03",
+            "classification": "executive-signature",
+            "description": "Signed by Governor",
+            "id": str(db_session.scalar(select(BillAction.id).where(BillAction.bill_id == bill.id))),
+            "order": None,
+            "organization_id": None,
+            "source_name": "openstates_v3_api",
+        }
+    ]
+    assert inputs["session"] == {
+        "active": True,
+        "end_date": None,
+        "has_recent_chamber_activity": False,
+        "id": str(session_row.id),
+    }
+    assert before == {"bill": {"id": str(bill.id), "status": None}, "substitution_relations": []}
+    assert after == {"bill": {"id": str(bill.id), "status": "enacted"}, "substitution_relations": []}
+
+
+def test_status_derivation_records_relation_only_change_when_status_is_already_current(db_session):
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    bill = _bill(db_session, jurisdiction, session_row, "SB 1")
+    bill.status = "substituted"
+    db_session.add(
+        BillAction(
+            bill_id=bill.id,
+            description="SUBSTITUTED BY HB 9999",
+            classification=None,
+        )
+    )
+    db_session.flush()
+
+    changed, cleared, related = recompute_status_for_bills(db_session, [bill.id], stamp=False)
+    db_session.flush()
+
+    assert (changed, cleared, related) == (0, 0, 1)
+    evidence = _derived_evidence(db_session)
+    assert len(evidence) == 1
+    record = evidence[0]
+    assert record.changed_components == ["substitution_relations"]
+    before = _read_evidence_blob(db_session, record.before_snapshot_sha256)
+    after = _read_evidence_blob(db_session, record.after_snapshot_sha256)
+    assert before["bill"]["status"] == after["bill"]["status"] == "substituted"
+    assert before["substitution_relations"] == []
+    assert after["substitution_relations"] == [
+        {
+            "id": after["substitution_relations"][0]["id"],
+            "related_bill_id": None,
+            "related_identifier": "HB 9999",
+            "relation_type": "substituted-by",
+        }
+    ]
+
+
+def test_status_derivation_noop_adds_no_evidence(db_session):
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    bill = _bill(db_session, jurisdiction, session_row, "HB 2")
+    db_session.add(
+        BillAction(
+            bill_id=bill.id,
+            action_date=date(2026, 2, 3),
+            description="Signed by Governor",
+            classification="executive-signature",
+        )
+    )
+    db_session.flush()
+    recompute_status_for_bills(db_session, [bill.id], stamp=False)
+    db_session.flush()
+    assert len(_derived_evidence(db_session)) == 1
+
+    changed, cleared, related = recompute_status_for_bills(db_session, [bill.id], stamp=False)
+    db_session.flush()
+    assert (changed, cleared, related) == (0, 0, 0)
+    assert len(_derived_evidence(db_session)) == 1
+
+
+def test_status_derivation_evidence_failure_rolls_back_status_and_relation_mutations(
+    db_session, monkeypatch
+):
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    bill = _bill(db_session, jurisdiction, session_row, "SB 2")
+    db_session.add(
+        BillAction(
+            bill_id=bill.id,
+            description="SUBSTITUTED BY HB 9999",
+            classification=None,
+        )
+    )
+    db_session.flush()
+
+    def fail_store(_db, _data):
+        raise RuntimeError("evidence store unavailable")
+
+    monkeypatch.setattr(status_evidence_mod, "_store_blob", fail_store)
+    with pytest.raises(RuntimeError, match="evidence store unavailable"):
+        with db_session.begin_nested():
+            recompute_status_for_bills(db_session, [bill.id], stamp=False)
+
+    persisted = db_session.get(Bill, bill.id)
+    assert persisted.status is None
+    assert _related_bills_for(db_session, bill.id) == []
+    assert _derived_evidence(db_session) == []
+
+
+def test_status_derivation_rejects_unbounded_action_input_and_rolls_back(db_session, monkeypatch):
+    jurisdiction, session_row = _jurisdiction_with_session(db_session)
+    bill = _bill(db_session, jurisdiction, session_row, "HB 3")
+    db_session.add_all(
+        [
+            BillAction(bill_id=bill.id, description="Introduced", classification="introduction"),
+            BillAction(bill_id=bill.id, description="Passed House", classification="passage"),
+        ]
+    )
+    db_session.flush()
+    monkeypatch.setattr(status_evidence_mod, "MAX_ACTIONS_PER_BILL", 1)
+
+    with pytest.raises(ValueError, match="action input exceeds configured record cap"):
+        with db_session.begin_nested():
+            recompute_status_for_bills(db_session, [bill.id], stamp=False)
+
+    assert db_session.get(Bill, bill.id).status is None
+    assert _derived_evidence(db_session) == []

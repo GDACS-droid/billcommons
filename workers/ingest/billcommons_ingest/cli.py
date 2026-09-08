@@ -58,6 +58,7 @@ from sqlalchemy import case, func, or_, select, text, update
 from billcommons_ingest import api_sync as api_sync_mod
 from billcommons_ingest import browser_fetch as browser_fetch_mod
 from billcommons_ingest import coverage as coverage_mod
+from billcommons_ingest import derived_status_evidence as status_evidence_mod
 from billcommons_ingest import events as events_mod
 from billcommons_ingest import fulltext as fulltext_mod
 from billcommons_ingest import host_auth as host_auth_mod
@@ -79,6 +80,7 @@ from billcommons_schema.models import (
     BillAction,
     BillDocument,
     BillVersion,
+    CorpusUpdateEvidence,
     IngestJob,
     IngestionRun,
     Jurisdiction,
@@ -1493,7 +1495,12 @@ def defer_job_for_budget(
 
 
 def recompute_status_for_bills(
-    db, bill_ids: list, counts: dict[str, int] | None = None, *, stamp: bool = True
+    db,
+    bill_ids: list,
+    counts: dict[str, int] | None = None,
+    *,
+    stamp: bool = True,
+    causal_evidence_by_bill: dict | None = None,
 ) -> tuple[int, int, int]:
     """Re-derive `bills.status` for a specific set of bills. Caller commits.
 
@@ -1548,6 +1555,10 @@ def recompute_status_for_bills(
         bill_jurisdiction[r.id] = r.jurisdiction_id
         bill_identifier_norm[r.id] = r.identifier_norm
         bill_session[r.id] = r.session_id
+    # Evidence uses exactly the state this local computation can overwrite.
+    # It is taken before ORM relation changes or the raw status UPDATE below,
+    # and recorded in this same caller-owned transaction.
+    before_evidence = status_evidence_mod.snapshot_state(db, bill_ids)
     # Session-level recent activity, for the case where the source calls a
     # session active but its predicted adjournment has passed. Deliberately
     # SESSION level, not bill level: a single bill can sit untouched for months
@@ -1558,10 +1569,8 @@ def recompute_status_for_bills(
     # 2026-09-01 -- a month ahead of today -- and letting a scheduled or
     # mis-keyed future date stand in as proof of current activity would make
     # the corroboration meaningless.
-    recent_cutoff = datetime.now(timezone.utc).date() - timedelta(
-        days=SESSION_ACTIVITY_WINDOW_DAYS
-    )
     today_date = datetime.now(timezone.utc).date()
+    recent_cutoff = today_date - timedelta(days=SESSION_ACTIVITY_WINDOW_DAYS)
     session_ids = {sid for sid in bill_session.values() if sid is not None}
     sessions_with_recent_activity: set = set()
     if session_ids:
@@ -1586,8 +1595,10 @@ def recompute_status_for_bills(
         }
 
     actions_by_bill: dict[object, list[status_mod.ActionRow]] = {bid: [] for bid in bill_ids}
+    action_evidence_by_bill: dict[object, list[dict]] = {bid: [] for bid in bill_ids}
     for a in db.execute(
         select(
+            BillAction.id,
             BillAction.bill_id,
             BillAction.action_date,
             BillAction.classification,
@@ -1619,6 +1630,17 @@ def recompute_status_for_bills(
                 order=a.order,
                 source_name=a.source_name,
             )
+        )
+        action_evidence_by_bill[a.bill_id].append(
+            {
+                "id": str(a.id),
+                "action_date": a.action_date.isoformat() if a.action_date else None,
+                "classification": a.classification,
+                "description": a.description,
+                "organization_id": str(a.organization_id) if a.organization_id else None,
+                "order": a.order,
+                "source_name": a.source_name,
+            }
         )
 
     # Pass 1: derive every bill in the chunk before propagating anything, so
@@ -1670,9 +1692,11 @@ def recompute_status_for_bills(
     text_derived_identifier = dict(survivor_identifier)
     related_rows = db.execute(
         select(
+            RelatedBill.id,
             RelatedBill.bill_id,
             RelatedBill.related_bill_id,
             RelatedBill.related_identifier,
+            RelatedBill.relation_type,
         )
         .where(
             RelatedBill.bill_id.in_(bill_ids),
@@ -1689,6 +1713,16 @@ def recompute_status_for_bills(
         # whatever the planner felt like handing back that day.
         .order_by(RelatedBill.bill_id, RelatedBill.created_at, RelatedBill.id)
     ).all()
+    consulted_relations_by_bill: dict[object, list[dict]] = {bid: [] for bid in bill_ids}
+    for row in related_rows:
+        consulted_relations_by_bill[row.bill_id].append(
+            {
+                "id": str(row.id),
+                "related_bill_id": str(row.related_bill_id) if row.related_bill_id else None,
+                "related_identifier": row.related_identifier,
+                "relation_type": row.relation_type,
+            }
+        )
     for row in related_rows:
         if row.related_bill_id is not None:
             # A bill can only ever be substituted by ONE survivor. If THIS
@@ -1737,6 +1771,7 @@ def recompute_status_for_bills(
             except ValueError:
                 pass
 
+    resolved_survivor_by_bill: dict[object, dict] = {}
     substitution_candidates = set(survivor_identifier) | set(survivor_bill_id)
     if substitution_candidates:
         # Resolve identifier-only survivors to a bill id within the same
@@ -1843,12 +1878,28 @@ def recompute_status_for_bills(
             else:
                 row = db.execute(select(Bill.status).where(Bill.id == sid)).first()
                 survivor_status = row.status if row else None
+            resolved_survivor_by_bill[bid] = {
+                "bill_id": str(sid),
+                "identifier": survivor_identifier.get(bid),
+                "status": survivor_status,
+            }
             if survivor_status is not None and survivor_status in status_mod.TERMINAL_STATUSES:
                 # No status_note/similar column exists on `bills` (checked
                 # models.py) -- inherit the status only, per spec R3.
                 derived_status[bid] = survivor_status
             else:
                 derived_status[bid] = status_mod.SUBSTITUTED
+
+    # Preserve an unresolved in-text or stored signal too: it is the input
+    # that made the derivation choose ``substituted`` even when no bill row
+    # could be found for its target.
+    for bid, identifier in survivor_identifier.items():
+        if bid in bill_ids and bid not in resolved_survivor_by_bill:
+            resolved_survivor_by_bill[bid] = {
+                "bill_id": None,
+                "identifier": identifier,
+                "status": None,
+            }
 
     # Persist the substitution relation itself. Everything above only ever
     # derives a STATUS from the survivor; nothing wrote the relation, so
@@ -2016,6 +2067,32 @@ def recompute_status_for_bills(
             ),
             updates,
         )
+    # All evidence writes stay in the transaction owned by the caller. If a
+    # content-addressed blob cannot be written, the corresponding derived
+    # status/relation mutation is rolled back with it.
+    inputs_by_bill = {
+        bid: status_evidence_mod.derivation_input(
+            bill_id=bid,
+            session_id=bill_session.get(bid),
+            session_end_date=session_end.get(bid),
+            session_active=session_active.get(bid, False),
+            session_has_recent_activity=bill_session.get(bid) in sessions_with_recent_activity,
+            as_of_date=today_date,
+            actions=action_evidence_by_bill.get(bid, []),
+            consulted_relations=consulted_relations_by_bill.get(bid, []),
+            resolved_survivor=resolved_survivor_by_bill.get(bid),
+        )
+        for bid in before_evidence
+    }
+    after_evidence = status_evidence_mod.snapshot_state(db, list(before_evidence))
+    status_evidence_mod.record_changes(
+        db,
+        before_by_bill=before_evidence,
+        after_by_bill=after_evidence,
+        inputs_by_bill=inputs_by_bill,
+        causal_evidence_by_bill=causal_evidence_by_bill,
+        derived_at=datetime.now(timezone.utc),
+    )
     return (len(updates), cleared, related_upserted)
 
 
@@ -2456,8 +2533,26 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                 try:
                     batch = sorted(pending_status_bills)
                     recompute_counts: dict[str, int] = {}
+                    # Source-response evidence is available for API-synced
+                    # bills. Keep the newest record per bill so a later local
+                    # derivation can name the exact corpus update it followed.
+                    causal_evidence_by_bill: dict = {}
+                    for evidence in db.execute(
+                        select(CorpusUpdateEvidence)
+                        .where(CorpusUpdateEvidence.bill_id.in_(batch))
+                        .order_by(
+                            CorpusUpdateEvidence.bill_id,
+                            CorpusUpdateEvidence.retrieved_at.desc(),
+                            CorpusUpdateEvidence.created_at.desc(),
+                            CorpusUpdateEvidence.id.desc(),
+                        )
+                    ).scalars():
+                        causal_evidence_by_bill.setdefault(evidence.bill_id, evidence.id)
                     changed, cleared, _related = recompute_status_for_bills(
-                        db, batch, recompute_counts
+                        db,
+                        batch,
+                        recompute_counts,
+                        causal_evidence_by_bill=causal_evidence_by_bill,
                     )
                     db.commit()
                     pending_status_bills = set()
