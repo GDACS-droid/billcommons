@@ -24,7 +24,14 @@ from typing import Any, Iterable
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session as OrmSession
 
-from billcommons_schema.models import Bill, IngestJob, IngestionRun, Jurisdiction, JurisdictionCoverage
+from billcommons_schema.models import (
+    Bill,
+    BillAction,
+    IngestJob,
+    IngestionRun,
+    Jurisdiction,
+    JurisdictionCoverage,
+)
 from billcommons_schema.models import Session as SessionModel
 
 
@@ -66,6 +73,7 @@ class BillEvidence:
     """Counts derived from the local `bills` table only."""
 
     bill_count: int = 0
+    action_count: int = 0
     missing_parser_version: int = 0
     missing_source_name: int = 0
     missing_source_url: int = 0
@@ -114,6 +122,7 @@ class JurisdictionEvidence:
     latest_api_sync_run: RunEvidence | None
     latest_successful_api_sync: RunEvidence | None
     coverage: CoverageEvidence | None
+    exists: bool = True
     aggregate_coverage_signal: CoverageEvidence | None = None
     dead_api_sync_jobs: int = 0
     queued_api_sync_jobs: int = 0
@@ -153,6 +162,17 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
     bills = evidence.bills
     jurisdiction = evidence.abbreviation
 
+    if not evidence.exists:
+        return [
+            Defect(
+                "error",
+                "MISSING_JURISDICTION",
+                jurisdiction,
+                "This canonical jurisdiction has no local jurisdiction row.",
+                {"jurisdiction": jurisdiction},
+            )
+        ]
+
     if evidence.cadence_minutes is None:
         defects.append(
             Defect(
@@ -161,6 +181,35 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
                 jurisdiction,
                 "No session is available to derive a local refresh cadence.",
                 {"cadence_tier": evidence.cadence_tier},
+            )
+        )
+
+    # A configured jurisdiction/session with no local bills is not a healthy
+    # empty state. The report deliberately says only that the local corpus is
+    # empty; it does not infer anything about the official source.
+    if evidence.cadence_minutes is not None and not bills.bill_count:
+        defects.append(
+            Defect(
+                "error",
+                "EMPTY_CORPUS",
+                jurisdiction,
+                "A refreshable jurisdiction has no local bills.",
+                {
+                    "cadence_tier": evidence.cadence_tier,
+                    "local_bill_count": 0,
+                    "local_action_count": bills.action_count,
+                },
+            )
+        )
+
+    if bills.bill_count and not bills.action_count:
+        defects.append(
+            Defect(
+                "error",
+                "EMPTY_ACTION_HISTORY",
+                jurisdiction,
+                "Local bills exist but no local action-history rows are recorded.",
+                {"local_bill_count": bills.bill_count, "local_action_count": 0},
             )
         )
 
@@ -218,6 +267,20 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
             )
         )
 
+    if (
+        evidence.latest_successful_api_sync is not None
+        and evidence.latest_successful_api_sync.observed_at is None
+    ):
+        defects.append(
+            Defect(
+                "error",
+                "UNKNOWN_SYNC_TIME",
+                jurisdiction,
+                "The latest successful incremental API sync has no usable timestamp.",
+                {"source_name": evidence.latest_successful_api_sync.source_name},
+            )
+        )
+
     # Scheduler suppression intentionally avoids enqueueing duplicate work.
     # That makes a very old queued/running job a liveness concern: it can
     # suppress future scheduling indefinitely.  This observer only reports
@@ -235,7 +298,7 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
         if age_minutes > pending_age_threshold:
             defects.append(
                 Defect(
-                    "warning",
+                    "error",
                     f"API_SYNC_{status.upper()}_STALLED_SUSPECTED",
                     jurisdiction,
                     f"An API sync job has remained {status} beyond the inspection threshold.",
@@ -320,14 +383,17 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
             )
         )
 
-    if evidence.coverage is None and bills.bill_count:
+    if evidence.coverage is None and evidence.cadence_minutes is not None:
         defects.append(
             Defect(
-                "warning",
+                "error",
                 "MISSING_JURISDICTION_COVERAGE",
                 jurisdiction,
-                "Local bills exist but no coverage row exists for the selected session or jurisdiction aggregate.",
-                {"local_bill_count": bills.bill_count},
+                "No coverage row exists for the selected session or jurisdiction aggregate.",
+                {
+                    "local_bill_count": bills.bill_count,
+                    "local_action_count": bills.action_count,
+                },
             )
         )
     elif evidence.coverage is not None:
@@ -493,12 +559,38 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
     makes no external request, which keeps the CLI safe for incident use.
     """
     now = _utc(now) or datetime.now(timezone.utc)
-    jurisdictions = [
-        jurisdiction
-        for jurisdiction in db.execute(select(Jurisdiction)).scalars().all()
-        if jurisdiction.abbreviation.upper() in PUBLIC_JURISDICTION_CODES
-    ]
-    targets = _session_targets(db.execute(select(SessionModel)).scalars().all(), now=now)
+    canonical_codes = tuple(sorted(PUBLIC_JURISDICTION_CODES))
+    jurisdictions = db.execute(
+        select(Jurisdiction).where(func.upper(Jurisdiction.abbreviation).in_(canonical_codes))
+    ).scalars().all()
+    jurisdictions_by_code = {
+        jurisdiction.abbreviation.upper(): jurisdiction for jurisdiction in jurisdictions
+    }
+    jurisdiction_ids = tuple(jurisdiction.id for jurisdiction in jurisdictions)
+
+    # PostgreSQL DISTINCT ON gives the collector precisely one operational
+    # session for each canonical jurisdiction. This matches scheduler priority
+    # (active first, then latest start date) and adds a UUID tie-breaker so an
+    # equal-date pair cannot make report scope depend on physical row order.
+    selected_sessions = []
+    if jurisdiction_ids:
+        selected_sessions = db.execute(
+            select(SessionModel)
+            .where(SessionModel.jurisdiction_id.in_(jurisdiction_ids))
+            .distinct(SessionModel.jurisdiction_id)
+            .order_by(
+                SessionModel.jurisdiction_id,
+                SessionModel.active.desc(),
+                SessionModel.start_date.desc().nulls_last(),
+                SessionModel.id.desc(),
+            )
+        ).scalars().all()
+    targets = {}
+    for session in selected_sessions:
+        tier = _cadence_tier(active=bool(session.active), end_date=session.end_date, now=now)
+        targets[session.jurisdiction_id] = RefreshTarget(
+            session.id, session.identifier, tier, _cadence_minutes(tier)
+        )
 
     bill_rows = db.execute(
         select(
@@ -514,11 +606,23 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
             .filter(or_(Bill.source_url.is_(None), Bill.source_url == ""))
             .label("missing_source_url"),
             func.count(Bill.id).filter(Bill.retrieved_at.is_(None)).label("missing_retrieved_at"),
-        ).group_by(Bill.jurisdiction_id)
+        )
+        .where(Bill.jurisdiction_id.in_(jurisdiction_ids))
+        .group_by(Bill.jurisdiction_id)
     ).all()
+    action_rows = db.execute(
+        select(Bill.jurisdiction_id, func.count(BillAction.id).label("action_count"))
+        .join(BillAction, BillAction.bill_id == Bill.id)
+        .where(Bill.jurisdiction_id.in_(jurisdiction_ids))
+        .group_by(Bill.jurisdiction_id)
+    ).all()
+    actions_by_jurisdiction = {
+        row.jurisdiction_id: int(row.action_count or 0) for row in action_rows
+    }
     bills = {
         row.jurisdiction_id: BillEvidence(
             bill_count=int(row.bill_count or 0),
+            action_count=actions_by_jurisdiction.get(row.jurisdiction_id, 0),
             missing_parser_version=int(row.missing_parser_version or 0),
             missing_source_name=int(row.missing_source_name or 0),
             missing_source_url=int(row.missing_source_url or 0),
@@ -543,7 +647,7 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
     def latest_runs(
         status: str | None = None, *, source_name: str | None = None
     ) -> dict[Any, RunEvidence]:
-        statement = select(*run_columns).where(IngestionRun.jurisdiction_id.is_not(None))
+        statement = select(*run_columns).where(IngestionRun.jurisdiction_id.in_(jurisdiction_ids))
         if status is not None:
             statement = statement.where(IngestionRun.status == status)
         if source_name is not None:
@@ -569,33 +673,52 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
         "success", source_name=API_SYNC_SOURCE
     )
 
-    session_identifiers = {
-        session.id: session.identifier
-        for session in db.execute(select(SessionModel)).scalars()
-    }
-    coverage_by_jurisdiction: dict[Any, list[tuple[Any, CoverageEvidence]]] = defaultdict(list)
-    for coverage in db.execute(select(JurisdictionCoverage)).scalars():
-        coverage_by_jurisdiction[coverage.jurisdiction_id].append(
-            (
-                coverage.session_id,
-                CoverageEvidence(
-                    coverage.status,
-                    int(coverage.bill_count or 0),
-                    int(coverage.full_text_count or 0),
-                    scope="session" if coverage.session_id is not None else "jurisdiction",
-                    session_identifier=session_identifiers.get(coverage.session_id),
+    selected_session_ids = tuple(target.session_id for target in targets.values())
+    coverage_by_selected_session: dict[Any, CoverageEvidence] = {}
+    aggregate_coverage_by_jurisdiction: dict[Any, CoverageEvidence] = {}
+    if jurisdiction_ids:
+        coverage_scope = JurisdictionCoverage.session_id.is_(None)
+        if selected_session_ids:
+            coverage_scope = or_(coverage_scope, JurisdictionCoverage.session_id.in_(selected_session_ids))
+        for coverage in db.execute(
+            select(JurisdictionCoverage).where(
+                JurisdictionCoverage.jurisdiction_id.in_(jurisdiction_ids), coverage_scope
+            )
+        ).scalars():
+            evidence = CoverageEvidence(
+                coverage.status,
+                int(coverage.bill_count or 0),
+                int(coverage.full_text_count or 0),
+                scope="session" if coverage.session_id is not None else "jurisdiction",
+                session_identifier=(
+                    next(
+                        (
+                            target.session_identifier
+                            for target in targets.values()
+                            if target.session_id == coverage.session_id
+                        ),
+                        None,
+                    )
+                    if coverage.session_id is not None
+                    else None
                 ),
             )
-        )
+            if coverage.session_id is None:
+                aggregate_coverage_by_jurisdiction[coverage.jurisdiction_id] = evidence
+            else:
+                coverage_by_selected_session[coverage.session_id] = evidence
 
     jobs_by_state: dict[str, dict[str, tuple[int, datetime | None]]] = defaultdict(dict)
-    job_state = IngestJob.payload["state"].astext
+    job_state = func.upper(IngestJob.payload["state"].astext)
+    queued_eligible_at = func.greatest(IngestJob.created_at, IngestJob.run_after)
     for row in db.execute(
         select(
             job_state.label("state"),
             IngestJob.status,
             func.count(IngestJob.id).label("count"),
-            func.min(IngestJob.created_at).label("oldest_created_at"),
+            func.min(queued_eligible_at)
+            .filter(IngestJob.status == "queued", IngestJob.run_after <= now)
+            .label("oldest_queued_eligible_at"),
             func.min(func.coalesce(IngestJob.locked_at, IngestJob.created_at)).label(
                 "oldest_running_at"
             ),
@@ -603,31 +726,47 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
         .where(
             IngestJob.kind == "api_sync",
             IngestJob.status.in_(("queued", "running", "dead")),
+            job_state.in_(canonical_codes),
         )
         .group_by(job_state, IngestJob.status)
     ).all():
         if row.state:
-            oldest_at = row.oldest_running_at if row.status == "running" else row.oldest_created_at
+            oldest_at = (
+                row.oldest_running_at
+                if row.status == "running"
+                else row.oldest_queued_eligible_at
+            )
             jobs_by_state[str(row.state).upper()][row.status] = (int(row.count), oldest_at)
 
     result = []
-    for jurisdiction in jurisdictions:
+    for abbreviation in canonical_codes:
+        jurisdiction = jurisdictions_by_code.get(abbreviation)
+        if jurisdiction is None:
+            result.append(
+                JurisdictionEvidence(
+                    abbreviation=abbreviation,
+                    name="Missing canonical jurisdiction record",
+                    exists=False,
+                    cadence_tier=None,
+                    cadence_minutes=None,
+                    bills=BillEvidence(),
+                    latest_run=None,
+                    latest_successful_run=None,
+                    latest_api_sync_run=None,
+                    latest_successful_api_sync=None,
+                    coverage=None,
+                )
+            )
+            continue
         refresh_target = targets.get(jurisdiction.id)
         tier = refresh_target.cadence_tier if refresh_target else None
         target = refresh_target.cadence_minutes if refresh_target else None
-        coverage_rows = coverage_by_jurisdiction[jurisdiction.id]
-        aggregate_coverage = next((item for session_id, item in coverage_rows if session_id is None), None)
+        aggregate_coverage = aggregate_coverage_by_jurisdiction.get(jurisdiction.id)
         selected_coverage = (
-            next(
-                (
-                    item
-                    for session_id, item in coverage_rows
-                    if refresh_target is not None and session_id == refresh_target.session_id
-                ),
-                None,
-            )
-            or aggregate_coverage
-        )
+            coverage_by_selected_session.get(refresh_target.session_id)
+            if refresh_target is not None
+            else None
+        ) or aggregate_coverage
         jobs = jobs_by_state[jurisdiction.abbreviation.upper()]
         result.append(
             JurisdictionEvidence(

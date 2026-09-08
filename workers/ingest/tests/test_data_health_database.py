@@ -8,8 +8,11 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 
+from sqlalchemy import select
+
 from billcommons_schema.models import (
     Bill,
+    BillAction,
     IngestJob,
     IngestionRun,
     Jurisdiction,
@@ -37,19 +40,20 @@ def _seed_current_session(db_session, abbreviation: str):
     )
     db_session.add(session)
     db_session.flush()
-    db_session.add(
-        Bill(
-            jurisdiction_id=jurisdiction.id,
-            session_id=session.id,
-            identifier="HB 1",
-            identifier_norm="HB 1",
-            title="Data health test bill",
-            source_name="adapter",
-            source_url="https://example.invalid/source",
-            parser_version="adapter/1",
-            retrieved_at=NOW,
-        )
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session.id,
+        identifier="HB 1",
+        identifier_norm="HB 1",
+        title="Data health test bill",
+        source_name="adapter",
+        source_url="https://example.invalid/source",
+        parser_version="adapter/1",
+        retrieved_at=NOW,
     )
+    db_session.add(bill)
+    db_session.flush()
+    db_session.add(BillAction(bill_id=bill.id, description="Introduced", action_date=NOW.date()))
     db_session.flush()
     return jurisdiction, session
 
@@ -180,5 +184,163 @@ def test_public_report_excludes_stray_jurisdictions_and_flags_missing_session_re
 
     report = collect_report(db_session, now=NOW)
 
-    assert [row["jurisdiction"] for row in report["jurisdictions"]] == ["AZ"]
-    assert [row["code"] for row in report["defects"]] == ["MISSING_REFRESH_CONFIGURATION"]
+    assert len(report["jurisdictions"]) == 51
+    assert {row["jurisdiction"] for row in report["jurisdictions"]} == {
+        "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL", "GA", "HI", "ID",
+        "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO",
+        "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA",
+        "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    }
+    assert "ZZ_DATA_HEALTH" not in {row["jurisdiction"] for row in report["jurisdictions"]}
+    by_jurisdiction = {
+        code: [defect["code"] for defect in report["defects"] if defect["jurisdiction"] == code]
+        for code in ("AZ", "AL")
+    }
+    assert by_jurisdiction["AZ"] == ["MISSING_REFRESH_CONFIGURATION"]
+    assert by_jurisdiction["AL"] == ["MISSING_JURISDICTION"]
+
+
+def test_configured_session_without_corpus_or_coverage_is_an_error(db_session):
+    jurisdiction = Jurisdiction(name="Empty local corpus", abbreviation="CA", classification="state")
+    db_session.add(jurisdiction)
+    db_session.flush()
+    db_session.add(
+        SessionModel(
+            jurisdiction_id=jurisdiction.id,
+            identifier="current-2026",
+            active=True,
+            start_date=date(2026, 1, 1),
+            end_date=NOW.date(),
+        )
+    )
+    db_session.flush()
+
+    report = collect_report(db_session, now=NOW)
+    defects = [
+        (defect["severity"], defect["code"])
+        for defect in report["defects"]
+        if defect["jurisdiction"] == "CA"
+    ]
+
+    assert defects == [
+        ("error", "EMPTY_CORPUS"),
+        ("error", "MISSING_JURISDICTION_COVERAGE"),
+    ]
+
+
+def test_unknown_api_sync_time_and_future_queued_job_are_not_silently_healthy(db_session):
+    jurisdiction, session = _seed_current_session(db_session, "CO")
+    db_session.add(
+        JurisdictionCoverage(
+            jurisdiction_id=jurisdiction.id,
+            session_id=session.id,
+            status="GREEN",
+            bill_count=1,
+            full_text_count=1,
+        )
+    )
+    db_session.add_all(
+        [
+            IngestionRun(
+                jurisdiction_id=jurisdiction.id,
+                source_name="openstates_api_sync",
+                status="success",
+                started_at=None,
+                finished_at=None,
+            ),
+            IngestJob(
+                kind="api_sync",
+                payload={"state": "co"},
+                status="queued",
+                attempts=1,
+                created_at=NOW - timedelta(hours=3),
+                updated_at=NOW - timedelta(hours=3),
+                run_after=NOW + timedelta(hours=3),
+            ),
+        ]
+    )
+    db_session.flush()
+
+    report = collect_report(db_session, now=NOW)
+    row = _report_row(report, "CO")
+    codes = [defect["code"] for defect in report["defects"] if defect["jurisdiction"] == "CO"]
+
+    assert row["source_health"]["queued_api_sync_jobs"] == 1
+    assert row["source_health"]["oldest_queued_api_sync_at"] is None
+    assert codes == ["UNKNOWN_SYNC_TIME"]
+
+
+def test_local_bills_without_history_are_an_error_from_the_database_aggregate(db_session):
+    jurisdiction, session = _seed_current_session(db_session, "DE")
+    bill_id = db_session.execute(
+        select(Bill.id).where(Bill.jurisdiction_id == jurisdiction.id)
+    ).scalar_one()
+    db_session.query(BillAction).filter(BillAction.bill_id == bill_id).delete(
+        synchronize_session=False
+    )
+    db_session.add(
+        JurisdictionCoverage(
+            jurisdiction_id=jurisdiction.id,
+            session_id=session.id,
+            status="GREEN",
+            bill_count=1,
+            full_text_count=1,
+        )
+    )
+    db_session.add(
+        IngestionRun(
+            jurisdiction_id=jurisdiction.id,
+            source_name="openstates_api_sync",
+            status="success",
+            started_at=NOW,
+            finished_at=NOW,
+        )
+    )
+    db_session.flush()
+
+    report = collect_report(db_session, now=NOW)
+    row = _report_row(report, "DE")
+    codes = [defect["code"] for defect in report["defects"] if defect["jurisdiction"] == "DE"]
+
+    assert row["parser_health"]["action_count"] == 0
+    assert codes == ["EMPTY_ACTION_HISTORY"]
+
+
+def test_selected_session_query_ignores_historical_coverage_rows(db_session):
+    jurisdiction, current = _seed_current_session(db_session, "CT")
+    historical = SessionModel(
+        jurisdiction_id=jurisdiction.id,
+        identifier="historical-2025",
+        active=False,
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 9, 1),
+    )
+    db_session.add(historical)
+    db_session.flush()
+    db_session.add_all(
+        [
+            JurisdictionCoverage(
+                jurisdiction_id=jurisdiction.id,
+                session_id=current.id,
+                status="GREEN",
+                bill_count=1,
+                full_text_count=1,
+            ),
+            JurisdictionCoverage(
+                jurisdiction_id=jurisdiction.id,
+                session_id=historical.id,
+                status="BLOCKED",
+                bill_count=1,
+                full_text_count=0,
+            ),
+        ]
+    )
+    db_session.flush()
+
+    report = collect_report(db_session, now=NOW)
+    row = _report_row(report, "CT")
+    codes = [defect["code"] for defect in report["defects"] if defect["jurisdiction"] == "CT"]
+
+    assert row["coverage"]["session_identifier"] == current.identifier
+    assert row["additional_jurisdiction_coverage_signal"] is None
+    assert "COVERAGE_BLOCKED" not in codes

@@ -27,7 +27,7 @@ def _evidence(**overrides) -> JurisdictionEvidence:
         "name": "Example",
         "cadence_tier": "active",
         "cadence_minutes": 30,
-        "bills": BillEvidence(bill_count=10),
+        "bills": BillEvidence(bill_count=10, action_count=10),
         "latest_run": RunEvidence("adapter", "success", NOW - timedelta(minutes=5), NOW - timedelta(minutes=4)),
         "latest_successful_run": RunEvidence(
             "adapter", "success", NOW - timedelta(minutes=5), NOW - timedelta(minutes=4)
@@ -73,7 +73,9 @@ def test_ledger_orders_operational_failures_by_severity_then_jurisdiction():
         latest_successful_api_sync=RunEvidence(
             "openstates_api_sync", "success", NOW - timedelta(hours=2), NOW - timedelta(hours=2)
         ),
-        bills=BillEvidence(bill_count=10, missing_parser_version=3, missing_source_url=2),
+        bills=BillEvidence(
+            bill_count=10, action_count=10, missing_parser_version=3, missing_source_url=2
+        ),
     )
 
     report = build_report([no_success, stale_provenance], now=NOW)
@@ -95,7 +97,7 @@ def test_ledger_orders_operational_failures_by_severity_then_jurisdiction():
 
 def test_fail_on_only_fails_at_or_above_its_requested_threshold():
     report = build_report(
-        [_evidence(bills=BillEvidence(bill_count=10, missing_parser_version=1))], now=NOW
+        [_evidence(bills=BillEvidence(bill_count=10, action_count=10, missing_parser_version=1))], now=NOW
     )
 
     assert exit_code(report, None) == 0
@@ -147,8 +149,10 @@ def test_pending_sync_beyond_target_is_a_suspected_stall_with_no_recovery_action
     )
 
     defect = report["defects"][0]
+    assert defect["severity"] == "error"
     assert defect["code"] == "API_SYNC_QUEUED_STALLED_SUSPECTED"
     assert defect["evidence"]["action"] == "inspect; this report performs no automatic recovery"
+    assert exit_code(report, "error") == 1
 
 
 def test_api_sync_failure_is_reported_even_when_an_unrelated_run_succeeds_later():
@@ -166,3 +170,41 @@ def test_api_sync_failure_is_reported_even_when_an_unrelated_run_succeeds_later(
     )
 
     assert [row["code"] for row in report["defects"]] == ["LATEST_API_SYNC_FAILED"]
+
+
+def test_missing_canonical_jurisdiction_is_an_error_instead_of_being_dropped():
+    report = build_report([_evidence(exists=False, abbreviation="CA")], now=NOW)
+
+    assert report["summary"]["jurisdiction_count"] == 1
+    assert report["defects"] == [
+        {
+            "severity": "error",
+            "code": "MISSING_JURISDICTION",
+            "jurisdiction": "CA",
+            "message": "This canonical jurisdiction has no local jurisdiction row.",
+            "evidence": {"jurisdiction": "CA"},
+        }
+    ]
+    assert exit_code(report, "error") == 1
+
+
+def test_empty_local_corpus_and_history_are_errors_without_claiming_source_freshness():
+    empty_corpus = build_report([_evidence(bills=BillEvidence())], now=NOW)
+    missing_history = build_report(
+        [_evidence(bills=BillEvidence(bill_count=10, action_count=0))], now=NOW
+    )
+
+    assert [row["code"] for row in empty_corpus["defects"]] == ["EMPTY_CORPUS"]
+    assert [row["code"] for row in missing_history["defects"]] == ["EMPTY_ACTION_HISTORY"]
+    assert empty_corpus["honesty"]["official_freshness"] == "unverified"
+    assert exit_code(empty_corpus, "error") == 1
+
+
+def test_successful_api_sync_without_any_timestamp_is_an_error_not_freshness():
+    unknown_time = RunEvidence("openstates_api_sync", "success", None, None)
+    report = build_report(
+        [_evidence(latest_api_sync_run=unknown_time, latest_successful_api_sync=unknown_time)], now=NOW
+    )
+
+    assert [row["code"] for row in report["defects"]] == ["UNKNOWN_SYNC_TIME"]
+    assert exit_code(report, "error") == 1
