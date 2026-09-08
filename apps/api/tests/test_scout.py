@@ -14,7 +14,7 @@ from billcommons_api.app import create_app
 from billcommons_api.deps import get_db
 from billcommons_api.routers import scout
 from billcommons_schema.base import Base
-from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutJobEvent, ScoutMonitor, ScoutMonitorRun, ScoutResearchJob, ScoutSource
+from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutMonitor, ScoutMonitorRun, ScoutResearchJob, ScoutSource
 from billcommons_shared.scout import scout_cache_key
 from billcommons_shared.scout_admission import admit_scout_job
 
@@ -119,6 +119,49 @@ def test_scout_california_admission_requires_explicit_session_and_uses_retained_
         assert job.cache_key == scout_cache_key(
             "AB 123 2025-2026", "CA", freshness_bucket="scout-ca-retained-p0"
         )
+
+
+def test_scout_california_terminal_evidence_can_be_saved_as_a_monitor(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    cache_key = scout_cache_key("AB 123 2025-2026", "CA", freshness_bucket="scout-ca-retained-p0")
+    with sessions() as db:
+        job = ScoutResearchJob(
+            customer_id=owner.id, original_query="AB 123 2025-2026", normalized_query="ab 123 2025-2026",
+            jurisdiction="CA", cache_key=cache_key, status="completed",
+            strategy={"adapter": "california_retained_p0", "mode": "retained_official_archive"},
+            limits={"max_ca_parse_seconds": 5}, usage={}, completed_at=datetime.now(timezone.utc),
+        )
+        db.add(job)
+        db.flush()
+        source = ScoutSource(
+            job_id=job.id, canonical_url="https://www.leginfo.ca.gov/pub/25-26/bill/asm/ab_0101-0150/ab_123_bill_20260115_status.html",
+            official=True, retrieval_mechanism="official_retained_archive", content_hash="a" * 64, raw_ref="a" * 64,
+        )
+        db.add(source)
+        db.flush()
+        db.add(ScoutFinding(
+            job_id=job.id, source_id=source.id, title="AB 123", what_happened="Read first time.",
+            confidence="high", extractor_version="ca-monitor-test",
+        ))
+        db.commit()
+        job_id = job.id
+    headers = {"x-test-customer": str(owner.id)}
+    with TestClient(app) as client:
+        created = client.post(f"/api/v1/scout/jobs/{job_id}/monitor", json={}, headers=headers)
+        assert created.status_code == 201
+        monitor = created.json()["monitor"]
+        history = client.get(f"/api/v1/scout/monitors/{monitor['id']}/runs", headers=headers)
+    assert history.status_code == 200
+    payload = history.json()
+    assert payload["next_cursor"] is None
+    assert payload["runs"][0]["status"] == "baseline"
+    assert payload["runs"][0]["source_snapshot"]["sources"][0]["content_hash"] == "a" * 64
+    with sessions() as db:
+        saved = db.get(ScoutMonitor, uuid.UUID(monitor["id"]))
+        original = db.get(ScoutResearchJob, job_id)
+    assert saved.cache_key == cache_key
+    assert original.strategy["adapter"] == "california_retained_p0"
+    assert original.limits["max_ca_parse_seconds"] == 5
 
 
 def test_scout_creation_snapshots_document_processing_caps(monkeypatch):

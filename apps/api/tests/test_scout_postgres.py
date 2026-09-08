@@ -1122,6 +1122,42 @@ def test_postgres_saved_monitor_requires_owner_terminal_evidence_and_supports_pa
     assert run["change_summary"]["absence_evaluated"] is False
 
 
+def test_postgres_saved_monitor_history_cursor_returns_every_run_once(
+    pg_scout: PostgresScoutHarness, scout_api
+):
+    customer = pg_scout.customer("monitor-history-cursor")
+    baseline = _terminal_monitor_baseline(pg_scout, customer)
+    headers = {"x-test-customer": str(customer.id)}
+    with TestClient(scout_api) as client:
+        saved = client.post(f"/api/v1/scout/jobs/{baseline.id}/monitor", json={}, headers=headers)
+        assert saved.status_code == 201
+        monitor_id = uuid.UUID(saved.json()["monitor"]["id"])
+    now = datetime.now(timezone.utc)
+    with pg_scout.sessions() as db:
+        for offset in (1, 2, 3):
+            db.add(ScoutMonitorRun(
+                monitor_id=monitor_id, status="completed", execution_mode="new",
+                scheduled_for=now + timedelta(seconds=offset), completed_at=now + timedelta(seconds=offset),
+                source_snapshot={}, change_summary={},
+            ))
+        db.commit()
+    with TestClient(scout_api) as client:
+        first = client.get(f"/api/v1/scout/monitors/{monitor_id}/runs?limit=2", headers=headers)
+        assert first.status_code == 200
+        first_payload = first.json()
+        assert first_payload["next_cursor"] == first_payload["runs"][-1]["id"]
+        second = client.get(
+            f"/api/v1/scout/monitors/{monitor_id}/runs?limit=2&cursor={first_payload['next_cursor']}",
+            headers=headers,
+        )
+        assert second.status_code == 200
+        second_payload = second.json()
+    assert second_payload["next_cursor"] is None
+    returned = [run["id"] for run in first_payload["runs"] + second_payload["runs"]]
+    assert len(returned) == 4
+    assert len(set(returned)) == 4
+
+
 def test_postgres_saved_monitor_scheduler_uses_admission_and_finalizes_hash_delta(
     pg_scout: PostgresScoutHarness, scout_api, tmp_path
 ):

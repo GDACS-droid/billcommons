@@ -21,6 +21,10 @@ Default limits are three monitors per owner and a cadence between six hours
 and seven days. Admission refusal is a durable `deferred` run with bounded
 exponential retry. It does not use alert email or webhook delivery.
 
+`GET /api/v1/scout/monitors/{monitor_id}/runs` returns newest-first history
+in pages of at most 100. Pass its `next_cursor` as `cursor` to continue after
+the final run returned by the previous page.
+
 ## Rollout
 
 1. Apply Alembic revision `0031` to the API and Scout worker database before

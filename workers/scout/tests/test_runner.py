@@ -47,6 +47,7 @@ def _runner(tmp_path, provider, fetcher, *, settings=None, limits=None):
     tables = [Base.metadata.tables[name] for name in (
         "api_customers", "scout_research_jobs", "scout_job_events", "scout_sources",
         "scout_findings", "scout_browser_sessions", "scout_monitors", "scout_monitor_runs",
+        "scout_raw_blobs",
     )]
     Base.metadata.create_all(engine, tables=tables)
     sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -152,6 +153,20 @@ def test_california_retained_archive_creates_evidence_without_fetch_or_browser(t
         job.jurisdiction = "CA"
         job.original_query = "AB 123 2025-2026"
         job.limits = {"max_direct_bytes": len(raw)}
+        monitor = ScoutMonitor(
+            customer_id=job.customer_id, original_query=job.original_query,
+            normalized_query="ab 123 2025-2026", jurisdiction="CA", cache_key=job.cache_key,
+            cadence_seconds=6 * 60 * 60, next_run_at=datetime.now(timezone.utc),
+        )
+        db.add(monitor)
+        db.flush()
+        run = ScoutMonitorRun(
+            monitor_id=monitor.id, job_id=job.id, status="queued", execution_mode="new",
+            scheduled_for=datetime.now(timezone.utc), source_snapshot={}, change_summary={},
+        )
+        db.add(run)
+        db.flush()
+        monitor_run_id = run.id
         db.commit()
 
     runner.process(job_id, "initial-claim")
@@ -171,6 +186,44 @@ def test_california_retained_archive_creates_evidence_without_fetch_or_browser(t
         assert "does not establish a current or comprehensive" in finding.why_it_matters
         selected = db.execute(select(ScoutJobEvent).where(ScoutJobEvent.job_id == job_id, ScoutJobEvent.kind == "retained_official_archive_selected")).scalar_one()
         assert selected.detail == {"observation_id": str(observation_id), "coverage": "delta_only"}
+        monitor_run = db.get(ScoutMonitorRun, monitor_run_id)
+        assert monitor_run.status == "completed"
+        assert monitor_run.source_snapshot["sources"][0]["content_hash"] == source.content_hash
+        assert monitor_run.source_snapshot["sources"][0]["finding_ids"] == [str(finding.id)]
+
+
+def test_california_monitor_scheduler_uses_retained_admission_and_parse_limit(tmp_path):
+    settings = ScoutSettings(enabled=True, allow_public_rollout=True, max_ca_parse_seconds=7, browser_cleanup_seconds=1)
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")), settings=settings)
+    with sessions() as db:
+        baseline = db.get(ScoutResearchJob, job_id)
+        baseline.status = "completed"
+        baseline.completed_at = datetime.now(timezone.utc)
+        baseline.claim_token = None
+        baseline.lease_expires_at = None
+        baseline.original_query = "AB 123 2025-2026"
+        baseline.normalized_query = "ab 123 2025-2026"
+        baseline.jurisdiction = "CA"
+        baseline.cache_key = "ca-monitor-retained-admission"
+        baseline.strategy = {"adapter": "california_retained_p0", "mode": "retained_official_archive"}
+        monitor = ScoutMonitor(
+            customer_id=baseline.customer_id, original_query=baseline.original_query,
+            normalized_query=baseline.normalized_query, jurisdiction="CA", cache_key=baseline.cache_key,
+            cadence_seconds=6 * 60 * 60, next_run_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+        db.add(monitor)
+        db.commit()
+        monitor_id = monitor.id
+    assert runner.schedule_one_due_monitor() is True
+    with sessions() as db:
+        run = db.execute(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.monitor_id == monitor_id, ScoutMonitorRun.status == "queued"
+        )).scalar_one()
+        scheduled = db.get(ScoutResearchJob, run.job_id)
+    assert run.execution_mode == "new"
+    assert scheduled.jurisdiction == "CA"
+    assert scheduled.strategy == {"adapter": "california_retained_p0", "mode": "retained_official_archive"}
+    assert scheduled.limits["max_ca_parse_seconds"] == 7
 
 
 def test_california_retained_archive_over_job_cap_is_truthful_partial_and_not_copied(tmp_path):

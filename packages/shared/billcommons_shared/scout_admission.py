@@ -22,7 +22,7 @@ from billcommons_schema.models import (
     ScoutRawBlob,
     ScoutResearchJob,
 )
-from billcommons_shared.scout import ScoutSettings
+from billcommons_shared.scout import CALIFORNIA, ScoutSettings
 
 _PLATFORM_ADMISSION_LOCK_KEY = 81_420_902
 _sqlite_platform_admission_lock = threading.RLock()
@@ -176,6 +176,7 @@ def _limits(settings: ScoutSettings) -> dict:
         "max_pdf_extract_seconds": settings.max_pdf_extract_seconds,
         "max_pdf_extract_memory_bytes": settings.max_pdf_extract_memory_bytes,
         "max_pdf_extract_cpu_seconds": settings.max_pdf_extract_cpu_seconds,
+        "max_ca_parse_seconds": settings.max_ca_parse_seconds,
         "max_routed_requests": settings.max_browser_routed_requests,
         "max_retries": settings.max_retries,
         "daily_jobs": settings.per_customer_daily_jobs,
@@ -254,13 +255,18 @@ def admit_scout_job(
             raise ScoutAdmissionError("scout_daily_browser_limit", "Daily Scout browser budget reached.", 3600)
         if len(active_jobs) >= settings.per_customer_active_jobs:
             raise ScoutAdmissionError("scout_active_job_limit", "Too many active Scout jobs.", 60)
+        is_california_retained = jurisdiction == CALIFORNIA
         job = ScoutResearchJob(
             customer_id=customer.id,
             original_query=original_query.strip(),
             normalized_query=normalized_query,
             jurisdiction=jurisdiction,
             cache_key=cache_key,
-            strategy={"adapter": "florida_p0", "mode": "structured_first"},
+            strategy=(
+                {"adapter": "california_retained_p0", "mode": "retained_official_archive"}
+                if is_california_retained
+                else {"adapter": "florida_p0", "mode": "structured_first"}
+            ),
             limits=_limits(settings),
             usage={},
         )

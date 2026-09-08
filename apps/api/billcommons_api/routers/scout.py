@@ -580,8 +580,11 @@ def list_monitor_runs(
     rows = list(db.execute(stmt.order_by(
         ScoutMonitorRun.scheduled_for.desc(), ScoutMonitorRun.id.desc()
     ).limit(limit + 1)).all())
-    next_cursor = str(rows[limit][0].id) if len(rows) > limit else None
+    has_more = len(rows) > limit
     rows = rows[:limit]
+    # Resume after the final row returned.  Using the first unseen row as the
+    # cursor would make the strict "older than cursor" predicate skip it.
+    next_cursor = str(rows[-1][0].id) if has_more else None
     response.headers["Cache-Control"] = "no-store"
     return {"monitor": _monitor_payload(monitor), "runs": [
         _monitor_run_payload(run, job) for run, job in rows
@@ -644,6 +647,12 @@ def cancel_job(job_id: uuid.UUID, request: Request, response: Response, db: Sess
         job.status = "canceled"
         job.completed_at = datetime.now(timezone.utc)
         db.add(ScoutJobEvent(job_id=job.id, kind="finished", detail={"status": "canceled", "error_class": None}))
+        for run in db.scalars(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.job_id == job.id, ScoutMonitorRun.status == "queued"
+        )).all():
+            run.status = "canceled"
+            run.completed_at = job.completed_at
+            run.error_class = None
         db.commit()
         db.refresh(job)
     response.headers["Cache-Control"] = "no-store"
