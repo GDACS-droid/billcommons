@@ -312,7 +312,11 @@ def run(
     pre_revision, fingerprint = _revision_and_fingerprint(target.url, connector=connector)
     if check_only:
         return MigrationReport(target.source, fingerprint, pre_revision, pre_revision, 0, "check")
-    expected_acknowledgement = acknowledgement_revision or target_revision
+    # The legacy Boolean acknowledged only the original 0025 release. Never
+    # reinterpret that caller's consent as acknowledgement of a newer target.
+    expected_acknowledgement = (
+        RELEASE_REVISION if acknowledgement_revision is None else acknowledgement_revision
+    )
     if not acknowledged:
         raise ControlledMigrationError(
             f"--acknowledge-upgrade-{target_revision} is required before any upgrade"

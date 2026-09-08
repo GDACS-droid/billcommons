@@ -207,6 +207,24 @@ def test_target_specific_acknowledgement_rejects_wrong_revision_before_alembic()
 
 
 @pytest.mark.parametrize("revision", ["0026", "0027", "0028", "0029", "0030"])
+@pytest.mark.parametrize("acknowledgement_revision", [None, ""])
+def test_legacy_boolean_cannot_acknowledge_a_newer_target(revision, acknowledgement_revision):
+    with pytest.raises(migration.ControlledMigrationError, match="does not match"):
+        migration.run(
+            target=_target(),
+            repo_root=Path.cwd(),
+            check_only=False,
+            acknowledged=True,
+            acknowledgement_revision=acknowledgement_revision,
+            expected_current="0025",
+            target_revision=revision,
+            environ=_environment(),
+            connector=_connector(["0025"]),
+            runner=lambda *args, **kwargs: pytest.fail("missing revision must stop before Alembic"),
+        )
+
+
+@pytest.mark.parametrize("revision", ["0026", "0027", "0028", "0029", "0030"])
 def test_upgrade_uses_explicit_pinned_revision_and_checks_matching_post_revision(revision: str):
     calls: list[dict] = []
 
