@@ -82,12 +82,16 @@ export default function ApiDocsPage() {
         </h2>
         <p className="mt-2 text-sm text-slate-600">
           No API key is required for the public anonymous tier: 60
-          requests/minute per IP. API keys for higher-volume tiers are
-          planned; see the{" "}
-          <Link href="/about" className="underline">
-            about page
+          requests/minute per IP. A free Developer key raises the daily
+          allowance, and paid tiers support higher-volume use; see{" "}
+          <Link href="/docs/api-keys" className="underline">
+            API keys
           </Link>{" "}
-          for status.
+          and{" "}
+          <Link href="/docs/bulk" className="underline">
+            bulk access
+          </Link>{" "}
+          for the current limits.
         </p>
       </section>
 
