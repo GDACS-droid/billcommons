@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-08T06:57:28.008109+00:00",
+  "checked_at": "2026-09-08T08:42:00.545209+00:00",
   "goal_status": "active; full autonomous 50-state semantic intelligence not complete",
   "units": {
     "api": {
@@ -15,10 +15,10 @@
       "archive_sha256": "e87652c353293139c6ea084689179ed56cf6097e39f176ac0f6cc849dd46af51"
     },
     "official_worker": {
-      "source_sha": "815be4a82fb3af370823f49f6ced9dbfb47981e1",
-      "deployment_id": "3490046e-3830-4dd4-8736-ebd6b3f9f7fb",
-      "image_digest": "sha256:5c542afd05166ee3d1a3205b93cfe6649dee2d54939b3f14e3cf979b36b7ea34",
-      "archive_sha256": "536dc3832d6f97e6d07544118a8fe0200d17eea97ae9a246fa424976af0bbe07"
+      "source_sha": "cff56b07d60885d938882498d028a1882cd50a64",
+      "deployment_id": "67e37132-0196-43ce-9411-0ab0c7fe61c5",
+      "image_digest": "sha256:4002135bee029056426427fba3094d3b184742e02ca3e29d1d1f255ce65db97f",
+      "archive_sha256": "ec9f70f3254e0c139e7a11ee8fa932011f7373505a05b61dfa180a4fc6e37370"
     },
     "web": {
       "source_sha": "3758f511428491a9b1da9ce6f605dd841dbedb42",
@@ -122,9 +122,26 @@
       "Sat": 28
     },
     "ca_comparison_total": 1418,
-    "ca_canary_observation_id": "8589d72e-7061-4d77-985c-ab61658bd487",
+    "ca_canary_observation_id": "3ea8a9d5-edf6-4b90-a08c-37229e236316",
     "ca_public_hashes_and_sample_comparisons_replayed": true,
-    "scope": "Bounded landing-page discovery and six CA weekday action-delta comparisons; archive pairs are not unique bills or corpus updates"
+    "scope": "Bounded landing-page discovery and six CA weekday action-delta comparisons; archive pairs are not unique bills or corpus updates",
+    "ca_content_canary": {
+      "scoped_bills": 346,
+      "events": 8521,
+      "byte_exact_benchmark_comparisons": 346,
+      "comparator_version": "ca-action-content-multiset/1",
+      "summary_totals": {
+        "official_records": 8521,
+        "local_records": 8716,
+        "content_agreement": 8521,
+        "official_only_content": 0,
+        "local_only_content": 195,
+        "ambiguous_insufficient_evidence": 0
+      },
+      "historical_comparison_retained": true,
+      "interpretation": "Bounded CA action content comparison; content correspondence is not occurrence proof and no corpus patch or statewide freshness is claimed"
+    },
+    "ca_comparison_version_scope": "Thursday latest observation uses ca-action-content-multiset/1; previous comparisons retain their original versions."
   },
   "health": {
     "api_15_minute_samples": 16,
@@ -137,7 +154,8 @@
     },
     "web_browser_errors": 0,
     "web_http_errors": 0,
-    "official_post_activation_cycles": 2
+    "official_post_activation_cycles": 2,
+    "latest_health_checked_at": "2026-09-08T08:41:16.496358+00:00"
   },
   "commercial": {
     "checked_at": "2026-09-08T06:21:27.788364+00:00",
@@ -200,5 +218,10 @@
     "status": "documented; ambient database fallback is now blocked by test guards",
     "scope": "An early legacy test teardown could have removed synthetic ZZ_/ZQ_ jurisdiction rows on production. Before/after jurisdiction totals matched; transient synthetic deletion cannot be established or excluded. That test result is rejected.",
     "detail": "docs/operations/autonomous-intelligence.md#test-isolation-incident"
+  },
+  "official_review": {
+    "status": "accepted",
+    "coverage": "nine families across original, corrective and recovered full-diff reviews; not nine fresh final-commit reviews",
+    "evidence": "official-lab-review-accepted-cff56b0.json"
   }
 }

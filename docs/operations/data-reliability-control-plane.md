@@ -14,7 +14,7 @@ state, or a freshness SLA.
 | API | `c05ae429bb1f` | `34230f24-3cc3-45fd-86ff-111bf02a1260` | 16 passing samples over 15 minutes; health, readiness, report, ordinary bill, web, MCP and new evidence endpoints |
 | Sync worker | `c05ae429bb1f` | `2a8f43f3-912a-41c5-94c5-37374872ea3c` | Old deployment absent through its nominal wake; new bounded cycle and stable follow-up samples |
 | Web | `3758f5114284` | `dpl_H7wqdC5NuYdB6y4saDeKSZCDvFT3` | Promoted production domain; live desktop/mobile browser interactions passed |
-| Official observer | `815be4a82fb3` | `3490046e-3830-4dd4-8736-ebd6b3f9f7fb` | Safe pause and two empty cycles; CA canary plus four repaired targets; two post-activation cycles |
+| Official observer | `cff56b07d608` | `67e37132-0196-43ce-9411-0ab0c7fe61c5` | Safe pause, old deployment removed, two startup cycles, 346 exact-input canary comparisons, 58 targets restored and two subsequent cycles |
 
 The additive migration from `0025` through `0030` was applied after creating a
 3,211,108,251-byte backup and restoring it into an owned PostgreSQL 18 cluster.
@@ -52,6 +52,24 @@ six CA delta successes and both CA source failures, downloaded the actual
 Thursday archive through its page link and verified its hash, and confirmed
 mobile layout without horizontal overflow or browser/HTTP errors.
 
+At **2026-09-08 08:40 UTC**, the subsequent official-worker release replaced the
+unstable history-ID assumption with `ca-action-content-multiset/1`. Its Thursday
+canary compared 346 bills: 8,521 official records had corresponding local
+content, with 195 additional local records retained for investigation. All 346
+output hashes and summaries matched the candidate benchmark when both retained
+input hashes matched. Two comparisons also passed a complete public-blob replay.
+Content agreement does not establish action occurrence identity; local excess
+does not establish duplication or authorize deletion. Older comparisons retain
+their original versions and remain available in observation history.
+
+All 58 targets were restored with their cadence and backoff preserved. Two
+post-restoration worker cycles, public desktop/mobile interactions, the linked
+archive download and hash, and a fresh API/readiness/bill/web/MCP sample passed.
+The source changes passed an accepted canonical review chain covering nine
+families, including corrective-diff reviews and recovered full-diff legs. This
+is not nine fresh reviews of the final commit; the original terminal HALT
+records and the exact coverage adjudication are retained.
+
 The sanitized [deployment summary](evidence/reliability-20260908/deployment-summary.json)
 binds the current deployment IDs, archive/image hashes, outcomes and remaining
 full-objective gaps.
@@ -76,10 +94,11 @@ proof that every route and device has been tested.
 - California action comparisons retain the official archive, local snapshot
   and structured diff. A newly confirmed source limitation is that history IDs
   change across archives, including for unchanged historical action content;
-  sequence numbers can also change. The deployed comparator still assumes
-  durable history IDs, so its missing/local-only counts are not proof that
-  actions need insertion or deletion. A versioned content comparison is being
-  developed; no automatic CA action mutation is enabled.
+  sequence numbers can also change. New comparisons use versioned content
+  multisets that preserve raw records and multiplicity without inventing stable
+  occurrence IDs. Historical identity-based comparisons remain visible with
+  their original versions. Neither version authorizes automatic CA action
+  mutation.
 - Public official-evidence and bill-history endpoints expose retained source
   observations, comparisons and update evidence. Evidence added prospectively
   does not reconstruct provenance that older ingestion never stored.
