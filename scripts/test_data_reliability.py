@@ -49,6 +49,7 @@ def main() -> int:
          "workers/ingest/tests/test_official_discovery.py",
          "workers/ingest/tests/test_official_discovery_database.py",
          "workers/ingest/tests/test_official_observer.py",
+         "workers/ingest/tests/test_official_replay.py",
          "workers/ingest/tests/test_official_worker.py",
          "workers/ingest/tests/test_source_budget.py",
          "workers/ingest/tests/test_openstates_api.py",
