@@ -169,6 +169,10 @@ export function MintKeyButton({ onMinted }: { onMinted: () => void }) {
         return;
       }
       const body = await res.json();
+      if (typeof body?.key !== "string" || body.key.length === 0) {
+        setError("The server did not return a key. Refresh your account to check its status.");
+        return;
+      }
       trackFunnel("api_key_revealed", { operation: "mint" });
       setRevealed(body.key);
       onMinted();

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 from collections.abc import Callable
 
 from fastapi import APIRouter, HTTPException, Response
@@ -18,6 +19,7 @@ from billcommons_shared.db import get_session
 
 router = APIRouter(prefix="/data-health", tags=["coverage"])
 REPORT_TTL_SECONDS = 300
+FAILURE_RETRY_SECONDS = 30
 
 
 class ReportCache:
@@ -26,10 +28,21 @@ class ReportCache:
         self.lock = threading.Lock()
         self.report: dict | None = None
         self.expires_at = 0.0
+        self.retry_at = 0.0
+
+    def _check_retry(self) -> None:
+        remaining = self.retry_at - self.clock()
+        if remaining > 0:
+            raise HTTPException(
+                status_code=503,
+                detail="Data health is temporarily unavailable. Please retry shortly.",
+                headers={"Retry-After": str(math.ceil(remaining)), "Cache-Control": "no-store"},
+            )
 
     def get(self, loader: Callable[[], dict]) -> dict:
         if self.report is not None and self.clock() < self.expires_at:
             return self.report
+        self._check_retry()
         if not self.lock.acquire(blocking=False):
             raise HTTPException(
                 status_code=503,
@@ -40,8 +53,17 @@ class ReportCache:
             # A refresh could have completed between the first read and lock.
             if self.report is not None and self.clock() < self.expires_at:
                 return self.report
-            report = loader()
+            self._check_retry()
+            try:
+                report = loader()
+            except Exception:
+                # Failed scans are also single-flight over time. Public
+                # traffic cannot immediately restart a timed-out scan.
+                self.report = None
+                self.retry_at = self.clock() + FAILURE_RETRY_SECONDS
+                raise
             self.report = report
+            self.retry_at = 0.0
             self.expires_at = self.clock() + REPORT_TTL_SECONDS
             return report
         finally:

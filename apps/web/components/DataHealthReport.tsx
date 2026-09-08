@@ -151,10 +151,10 @@ export default function DataHealthReport({ report }: { report: DataHealthData })
                   </summary>
                   <div className="mt-3 max-w-3xl space-y-4 leading-6 text-slate-700">
                     <p>{row.official_reconciliation.reason}</p>
-                    <p>Stored bills: <span className="tabular-nums">{row.parser_health.bill_count.toLocaleString()}</span>.
-                      {" "}Missing source links: {row.parser_health.missing_source_url.toLocaleString()}.
-                      {" "}Missing parser versions: {row.parser_health.missing_parser_version.toLocaleString()}.
-                      {" "}Dead sync jobs: {row.source_health.dead_api_sync_jobs.toLocaleString()}.</p>
+                    <p>Stored bills: <span className="tabular-nums">{row.parser_health.bill_count.toLocaleString("en-US")}</span>.
+                      {" "}Missing source links: {row.parser_health.missing_source_url.toLocaleString("en-US")}.
+                      {" "}Missing parser versions: {row.parser_health.missing_parser_version.toLocaleString("en-US")}.
+                      {" "}Dead sync jobs: {row.source_health.dead_api_sync_jobs.toLocaleString("en-US")}.</p>
                     {defects.length > 0 && <ul className="space-y-4">
                       {defects.map((defect, index) => <li key={`${defect.code}-${index}`}>
                         <p className="font-medium text-slate-900">{defect.message}</p>
