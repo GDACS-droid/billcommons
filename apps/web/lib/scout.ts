@@ -481,7 +481,7 @@ function apiError(response: Response, payload: unknown): ScoutApiError {
   return new ScoutApiError(detail ?? `Scout request failed (${response.status}).`, response.status);
 }
 
-export async function createScoutJob(query: string, jurisdiction: string): Promise<ScoutJob> {
+export async function createScoutJob(query: string, jurisdiction: string, signal?: AbortSignal): Promise<ScoutJob> {
   let response: Response;
   try {
     response = await fetch(`${API_BASE}/api/v1/scout/jobs`, {
@@ -489,8 +489,10 @@ export async function createScoutJob(query: string, jurisdiction: string): Promi
       credentials: "include",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify({ query, jurisdiction }),
+      signal,
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
     throw new ScoutApiError("Scout could not reach the service. Please try again.");
   }
 

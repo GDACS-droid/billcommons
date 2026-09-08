@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   getScoutMonitorRuns,
   isScoutMonitorEligible,
@@ -29,18 +29,34 @@ function cadenceLabel(seconds: number): string {
   return CADENCES.find((cadence) => cadence.seconds === seconds)?.label ?? `${Math.max(1, Math.round(seconds / 3600))} hours`;
 }
 
-function count(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+function count(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+function arrayOrCount(value: unknown, fallback: unknown): number | undefined {
+  return Array.isArray(value) ? value.length : count(fallback);
+}
+
+function comparisonState(run: ScoutMonitorRun): "pending" | "unavailable" | "available" | "missing" {
+  if (["queued", "running", "scheduled", "deferred"].includes(run.status)) return "pending";
+  if (["failed", "canceled", "cancelled"].includes(run.status)) return "unavailable";
+  const summary = run.changeSummary;
+  return arrayOrCount(summary.new_sources, summary.new_source_count) !== undefined
+    && arrayOrCount(summary.changed_sources, summary.changed_source_count) !== undefined
+    && count(summary.unchanged_source_count) !== undefined
+    ? "available"
+    : "missing";
 }
 
 function RunSummary({ run }: { run: ScoutMonitorRun }) {
   const summary = run.changeSummary;
   const baseline = summary.baseline === true || run.executionMode === "baseline";
-  const newSources = Array.isArray(summary.new_sources) ? summary.new_sources.length : count(summary.new_source_count);
-  const changedSources = Array.isArray(summary.changed_sources) ? summary.changed_sources.length : count(summary.changed_source_count);
+  const newSources = arrayOrCount(summary.new_sources, summary.new_source_count);
+  const changedSources = arrayOrCount(summary.changed_sources, summary.changed_source_count);
   const unchanged = count(summary.unchanged_source_count);
   const observed = count(summary.observed_source_count);
   const absenceEvaluated = summary.absence_evaluated === true;
+  const comparison = comparisonState(run);
   const mode = run.executionMode === "cached" ? "Cached matching research" : run.executionMode === "coalesced" ? "Joined active research" : run.executionMode === "new" ? "Fresh research" : run.executionMode.replaceAll("_", " ");
   return (
     <article className="border-t border-slate-200 py-4 first:border-t-0 first:pt-0">
@@ -52,10 +68,13 @@ function RunSummary({ run }: { run: ScoutMonitorRun }) {
         {run.job?.id ? <Link href={`/scout?job=${encodeURIComponent(run.job.id)}`} className="text-sm font-semibold text-blue-800 underline underline-offset-2 hover:text-blue-600">Open evidence</Link> : null}
       </div>
       {baseline ? (
-        <p className="mt-3 text-sm leading-6 text-slate-700">This saved result is the comparison baseline. {observed ? `${observed} retained ${observed === 1 ? "source" : "sources"} observed.` : "Observed source count was not returned."}</p>
+        <p className="mt-3 text-sm leading-6 text-slate-700">This saved result is the comparison baseline. {observed === undefined ? "Observed source count was not returned." : `${observed} retained ${observed === 1 ? "source" : "sources"} observed.`}</p>
       ) : (
         <div className="mt-3 text-sm leading-6 text-slate-700">
-          <p>{newSources} new · {changedSources} changed · {unchanged} unchanged observed sources.</p>
+          {comparison === "available" ? <p>{newSources} new · {changedSources} changed · {unchanged} unchanged observed sources.</p> : null}
+          {comparison === "pending" ? <p>Comparison is pending. Source-change counts are not available yet.</p> : null}
+          {comparison === "unavailable" ? <p>Comparison is unavailable for this run.</p> : null}
+          {comparison === "missing" ? <p>Comparison counts were not returned for this run.</p> : null}
           <p className="mt-1 text-slate-600">{absenceEvaluated ? "Absence evaluation was recorded." : "Source absence is not evaluated: an incomplete fetch cannot prove a source disappeared."}</p>
           {run.errorClass ? <p className="mt-1 text-amber-800">Run note: {run.errorClass.replaceAll("_", " ")}</p> : null}
         </div>
@@ -127,22 +146,72 @@ function MonitorRow({ monitor, onChange }: { monitor: ScoutMonitor; onChange: (m
   </li>;
 }
 
+type ListStatus = "loading" | "ready" | "error";
+
 export default function SavedMonitors({ job }: { job?: ScoutJob }) {
   const [monitors, setMonitors] = useState<ScoutMonitor[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  const [listStatus, setListStatus] = useState<ListStatus>("loading");
+  const [listError, setListError] = useState("");
+  const [saveError, setSaveError] = useState("");
   const [cadence, setCadence] = useState(CADENCES[1].seconds);
   const [saving, setSaving] = useState(false);
+  const monitorVersion = useRef(0);
   const eligible = job ? isScoutMonitorEligible(job) : false;
-  async function refresh() { try { setMonitors(await listScoutMonitors()); setError(""); } catch (reason) { setError(reason instanceof Error ? reason.message : "Scout could not load saved monitors."); } finally { setLoading(false); } }
-  useEffect(() => { void refresh(); }, []);
-  async function save() { if (!job || !eligible) return; setSaving(true); setError(""); try { const result = await saveScoutMonitor(job.id, cadence); setMonitors((current) => [result.monitor, ...current.filter((item) => item.id !== result.monitor.id)]); } catch (reason) { setError(reason instanceof Error ? reason.message : "Scout could not save this monitor."); } finally { setSaving(false); } }
+
+  const refresh = useCallback(async () => {
+    const version = monitorVersion.current;
+    setListStatus("loading");
+    setListError("");
+    try {
+      const next = await listScoutMonitors();
+      if (monitorVersion.current !== version) return;
+      setMonitors(next);
+      setListStatus("ready");
+    } catch (reason) {
+      if (monitorVersion.current !== version) return;
+      setListError(reason instanceof Error ? reason.message : "Scout could not load saved monitors.");
+      setListStatus("error");
+    }
+  }, []);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  function acceptMonitor(next: ScoutMonitor) {
+    monitorVersion.current += 1;
+    setMonitors((current) => current.map((item) => item.id === next.id ? next : item));
+    setListStatus("ready");
+    setListError("");
+  }
+
+  async function save() {
+    if (!job || !eligible) return;
+    const version = monitorVersion.current + 1;
+    monitorVersion.current = version;
+    setSaving(true); setSaveError("");
+    try {
+      const result = await saveScoutMonitor(job.id, cadence);
+      if (monitorVersion.current !== version) return;
+      setMonitors((current) => [result.monitor, ...current.filter((item) => item.id !== result.monitor.id)]);
+      setListStatus("loading");
+      setListError("");
+    } catch (reason) {
+      if (monitorVersion.current !== version) return;
+      setSaveError(reason instanceof Error ? reason.message : "Scout could not save this monitor.");
+    } finally {
+      if (monitorVersion.current === version) await refresh();
+      setSaving(false);
+    }
+  }
+
+  const savedCount = listStatus === "ready" ? `${monitors.length}/3 saved` : listStatus === "loading" ? "Loading saved monitors…" : "Saved monitor count unavailable";
+  const limitReached = listStatus === "ready" && monitors.length >= 3;
   return <section className="mt-10 border-y border-slate-300 py-6" aria-labelledby="saved-monitors-heading">
-    <div className="flex flex-wrap items-baseline justify-between gap-3"><div><h2 id="saved-monitors-heading" className="text-xl font-semibold tracking-tight text-slate-950">Saved monitors</h2><p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">Keep up to three evidence-backed queries on a cadence. A run records observed source changes; it does not claim a source was removed.</p></div><p className="text-sm text-slate-500">{monitors.length}/3 saved</p></div>
-    {job ? <div className="mt-5 border-t border-slate-200 pt-4"><p className="text-sm font-semibold text-slate-900">Save this research result</p>{eligible ? <div className="mt-3 flex flex-wrap items-end gap-3"><label className="text-sm text-slate-700">Cadence<select value={cadence} onChange={(event) => setCadence(Number(event.target.value))} className="ml-2 rounded-sm border border-slate-400 bg-white px-2 py-1.5 text-sm text-slate-950">{CADENCES.map((item) => <option key={item.seconds} value={item.seconds}>{item.label}</option>)}</select></label><button type="button" disabled={saving || monitors.length >= 3} onClick={() => void save()} className="rounded-sm bg-slate-950 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50">{saving ? "Saving…" : monitors.length >= 3 ? "Monitor limit reached" : "Save monitor"}</button></div> : <p className="mt-2 text-sm leading-6 text-slate-600">Only completed or partial results with retained findings can become monitors. Operator and canary research cannot be saved.</p>}</div> : null}
-    {loading ? <p className="mt-6 text-sm text-slate-600">Loading saved monitors…</p> : null}
-    {!loading && !monitors.length ? <p className="mt-6 text-sm text-slate-600">No saved monitors yet. Save an eligible evidence result to begin a bounded comparison history.</p> : null}
-    {monitors.length ? <ul className="mt-6">{monitors.map((monitor) => <MonitorRow key={monitor.id} monitor={monitor} onChange={(next) => setMonitors((current) => current.map((item) => item.id === next.id ? next : item))} />)}</ul> : null}
-    {error ? <p role="alert" className="mt-4 text-sm text-red-800">{error}</p> : null}
+    <div className="flex flex-wrap items-baseline justify-between gap-3"><div><h2 id="saved-monitors-heading" className="text-xl font-semibold tracking-tight text-slate-950">Saved monitors</h2><p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">Keep up to three evidence-backed queries on a cadence. A run records observed source changes; it does not claim a source was removed.</p></div><p className="text-sm text-slate-500">{savedCount}</p></div>
+    {job ? <div className="mt-5 border-t border-slate-200 pt-4"><p className="text-sm font-semibold text-slate-900">Save this research result</p>{eligible ? <div className="mt-3 flex flex-wrap items-end gap-3"><label className="text-sm text-slate-700">Cadence<select value={cadence} onChange={(event) => setCadence(Number(event.target.value))} className="ml-2 rounded-sm border border-slate-400 bg-white px-2 py-1.5 text-sm text-slate-950">{CADENCES.map((item) => <option key={item.seconds} value={item.seconds}>{item.label}</option>)}</select></label><button type="button" disabled={saving || limitReached} onClick={() => void save()} className="rounded-sm bg-slate-950 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50">{saving ? "Saving…" : limitReached ? "Monitor limit reached" : "Save monitor"}</button></div> : <p className="mt-2 text-sm leading-6 text-slate-600">Only completed or partial results with retained findings can become monitors. Operator and canary research cannot be saved.</p>}</div> : null}
+    {listStatus === "loading" ? <p className="mt-6 text-sm text-slate-600">Loading saved monitors…</p> : null}
+    {listStatus === "ready" && !monitors.length ? <p className="mt-6 text-sm text-slate-600">No saved monitors yet. Save an eligible evidence result to begin a bounded comparison history.</p> : null}
+    {monitors.length ? <ul className="mt-6">{monitors.map((monitor) => <MonitorRow key={monitor.id} monitor={monitor} onChange={acceptMonitor} />)}</ul> : null}
+    {listError ? <p role="alert" className="mt-4 text-sm text-red-800">{listError}</p> : null}
+    {saveError ? <p role="alert" className="mt-4 text-sm text-red-800">{saveError}</p> : null}
   </section>;
 }

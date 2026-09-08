@@ -2,7 +2,7 @@
 
 import { track } from "@vercel/analytics";
 import Link from "next/link";
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import SavedMonitors from "@/components/scout/SavedMonitors";
 import {
   cancelScoutJob,
@@ -419,6 +419,14 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
   const [refreshError, setRefreshError] = useState("");
   const trackedFacts = useRef(new Set<string>());
   const unknownPolls = useRef(0);
+  const jobRequest = useRef<{ generation: number; controller?: AbortController }>({ generation: 0 });
+  const beginJobRequest = useCallback(() => {
+    jobRequest.current.controller?.abort();
+    const controller = new AbortController();
+    const generation = jobRequest.current.generation + 1;
+    jobRequest.current = { generation, controller };
+    return { generation, controller };
+  }, []);
   const pollJobId = job?.id;
   const pollJobStatus = job?.status;
 
@@ -444,6 +452,8 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
   }, [enabled]);
 
   useEffect(() => {
+    const request = beginJobRequest();
+    setSubmitting(false);
     if (initialJobId === undefined) return;
     const jobId = initialJobId?.trim() ?? "";
     if (!SCOUT_JOB_ID_PATTERN.test(jobId)) {
@@ -452,23 +462,22 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
       setRefreshError("");
       return;
     }
-    let active = true;
-    const controller = new AbortController();
     setJob(null);
     setError("");
     setRefreshError("");
-    void getScoutJob(jobId, controller.signal).then((next) => {
-      if (active) setJob(next);
+    void getScoutJob(jobId, request.controller.signal).then((next) => {
+      if (jobRequest.current.generation === request.generation) setJob(next);
     }).catch((reason) => {
-      if (!active || (reason instanceof DOMException && reason.name === "AbortError")) return;
+      if (jobRequest.current.generation !== request.generation || (reason instanceof DOMException && reason.name === "AbortError")) return;
       setJob(null);
       setError(reason instanceof Error ? reason.message : "Scout could not load linked research.");
     });
     return () => {
-      active = false;
-      controller.abort();
+      if (jobRequest.current.generation === request.generation) request.controller.abort();
     };
-  }, [initialJobId]);
+  }, [beginJobRequest, initialJobId]);
+
+  useEffect(() => () => { jobRequest.current.controller?.abort(); }, []);
 
   useEffect(() => {
     if (!job) return;
@@ -552,11 +561,13 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
       setError("Scout is not enabled in this environment, so no research job was created.");
       return;
     }
+    const request = beginJobRequest();
     setSubmitting(true);
     setError("");
     setRefreshError("");
     try {
-      const next = await createScoutJob(trimmed, jurisdiction);
+      const next = await createScoutJob(trimmed, jurisdiction, request.controller.signal);
+      if (jobRequest.current.generation !== request.generation) return;
       setJob(next);
       track("scout_job_created", {
         jurisdiction: next.jurisdiction,
@@ -565,9 +576,10 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
       });
       if (next.cacheHit) track("scout_cache_hit", { jurisdiction: next.jurisdiction });
     } catch (reason) {
+      if (jobRequest.current.generation !== request.generation || (reason instanceof DOMException && reason.name === "AbortError")) return;
       setError(reason instanceof Error ? reason.message : "Scout could not start this research job.");
     } finally {
-      setSubmitting(false);
+      if (jobRequest.current.generation === request.generation) setSubmitting(false);
     }
   }
 

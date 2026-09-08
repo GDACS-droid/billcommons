@@ -20,3 +20,13 @@ test("saved monitor controls do not promise email and gate saving on eligible ev
   assert.match(source, /Operator and canary research cannot be saved/);
   assert.match(source, /Open evidence/);
 });
+
+
+test("saved monitor UI distinguishes pending, unavailable, missing, and zero-count comparisons", () => {
+  assert.match(source, /Number\.isInteger\(value\) && value >= 0/);
+  assert.match(source, /Comparison is pending\. Source-change counts are not available yet\./);
+  assert.match(source, /Comparison is unavailable for this run\./);
+  assert.match(source, /Comparison counts were not returned for this run\./);
+  assert.match(source, /listStatus === "ready" && !monitors\.length/);
+  assert.match(source, /monitorVersion\.current !== version/);
+});

@@ -35,8 +35,11 @@ test("linked monitor evidence loads an existing job without creating research an
   assert.match(source, /const SCOUT_JOB_ID_PATTERN = \/\^\[A-Za-z0-9\]\[A-Za-z0-9_-\]\{0,127\}\$\//);
   assert.match(source, /if \(initialJobId === undefined\) return;/);
   assert.match(source, /The requested Scout research link is invalid\./);
-  assert.match(source, /getScoutJob\(jobId, controller\.signal\)/);
-  assert.match(source, /controller\.abort\(\)/);
+  assert.match(source, /const beginJobRequest = useCallback/);
+  assert.match(source, /jobRequest\.current\.controller\?\.abort\(\)/);
+  assert.match(source, /getScoutJob\(jobId, request\.controller\.signal\)/);
+  assert.match(source, /createScoutJob\(trimmed, jurisdiction, request\.controller\.signal\)/);
+  assert.match(source, /jobRequest\.current\.generation === request\.generation/);
   assert.doesNotMatch(source, /new URLSearchParams\(window\.location\.search\)/);
   assert.match(pageSource, /searchParams: Promise<\{ job\?: string \| string\[\] \}>/);
   assert.match(pageSource, /initialJobId=\{jobId\}/);
