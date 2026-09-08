@@ -197,9 +197,9 @@ def _target_day(target: OfficialSourceTarget, jurisdiction: Jurisdiction | None)
 def _continuation_from_scope(scope: Mapping[str, Any]) -> _CaContinuation | None:
     """Validate the sole mutable field permitted alongside reviewed policy."""
 
-    raw = scope.get(CONTINUATION_KEY)
-    if raw is None:
+    if CONTINUATION_KEY not in scope:
         return None
+    raw = scope[CONTINUATION_KEY]
     if not isinstance(raw, Mapping) or set(raw) != _CONTINUATION_FIELDS:
         raise InvalidOfficialTarget("CA continuation state has an invalid shape")
     observation_id, raw_sha256, next_bill_index, adapter_version = (

@@ -591,3 +591,9 @@ def test_continuation_replays_exact_archive_after_rollback_without_refetching(mo
             cleanup.commit()
         finally:
             cleanup.close()
+
+
+@pytest.mark.parametrize('value', [None, {}, [], {'next_bill_index': True}])
+def test_explicit_malformed_continuation_is_rejected(value):
+    with pytest.raises(observer.InvalidOfficialTarget):
+        observer._continuation_from_scope({'continuation': value})
