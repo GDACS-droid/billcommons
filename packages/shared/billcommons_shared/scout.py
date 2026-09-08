@@ -158,6 +158,11 @@ class ScoutSettings:
     platform_max_daily_jobs: int = DEFAULT_PLATFORM_MAX_DAILY_JOBS
     platform_max_daily_browser_seconds: int = DEFAULT_PLATFORM_MAX_DAILY_BROWSER_SECONDS
     max_retained_rawstore_bytes: int = DEFAULT_MAX_RETAINED_RAWSTORE_BYTES
+    # Saved monitors are deliberately few and slow: each due run uses the
+    # normal Scout admission path and may consume the same provider budget.
+    max_saved_monitors_per_customer: int = 3
+    monitor_min_cadence_seconds: int = 6 * 60 * 60
+    monitor_max_cadence_seconds: int = 7 * 24 * 60 * 60
 
     def __post_init__(self) -> None:
         for name in (
@@ -165,10 +170,15 @@ class ScoutSettings:
             "platform_max_daily_jobs",
             "platform_max_daily_browser_seconds",
             "max_retained_rawstore_bytes",
+            "max_saved_monitors_per_customer",
+            "monitor_min_cadence_seconds",
+            "monitor_max_cadence_seconds",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.monitor_min_cadence_seconds > self.monitor_max_cadence_seconds:
+            raise ValueError("monitor cadence bounds are invalid")
         if any(
             not email
             or "@" not in email
@@ -302,6 +312,15 @@ class ScoutSettings:
             max_retained_rawstore_bytes=positive(
                 "BILLCOMMONS_SCOUT_MAX_RETAINED_RAWSTORE_BYTES",
                 DEFAULT_MAX_RETAINED_RAWSTORE_BYTES,
+            ),
+            max_saved_monitors_per_customer=positive(
+                "BILLCOMMONS_SCOUT_MAX_SAVED_MONITORS", 3
+            ),
+            monitor_min_cadence_seconds=positive(
+                "BILLCOMMONS_SCOUT_MONITOR_MIN_CADENCE_SECONDS", 6 * 60 * 60
+            ),
+            monitor_max_cadence_seconds=positive(
+                "BILLCOMMONS_SCOUT_MONITOR_MAX_CADENCE_SECONDS", 7 * 24 * 60 * 60
             ),
         )
 

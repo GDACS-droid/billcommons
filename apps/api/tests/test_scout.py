@@ -16,6 +16,7 @@ from billcommons_api.routers import scout
 from billcommons_schema.base import Base
 from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutJobEvent, ScoutResearchJob, ScoutSource
 from billcommons_shared.scout import scout_cache_key
+from billcommons_shared.scout_admission import admit_scout_job
 
 
 def _app(monkeypatch):
@@ -356,9 +357,9 @@ def test_scout_payload_never_describes_cross_customer_prior_source(monkeypatch):
 
 
 def test_scout_quota_decision_locks_the_customer_row_before_counting():
-    source = inspect.getsource(scout.create_job)
+    source = inspect.getsource(admit_scout_job)
     lock = source.index("with_for_update()")
-    count = source.index("active_count")
+    count = source.index("_browser_budget_totals")
     assert lock < count, "Postgres must serialize the per-customer quota check/create decision"
 
 

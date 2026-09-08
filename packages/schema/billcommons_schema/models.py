@@ -1686,6 +1686,73 @@ class ScoutResearchJob(UUIDPkMixin, TimestampMixin, Base):
     )
 
 
+class ScoutMonitor(UUIDPkMixin, TimestampMixin, Base):
+    """An owner-saved Scout query with a durable, bounded next due time."""
+
+    __tablename__ = "scout_monitors"
+
+    customer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_customers.id", ondelete="CASCADE"), nullable=False
+    )
+    original_query: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_query: Mapped[str] = mapped_column(Text, nullable=False)
+    jurisdiction: Mapped[str] = mapped_column(Text, nullable=False)
+    cache_key: Mapped[str] = mapped_column(Text, nullable=False)
+    cadence_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_completed_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    consecutive_deferrals: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    __table_args__ = (
+        CheckConstraint("cadence_seconds BETWEEN 21600 AND 604800", name="ck_scout_monitors_cadence"),
+        CheckConstraint("consecutive_deferrals >= 0", name="ck_scout_monitors_deferrals"),
+        UniqueConstraint("customer_id", "normalized_query", "jurisdiction", name="uq_scout_monitors_owner_query"),
+        Index(
+            "ix_scout_monitors_due", "next_run_at",
+            postgresql_where=text("active"), sqlite_where=text("active"),
+        ),
+    )
+
+
+class ScoutMonitorRun(UUIDPkMixin, Base):
+    """An owner-visible monitor attempt and immutable evidence comparison record."""
+
+    __tablename__ = "scout_monitor_runs"
+
+    monitor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("scout_monitors.id", ondelete="CASCADE"), nullable=False
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("scout_research_jobs.id", ondelete="RESTRICT"), nullable=True
+    )
+    baseline_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    execution_mode: Mapped[str] = mapped_column(Text, nullable=False)
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_class: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    change_summary: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('baseline','queued','completed','partial','failed','canceled','deferred')",
+            name="ck_scout_monitor_runs_status",
+        ),
+        CheckConstraint(
+            "execution_mode in ('baseline','cached','coalesced','new')",
+            name="ck_scout_monitor_runs_execution_mode",
+        ),
+        Index("ix_scout_monitor_runs_monitor_scheduled", "monitor_id", "scheduled_for"),
+        Index("ix_scout_monitor_runs_job", "job_id"),
+    )
+
+
 class ScoutJobEvent(UUIDPkMixin, Base):
     """Append-only, worker-authored Scout progress event (never fake time progress)."""
 

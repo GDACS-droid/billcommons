@@ -53,6 +53,8 @@ from billcommons_schema.models import (
     ScoutBrowserSession,
     ScoutFinding,
     ScoutJobEvent,
+    ScoutMonitor,
+    ScoutMonitorRun,
     ScoutRawBlob,
     ScoutResearchJob,
     ScoutSource,
@@ -189,7 +191,9 @@ class PostgresScoutHarness:
         """Delete only UUID-addressed fixture rows; never truncate/cascade globally."""
         with self.sessions() as db:
             if self.customer_ids:
-                # All Scout children use ON DELETE CASCADE from their job.
+                # Monitor runs retain job references, so delete owner monitors
+                # first; their child run journal rows cascade with them.
+                db.execute(delete(ScoutMonitor).where(ScoutMonitor.customer_id.in_(self.customer_ids)))
                 db.execute(delete(ScoutResearchJob).where(ScoutResearchJob.customer_id.in_(self.customer_ids)))
             if self.raw_blob_keys:
                 db.execute(delete(ScoutRawBlob).where(ScoutRawBlob.sha256.in_(self.raw_blob_keys)))
@@ -1043,3 +1047,161 @@ def test_postgres_global_browser_cap_and_reaper_claim_are_cross_runner_atomic(tm
         outcomes = list(pool.map(lambda runner: (barrier.wait(timeout=10), runner.reap_sessions())[1], reapers))
     assert sum(outcomes) == 1
     assert shared.released == ["one-orphan"]
+
+
+
+def _terminal_monitor_baseline(
+    pg_scout: PostgresScoutHarness, customer: ApiCustomer, *, operator: bool = False, query: str = "HB 625"
+) -> ScoutResearchJob:
+    """Create the smallest completed evidence-bearing owner job for monitor APIs."""
+    now = datetime.now(timezone.utc)
+    with pg_scout.sessions() as db:
+        job = ScoutResearchJob(
+            customer_id=customer.id,
+            original_query=query,
+            normalized_query=query.casefold(),
+            jurisdiction="FL",
+            cache_key=f"monitor-{uuid.uuid4().hex}",
+            status="completed",
+            strategy={"mode": "operator_lifecycle_validation", "user_finding": False} if operator else {"mode": "structured_first"},
+            limits={}, usage={}, completed_at=now,
+        )
+        db.add(job)
+        db.flush()
+        source = ScoutSource(
+            job_id=job.id,
+            canonical_url="https://www.flsenate.gov/Session/Bill/2026/625",
+            official=True,
+            retrieval_mechanism="direct",
+            content_hash="a" * 64,
+            raw_ref="a" * 64,
+        )
+        db.add(source)
+        db.flush()
+        db.add(ScoutFinding(
+            job_id=job.id, source_id=source.id, title="HB 625", what_happened="Official history retained.",
+            confidence="high", extractor_version="monitor-test",
+        ))
+        db.commit()
+        return job
+
+
+def test_postgres_saved_monitor_requires_owner_terminal_evidence_and_supports_pause_history(
+    monkeypatch, pg_scout: PostgresScoutHarness, scout_api
+):
+    customer = pg_scout.customer("monitor-owner")
+    other = pg_scout.customer("monitor-other")
+    baseline = _terminal_monitor_baseline(pg_scout, customer)
+    operator = _terminal_monitor_baseline(pg_scout, customer, operator=True)
+    second = _terminal_monitor_baseline(pg_scout, customer, query="HB 626")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_SAVED_MONITORS", "1")
+    headers = {"x-test-customer": str(customer.id)}
+    other_headers = {"x-test-customer": str(other.id)}
+    with TestClient(scout_api) as client:
+        denied = client.post(f"/api/v1/scout/jobs/{operator.id}/monitor", json={}, headers=headers)
+        assert denied.status_code == 422 and denied.json()["error"]["code"] == "invalid_monitor_baseline"
+        created = client.post(f"/api/v1/scout/jobs/{baseline.id}/monitor", json={"cadence_seconds": 21600}, headers=headers)
+        assert created.status_code == 201, created.text
+        monitor_id = uuid.UUID(created.json()["monitor"]["id"])
+        repeated = client.post(f"/api/v1/scout/jobs/{baseline.id}/monitor", json={}, headers=headers)
+        assert repeated.status_code == 200 and repeated.json()["created"] is False
+        limited = client.post(f"/api/v1/scout/jobs/{second.id}/monitor", json={}, headers=headers)
+        assert limited.status_code == 429 and limited.json()["error"]["code"] == "scout_monitor_limit"
+        denied_history = client.get(f"/api/v1/scout/monitors/{monitor_id}/runs", headers=other_headers)
+        assert denied_history.status_code == 404
+        paused = client.patch(f"/api/v1/scout/monitors/{monitor_id}", json={"active": False}, headers=headers)
+        assert paused.status_code == 200 and paused.json()["monitor"]["active"] is False
+        resumed = client.patch(f"/api/v1/scout/monitors/{monitor_id}", json={"active": True}, headers=headers)
+        assert resumed.status_code == 200 and resumed.json()["monitor"]["active"] is True
+        history = client.get(f"/api/v1/scout/monitors/{monitor_id}/runs", headers=headers)
+        assert history.status_code == 200
+        run = history.json()["runs"][0]
+    assert run["status"] == "baseline"
+    assert run["source_snapshot"]["sources"][0]["content_hash"] == "a" * 64
+    assert run["change_summary"]["absence_evaluated"] is False
+
+
+def test_postgres_saved_monitor_scheduler_uses_admission_and_finalizes_hash_delta(
+    pg_scout: PostgresScoutHarness, scout_api, tmp_path
+):
+    customer = pg_scout.customer("monitor-scheduler")
+    baseline = _terminal_monitor_baseline(pg_scout, customer)
+    headers = {"x-test-customer": str(customer.id)}
+    with TestClient(scout_api) as client:
+        saved = client.post(f"/api/v1/scout/jobs/{baseline.id}/monitor", json={}, headers=headers)
+        assert saved.status_code == 201, saved.text
+        monitor_id = uuid.UUID(saved.json()["monitor"]["id"])
+    with pg_scout.sessions() as db:
+        monitor = db.get(ScoutMonitor, monitor_id)
+        monitor.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+    runner = ScoutRunner(
+        pg_scout.sessions, FilesystemRawStore(tmp_path / "monitor-raw"), MockResearchBrowserProvider(),
+        settings=ScoutSettings(enabled=True, allow_public_rollout=True, browser_cleanup_seconds=1),
+    )
+    assert runner.schedule_one_due_monitor() is True
+    with pg_scout.sessions() as db:
+        queued = db.scalar(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.monitor_id == monitor_id, ScoutMonitorRun.status == "queued"
+        ))
+        assert queued is not None and queued.execution_mode == "new" and queued.job_id is not None
+        scheduled_job_id = queued.job_id
+    claim = runner.claim_next("monitor-postgres-test")
+    assert claim is not None and claim.job_id == scheduled_job_id
+    with pg_scout.sessions() as db:
+        job = db.get(ScoutResearchJob, scheduled_job_id)
+        source = ScoutSource(
+            job_id=job.id,
+            canonical_url="https://www.flsenate.gov/Session/Bill/2026/625",
+            official=True,
+            retrieval_mechanism="direct",
+            content_hash="b" * 64,
+            raw_ref="b" * 64,
+        )
+        db.add(source)
+        db.flush()
+        db.add(ScoutFinding(
+            job_id=job.id, source_id=source.id, title="HB 625", what_happened="Updated official history retained.",
+            confidence="high", extractor_version="monitor-test",
+        ))
+        runner._finish(db, job, claim.token, "completed", None, False)
+    with pg_scout.sessions() as db:
+        run = db.scalar(select(ScoutMonitorRun).where(ScoutMonitorRun.job_id == scheduled_job_id))
+        assert run.status == "completed"
+        assert run.change_summary["absence_evaluated"] is False
+        assert run.change_summary["changed_sources"] == [{
+            "canonical_url": "https://www.flsenate.gov/Session/Bill/2026/625",
+            "previous_content_hash": "a" * 64,
+            "content_hash": "b" * 64,
+        }]
+        assert "removed_sources" not in run.change_summary
+
+
+def test_postgres_saved_monitor_defers_when_shared_daily_admission_refuses(
+    pg_scout: PostgresScoutHarness, scout_api, tmp_path
+):
+    customer = pg_scout.customer("monitor-deferred")
+    baseline = _terminal_monitor_baseline(pg_scout, customer)
+    with TestClient(scout_api) as client:
+        saved = client.post(
+            f"/api/v1/scout/jobs/{baseline.id}/monitor", json={},
+            headers={"x-test-customer": str(customer.id)},
+        )
+        assert saved.status_code == 201
+        monitor_id = uuid.UUID(saved.json()["monitor"]["id"])
+    with pg_scout.sessions() as db:
+        monitor = db.get(ScoutMonitor, monitor_id)
+        monitor.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+    runner = ScoutRunner(
+        pg_scout.sessions, FilesystemRawStore(tmp_path / "monitor-deferred-raw"), MockResearchBrowserProvider(),
+        settings=ScoutSettings(enabled=True, allow_public_rollout=True, per_customer_daily_jobs=1, browser_cleanup_seconds=1),
+    )
+    assert runner.schedule_one_due_monitor() is True
+    with pg_scout.sessions() as db:
+        deferred = db.scalar(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.monitor_id == monitor_id, ScoutMonitorRun.status == "deferred"
+        ))
+        monitor = db.get(ScoutMonitor, monitor_id)
+    assert deferred is not None and deferred.error_class == "scout_daily_job_limit"
+    assert monitor.consecutive_deferrals == 1

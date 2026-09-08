@@ -27,6 +27,8 @@ from billcommons_schema.models import (
     ScoutBrowserSession,
     ScoutFinding,
     ScoutJobEvent,
+    ScoutMonitor,
+    ScoutMonitorRun,
     ScoutRawBlob,
     ScoutResearchJob,
     ScoutSource,
@@ -34,6 +36,8 @@ from billcommons_schema.models import (
 )
 from billcommons_shared.ca_official_actions import OfficialCaActionsError, parse_ca_official_actions_zip
 from billcommons_shared.rawstore import RawStore
+from billcommons_shared.scout_admission import ScoutAdmissionError, admit_scout_job, customer_is_admitted
+from billcommons_shared.scout_monitors import defer_delay_seconds, finalize_monitor_run
 from billcommons_shared.safe_http import SafeHttpError, SsrfRejected, new_safe_http_client
 from billcommons_shared.scout import (
     BrowserCapture, BrowserRequest, ResearchBrowserProvider, ScoutPolicyError,
@@ -281,6 +285,7 @@ class ScoutRunner:
                     job.claim_owner = None
                     job.claim_token = None
                     db.add(ScoutJobEvent(job_id=job.id, kind="finished", detail={"status": "failed", "error_class": "retry_exhausted"}))
+                    self._finalize_monitor_runs(db, job, "failed", now)
                     db.commit()
                     return None
                 job.retry_count += 1
@@ -327,12 +332,153 @@ class ScoutRunner:
         )
         return session_match is not None and source_match["year"] == session_match[1]
 
-    def run_once(self, worker_id: str) -> bool:
-        claim = self.claim_next(worker_id)
-        if claim is None:
-            return False
-        self.process(claim.job_id, claim.token)
+    def _defer_monitor(self, db: Session, monitor: ScoutMonitor, now: datetime, error_class: str) -> None:
+        delay = defer_delay_seconds(monitor.cadence_seconds, monitor.consecutive_deferrals)
+        monitor.consecutive_deferrals += 1
+        monitor.next_run_at = now + timedelta(seconds=delay)
+        db.add(ScoutMonitorRun(
+            monitor_id=monitor.id,
+            status="deferred",
+            execution_mode="new",
+            scheduled_for=now,
+            completed_at=now,
+            error_class=error_class,
+            source_snapshot={},
+            change_summary={"comparison_complete": False, "absence_evaluated": False},
+        ))
+
+    def schedule_one_due_monitor(self) -> bool:
+        """Journal and admit at most one due saved monitor in one transaction.
+
+        A fresh/active cache is associated with the journal; a new job is only
+        created through shared admission, never by a worker-side insert.
+        """
+        now = datetime.now(timezone.utc)
+        run_id: uuid.UUID | None = None
+        with self.sessions() as db:
+            monitor = db.execute(select(ScoutMonitor).where(
+                ScoutMonitor.active.is_(True), ScoutMonitor.next_run_at <= now,
+            ).order_by(ScoutMonitor.next_run_at).with_for_update(skip_locked=True).limit(1)).scalar_one_or_none()
+            if monitor is None:
+                return False
+            customer = db.execute(select(ApiCustomer).where(ApiCustomer.id == monitor.customer_id).with_for_update()).scalar_one_or_none()
+            if customer is None or not self.settings.enabled or not customer_is_admitted(customer, self.settings):
+                self._defer_monitor(db, monitor, now, "scout_rollout_not_available")
+                db.commit()
+                return True
+            try:
+                admission = admit_scout_job(
+                    db, customer,
+                    original_query=monitor.original_query,
+                    normalized_query=monitor.normalized_query,
+                    jurisdiction=monitor.jurisdiction,
+                    cache_key=monitor.cache_key,
+                    settings=self.settings,
+                )
+            except ScoutAdmissionError as exc:
+                self._defer_monitor(db, monitor, now, exc.code)
+                db.commit()
+                return True
+            mode = "cached" if admission.cached else "coalesced" if admission.coalesced else "new"
+            run = ScoutMonitorRun(
+                monitor_id=monitor.id,
+                job_id=admission.job.id,
+                baseline_run_id=monitor.last_completed_run_id,
+                status="queued",
+                execution_mode=mode,
+                scheduled_for=now,
+                started_at=now if admission.job.status == "running" else None,
+                source_snapshot={},
+                change_summary={},
+            )
+            db.add(run)
+            # Commit the association before a concurrent worker can finish a
+            # coalesced job.  The post-commit reconciliation below closes the
+            # converse interleaving, where that worker finished just before
+            # this insert became visible.
+            db.flush()
+            run_id = run.id
+            monitor.next_run_at = now + timedelta(seconds=monitor.cadence_seconds)
+            if admission.cached and admission.job.status in {"completed", "partial"}:
+                try:
+                    finalize_monitor_run(
+                        db, monitor, run, admission.job, status=admission.job.status,
+                        completed_at=now,
+                    )
+                except ValueError:
+                    run.status = "failed"
+                    run.completed_at = now
+                    run.error_class = "monitor_snapshot_source_limit"
+            db.commit()
+        assert run_id is not None
+        self._reconcile_terminal_monitor_run(run_id)
         return True
+
+    def _finalize_monitor_runs(self, db: Session, job: ScoutResearchJob, status: str, completed_at: datetime) -> None:
+        # All terminal paths acquire a run before its monitor.  Scheduler
+        # admission deliberately does not lock a job while holding a monitor,
+        # so this cannot form a monitor/job lock inversion.
+        runs = db.scalars(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.job_id == job.id, ScoutMonitorRun.status == "queued"
+        ).with_for_update(skip_locked=True)).all()
+        for run in runs:
+            monitor = db.execute(select(ScoutMonitor).where(
+                ScoutMonitor.id == run.monitor_id
+            ).with_for_update()).scalar_one()
+            try:
+                finalize_monitor_run(db, monitor, run, job, status=status, completed_at=completed_at)
+            except ValueError:
+                run.status = "failed"
+                run.completed_at = completed_at
+                run.error_class = "monitor_snapshot_source_limit"
+
+    def _reconcile_terminal_monitor_run(self, run_id: uuid.UUID | None = None) -> bool:
+        """Finish one journal row whose associated job is already terminal.
+
+        The scheduler commits a coalesced job/run association without locking
+        the job: locking it while holding the monitor would invert the worker
+        finalizer's job-to-run-to-monitor order.  A worker that terminalized
+        just before the association became visible therefore cannot see it.
+        This bounded reconciliation covers that committed interleaving and
+        also recovers a scheduler process that died between the two phases.
+        """
+        terminal = ("completed", "partial", "failed", "canceled")
+        with self.sessions() as db:
+            stmt = select(ScoutMonitorRun).join(
+                ScoutResearchJob, ScoutResearchJob.id == ScoutMonitorRun.job_id
+            ).where(ScoutMonitorRun.status == "queued")
+            if run_id is not None:
+                stmt = stmt.where(ScoutMonitorRun.id == run_id)
+            else:
+                stmt = stmt.where(ScoutResearchJob.status.in_(terminal)).order_by(
+                    ScoutMonitorRun.scheduled_for
+                )
+            run = db.execute(stmt.with_for_update(skip_locked=True).limit(1)).scalar_one_or_none()
+            if run is None:
+                return False
+            job = db.get(ScoutResearchJob, run.job_id)
+            if job is None or job.status not in terminal:
+                return False
+            monitor = db.execute(select(ScoutMonitor).where(
+                ScoutMonitor.id == run.monitor_id
+            ).with_for_update()).scalar_one()
+            try:
+                finalize_monitor_run(db, monitor, run, job, status=job.status, completed_at=job.completed_at or datetime.now(timezone.utc))
+            except ValueError:
+                run.status = "failed"
+                run.completed_at = job.completed_at or datetime.now(timezone.utc)
+                run.error_class = "monitor_snapshot_source_limit"
+            db.commit()
+            return True
+
+    def run_once(self, worker_id: str) -> bool:
+        reconciled = self._reconcile_terminal_monitor_run()
+        scheduled = self.schedule_one_due_monitor()
+        claim = self.claim_next(worker_id)
+        if claim is not None:
+            self.process(claim.job_id, claim.token)
+            return True
+        return scheduled or reconciled
 
     def run_operator_lifecycle_canary(self, customer_id: uuid.UUID) -> str:
         """Run one durable, non-user-facing Solari lifecycle validation.
@@ -2331,4 +2477,5 @@ class ScoutRunner:
         if status in {"completed", "partial"}:
             job.fresh_until = datetime.now(timezone.utc) + timedelta(seconds=self.settings.cache_ttl_seconds)
         db.add(ScoutJobEvent(job_id=job.id, kind="finished", detail={"status": status, "error_class": error_class}))
+        self._finalize_monitor_runs(db, job, status, job.completed_at)
         db.commit()
