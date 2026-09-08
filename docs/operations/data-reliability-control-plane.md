@@ -139,7 +139,9 @@ npm run lint -- --quiet
 npm run build
 ```
 
-The final integration run passed 74 shared/ingest tests and 7 API tests. The API tests
+The earlier integration run passed 74 shared/ingest tests and 7 API tests;
+these are historical results, not counts for the current release candidate.
+Current candidate results and review adjudication follow below. The API tests
 include cache expiry, single-flight behavior, redacted failure, endpoint
 registration, read-only SQL, and connection cleanup. The 22 targeted web tests,
 lint, TypeScript and production build passed. The installed Starlette test
@@ -243,3 +245,24 @@ Proposed ordering after the existing gates are satisfied:
    team inbox and signed webhooks, with duplicate suppression and delivery
    receipts. For the supplied GTM persona, this connects source research to a
    team's existing workflows. Buyer demand is a hypothesis until measured.
+
+### First-stage observation-age review fixes
+
+The canonical aggregate `ff83068` review returned BLOCK. Confirmed issues:
+report collection time was added to the 300-second cache lifetime, and the UI
+counted informational waiting as an issue. Cache expiry now begins before
+collection and an already-expired collection is rejected. Only non-info
+defects affect issue counts and filtering; the deferred queue count is labeled
+as included in the total. Checkout redirect events now require a non-empty,
+valid HTTPS destination before navigation. No payment configuration changed.
+
+The scheduler case claim was disproved by its actual comparison: both operands
+are uppercased. IngestJob timestamps use DateTime(timezone=True), and the report
+route has a real PostgreSQL read-only transaction test. The clock is monotonic
+in production; arbitrary backwards test clocks are not a supported contract.
+CLI cleanup failure remains a controlled check failure because cleanup was not
+completed. Per-statement limits bound the finite report query sequence, but an
+overall short HTTP deadline is not claimed. Version-1 ambiguous comparison
+records retain their reason-discriminated shapes, now explicitly documented.
+The advocate step was cancelled (rc=1), so this review is not a verification
+pass. A fresh canonical review is required after the confirmed fixes.

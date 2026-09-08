@@ -183,3 +183,29 @@ def test_actual_postgres_report_route_reads_snapshot(client, monkeypatch):
     body = response.json()
     assert body['summary']['jurisdiction_count'] == 51
     assert response.headers['cache-control'] == 'no-store'
+
+
+def test_collection_time_counts_against_observation_lifetime():
+    now = [0.0]
+    cache = module.ReportCache(clock=lambda: now[0])
+    def slow_load():
+        now[0] += 45
+        return {"generation": "first"}
+    assert cache.get(slow_load)["generation"] == "first"
+    now[0] = 299
+    assert cache.get(lambda: pytest.fail("early refresh"))["generation"] == "first"
+    now[0] = 300
+    assert cache.get(lambda: {"generation": "second"})["generation"] == "second"
+
+
+def test_expired_during_collection_is_never_published():
+    now = [0.0]
+    cache = module.ReportCache(clock=lambda: now[0])
+    def expired_load():
+        now[0] = module.REPORT_TTL_SECONDS
+        return {"generation": "expired"}
+    with pytest.raises(RuntimeError):
+        cache.get(expired_load)
+    assert cache.entry is None
+    with pytest.raises(HTTPException):
+        cache.get(lambda: pytest.fail("failure cooldown bypassed"))

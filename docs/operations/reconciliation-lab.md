@@ -85,3 +85,12 @@ fixture from making the audit process unbounded; they do not alter source data.
 This laboratory is the shared foundation for state adapters. It does not claim
 that an official snapshot authorizes deleting local history: a source can be
 partial, revised, or unavailable.
+
+### Ambiguous-record shapes in schema version 1
+
+Treat `ambiguous_identities` as a union discriminated by `reason`. For
+`duplicate_explicit_identity`, `identity` is present and both `official` and
+`local` are lists (either may be empty). For `missing_explicit_identity`,
+`identity` is null and exactly one side key is present; its value is a single
+event object. Consumers must branch on `reason` before iterating either side.
+This preserves the existing version-1 output and retained replay bytes.

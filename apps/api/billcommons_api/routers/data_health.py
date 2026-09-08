@@ -57,15 +57,18 @@ class ReportCache:
             if entry is not None and self.clock() < entry[1]:
                 return entry[0]
             self._check_retry()
+            refresh_started = self.clock()
             try:
                 report = loader()
+                if self.clock() >= refresh_started + REPORT_TTL_SECONDS:
+                    raise RuntimeError("report generation exceeded observation lifetime")
             except Exception:
                 # Failed scans are also single-flight over time. Public
                 # traffic cannot immediately restart a timed-out scan.
                 self.entry = None
                 self.retry_at = self.clock() + FAILURE_RETRY_SECONDS
                 raise
-            self.entry = (report, self.clock() + REPORT_TTL_SECONDS)
+            self.entry = (report, refresh_started + REPORT_TTL_SECONDS)
             self.retry_at = 0.0
             return report
         finally:

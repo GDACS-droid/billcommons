@@ -45,8 +45,15 @@ export default function CheckoutButton({ plan, interval, label, className }: Pro
         return;
       }
       const body = await res.json();
+      if (typeof body?.url !== "string" || !body.url.trim()) {
+        throw new Error("Checkout URL missing");
+      }
+      const redirect = new URL(body.url);
+      if (redirect.protocol !== "https:" || redirect.username || redirect.password) {
+        throw new Error("Checkout URL invalid");
+      }
       trackFunnel("checkout_redirect_created", { product: "subscription", plan, interval });
-      window.location.href = body.url;
+      window.location.href = redirect.toString();
     } catch {
       setError("Could not reach the server — please try again.");
       setBusy(false);

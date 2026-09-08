@@ -82,7 +82,7 @@ export default function DataHealthReport({ report, officialSources }: {
     (officialSources?.items ?? []).map((item) => [item.jurisdiction, item]),
   ), [officialSources]);
   function issueCount(code: string) {
-    return (byJurisdiction.get(code)?.length ?? 0)
+    return (byJurisdiction.get(code)?.filter((defect) => defect.severity !== "info").length ?? 0)
       + (officialByJurisdiction.get(code)?.targets.filter(sourceNeedsAttention).length ?? 0);
   }
   const rows = report.jurisdictions.filter((row) => {
@@ -163,7 +163,7 @@ export default function DataHealthReport({ report, officialSources }: {
                   <div><dt className="text-xs text-slate-600">Sync queue</dt>
                     <dd className="mt-1 tabular-nums text-slate-900">{row.source_health.queued_api_sync_jobs} queued · {row.source_health.running_api_sync_jobs} running
                       {!!row.source_health.deferred_api_sync_jobs && <span className="mt-1 block text-xs text-slate-600">
-                        {row.source_health.deferred_api_sync_jobs} waiting until {timestamp(row.source_health.next_deferred_api_sync_at)}
+                        Includes {row.source_health.deferred_api_sync_jobs} waiting until {timestamp(row.source_health.next_deferred_api_sync_at)}
                       </span>}
                     </dd></div>
                   <div><dt className="text-xs text-slate-600">Official-source agreement</dt>
@@ -171,7 +171,7 @@ export default function DataHealthReport({ report, officialSources }: {
                 </dl>
                 <details className="mt-4 text-sm">
                   <summary className="w-fit cursor-pointer py-2 font-medium text-blue-800 hover:underline">
-                    Inspect evidence{defects.length > 0 ? ` and ${defects.length} issue${defects.length === 1 ? "" : "s"}` : ""}
+                    Inspect evidence{issues > 0 ? ` and ${issues} issue${issues === 1 ? "" : "s"}` : ""}
                   </summary>
                   <div className="mt-3 max-w-3xl space-y-4 leading-6 text-slate-700">
                     <p>{row.official_reconciliation.reason}</p>
