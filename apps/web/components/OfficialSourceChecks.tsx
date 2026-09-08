@@ -19,7 +19,7 @@ export interface OfficialSourceOverview {
 }
 
 export function sourceNeedsAttention(target: OfficialTarget) {
-  return target.state === "failed" || target.state === "observation_overdue";
+  return target.enabled && target.state !== "observed";
 }
 
 function stateLabel(state: string): string {
