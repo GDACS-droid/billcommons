@@ -511,7 +511,7 @@ class OfficialRawBlob(Base):
 
     __table_args__ = (
         CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="ck_official_blob_hash"),
-        CheckConstraint("length(data) BETWEEN 1 AND 8388608", name="ck_official_blob_size"),
+        CheckConstraint("length(data) BETWEEN 0 AND 8388608", name="ck_official_blob_size"),
     )
 
 

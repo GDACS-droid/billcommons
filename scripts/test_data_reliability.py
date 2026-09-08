@@ -45,6 +45,8 @@ def main() -> int:
     # fixture contracts without monkeypatching pytest's module loader.
     groups = [
         ["workers/ingest/tests/test_scheduler.py",
+         "workers/ingest/tests/test_fulltext.py",
+         "workers/ingest/tests/test_browser_fetch.py",
          "workers/ingest/tests/test_official_ca_actions.py",
          "workers/ingest/tests/test_official_discovery.py",
          "workers/ingest/tests/test_official_discovery_database.py",
@@ -60,7 +62,8 @@ def main() -> int:
          "packages/shared/tests/test_reconciliation.py"],
         ["apps/api/tests/test_data_health.py",
          "apps/api/tests/test_official_evidence.py",
-         "apps/api/tests/test_official_evidence_database.py"],
+         "apps/api/tests/test_official_evidence_database.py",
+         "apps/api/tests/test_corpus_updates.py"],
     ]
     for tests in groups:
         result = subprocess.call([sys.executable, "-m", "pytest", *tests, "-q"])

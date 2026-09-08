@@ -2830,6 +2830,14 @@ def test_process_fetch_text_job_passes_document_url_as_original_candidate(db_ses
     assert document.license_note == f"fulltext_status={STATUS_OK}"
 
 
+    # A successful zero-byte response still has exact retained evidence.
+    evidence = db_session.execute(select(CorpusUpdateEvidence).where(
+        CorpusUpdateEvidence.request_scope["document_id"].astext == str(document.id)
+    )).scalar_one()
+    assert evidence.response_sha256 == hashlib.sha256(b"").hexdigest()
+    assert db_session.get(OfficialRawBlob, evidence.response_sha256).data == b""
+
+
 # ---------------------------------------------------------------------------
 # MA docket -> authoritative bill-number resolution (_resolve_ma_document)
 #
@@ -2843,6 +2851,7 @@ def test_process_fetch_text_job_passes_document_url_as_original_candidate(db_ses
 # `BillNumber` field from the API and cross-checks the resolved bill's
 # `DocketNumber` before ever accepting its text.
 # ---------------------------------------------------------------------------
+
 
 
 def _ma_document_url(doc_id: str, *, court: str = "194") -> MaDocumentUrl:

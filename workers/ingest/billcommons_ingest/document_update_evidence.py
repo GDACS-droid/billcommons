@@ -76,8 +76,8 @@ def snapshot_document(document: BillDocument) -> dict[str, Any]:
 
 def _store_blob(db: OrmSession, data: bytes, *, content_type: str) -> str:
     """Content-address bounded evidence bytes and verify the stored value."""
-    if not isinstance(data, bytes) or not 1 <= len(data) <= MAX_BLOB_BYTES:
-        raise ValueError("document update evidence must be non-empty bytes within the storage cap")
+    if not isinstance(data, bytes) or len(data) > MAX_BLOB_BYTES:
+        raise ValueError("document update evidence must be bytes within the storage cap")
     sha256 = hashlib.sha256(data).hexdigest()
     db.execute(
         insert(OfficialRawBlob)

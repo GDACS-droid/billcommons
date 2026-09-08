@@ -248,6 +248,8 @@ def test_sync_state_noop_records_no_extra_blobs_or_evidence(db_session):
 
 
 def test_sync_state_rolls_back_local_mutation_when_evidence_storage_fails(db_session, monkeypatch):
+    initial_blob_hashes = set(db_session.scalars(select(OfficialRawBlob.sha256)))
+    initial_evidence_ids = set(db_session.scalars(select(CorpusUpdateEvidence.id)))
     jurisdiction, _ = _make_jurisdiction_with_active_session(db_session)
     payload = _v3_bill_payload(
         openstates_id="ocd-bill/evidence-rollback", identifier="HB 904", title="Rollback evidence"
@@ -263,11 +265,13 @@ def test_sync_state_rolls_back_local_mutation_when_evidence_storage_fails(db_ses
             sync_state(db_session, jurisdiction, client=client)
 
     assert db_session.execute(select(Bill).where(Bill.jurisdiction_id == jurisdiction.id)).scalars().all() == []
-    assert db_session.execute(select(CorpusUpdateEvidence)).scalars().all() == []
-    assert db_session.execute(select(OfficialRawBlob)).scalars().all() == []
+    assert set(db_session.scalars(select(CorpusUpdateEvidence.id))) == initial_evidence_ids
+    assert set(db_session.scalars(select(OfficialRawBlob.sha256))) == initial_blob_hashes
 
 
 def test_snapshot_child_cap_fails_closed_without_mutation_or_evidence(db_session, monkeypatch):
+    initial_blob_hashes = set(db_session.scalars(select(OfficialRawBlob.sha256)))
+    initial_evidence_ids = set(db_session.scalars(select(CorpusUpdateEvidence.id)))
     jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
     bill = Bill(
         jurisdiction_id=jurisdiction.id,
@@ -306,8 +310,8 @@ def test_snapshot_child_cap_fails_closed_without_mutation_or_evidence(db_session
     assert (raised.value.component, raised.value.cap) == ("sponsorships", 1)
     db_session.refresh(bill)
     assert bill.title == "Before cap failure"
-    assert db_session.execute(select(CorpusUpdateEvidence)).scalars().all() == []
-    assert db_session.execute(select(OfficialRawBlob)).scalars().all() == []
+    assert set(db_session.scalars(select(CorpusUpdateEvidence.id))) == initial_evidence_ids
+    assert set(db_session.scalars(select(OfficialRawBlob.sha256))) == initial_blob_hashes
 
 
 def test_sync_state_creates_new_bill(db_session):
