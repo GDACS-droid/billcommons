@@ -28,11 +28,15 @@ from billcommons_ingest.url_resolvers import (
     ma_docket_from_url,
     resolve_fetch_url,
     resolver_name_for_candidate,
+    tx_ftp_tlodocs_candidate,
 )
 
 MA_DOCKET_URL = "https://malegislature.gov/Bills/194/HD177.pdf"
 MA_ALREADY_BILL_STYLE_URL = "https://malegislature.gov/Bills/194/H177.pdf"
 IA_STALE_URL = "https://www.legis.iowa.gov/docs/publications/LGEG/91/attachments/SF397.html"
+TX_FTP_89R_URL = "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm"
+TX_FTP_892_URL = "ftp://ftp.legis.state.tx.us/bills/892/witlistbill/html/HB00027H.htm"
+TX_FTP_891_URL = "ftp://ftp.legis.state.tx.us/bills/891/witlistbill/html/SB00015S.HTM"
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +63,7 @@ def test_ma_is_not_in_resolver_rules_and_resolve_fetch_url_returns_only_the_orig
     # bill's own record) -- it cannot be expressed as this module's
     # data-driven, network-free candidate list, so it is handled entirely
     # by fulltext._resolve_ma_document, not resolve_fetch_url.
-    assert {rule.jurisdiction for rule in RESOLVER_RULES} == {"ia"}
+    assert {rule.jurisdiction for rule in RESOLVER_RULES} == {"ia", "tx"}
     assert resolve_fetch_url("ma", MA_DOCKET_URL) == [MA_DOCKET_URL]
     assert resolve_fetch_url("MA", MA_DOCKET_URL) == [MA_DOCKET_URL]
 
@@ -90,6 +94,51 @@ def test_resolve_fetch_url_never_duplicates_a_candidate_equal_to_the_original():
 
 
 # ---------------------------------------------------------------------------
+# Texas: only reviewed FTP witness-list paths may receive an HTTPS candidate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source_url", "expected"),
+    [
+        (TX_FTP_89R_URL, "https://capitol.texas.gov/tlodocs/89R/witlistbill/html/HB00576H.htm"),
+        (TX_FTP_892_URL, "https://capitol.texas.gov/tlodocs/892/witlistbill/html/HB00027H.htm"),
+        (TX_FTP_891_URL, "https://capitol.texas.gov/tlodocs/891/witlistbill/html/SB00015S.HTM"),
+    ],
+)
+def test_tx_ftp_tlodocs_candidate_maps_only_the_verified_sessions(source_url, expected):
+    assert tx_ftp_tlodocs_candidate(source_url) == expected
+
+
+def test_tx_resolver_preserves_the_original_ftp_url_before_the_https_candidate():
+    assert resolve_fetch_url("TX", TX_FTP_89R_URL) == [
+        TX_FTP_89R_URL,
+        "https://capitol.texas.gov/tlodocs/89R/witlistbill/html/HB00576H.htm",
+    ]
+
+
+@pytest.mark.parametrize(
+    "source_url",
+    [
+        "ftp://other.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm",
+        "https://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm",
+        "ftp://ftp.legis.state.tx.us/bills/90R/witlistbill/html/HB00576H.htm",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/pdf/HB00576H.htm",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/../HB00576H.htm",
+        "ftp://ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm?download=1",
+        "ftp://ftp.legis.state.tx.us:21/bills/89R/witlistbill/html/HB00576H.htm",
+        "ftp://user@ftp.legis.state.tx.us/bills/89R/witlistbill/html/HB00576H.htm",
+    ],
+)
+def test_tx_ftp_tlodocs_candidate_rejects_unreviewed_or_unsafe_source_shape(source_url):
+    assert tx_ftp_tlodocs_candidate(source_url) is None
+
+
+def test_tx_rule_does_not_fire_for_another_jurisdiction():
+    assert resolve_fetch_url("ok", TX_FTP_89R_URL) == [TX_FTP_89R_URL]
+
+
+# ---------------------------------------------------------------------------
 # resolver_name_for_candidate (used to tag license_note on success)
 # ---------------------------------------------------------------------------
 
@@ -105,6 +154,12 @@ def test_resolver_name_for_candidate_matches_the_owning_rule():
 
 def test_resolver_name_for_candidate_returns_none_for_an_unrelated_url():
     assert resolver_name_for_candidate("ia", IA_STALE_URL, "https://example.com/unrelated") is None
+
+
+def test_tx_resolved_candidate_has_the_success_provenance_tag():
+    candidate = tx_ftp_tlodocs_candidate(TX_FTP_89R_URL)
+    assert candidate is not None
+    assert resolver_name_for_candidate("tx", TX_FTP_89R_URL, candidate) == "tx_ftp_tlodocs"
 
 
 def test_resolver_rules_table_is_data_driven_not_hardcoded_elsewhere():

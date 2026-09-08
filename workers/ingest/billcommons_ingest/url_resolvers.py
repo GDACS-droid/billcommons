@@ -29,6 +29,11 @@ but the UPSTREAM site's URL shape has since drifted, so the document now
   * Iowa (legis.iowa.gov) renamed the publication-code path segment from
     `LGEG` to `LGI`; every other path segment is unchanged. This one IS a
     pure, static rewrite, so it stays in `RESOLVER_RULES` below.
+  * Texas legacy records use FTP witness-list paths for the reviewed 89R,
+    891, and 892 sessions. The Texas Legislature now publishes the exact
+    same bounded path shape over HTTPS at capitol.texas.gov. This resolver
+    accepts only that exact legacy host, reviewed session, and safe HTML
+    filename shape; it never derives a session or filename.
 
 This module holds ONLY pure URL-shape logic -- no network/DB access -- kept
 deliberately separate from the fetch pipeline (`fulltext.py`) so it is
@@ -128,6 +133,60 @@ def _ia_candidates(source_url: str, bill_identifier: str | None, session: str | 
 
 
 # ---------------------------------------------------------------------------
+# Texas: reviewed legacy FTP witness-list paths -> official HTTPS publication
+# ---------------------------------------------------------------------------
+
+_TX_FTP_HOST = "ftp.legis.state.tx.us"
+_TX_REVIEWED_SESSIONS = frozenset({"89R", "891", "892"})
+_TX_WITNESS_LIST_PATH_RE = re.compile(
+    r"^/bills/(?P<session>89R|891|892)/witlistbill/html/"
+    r"(?P<filename>[A-Za-z0-9][A-Za-z0-9._-]*\.(?i:html?))$"
+)
+
+
+def tx_ftp_tlodocs_candidate(
+    source_url: str,
+    bill_identifier: str | None = None,
+    session: str | None = None,
+) -> str | None:
+    """Return Texas's reviewed HTTPS witness-list URL for one legacy FTP URL.
+
+    `bill_identifier` and `session` are intentionally unused: the reviewed
+    session and filename must already be present in the source URL. This
+    prevents a caller from deriving a destination from unreviewed metadata.
+    """
+    del bill_identifier, session
+    parsed = urlparse(source_url)
+    if (
+        parsed.scheme != "ftp"
+        or parsed.netloc != _TX_FTP_HOST
+        or parsed.query
+        or parsed.fragment
+        or parsed.params
+    ):
+        return None
+    match = _TX_WITNESS_LIST_PATH_RE.fullmatch(parsed.path)
+    if match is None:
+        return None
+    reviewed_session = match.group("session")
+    # The regexp admits only this fixed set; retain this guard as an explicit
+    # invariant if the expression is later broadened.
+    if reviewed_session.upper() not in _TX_REVIEWED_SESSIONS:
+        return None
+    return (
+        "https://capitol.texas.gov/tlodocs/"
+        f"{reviewed_session}/witlistbill/html/{match.group('filename')}"
+    )
+
+
+def _tx_ftp_tlodocs_candidates(
+    source_url: str, bill_identifier: str | None, session: str | None
+) -> list[str]:
+    candidate = tx_ftp_tlodocs_candidate(source_url, bill_identifier, session)
+    return [candidate] if candidate is not None else []
+
+
+# ---------------------------------------------------------------------------
 # Rules table
 # ---------------------------------------------------------------------------
 
@@ -149,6 +208,7 @@ class ResolverRule:
 # docstring.
 RESOLVER_RULES: tuple[ResolverRule, ...] = (
     ResolverRule("ia", "ia_lgeg_to_lgi", _ia_candidates),
+    ResolverRule("tx", "tx_ftp_tlodocs", _tx_ftp_tlodocs_candidates),
 )
 
 
