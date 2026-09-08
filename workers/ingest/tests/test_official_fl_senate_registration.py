@@ -38,6 +38,20 @@ def _florida_target(db):
     ))
 
 
+def _add_exact_florida_target(db, jurisdictions):
+    target = OfficialSourceTarget(
+        jurisdiction_id=jurisdictions["FL"].id,
+        adapter_name=registration.fl_capture.ADAPTER_NAME,
+        source_url=registration.FLORIDA_SOURCE_URL,
+        scope=dict(registration.FLORIDA_SCOPE),
+        enabled=False,
+        cadence_seconds=registration.CADENCE_SECONDS,
+    )
+    db.add(target)
+    db.flush()
+    return target
+
+
 def test_registers_only_exact_disabled_fifty_ninth_target_and_is_idempotent(db_session, monkeypatch):
     jurisdictions = _seed_reviewed_initial_inventory(db_session)
     before = {target.id: (target.next_check_at, target.consecutive_failures) for target in db_session.scalars(select(OfficialSourceTarget))}
@@ -72,6 +86,24 @@ def test_registration_rolls_back_with_the_callers_savepoint(db_session):
     assert len(db_session.scalars(select(OfficialSourceTarget)).all()) == 59
     savepoint.rollback()
     assert len(db_session.scalars(select(OfficialSourceTarget)).all()) == 58
+
+
+def test_registration_flushes_pending_jurisdiction_edit_before_inventory_lookup():
+    engine = get_engine()
+    with engine.connect() as connection:
+        outer = connection.begin()
+        try:
+            with Session(connection, join_transaction_mode="create_savepoint", autoflush=False) as db:
+                florida = _seed_reviewed_initial_inventory(db)["FL"]
+                florida.name = "Pending Florida registration edit"
+                with db.no_autoflush:
+                    registration.register_reviewed_fl_senate_target(db)
+                assert florida.name == "Pending Florida registration edit"
+                assert connection.scalar(
+                    select(Jurisdiction.name).where(Jurisdiction.id == florida.id)
+                ) == florida.name
+        finally:
+            outer.rollback()
 
 
 def test_registration_advisory_lock_rejects_a_second_transaction(db_session):
@@ -167,6 +199,25 @@ def test_activation_locks_and_enables_only_pristine_florida_target(db_session, m
         registration.activate_reviewed_fl_senate_target(db_session, now=NOW)
 
 
+def test_activation_flushes_pending_jurisdiction_edit_before_inventory_lookup():
+    engine = get_engine()
+    with engine.connect() as connection:
+        outer = connection.begin()
+        try:
+            with Session(connection, join_transaction_mode="create_savepoint", autoflush=False) as db:
+                florida = _seed_reviewed_initial_inventory(db)["FL"]
+                registration.register_reviewed_fl_senate_target(db)
+                florida.name = "Pending Florida activation edit"
+                with db.no_autoflush:
+                    registration.activate_reviewed_fl_senate_target(db, now=NOW)
+                assert florida.name == "Pending Florida activation edit"
+                assert connection.scalar(
+                    select(Jurisdiction.name).where(Jurisdiction.id == florida.id)
+                ) == florida.name
+        finally:
+            outer.rollback()
+
+
 def test_activation_rolls_back_and_locks_only_the_florida_target(db_session):
     _seed_reviewed_initial_inventory(db_session)
     statements = []
@@ -202,20 +253,21 @@ def test_second_activation_transaction_loses_the_advisory_lock():
         outer = connection.begin()
         try:
             with Session(connection, join_transaction_mode="create_savepoint") as setup:
-                _seed_reviewed_initial_inventory(setup)
-                registered = registration.register_reviewed_fl_senate_target(setup)
+                jurisdictions = _seed_reviewed_initial_inventory(setup)
+                target = _add_exact_florida_target(setup, jurisdictions)
+                target_id = target.id
                 setup.commit()
             with Session(connection, join_transaction_mode="create_savepoint") as first:
                 registration.activate_reviewed_fl_senate_target(first, now=NOW)
                 with Session(engine) as second:
                     # The second call must fail on the lock before it reads the
                     # inventory, so the fixture need not become globally visible.
-                    assert second.get(OfficialSourceTarget, registered.target_id) is None
+                    assert second.get(OfficialSourceTarget, target_id) is None
                     with pytest.raises(registration.FloridaSenateRegistrationError, match="advisory lock"):
                         registration.activate_reviewed_fl_senate_target(second, now=NOW)
                 first.rollback()
             with Session(connection, join_transaction_mode="create_savepoint") as check:
-                assert check.get(OfficialSourceTarget, registered.target_id).enabled is False
+                assert check.get(OfficialSourceTarget, target_id).enabled is False
         finally:
             outer.rollback()
 
