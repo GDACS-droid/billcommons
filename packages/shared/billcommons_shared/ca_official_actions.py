@@ -15,6 +15,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import lzma
 import re
 import time
 import zipfile
@@ -514,7 +515,10 @@ def parse_ca_official_actions_zip(
                 reject_duplicate_history_ids=True,
                 deadline=deadline,
             )
-    except (zipfile.BadZipFile, EOFError, NotImplementedError, zlib.error) as exc:
+    # ZIP BZIP2 raises OSError and ZIP LZMA raises LZMAError for corrupt
+    # payloads. All reads here are from the already-retained in-memory ZIP,
+    # so these represent decoder failures, not transport/storage failures.
+    except (zipfile.BadZipFile, EOFError, NotImplementedError, zlib.error, OSError, lzma.LZMAError) as exc:
         raise OfficialCaActionsError(
             "official CA response is not a valid ZIP archive",
             code="archive_crc_or_invalid_zip",
