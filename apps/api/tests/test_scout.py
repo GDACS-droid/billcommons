@@ -116,9 +116,10 @@ def test_scout_creation_snapshots_document_processing_caps(monkeypatch):
             limits = db.get(ScoutResearchJob, job_id).limits
             assert {
                 name: limits[name]
-                for name in ("max_related_documents", "max_direct_bytes", "max_pdf_pages", "max_pdf_text_chars")
+                for name in ("max_related_documents", "max_related_vote_records", "max_direct_bytes", "max_pdf_pages", "max_pdf_text_chars")
             } == {
                 "max_related_documents": 1,
+                "max_related_vote_records": 1,
                 "max_direct_bytes": 1024,
                 "max_pdf_pages": 3,
                 "max_pdf_text_chars": 400,

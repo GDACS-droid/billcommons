@@ -10,6 +10,7 @@ from billcommons_shared.scout import (
     content_changed,
     content_hash,
     discover_florida_senate_related_documents,
+    discover_florida_senate_vote_records,
     is_pdf_attachment_payload,
     normalize_query,
     scout_cache_key,
@@ -49,6 +50,7 @@ def test_scout_settings_preserve_absent_defaults_and_parse_enabled_api_worker_li
     assert defaults.max_query_chars == 500
     assert defaults.max_direct_bytes == 2 * 1024 * 1024
     assert defaults.max_external_requests == 5
+    assert defaults.max_related_vote_records == 1
     assert defaults.platform_max_active_jobs == 10
     assert defaults.platform_max_daily_jobs == 100
     assert defaults.platform_max_daily_browser_seconds == 3_600
@@ -66,6 +68,7 @@ def test_scout_settings_preserve_absent_defaults_and_parse_enabled_api_worker_li
     assert settings.allow_public_rollout is False
     assert settings.max_query_chars == 480
     assert settings.max_external_requests == 3
+    assert settings.max_related_vote_records == 1
     assert settings.browser_wall_seconds == 45
 
 
@@ -185,6 +188,36 @@ def test_florida_senate_related_document_discovery_parses_valid_link_after_navig
     documents = discover_florida_senate_related_documents(page, body, max_html_bytes=len(body))
     assert [item.canonical_url for item in documents] == [
         "https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF"
+    ]
+
+
+def test_florida_senate_attachment_routes_preserve_encoded_analysis_and_bound_votes():
+    page = "https://www.flsenate.gov/Session/Bill/2025/7031/ByCategory"
+    body = b"""
+        <a href="/Session/Bill/2025/7031/Analyses/H7031 Conference Report 75.PDF">Report</a>
+        <a href="/Session/Bill/2025/7031/Vote/2025-06-05 0230PM~H07031 Vote Record.PDF">Committee vote</a>
+        <a href="/Session/Bill/2025/7031/Vote/HouseVote_h07031__063.PDF?campaign=tracker">Floor vote alias</a>
+        <a href="/Session/Bill/2025/7030/Vote/HouseVote_h07030__063.PDF">Other bill</a>
+        <a href="/Session/Bill/2026/7031/Vote/HouseVote_h07031__063.PDF">Other session</a>
+        <a href="https://example.test/Session/Bill/2025/7031/Vote/evil.PDF">Offsite</a>
+        <a href="/Session/Bill/2025/7031/Vote/bad%2Froute.PDF">Encoded slash</a>
+        <a href="/Session/Bill/2025/7031/Vote/%2E%2E%2Foutside.PDF">Encoded traversal</a>
+        <a href="/Session/Bill/2025/7031/Vote/bad%3Fquery.PDF">Encoded query</a>
+        <a href="/Session/Bill/2025/7031/Vote/bad%23fragment.PDF">Encoded fragment</a>
+        <a href="/Session/Bill/2025/7031/Vote/bad%ZZ.PDF">Invalid escape</a>
+        <a href="/Session/Bill/2025/7031/Vote/fragment.PDF#section">Fragment</a>
+        <a href="/Session/Bill/2025/7031/Vote/not-a-pdf">Non-PDF</a>
+    """
+
+    assert [(item.artifact_type, item.canonical_url) for item in discover_florida_senate_related_documents(page, body, maximum=10)] == [
+        ("committee analysis", "https://www.flsenate.gov/Session/Bill/2025/7031/Analyses/H7031%20Conference%20Report%2075.PDF"),
+    ]
+    assert [(item.artifact_type, item.canonical_url) for item in discover_florida_senate_vote_records(page, body, maximum=1)] == [
+        ("vote record", "https://www.flsenate.gov/Session/Bill/2025/7031/Vote/2025-06-05%200230PM~H07031%20Vote%20Record.PDF"),
+    ]
+    assert [item.canonical_url for item in discover_florida_senate_vote_records(page, body, maximum=2)] == [
+        "https://www.flsenate.gov/Session/Bill/2025/7031/Vote/2025-06-05%200230PM~H07031%20Vote%20Record.PDF",
+        "https://www.flsenate.gov/Session/Bill/2025/7031/Vote/HouseVote_h07031__063.PDF",
     ]
 
 

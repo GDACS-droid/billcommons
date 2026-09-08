@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
+from urllib.parse import urlsplit
 
 from sqlalchemy import and_, delete, exists, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
@@ -21,7 +22,7 @@ from billcommons_shared.safe_http import SafeHttpError, SsrfRejected, new_safe_h
 from billcommons_shared.scout import (
     BrowserCapture, BrowserRequest, ResearchBrowserProvider, ScoutPolicyError,
     ScoutSettings, browser_required, canonicalize_url, classify_direct_response,
-    content_hash, discover_florida_senate_related_documents,
+    content_hash, discover_florida_senate_related_documents, discover_florida_senate_vote_records,
     extract_florida_bill_identifier, summarize_content_change,
     is_pdf_attachment_payload, topical_search_terms,
 )
@@ -43,6 +44,10 @@ _RELATED_DATE_RE = re.compile(
     r"((?:(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+20\d{2})|(?:\d{1,2}/\d{1,2}/20\d{2}))\b",
     re.I,
 )
+_FLORIDA_SENATE_BILL_SOURCE_PATH_RE = re.compile(
+    r"^/Session/Bill/(?P<year>20\d{2})/\d{1,6}(?:/.*)?$", re.I
+)
+_SESSION_IDENTIFIER_YEAR_PREFIX_RE = re.compile(r"^(20\d{2})(?:\D|$)")
 _SHELL_MARKERS = (
     "sign in", "log in", "login", "maintenance", "temporarily unavailable",
     "enable javascript", "javascript is required", "please enable javascript",
@@ -87,6 +92,16 @@ def describe_related_document(
     similarly named official attachments.
     """
     display_text = _SPACE_RE.sub(" ", text).strip()
+    if artifact_type == "vote record":
+        # The URL establishes only a one-hop official vote-record attachment.
+        # Do not transform its path, the parent page, or a later PDF header
+        # into a chamber, tally, member-vote, or corpus-action assertion.
+        return RelatedDocumentDescription(
+            title=f"{identifier}: official vote record",
+            what_happened=f"Official vote record retrieved for {identifier}.",
+            relevant_date=None,
+            confidence="medium",
+        )
     # A chamber name mentioned deep in the document can be a quotation or a
     # cross-reference. Restrict attribution to the document header area.
     header_text = display_text[:1_000]
@@ -257,6 +272,34 @@ class ScoutRunner:
         """Use the request-time budget, with a safe fallback for legacy rows."""
         value = (job.limits or {}).get(name, fallback)
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else fallback
+
+    @staticmethod
+    def _vote_record_limit(job: ScoutResearchJob) -> int:
+        """Read the vote lane only when the immutable job explicitly permits it."""
+        limits = job.limits if isinstance(job.limits, dict) else {}
+        value = limits.get("max_related_vote_records")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return 0
+        return min(1, value)
+
+    @staticmethod
+    def _senate_source_matches_bill_session(url: str, session_identifier: str | None) -> bool:
+        """Reject a Senate bill URL whose explicit year conflicts with its Bill row."""
+        if not isinstance(url, str):
+            return True
+        try:
+            parsed = urlsplit(url)
+        except (TypeError, ValueError):
+            return True
+        if (parsed.hostname or "").casefold().rstrip(".") not in {"flsenate.gov", "www.flsenate.gov"}:
+            return True
+        source_match = _FLORIDA_SENATE_BILL_SOURCE_PATH_RE.fullmatch(parsed.path)
+        if source_match is None:
+            return True
+        session_match = _SESSION_IDENTIFIER_YEAR_PREFIX_RE.match(
+            session_identifier if isinstance(session_identifier, str) else ""
+        )
+        return session_match is not None and source_match["year"] == session_match[1]
 
     def run_once(self, worker_id: str) -> bool:
         claim = self.claim_next(worker_id)
@@ -459,7 +502,9 @@ class ScoutRunner:
         candidates = []
         seen_identifiers: set[str] = set()
         for url, bill_id, title, status, bill_identifier, identifier_norm, action, action_date, status_date, session_identifier, session_name, session_active, session_start, session_end in rows:
-            if not url or identifier_norm in seen_identifiers:
+            if not url or not self._senate_source_matches_bill_session(url, session_identifier):
+                continue
+            if identifier_norm in seen_identifiers:
                 continue
             seen_identifiers.add(identifier_norm)
             candidates.append((url, bill_id, title, status, {
@@ -697,6 +742,7 @@ class ScoutRunner:
             if job is None or self._canceled(db, job, cancel_version, token):
                 return 0, 0, False
             maximum = self._job_limit(job, "max_related_documents", self.settings.max_related_documents)
+            vote_maximum = self._vote_record_limit(job)
             max_direct_bytes = self._job_limit(job, "max_direct_bytes", self.settings.max_direct_bytes)
         related = discover_florida_senate_related_documents(
             parent_url, parent_body, maximum=maximum, max_html_bytes=max_direct_bytes
@@ -707,9 +753,21 @@ class ScoutRunner:
                     db.add(ScoutJobEvent(job_id=job_id, kind="related_sources_discovered", detail={"count": len(related)}))
                     db.commit()
 
+        # This is a separate lane rather than another item in the ordinary
+        # document cap. Existing jobs retain their analysis/amendment budget;
+        # one deterministic vote record follows only after that lane.
+        vote_records = discover_florida_senate_vote_records(
+            parent_url, parent_body, maximum=vote_maximum, max_html_bytes=max_direct_bytes
+        )
+        if vote_records:
+            with self.sessions() as db:
+                if self._fenced(db, job_id, token) is not None:
+                    db.add(ScoutJobEvent(job_id=job_id, kind="vote_records_discovered", detail={"count": len(vote_records)}))
+                    db.commit()
+
         successes = 0
         failures = 0
-        for document in related:
+        for document in (*related, *vote_records):
             if document.canonical_url in seen_urls:
                 continue
             seen_urls.add(document.canonical_url)
@@ -928,7 +986,7 @@ class ScoutRunner:
                     exact_raw_ref = None
             mime_base = (mime or "").split(";", 1)[0].lower()
             related_artifact_type = metadata.get("related_artifact_type")
-            if related_artifact_type not in {"committee analysis", "amendment"}:
+            if related_artifact_type not in {"committee analysis", "amendment", "vote record"}:
                 related_artifact_type = None
             evidence: tuple[str, int, int] | None = None
             related_description: RelatedDocumentDescription | None = None
