@@ -2614,14 +2614,18 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                         causal_evidence_by_bill=causal_evidence_by_bill,
                     )
                     db.commit()
-                except Exception:
+                except status_evidence_mod.DerivationInputLimitExceeded as exc:
                     db.rollback()
-                    traceback.print_exc()
                     # A single bill with oversized local inputs must not hold
                     # every later state behind this batch forever. Retry the
                     # members independently; successful singleton commits are
                     # removed below, while the failing bill and its exact
                     # source-evidence link remain pending for a later repair.
+                    print(
+                        f"sync-worker {worker_id}: status recompute input limit "
+                        f"({type(exc).__name__}) for {len(batch)} bill(s); isolating",
+                        flush=True,
+                    )
                     if len(batch) > 1:
                         for bill_id in batch:
                             isolated_db = get_session()
@@ -2651,13 +2655,22 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                                     f"related row(s) removed",
                                     flush=True,
                                 )
-                            except Exception:
+                            except status_evidence_mod.DerivationInputLimitExceeded as isolated_exc:
                                 isolated_db.rollback()
                                 status_failures_this_cycle.add(bill_id)
-                                traceback.print_exc()
                                 print(
-                                    f"sync-worker {worker_id}: status recompute FAILED for "
-                                    f"isolated bill {bill_id}; retrying next cycle",
+                                    f"sync-worker {worker_id}: status recompute input limit "
+                                    f"({type(isolated_exc).__name__}) for isolated bill; "
+                                    "retrying next cycle",
+                                    flush=True,
+                                )
+                            except Exception as isolated_exc:
+                                isolated_db.rollback()
+                                status_failures_this_cycle.add(bill_id)
+                                print(
+                                    f"sync-worker {worker_id}: status recompute FAILED "
+                                    f"({type(isolated_exc).__name__}) for isolated bill; "
+                                    "retrying next cycle",
                                     flush=True,
                                 )
                             finally:
@@ -2665,11 +2678,22 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                         continue
                     status_failures_this_cycle.add(batch[0])
                     print(
-                        f"sync-worker {worker_id}: status recompute FAILED for "
-                        f"isolated bill {batch[0]}; retrying next cycle",
+                        f"sync-worker {worker_id}: status recompute input limit "
+                        f"({type(exc).__name__}) for isolated bill; retrying next cycle",
                         flush=True,
                     )
                     continue
+                except Exception as exc:
+                    db.rollback()
+                    # Unexpected database or evidence-store failures are not
+                    # input-shape problems. Leave the whole batch pending and
+                    # stop this phase rather than retrying every member.
+                    print(
+                        f"sync-worker {worker_id}: status recompute FAILED "
+                        f"({type(exc).__name__}) for {len(batch)} bill(s); retrying next cycle",
+                        flush=True,
+                    )
+                    break
                 finally:
                     db.close()
 
