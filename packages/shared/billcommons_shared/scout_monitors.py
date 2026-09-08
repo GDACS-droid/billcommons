@@ -41,7 +41,7 @@ def source_snapshot(db: Session, job_id) -> dict:
         ScoutSource.retrieval_mechanism.in_(_FINAL_RETRIEVAL_MECHANISMS),
         ScoutSource.content_hash.is_not(None),
         ScoutSource.raw_ref.is_not(None),
-    ).order_by(ScoutSource.canonical_url, ScoutSource.id)).all())
+    ).order_by(ScoutSource.canonical_url, ScoutSource.retrieved_at, ScoutSource.id)).all())
     if len(sources) > _MAX_SNAPSHOT_SOURCES:
         raise ValueError("monitor_snapshot_source_limit")
     findings = list(db.scalars(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).all())
@@ -62,6 +62,9 @@ def source_snapshot(db: Session, job_id) -> dict:
 
 def compare_snapshots(previous: dict | None, current: dict, *, complete: bool) -> dict:
     """Compare observed URL/hash pairs without ever asserting a removal."""
+    # Snapshots retain every finalized version, oldest to newest within a URL.
+    # A reclaimed job may have fetched more than one version; compare its last
+    # observed version without discarding the earlier evidence references.
     old_sources = (previous or {}).get("sources", [])
     current_sources = current.get("sources", [])
     old_by_url = {item.get("canonical_url"): item for item in old_sources if item.get("canonical_url")}

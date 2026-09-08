@@ -17,6 +17,7 @@ from billcommons_schema.base import Base
 from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutMonitor, ScoutMonitorRun, ScoutResearchJob, ScoutSource
 from billcommons_shared.scout import scout_cache_key
 from billcommons_shared.scout_admission import admit_scout_job
+from billcommons_shared.scout_monitors import compare_snapshots
 
 
 def _app(monkeypatch):
@@ -258,6 +259,57 @@ def test_scout_monitor_rejects_finding_without_final_snapshot_source(monkeypatch
         assert db.scalar(select(func.count()).select_from(ScoutMonitor).where(
             ScoutMonitor.customer_id == owner.id
         )) == 0
+
+
+def test_scout_monitor_compares_latest_retained_version_not_uuid_order(monkeypatch):
+    app, owner, _other, sessions = _app(monkeypatch)
+    now = datetime.now(timezone.utc)
+    url = "https://www.flsenate.gov/Session/Bill/2026/625"
+    with sessions() as db:
+        job = ScoutResearchJob(
+            customer_id=owner.id, original_query="HB 625", normalized_query="hb 625",
+            jurisdiction="FL", cache_key="monitor-version-order", status="completed",
+            completed_at=now, strategy={}, limits={}, usage={},
+        )
+        db.add(job)
+        db.flush()
+        # A reclaimed job can retain an earlier final source and then fetch a
+        # changed version. UUID ordering deliberately opposes observation time.
+        newer = ScoutSource(
+            id=uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"), job_id=job.id,
+            canonical_url=url, official=True, retrieval_mechanism="direct",
+            content_hash="b" * 64, raw_ref="raw/" + "b" * 64, retrieved_at=now,
+        )
+        older = ScoutSource(
+            id=uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa2"), job_id=job.id,
+            canonical_url=url, official=True, retrieval_mechanism="direct",
+            content_hash="a" * 64, raw_ref="raw/" + "a" * 64,
+            retrieved_at=now - timedelta(minutes=5),
+        )
+        db.add_all((newer, older))
+        db.flush()
+        db.add(ScoutFinding(
+            job_id=job.id, source_id=newer.id, title="Retained version", what_happened="Official text retained",
+            excerpt="Official text", excerpt_hash="c" * 64, confidence=1.0, extractor_version="test",
+        ))
+        db.commit()
+        job_id = job.id
+    with TestClient(app) as client:
+        headers = {"x-test-customer": str(owner.id)}
+        saved = client.post(f"/api/v1/scout/jobs/{job_id}/monitor", json={}, headers=headers)
+        assert saved.status_code == 201
+        monitor_id = saved.json()["monitor"]["id"]
+        history = client.get(f"/api/v1/scout/monitors/{monitor_id}/runs", headers=headers)
+        assert history.status_code == 200
+    snapshot = history.json()["runs"][0]["source_snapshot"]
+    latest_only = {"sources": [{"canonical_url": url, "content_hash": "b" * 64}]}
+    # Retain both evidence references, but compare the newest version in either
+    # baseline/current position. A retry must not manufacture an A↔B change.
+    assert len(snapshot["sources"]) == 2
+    for before, after in ((snapshot, latest_only), (latest_only, snapshot)):
+        result = compare_snapshots(before, after, complete=True)
+        assert result["changed_sources"] == []
+        assert result["unchanged_source_count"] == 1
 
 
 def test_scout_creation_snapshots_document_processing_caps(monkeypatch):
