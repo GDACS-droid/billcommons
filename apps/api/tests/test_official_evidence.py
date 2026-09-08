@@ -198,3 +198,37 @@ def test_missing_blob_is_404_and_closes(monkeypatch):
         official_evidence.blob("a" * 64)
     assert failure.value.status_code == 404
     assert db.closed
+
+
+@pytest.mark.parametrize('enabled,status,age,observed,expected', [
+    (False, 'failed', 0, True, 'disabled'),
+    (True, None, 0, False, 'not_observed'),
+    (True, 'failed', 0, True, 'failed'),
+    (True, 'succeeded', 3601, True, 'observation_overdue'),
+    (True, 'succeeded', 0, True, 'observed'),
+])
+def test_overview_distinguishes_observation_health(monkeypatch, enabled, status, age, observed, expected):
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    row = dict(abbreviation='CA', id=uuid.uuid4(), adapter_name='fixture',
+               source_url='https://example.invalid', scope={}, enabled=enabled,
+               cadence_seconds=3600, next_check_at=now, consecutive_failures=0,
+               observation_id=uuid.uuid4() if observed else None,
+               retrieved_at=now - timedelta(seconds=age) if observed else None,
+               status=status, error_class=None, raw_sha256=None, record_count=0)
+    db = _DB([row])
+    monkeypatch.setattr(official_evidence, 'get_session', lambda: db)
+    body = official_evidence.overview()
+    state = next(item for item in body['items'] if item['jurisdiction'] == 'CA')
+    assert state['targets'][0]['state'] == expected
+    assert state['official_freshness'] == 'unverified'
+    assert db.closed
+
+
+def test_overview_refuses_silent_inventory_truncation(monkeypatch):
+    db = _DB([{}] * 1001)
+    monkeypatch.setattr(official_evidence, 'get_session', lambda: db)
+    with pytest.raises(HTTPException) as error:
+        official_evidence.overview()
+    assert error.value.status_code == 503
+    assert db.closed

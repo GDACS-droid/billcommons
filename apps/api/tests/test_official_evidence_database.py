@@ -89,3 +89,19 @@ def test_real_evidence_queries_paginate_and_serve_exact_retained_bytes(client, r
     assert blob.content == data
     assert blob.headers["content-type"] == "application/octet-stream"
     assert blob.headers["x-content-type-options"] == "nosniff"
+
+
+def test_overview_covers_missing_states_and_never_promotes_discovery(client, retained_evidence):
+    observation_id, digest, _ = retained_evidence
+    response = client.get("/api/v1/official-evidence/overview")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["jurisdiction_count"] == 51
+    states = {item["jurisdiction"]: item for item in body["items"]}
+    assert len(states) == 51
+    assert states["WY"]["targets"] == []
+    assert all(item["official_freshness"] == "unverified" for item in states.values())
+    target = next(item for item in states["CA"]["targets"]
+                  if item["observation_id"] == str(observation_id))
+    assert target["raw_sha256"] == digest
+    assert target["state"] == "disabled"

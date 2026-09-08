@@ -465,7 +465,8 @@ def build_report(evidence: Iterable[JurisdictionEvidence], *, now: datetime | No
                 ),
                 "official_reconciliation": {
                     "state": RECONCILIATION_UNAVAILABLE,
-                    "reason": "No persisted differential result against a freshly read official source exists.",
+                    "reason": "This local ingestion report does not assess official observations or differential results.",
+                    "evidence_url": f"/api/v1/official-evidence/observations?jurisdiction={item.abbreviation}",
                 },
             }
         )
@@ -478,6 +479,7 @@ def build_report(evidence: Iterable[JurisdictionEvidence], *, now: datetime | No
             "official_freshness": "unverified",
             "official_freshness_reason": "This command performs no official-source fetch and local timestamps cannot prove source freshness.",
             "official_reconciliation": RECONCILIATION_UNAVAILABLE,
+            "official_evidence_overview_url": "/api/v1/official-evidence/overview",
         },
         "summary": {
             "jurisdiction_count": len(rows),
