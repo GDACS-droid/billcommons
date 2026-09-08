@@ -1,0 +1,323 @@
+"""PostgreSQL contracts for the durable, non-mutating CA observation worker.
+
+Run these only through the disposable-Postgres harness below.  Each test uses
+an outer rollback transaction, while a separate session verifies SKIP LOCKED.
+"""
+from __future__ import annotations
+
+import csv
+import hashlib
+import io
+import json
+import zipfile
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import delete, func, select
+from sqlalchemy.orm import Session
+
+from billcommons_ingest import official_ca_actions as ca_actions
+from billcommons_ingest import official_observer as observer
+from billcommons_schema.models import (
+    Bill,
+    BillAction,
+    Jurisdiction,
+    OfficialRawBlob,
+    OfficialReconciliationRun,
+    OfficialSourceObservation,
+    OfficialSourceTarget,
+    Session as SessionModel,
+)
+from billcommons_shared.db import get_engine
+from billcommons_shared.normalize import normalize_bill_number
+
+NOW = datetime(2026, 9, 7, 16, tzinfo=timezone.utc)
+
+
+def _tsv(rows: list[list[str]]) -> bytes:
+    stream = io.StringIO(newline="")
+    csv.writer(stream, delimiter="\t", quotechar="`", lineterminator="\n").writerows(rows)
+    return stream.getvalue().encode()
+
+
+def _archive(*, official_bill_id: str = "202520260AB12", history_id: str = "101") -> bytes:
+    bill = [official_bill_id, "20252026", "0", "AB", "12"] + [""] * 14
+    history = [
+        official_bill_id, history_id, "2026-09-01 00:00:00", "Read first time.", "src",
+        "2026-09-01 12:00:00", "1", "x", "x", "x", "x", "x", "x",
+    ]
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("BILL_TBL.dat", _tsv([bill]))
+        archive.writestr("BILL_HISTORY_TBL.dat", _tsv([history]))
+    return out.getvalue()
+
+
+def _captured(raw: bytes):
+    return ca_actions.CapturedCaOfficialActionsResponse(
+        source_url=ca_actions.ca_delta_url("Mon"),
+        raw_bytes=raw,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        retrieved_at=NOW,
+        upstream_modified="Sun, 07 Sep 2026 15:30:00 GMT",
+    )
+
+
+def _target(db_session, unique_abbr, *, due: datetime = NOW, scope=None, source_url=None):
+    jurisdiction = Jurisdiction(name="Test California", abbreviation=unique_abbr("ZZ_CA"), classification="state")
+    db_session.add(jurisdiction)
+    db_session.flush()
+    target = OfficialSourceTarget(
+        jurisdiction_id=jurisdiction.id,
+        adapter_name=observer.ADAPTER_NAME,
+        source_url=source_url or ca_actions.ca_delta_url("Mon"),
+        scope=scope if scope is not None else {"day": "Mon", "sessions": ["special1", "20252026 regular"]},
+        enabled=True,
+        cadence_seconds=300,
+        next_check_at=due,
+    )
+    db_session.add(target)
+    db_session.flush()
+    # The adapter protects the exact external CA scope; tests use disposable
+    # jurisdiction rows, so only their abbreviation needs to be California.
+    jurisdiction.abbreviation = "CA"
+    db_session.flush()
+    return jurisdiction, target
+
+
+def _local_bill(db_session, jurisdiction: Jurisdiction, *, identifier="AB 12") -> Bill:
+    session = SessionModel(
+        jurisdiction_id=jurisdiction.id,
+        identifier=ca_actions.REGULAR_SESSION_IDENTIFIER,
+        classification="regular",
+        active=True,
+    )
+    db_session.add(session)
+    db_session.flush()
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session.id,
+        identifier=identifier,
+        identifier_norm=normalize_bill_number(identifier),
+        title="Test bill",
+    )
+    db_session.add(bill)
+    db_session.flush()
+    return bill
+
+
+def test_success_records_verified_raw_replayable_diff_and_never_mutates_actions(db_session, unique_abbr, monkeypatch):
+    jurisdiction, target = _target(db_session, unique_abbr)
+    bill = _local_bill(db_session, jurisdiction)
+    local = BillAction(
+        bill_id=bill.id,
+        description="Read first time.",
+        action_date=NOW.date() - timedelta(days=6),
+        source_name="older-import",
+        upstream_id="ca-history:101",
+    )
+    ignored = BillAction(
+        bill_id=bill.id,
+        description="Other source fact",
+        action_date=NOW.date(),
+        upstream_id="openstates:unrelated",
+    )
+    db_session.add_all((local, ignored))
+    db_session.flush()
+    raw = _archive()
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: _captured(raw))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result is not None
+    assert (result.status, result.record_count, result.reconciliation_count) == ("succeeded", 1, 1)
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert observation.upstream_updated_at == datetime(2026, 9, 7, 15, 30, tzinfo=timezone.utc)
+    assert observation.scope["coverage"] == "delta_only"
+    assert db_session.get(OfficialRawBlob, observation.raw_sha256).data == raw
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    assert run.status == "completed"
+    assert run.bill_id == bill.id
+    assert run.local_snapshot_sha256 and run.diff_sha256
+    report = json.loads(db_session.get(OfficialRawBlob, run.diff_sha256).data)
+    assert report["summary"]["matched"] == 1
+    assert report["summary"]["local_records"] == 1
+    assert db_session.get(BillAction, local.id).description == "Read first time."
+    assert db_session.get(BillAction, ignored.id).description == "Other source fact"
+    assert target.consecutive_failures == 0
+    assert target.next_check_at == NOW + timedelta(seconds=300)
+
+
+def test_malformed_archive_retains_raw_invalid_observation_and_backoff(db_session, unique_abbr, monkeypatch):
+    _, target = _target(db_session, unique_abbr)
+    raw = b"not a ZIP"
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: _captured(raw))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "invalid"
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.status == "invalid"
+    assert observation.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert db_session.get(OfficialRawBlob, observation.raw_sha256).data == raw
+    assert observation.error_class == "OfficialCaActionsError"
+    assert target.consecutive_failures == 1
+    assert target.next_check_at == NOW + timedelta(seconds=300)
+
+
+def test_failed_fetch_stores_no_raw_and_uses_durable_backoff(db_session, unique_abbr, monkeypatch):
+    _, target = _target(db_session, unique_abbr)
+
+    def unavailable(day: str):
+        raise RuntimeError("never persist upstream message or URL tokens")
+
+    monkeypatch.setattr(observer, "_capture_ca_response", unavailable)
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "failed"
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.raw_sha256 is None
+    assert observation.error_class == "RuntimeError"
+    assert db_session.scalar(select(func.count()).select_from(OfficialRawBlob)) == 0
+    assert target.consecutive_failures == 1
+    assert target.next_check_at == NOW + timedelta(seconds=300)
+
+
+def test_missing_local_mapping_is_partial_and_does_not_guess_a_bill(db_session, unique_abbr, monkeypatch):
+    _, target = _target(db_session, unique_abbr)
+    raw = _archive()
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: _captured(raw))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "succeeded"
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    assert run.status == "partial"
+    assert run.bill_id is None
+    assert run.summary == {"reason": "local_session_missing_or_ambiguous"}
+    assert run.local_snapshot_sha256 is None
+    assert run.diff_sha256 is None
+    assert target.consecutive_failures == 0
+
+
+def test_invalid_target_is_observed_without_calling_external_capture(db_session, unique_abbr, monkeypatch):
+    _, target = _target(
+        db_session,
+        unique_abbr,
+        scope={"day": "Mon", "sessions": ["20252026 regular", "special1"], "extra": True},
+    )
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: (_ for _ in ()).throw(AssertionError("should not fetch")))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "invalid"
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.status == "invalid"
+    assert observation.error_class == "InvalidOfficialTarget"
+    assert target.next_check_at == NOW + timedelta(seconds=300)
+
+
+def test_due_claim_uses_skip_locked_and_no_due_target_returns_none(db_session, unique_abbr):
+    # A second connection can only prove SKIP LOCKED after it can see a
+    # committed target.  Seed it outside db_session's rollback transaction.
+    seed = Session(get_engine(), autoflush=False)
+    try:
+        jurisdiction = Jurisdiction(name="Lock Test California", abbreviation="CA", classification="state")
+        seed.add(jurisdiction)
+        seed.flush()
+        target = OfficialSourceTarget(
+            jurisdiction_id=jurisdiction.id,
+            adapter_name=observer.ADAPTER_NAME,
+            source_url=ca_actions.ca_delta_url("Mon"),
+            scope={"day": "Mon", "sessions": ["20252026 regular", "special1"]},
+            enabled=True,
+            cadence_seconds=300,
+            next_check_at=NOW,
+        )
+        seed.add(target)
+        seed.commit()
+        target_id = target.id
+        jurisdiction_id = jurisdiction.id
+    finally:
+        seed.close()
+    locker = Session(get_engine(), autoflush=False)
+    locker.execute(select(OfficialSourceTarget).where(OfficialSourceTarget.id == target_id).with_for_update())
+    other = Session(get_engine(), autoflush=False)
+    try:
+        assert observer.observe_due_target(other, now=NOW) is None
+        other.rollback()
+    finally:
+        other.close()
+        locker.rollback()
+        locker.close()
+    cleaner = Session(get_engine(), autoflush=False)
+    cleaner.execute(
+        OfficialSourceTarget.__table__.update()
+        .where(OfficialSourceTarget.id == target_id)
+        .values(next_check_at=NOW + timedelta(seconds=1))
+    )
+    cleaner.commit()
+    assert observer.observe_due_target(cleaner, now=NOW) is None
+    # The disposable harness removes its database after the run; clean this
+    # committed seed now so the test also remains repeatable in one database.
+    cleaner.execute(delete(OfficialSourceTarget).where(OfficialSourceTarget.id == target_id))
+    cleaner.execute(delete(Jurisdiction).where(Jurisdiction.id == jurisdiction_id))
+    cleaner.commit()
+    cleaner.close()
+
+
+def test_repeated_unchanged_capture_reuses_content_addressed_evidence(db_session, unique_abbr, monkeypatch):
+    jurisdiction, target = _target(db_session, unique_abbr)
+    bill = _local_bill(db_session, jurisdiction)
+    db_session.add(
+        BillAction(
+            bill_id=bill.id,
+            description="Read first time.",
+            action_date=NOW.date() - timedelta(days=6),
+            upstream_id="ca-history:101",
+        )
+    )
+    raw = _archive()
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: _captured(raw))
+
+    first = observer.observe_due_target(db_session, now=NOW)
+    target.next_check_at = NOW
+    db_session.flush()
+    second = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert first and second and first.status == second.status == "succeeded"
+    assert db_session.scalar(select(func.count()).select_from(OfficialSourceObservation)) == 2
+    # Source archive, local fixture, and reconciliation report are unchanged
+    # and therefore each occupy one blob despite two observations.
+    assert db_session.scalar(select(func.count()).select_from(OfficialRawBlob)) == 3
+
+
+def test_explicit_ca_history_identity_reports_unpaired_events_without_guessing(db_session, unique_abbr, monkeypatch):
+    jurisdiction, _ = _target(db_session, unique_abbr)
+    bill = _local_bill(db_session, jurisdiction)
+    db_session.add(
+        BillAction(
+            bill_id=bill.id,
+            description="Read first time.",
+            action_date=NOW.date() - timedelta(days=6),
+            upstream_id="ca-history:different-id",
+        )
+    )
+    raw = _archive(history_id="101")
+    monkeypatch.setattr(observer, "_capture_ca_response", lambda day: _captured(raw))
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "succeeded"
+    run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
+    report = json.loads(db_session.get(OfficialRawBlob, run.diff_sha256).data)
+    assert report["summary"]["matched"] == 0
+    assert report["summary"]["missing_from_local"] == 1
+    assert report["summary"]["local_only_not_deletion"] == 1
