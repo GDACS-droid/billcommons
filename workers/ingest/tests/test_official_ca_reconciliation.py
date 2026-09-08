@@ -121,6 +121,8 @@ def test_scope_identifiers_remain_exact_for_links_to_source_and_run():
     assert report['scope']['bill_id'] == item['bill_id']
     assert report['scope']['session'] == item['session']
     assert report['official_only_content'][0]['content']['bill_id'] == item['bill_id']
+    evidence = report['official_only_content'][0]['official_evidence'][0]['content_evidence']
+    assert {key: evidence[key] for key in report['scope']} == report['scope']
     with pytest.raises(ReconciliationInputError, match='mixed jurisdiction'):
         reconcile_ca_action_content([item], [{**item, 'bill_id': item['bill_id'].lower()}])
 

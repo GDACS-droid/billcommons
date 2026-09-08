@@ -323,6 +323,20 @@ def test_fetch_nonstandard_status_remains_a_structured_source_failure(status):
     assert exc_info.value.diagnostic_details == {}
 
 
+def test_negative_content_length_is_invalid_source_metadata_not_a_capture_limit():
+    def negative_length(request):
+        return httpx.Response(200, request=request, headers={"Content-Length": "-1"}, content=b"unused")
+
+    with httpx.Client(transport=httpx.MockTransport(negative_length)) as client:
+        with pytest.raises(adapter.OfficialCaActionsError) as exc_info:
+            adapter.fetch_ca_official_actions_response("Mon", client=client, retrieved_at=RETRIEVED_AT)
+    from billcommons_ingest.official_diagnostics import failure_diagnosis
+    diagnosis = failure_diagnosis(exc_info.value, stage="capture")
+    assert diagnosis["code"] == "invalid_content_length"
+    assert diagnosis["recommended_action"] == "review_source_endpoint"
+    assert "details" not in diagnosis
+
+
 def test_fetch_rejects_http_status_and_stream_bytes_when_content_length_lies():
     def unavailable(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, request=request)

@@ -112,7 +112,7 @@ def _events(fixture: Any, side: str) -> list[_Event]:
 def _evidence(event: _Event) -> dict[str, Any]:
     return {
         "content_evidence": {
-            "jurisdiction": event.scope[0], "session": event.scope[1], "bill_id": event.scope[2],
+            "jurisdiction": event.scope[0].upper(), "session": event.scope[1], "bill_id": event.scope[2],
             "date": event.date, "description": event.description,
         },
         "original_evidence": event.raw,

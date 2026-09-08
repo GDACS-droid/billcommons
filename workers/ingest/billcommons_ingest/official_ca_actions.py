@@ -563,7 +563,12 @@ def fetch_ca_official_actions_response(
                         "official CA delta has invalid Content-Length",
                         code="invalid_content_length",
                     ) from exc
-                if declared_length < 0 or declared_length > MAX_RESPONSE_BYTES:
+                if declared_length < 0:
+                    raise OfficialCaActionsError(
+                        "official CA delta has invalid Content-Length",
+                        code="invalid_content_length",
+                    )
+                if declared_length > MAX_RESPONSE_BYTES:
                     raise OfficialCaActionsError(
                         "official CA delta Content-Length exceeds response cap",
                         code="content_length_limit_exceeded",
