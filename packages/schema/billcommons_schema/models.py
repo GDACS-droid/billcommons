@@ -710,6 +710,86 @@ class DerivedStatusEvidence(UUIDPkMixin, Base):
     )
 
 
+class TlsFulltextRepair(UUIDPkMixin, TimestampMixin, Base):
+    """One explicitly approved, bounded retry after a verified TLS repair.
+
+    This is not the ordinary fetch queue.  It records why a document exhausted
+    normal retries can receive a narrowly scoped retry without clearing its
+    normal retry budget or reopening terminal document classes generally.
+    """
+
+    __tablename__ = "tls_fulltext_repairs"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bill_documents.id", ondelete="CASCADE"), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    remediation_version: Mapped[str] = mapped_column(Text, nullable=False)
+    source_dead_job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("ingest_jobs.id"), nullable=False
+    )
+    source_error_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'planned'"))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("2"))
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reservation_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    reserved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id", "reason", "remediation_version", name="uq_tls_repair_document_reason_version"
+        ),
+        CheckConstraint("reason = 'missing_tls_intermediate'", name="ck_tls_repair_reason"),
+        CheckConstraint(
+            "status IN ('planned','reserved','succeeded','exhausted','expired','skipped')",
+            name="ck_tls_repair_status",
+        ),
+        CheckConstraint("attempts BETWEEN 0 AND max_attempts", name="ck_tls_repair_attempts"),
+        CheckConstraint("max_attempts BETWEEN 1 AND 2", name="ck_tls_repair_max_attempts"),
+        CheckConstraint(
+            "source_error_sha256 ~ '^[0-9a-f]{64}$'", name="ck_tls_repair_error_hash"
+        ),
+        Index(
+            "ix_tls_repair_due",
+            "next_attempt_at",
+            postgresql_where=text("status = 'planned'"),
+            sqlite_where=text("status = 'planned'"),
+        ),
+    )
+
+
+class TlsFulltextRepairAttempt(UUIDPkMixin, Base):
+    """Immutable outcome of one outbound TLS-repair fetch attempt."""
+
+    __tablename__ = "tls_fulltext_repair_attempts"
+
+    repair_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tls_fulltext_repairs.id", ondelete="CASCADE"), nullable=False
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    document_status_before: Mapped[str | None] = mapped_column(Text, nullable=True)
+    document_status_after: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("repair_id", "attempt_number", "outcome", name="uq_tls_repair_attempt_event"),
+        CheckConstraint("attempt_number >= 1", name="ck_tls_repair_attempt_number"),
+        CheckConstraint(
+            "outcome IN ('admitted','succeeded','document_fetch_error','unfetchable','terminal_no_text','ineligible','unexpected')",
+            name="ck_tls_repair_attempt_outcome",
+        ),
+        Index("ix_tls_repair_attempt_repair_time", "repair_id", "started_at"),
+    )
+
+
 class IngestionRun(UUIDPkMixin, TimestampMixin, Base):
     """A single run of an ingestion job (bootstrap or incremental)."""
 
