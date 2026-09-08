@@ -310,6 +310,19 @@ def test_parse_rejects_zip_bomb_and_crc_failure_before_table_parsing():
         adapter.parse_ca_official_actions_zip(bytes(corrupted), source_url=adapter.ca_delta_url("Mon"), retrieved_at=RETRIEVED_AT)
 
 
+@pytest.mark.parametrize("status", [0, 999])
+def test_fetch_nonstandard_status_remains_a_structured_source_failure(status):
+    def unexpected(request):
+        return httpx.Response(status, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(unexpected)) as client:
+        with pytest.raises(adapter.OfficialCaActionsError) as exc_info:
+            adapter.fetch_ca_official_actions_response("Mon", client=client, retrieved_at=RETRIEVED_AT)
+    assert exc_info.value.diagnostic_code == "http_status_unexpected"
+    assert exc_info.value.http_status is None
+    assert exc_info.value.diagnostic_details == {}
+
+
 def test_fetch_rejects_http_status_and_stream_bytes_when_content_length_lies():
     def unavailable(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, request=request)

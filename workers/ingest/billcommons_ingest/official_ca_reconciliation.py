@@ -43,7 +43,7 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def _normalized_string(raw: Mapping[str, Any], field: str, *, required: bool = False) -> str | None:
+def _normalized_string(raw: Mapping[str, Any], field: str, *, required: bool = False, fold_case: bool = True) -> str | None:
     value = raw.get(field)
     if value is None:
         if required:
@@ -51,7 +51,9 @@ def _normalized_string(raw: Mapping[str, Any], field: str, *, required: bool = F
         return None
     if not isinstance(value, str):
         raise ReconciliationInputError(f"CA event field {field!r} must be a string or null")
-    normalized = " ".join(value.split()).casefold()
+    normalized = " ".join(value.split())
+    if fold_case:
+        normalized = normalized.casefold()
     if not normalized and required:
         raise ReconciliationInputError(f"CA event field {field!r} is required for scope")
     return normalized or None
@@ -90,7 +92,7 @@ def _event(raw: Any) -> _Event:
     jurisdiction = _normalized_string(raw, "jurisdiction", required=True)
     if jurisdiction != CA_JURISDICTION:
         raise ReconciliationInputError("CA content comparison requires jurisdiction 'CA'")
-    scope = (jurisdiction, _normalized_string(raw, "session", required=True), _normalized_string(raw, "bill_id", required=True))
+    scope = (jurisdiction, _normalized_string(raw, "session", required=True, fold_case=False), _normalized_string(raw, "bill_id", required=True, fold_case=False))
     description = _normalized_string(raw, "description")
     text = _normalized_string(raw, "text")
     if description is not None and text is not None and description != text:
@@ -181,7 +183,7 @@ def reconcile_ca_action_content(official_fixture: Any, local_fixture: Any, *, sc
     report = {
         "schema_version": 1,
         "comparator_version": COMPARATOR_VERSION,
-        "interpretation": "Content agreement is not occurrence proof and this report proposes no deletion, insertion, or identity mutation.",
+        "interpretation": "Counts compare retained records, not identified occurrences. Content agreement is not occurrence proof; local-only content does not imply deletion, and official-only content does not authorize insertion.",
         "scope": {"jurisdiction": scope[0].upper(), "session": scope[1], "bill_id": scope[2]},
         "summary": {"official_records": len(official), "local_records": len(local), "content_agreement": len(agreement),
                     "official_only_content": len(official_only), "local_only_content": len(local_only),

@@ -105,3 +105,29 @@ def test_overview_covers_missing_states_and_never_promotes_discovery(client, ret
                   if item["observation_id"] == str(observation_id))
     assert target["raw_sha256"] == digest
     assert target["state"] == "disabled"
+
+
+def test_api_preserves_legacy_and_content_summary_versions(client, retained_evidence):
+    """The public reader returns each comparator's opaque summary unchanged."""
+    from billcommons_ingest.official_ca_reconciliation import COMPARATOR_VERSION, reconcile_ca_action_content
+    observation_id, _, _ = retained_evidence
+    event = {'jurisdiction': 'CA', 'session': '2025-2026 Regular Session',
+             'bill_id': '202520260AB12', 'date': '2026-09-01', 'description': 'Read first time.'}
+    current = reconcile_ca_action_content([event], [event])['summary']
+    legacy = {'official_records': 1, 'local_records': 1, 'matched': 1,
+              'missing_from_local': 0, 'local_only_not_deletion': 0,
+              'mismatched_evidence': 0, 'uncertain_evidence': 0, 'ambiguous_identities': 0}
+    with get_session() as db:
+        runs = list(db.scalars(select(OfficialReconciliationRun).where(
+            OfficialReconciliationRun.observation_id == observation_id).order_by(OfficialReconciliationRun.official_bill_id)))
+        runs[0].comparator_version = 'reconcile-events/1'
+        runs[0].summary = legacy
+        runs[1].comparator_version = COMPARATOR_VERSION
+        runs[1].summary = current
+        db.commit()
+    response = client.get('/api/v1/official-evidence/reconciliations', params={'observation_id': str(observation_id)})
+    assert response.status_code == 200
+    by_version = {item['comparator_version']: item['summary'] for item in response.json()['items']}
+    assert by_version['reconcile-events/1'] == legacy
+    assert by_version[COMPARATOR_VERSION] == current
+    assert 'matched' not in by_version[COMPARATOR_VERSION]

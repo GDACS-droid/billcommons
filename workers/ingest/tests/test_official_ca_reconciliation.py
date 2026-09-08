@@ -113,3 +113,32 @@ def test_record_and_output_size_caps_fail_closed(monkeypatch):
     monkeypatch.setattr(comparator, 'MAX_REPORT_BYTES', 100)
     with pytest.raises(ReconciliationInputError, match='report exceeds'):
         reconcile_ca_action_content([event()], [event()])
+
+
+def test_scope_identifiers_remain_exact_for_links_to_source_and_run():
+    item = event()
+    report = reconcile_ca_action_content([item], [])
+    assert report['scope']['bill_id'] == item['bill_id']
+    assert report['scope']['session'] == item['session']
+    assert report['official_only_content'][0]['content']['bill_id'] == item['bill_id']
+    with pytest.raises(ReconciliationInputError, match='mixed jurisdiction'):
+        reconcile_ca_action_content([item], [{**item, 'bill_id': item['bill_id'].lower()}])
+
+
+def test_mixed_local_sources_can_agree_on_content_without_proving_occurrences():
+    official = [event(history_id='a'), event(history_id='b')]
+    local = [event(history_id='old', local_source_name='ca_history_import'),
+             event(history_id='unrelated', source_identity=None, occurrence_id=None, local_source_name='openstates_api_sync')]
+    report = reconcile_ca_action_content(official, local)
+    agreement = report['content_agreement'][0]
+    assert agreement['official_count'] == agreement['local_count'] == 2
+    assert agreement['agreement'] == 'repeated_content_multiset_agreement'
+    assert agreement['occurrence_proof'] is False
+    assert 'matched' not in report['summary']
+    assert [e['original_evidence']['local_source_name'] for e in agreement['local_evidence']] == ['ca_history_import', 'openstates_api_sync']
+
+
+def test_declared_unknown_date_is_never_exact_day_evidence():
+    report = reconcile_ca_action_content([event(date='2026-09-01', date_precision='unknown')], [event()])
+    assert report['summary']['content_agreement'] == 0
+    assert report['summary']['ambiguous_insufficient_evidence'] == 1

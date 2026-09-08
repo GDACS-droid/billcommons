@@ -144,3 +144,21 @@ def test_malformed_recorded_diagnosis_is_not_echoed(db_session, unique_abbr):
     plan = plan_observation_repair(db_session, obs.id)
     assert plan['recommended_action'] == 'collect_next_scheduled_capture_diagnosis'
     assert 'recorded_failure' not in plan
+
+
+@pytest.mark.parametrize('error,stage,code,action', [
+    (ca.OfficialCaActionsError('private compatibility detail'), 'capture', 'source_contract_failure', 'review_source_endpoint'),
+    (ValueError('private adapter detail'), 'capture', 'adapter_failure', 'inspect_adapter_failure'),
+    (ca.OfficialCaActionsError('private compatibility detail'), 'parse', 'source_contract_failure', 'review_source_schema'),
+    (RuntimeError('private adapter detail'), 'replay', 'adapter_failure', 'inspect_adapter_failure'),
+])
+def test_observer_generic_diagnosis_survives_planner_validation(db_session, unique_abbr, error, stage, code, action):
+    from billcommons_ingest.official_diagnostics import failure_diagnosis
+    _, obs = _failed(db_session, unique_abbr)
+    obs.scope = {'failure': failure_diagnosis(error, stage=stage)}
+    db_session.flush()
+    plan = plan_observation_repair(db_session, obs.id)
+    assert plan['recorded_failure']['code'] == code
+    assert plan['recorded_failure']['stage'] == stage
+    assert plan['recommended_action'] == action
+    assert 'private' not in str(plan)

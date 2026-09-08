@@ -50,7 +50,7 @@ CODE_ACTIONS = {
     "archive_crc_or_invalid_zip": "review_source_schema",
     "observation_deadline_exceeded": "retry_as_scheduled",
 }
-ALLOWED_CODES = frozenset(CODE_ACTIONS)
+ALLOWED_CODES = frozenset(CODE_ACTIONS) | {"source_contract_failure", "adapter_failure"}
 
 _GENERIC_ACTIONS = {
     "capture": "review_source_endpoint",
@@ -99,7 +99,7 @@ def failure_diagnosis(error: BaseException, *, stage: str) -> dict[str, Any]:
     if stage not in STAGES:
         raise ValueError("unsupported official diagnosis stage")
     code, details = _metadata_from_error(error)
-    if code is not None:
+    if code in CODE_ACTIONS:
         recommended_action = CODE_ACTIONS[code]
         # A bounded status is transport evidence, not endpoint-policy drift:
         # retain the normal failure cadence for rate limits and server errors.
@@ -107,12 +107,12 @@ def failure_diagnosis(error: BaseException, *, stage: str) -> dict[str, Any]:
             details.get("http_status") == 429 or details.get("http_status", 0) >= 500
         ):
             recommended_action = "retry_as_scheduled"
-    elif type(error).__name__ == "OfficialCaActionsError":
+    elif code == "source_contract_failure" or (code is None and type(error).__name__ == "OfficialCaActionsError"):
         # Old callers may construct this exception with arbitrary private text.
         # Its text is deliberately neither inspected nor persisted.
         code = "source_contract_failure"
         recommended_action = _GENERIC_ACTIONS[stage]
-    elif type(error).__name__ == "ObservationDeadlineExceeded":
+    elif code is None and type(error).__name__ == "ObservationDeadlineExceeded":
         code = "observation_deadline_exceeded"
         recommended_action = CODE_ACTIONS[code]
     else:

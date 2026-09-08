@@ -550,7 +550,9 @@ def fetch_ca_official_actions_response(
                 raise OfficialCaActionsError(
                     f"official CA delta fetch failed with HTTP {response.status_code}",
                     code="http_status_unexpected",
-                    http_status=response.status_code,
+                    # Nonstandard wire statuses still fail as source errors;
+                    # only valid HTTP status evidence enters the diagnosis.
+                    http_status=response.status_code if 100 <= response.status_code <= 599 else None,
                 )
             content_length = response.headers.get("Content-Length")
             if content_length is not None:
