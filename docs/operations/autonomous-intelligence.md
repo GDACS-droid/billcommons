@@ -34,7 +34,8 @@ semantic freshness or completeness.
   applicable checks.
 - First-stage aggregate review: `c3ec3c5`, exact binary diff from baseline
   `26e99e2` checked against the release source. Canonical nine-family run:
-  `/home/alberto/verify-runs/20260908T031416Z-c3ec3c5` (pending).
+  `/home/alberto/verify-runs/20260908T031416Z-c3ec3c5` (completed: eight SHIP,
+  one BLOCK, zero dead families; owner adjudication below).
 - Earlier reviews found real case-normalization, undated-run ordering,
   quota-delayed queue age, canonical-inventory, bounded-query, cache and test
   routing defects. These are repaired and have focused regression coverage.
@@ -220,3 +221,41 @@ database read fails. Exact before/apply/rollback metadata is retained in the
 release evidence directory. No config mutation has run. The separate restore
 environment is excluded. Canonical first-stage review remains pending its
 last family and advocate; eight completed families currently report SHIP.
+
+## First API rollout — 2026-09-08 03:44 UTC
+
+The canonical tool returned BLOCK: eight SHIP, one DeepSeek BLOCK, no dead
+families; the advocate returned CONSENSUS-STANDS. The owner checked all
+dissenting mechanisms against exact source. Cache writers share one lock;
+PostgreSQL permits transaction attributes as the first statement after BEGIN;
+all 503 paths already set no-store; zero deferred count cannot enter the JSX
+branch. Trusted checkout responses come directly from Stripe, and magic-link
+success is actually HTTP202. The hypothetical compromised-API/error-200 cases
+are not demonstrated regressions. The advocate's NULL cases are excluded by
+actual production NOT NULL constraints. Two exact-source live, read-only
+report loads passed in 3.266/1.616 seconds; the slowest SQL took0.436 seconds.
+The current bounds have measured headroom; future corpus growth remains an
+operational risk. Owner adjudication accepted the source without pretending
+the tool's BLOCK was a unanimous pass. The complete safe adjudication and live
+proof are retained in the release evidence directory.
+
+Only the API is deploying in this action. Production-specific readiness
+configuration was applied and read back: `/api/v1/data-health`, timeout300,
+draining60, overlap0. Restore environment config ETag remained unchanged.
+The exact frozen Git archive contained476 verified tracked files, SHA-256
+`cdc7343e4656a675b1b9ae28e165b9ed7c0172fb27893e7f4aee2a41256d2885`.
+Railway accepted API deployment `c2537036-b510-48a8-8fcc-20e1aaa2135c`.
+A deterministic monitor watches that ID through startup and900 seconds of
+repeated health/readiness/report/bill/web/MCP proof. Its handle is
+`api-c2537036-b510-48a8-8fcc-20e1aaa2135c`; state is
+`~/.local/share/billcommons/reliability-release-20260908/api-c2537036-monitor.json`.
+Rollback restores the readiness fields from the recorded null baseline before
+redeploying prior API artifact `5828ea8b-6a85-4ca6-b453-f76e604ad374`.
+No schema migration or worker cutover occurred with this API action.
+
+The current integrated web production build, TypeScript and lint passed.
+Rendered desktop/mobile tests passed with zero browser errors or failed
+responses, including German locale, deferred/info-only reporting, optional
+source failure, core report failure, filters and both bill evidence links.
+A stale browser assertion expected text without the new “Includes” prefix;
+inspection confirmed the intended text and the corrected assertion passed.
