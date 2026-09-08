@@ -13,12 +13,12 @@ in the original checkout are preserved. The canonical inventory covers 50 states
 plus DC. Generic website observation is never treated as proof of statewide
 semantic freshness or completeness.
 
-## Acceptance and present limits — 2026-09-08 10:54 UTC
+## Acceptance and present limits — 2026-09-08 12:36 UTC
 
 The deployed and hash-bound release status is recorded in
 [data-reliability-control-plane.md](data-reliability-control-plane.md) and its
 [sanitized deployment summary](evidence/reliability-20260908/deployment-summary.json).
-API and Scout run `5126bec`; sync runs `c05ae42`; web runs `f610d67` with Scout enabled; the recurring official worker
+API and Scout run `0d606c2`; sync runs `c05ae42`; web runs `f85b990` with Florida and California Scout enabled; the recurring official worker
 runs `e155da7`. The additive migrations through `0030` are applied, and the
 initial UTC-day source budget was conservatively seeded at its full
 225-request allowance. The official worker has completed two healthy cycles
@@ -33,9 +33,25 @@ after the 59-target inventory was restored and enabled.
 | Operate autonomously | Dedicated recurring worker, durable schedule/backoff, 300-second hard observation deadline, real claim pause and graceful shutdown; two healthy `e155da7` cycles after all 59 targets were enabled | Broader semantic state coverage, automatic discrepancy remediation, durable saved-topic product workflow |
 | Deploy | API, web, sync and official worker deployed with immutable source/archive/image bindings, restored backup and post-deploy runtime/browser proof | Generic-worker cutover and held TX repair; the full objective remains active |
 
+### California Scout retained evidence — 12:36 UTC
+
+The API/Scout `0d606c2` and web `f85b990` releases passed the retained-source
+replay, live owner canary, sixteen sustained health samples and actual public
+desktop/mobile browser checks. `AB 1039 2025-2026` returned the selected official
+archive action with its exact source hash and original retrieval time. The
+worker used retained bytes, made no upstream/browser request and left the local
+bill/action corpus unchanged. Both browser submissions reused the same job;
+the second corrected a test-helper label assertion. Job count remained ten.
+
+The interface explicitly says the weekday delta does not establish current or
+complete California history. Broader CA material discovery and comprehensive
+Florida coverage remain gaps. Saved monitors are implemented and undergoing
+their separate final review, backup/restore and additive `0031` release gates;
+they are not included in this deployed source.
+
 ### Florida Scout vote evidence and public web — 10:54 UTC
 
-API and Scout source `5126bec` are deployed. The completed owner request for
+API and Scout source `5126bec` were deployed at this stage. The completed owner request for
 HB 625 returned four findings, including one official House vote PDF, using
 four external requests and no browser requests. The vote source SHA-256 is
 `0e788cee07ffb5861b9cf857f5c94285b742cd6b24fcab7c70405224c26ed7ea`;

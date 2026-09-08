@@ -11,11 +11,11 @@ state, or a freshness SLA.
 
 | Unit | Source | Deployment | Evidence |
 | --- | --- | --- | --- |
-| API | `5126becb1fb9` | `cc670ca3-a419-4072-a03a-bdcf46e70f94` | 16 passing samples over 15 minutes; health, readiness, report, bill, web and MCP; live Scout owner canary |
+| API | `0d606c2500d5` | `0cc40220-dde3-4a60-aac6-f5c7bd667a39` | 16 passing samples over 15 minutes; health, readiness, report, bill, web and MCP; live CA retained-archive owner canary |
 | Sync worker | `c05ae429bb1f` | `2a8f43f3-912a-41c5-94c5-37374872ea3c` | Old deployment absent through its nominal wake; new bounded cycle and stable follow-up samples |
-| Web | `f610d67c7e4e` | `dpl_HSW3n7vpBKA8ji9hw1UWS75e7Rex` | Scout-enabled build promoted; actual desktop/mobile research, cache reuse and vote evidence link passed |
+| Web | `f85b990774b8` | `dpl_HLbB8zG5hehDPD2GrgqC9CjDzGrj` | Public FL/CA selector; actual desktop/mobile CA request, cached retained result, original excerpt and archive link passed |
 | Official observer | `e155da72e7a8` | `a19bbb06-8a15-49ed-ad56-9d0e1daf0c32` | CA content comparisons plus FL source-only snapshot; all 59 targets restored and two healthy subsequent cycles |
-| Scout worker | `5126becb1fb9` | `163338d8-a618-4642-a878-4a992dd184f5` | Exact old/intermediate process absence, bounded readiness, completed owner vote canary and cached public UI proof |
+| Scout worker | `0d606c2500d5` | `4d6e94d1-2580-42fb-9158-dcfab5ac173f` | Old process positively absent; two readiness samples; completed CA owner/archive canary and public cached UI proof |
 
 The additive migration from `0025` through `0030` was applied after creating a
 3,211,108,251-byte backup and restoring it into an owned PostgreSQL 18 cluster.
@@ -80,6 +80,29 @@ no-match and clear states, CA evidence details, two actual bill-evidence links,
 mobile overflow and a German browser locale. There were no observed console,
 page or HTTP errors during those interactions. These are bounded checks, not
 proof that every route and device has been tested.
+
+## California Scout retained-archive release — 12:36 UTC
+
+California Scout is public alongside Florida. The live `AB 1039 2025-2026`
+request matched the retained Thursday archive and returned one selected official
+action with its original excerpt, retrieval timestamp, source URL and SHA-256.
+The candidate replay parsed 23 archive actions for the bill; the live canary
+verified the exact retained bytes and owner evidence without changing the local
+bill or its 24 stored actions. It made no upstream or browser-provider request.
+This is a bounded retained delta, not a claim of current or complete history.
+
+API and Scout run `0d606c2`; the web runs `f85b990`. Sixteen health samples over
+more than 15 minutes passed. A real public browser selected California, typed
+the exact measure/session and reused the completed result at desktop and mobile
+widths. It verified the excerpt, archive link and currency disclosure, then
+switched back to Florida. There was no horizontal overflow or observed page,
+console or HTTP error in the completed run; the Scout job count remained ten.
+The first browser attempt had already rendered the correct result but stopped
+on a wrong expected Florida example label in the test helper. A corrected,
+separately journaled cache-only recheck passed and created no additional job.
+
+Saved monitors are a separate, undeployed `0031` change. Their review and current
+backup/restore gate are still in progress; this release does not claim them live.
 
 ## What the system establishes
 

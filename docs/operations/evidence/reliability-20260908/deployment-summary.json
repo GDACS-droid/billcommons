@@ -1,14 +1,14 @@
 {
-  "checked_at": "2026-09-08T10:54:35.384479+00:00",
+  "checked_at": "2026-09-08T12:36:41.894407+00:00",
   "goal_status": "active; full autonomous 50-state semantic intelligence not complete",
   "units": {
     "api": {
-      "deployment_id": "cc670ca3-a419-4072-a03a-bdcf46e70f94",
+      "deployment_id": "0cc40220-dde3-4a60-aac6-f5c7bd667a39",
+      "image_digest": "sha256:f26b9bf8da4e158edc1162916dc38d8ebff2c35fc1a083a430d92f283f4ffbe9",
       "dockerfile": "infra/docker/Dockerfile.api",
-      "image_digest": "sha256:c10efa8cbf3720fd9c96904882d4fc2b51b4ab2593699f091a7a88c3df8bd96b",
       "service_id": "d2b00b96-950a-4adc-8d82-87c09b1ce3d6",
-      "source_sha": "5126becb1fb9066c7c080e35148a7a1435b91adc",
-      "archive_sha256": "b60e27a5003b2acedc7eb911c54fa19b70471b59e844c81e6e5e55282c915dce"
+      "source_sha": "0d606c2500d587622b18567bb6af99bcd045d6e2",
+      "archive_sha256": "f4109530b80adc2d081bfdb0cb3f201c60c16678e4e2bf81528e02f412823aa7"
     },
     "sync_worker": {
       "source_sha": "c05ae429bb1f70fe9656464eac71efbbf0f9b40e",
@@ -23,18 +23,18 @@
       "archive_sha256": "4870293dc981f7d90629f01f7bc3f11d3ed7381dcad5333dfc3b0103e8c0053c"
     },
     "web": {
-      "source_sha": "f610d67c7e4e7b4910ba483bac5779cd407b095f",
-      "deployment_id": "dpl_HSW3n7vpBKA8ji9hw1UWS75e7Rex",
-      "archive_sha256": "36cd3245de93a6999b080ec9d245ec7e562d54ac4988c4952de8f49d8a1265c7",
+      "source_sha": "f85b990774b8b94a8c4967ce7280a7128ce8cc1f",
+      "archive_sha256": "954520a3cdbbbf47c980a5002b7888808a1c6c25a6217d7110a9ee912b77aa7e",
+      "deployment_id": "dpl_HLbB8zG5hehDPD2GrgqC9CjDzGrj",
       "scout_enabled": true
     },
     "scout_worker": {
-      "deployment_id": "163338d8-a618-4642-a878-4a992dd184f5",
+      "deployment_id": "4d6e94d1-2580-42fb-9158-dcfab5ac173f",
+      "image_digest": "sha256:40660de3dfce25fa6fb8452b53c11f9fc3c93129c0e866771cac12cd26c4b4da",
       "dockerfile": "infra/docker/Dockerfile.scout-worker",
-      "image_digest": "sha256:534045d5cf9187820274ed6eaa0e9462b48d98c344122385291fabfb1085b6e3",
       "service_id": "1f614208-b5dd-4f0e-b087-aa5d726bf3e7",
-      "source_sha": "5126becb1fb9066c7c080e35148a7a1435b91adc",
-      "archive_sha256": "b60e27a5003b2acedc7eb911c54fa19b70471b59e844c81e6e5e55282c915dce"
+      "source_sha": "0d606c2500d587622b18567bb6af99bcd045d6e2",
+      "archive_sha256": "f4109530b80adc2d081bfdb0cb3f201c60c16678e4e2bf81528e02f412823aa7"
     }
   },
   "migration": {
@@ -167,7 +167,7 @@
     }
   },
   "health": {
-    "api_15_minute_samples": 16,
+    "api_15_minute_samples": 17,
     "latest_health_status": "passed",
     "latest_defects_by_severity": {
       "critical": 0,
@@ -178,7 +178,7 @@
     "web_browser_errors": 0,
     "web_http_errors": 0,
     "official_post_activation_cycles": 2,
-    "latest_health_checked_at": "2026-09-08T10:49:52.517877+00:00",
+    "latest_health_checked_at": "2026-09-08T12:29:03.910735+00:00",
     "official_e155_post_restore_cycles": 2,
     "official_e155_cycle_monitor": "fl-semantic-live-monitor-e155da7.json: success"
   },
@@ -270,6 +270,28 @@
       "source_sha": "f610d67c7e4e7b4910ba483bac5779cd407b095f",
       "deployment_id": "dpl_3TrSjdBRXHobJSimpppoj27U9WbJ",
       "archive_sha256": "36cd3245de93a6999b080ec9d245ec7e562d54ac4988c4952de8f49d8a1265c7"
+    },
+    "api_before_scout_ca": {
+      "deployment_id": "cc670ca3-a419-4072-a03a-bdcf46e70f94",
+      "dockerfile": "infra/docker/Dockerfile.api",
+      "image_digest": "sha256:c10efa8cbf3720fd9c96904882d4fc2b51b4ab2593699f091a7a88c3df8bd96b",
+      "service_id": "d2b00b96-950a-4adc-8d82-87c09b1ce3d6",
+      "source_sha": "5126becb1fb9066c7c080e35148a7a1435b91adc",
+      "archive_sha256": "b60e27a5003b2acedc7eb911c54fa19b70471b59e844c81e6e5e55282c915dce"
+    },
+    "scout_worker_before_scout_ca": {
+      "deployment_id": "163338d8-a618-4642-a878-4a992dd184f5",
+      "dockerfile": "infra/docker/Dockerfile.scout-worker",
+      "image_digest": "sha256:534045d5cf9187820274ed6eaa0e9462b48d98c344122385291fabfb1085b6e3",
+      "service_id": "1f614208-b5dd-4f0e-b087-aa5d726bf3e7",
+      "source_sha": "5126becb1fb9066c7c080e35148a7a1435b91adc",
+      "archive_sha256": "b60e27a5003b2acedc7eb911c54fa19b70471b59e844c81e6e5e55282c915dce"
+    },
+    "web_before_scout_ca": {
+      "source_sha": "f610d67c7e4e7b4910ba483bac5779cd407b095f",
+      "deployment_id": "dpl_HSW3n7vpBKA8ji9hw1UWS75e7Rex",
+      "archive_sha256": "36cd3245de93a6999b080ec9d245ec7e562d54ac4988c4952de8f49d8a1265c7",
+      "scout_enabled": true
     }
   },
   "scout_vote_release": {
@@ -296,5 +318,62 @@
     "scope": "One bounded FL related-vote record per job; exact retained bytes and provenance; no comprehensive FL or CA coverage claim",
     "worker_cutover": "Old process and config-generated intermediate positively stopped before reviewed replacement; drain 300, overlap 0, one replica",
     "public_api_restoration": "Previously public cohort restored after worker readiness; no additional customers or communications"
+  },
+  "scout_ca_release": {
+    "review_evidence": "scout-ca-review-accepted-0d606c2.json",
+    "web_review_evidence": "web-ca-review-accepted-f85b990.json",
+    "owner_canary": {
+      "status": "passed",
+      "checked_at": "2026-09-08T12:17:58.250966+00:00",
+      "job_id": "7a36bcea-f49f-45a5-8254-6a1ad1709c0c",
+      "cache_reuse_verified": true,
+      "corpus_unchanged": true
+    },
+    "retained_candidate": {
+      "status": "passed",
+      "checked_at": "2026-09-08T12:02:14.476022+00:00",
+      "source_sha": "0d606c2500d587622b18567bb6af99bcd045d6e2",
+      "query": "AB 1039 2025-2026",
+      "jurisdiction": "CA",
+      "bill_id": "bf48112b-2bc7-4859-967f-e523c787f07e",
+      "official_bill_id": "202520260AB1039",
+      "observation_id": "3ea8a9d5-edf6-4b90-a08c-37229e236316",
+      "source_url": "https://downloads.leginfo.legislature.ca.gov/pubinfo_Thu.zip",
+      "retrieved_at": "2026-09-08T08:38:15.325763+00:00",
+      "upstream_updated_at": "2026-09-04T04:20:07+00:00",
+      "raw_sha256": "9e0cdaf9757a6903198cf2ab65ad574691521e4613ffbc98b8cb59b5f72e8999",
+      "bytes": 1051005,
+      "action_count": 23,
+      "selected_action_date": "2026-08-30",
+      "selected_action_text": "Senate amendments concurred in. To Engrossing and Enrolling. (Ayes 75. Noes 3.).",
+      "database_transaction_read_only": true,
+      "database_writes": 0,
+      "upstream_requests": 0,
+      "interpretation": "Candidate exact retained selection; not a production Scout job or current/complete history claim",
+      "archive_sha256": "f4109530b80adc2d081bfdb0cb3f201c60c16678e4e2bf81528e02f412823aa7"
+    },
+    "live_browser": {
+      "status": "passed",
+      "checked_at": "2026-09-08T12:36:41.894407+00:00",
+      "source_sha": "0d606c2500d587622b18567bb6af99bcd045d6e2",
+      "web_source_sha": "f85b990774b8b94a8c4967ce7280a7128ce8cc1f",
+      "web_deployment_id": "dpl_HLbB8zG5hehDPD2GrgqC9CjDzGrj",
+      "job_id": "7a36bcea-f49f-45a5-8254-6a1ad1709c0c",
+      "job_count_before": 10,
+      "job_count_after": 10,
+      "findings": 1,
+      "raw_sha256": "9e0cdaf9757a6903198cf2ab65ad574691521e4613ffbc98b8cb59b5f72e8999",
+      "checks": [
+        "Real CA selection, typed exact bill/session, one UI POST reused reviewed job, archive link/excerpt and delta-only disclosure visible",
+        "Desktop/mobile retained finding and original source; no horizontal overflow",
+        "FL selector and examples remain usable"
+      ],
+      "errors": [],
+      "previous_attempt": "First UI cache response and result screenshots passed; harness used wrong FL example label. Separate readonly label diagnostic confirmed exact wording. This full corrected recheck is a second bounded cache UI request; no new research job."
+    },
+    "scope": "Exact California measure and explicit session matched to one bounded retained weekday action archive; original retrieval timestamp and raw hash preserved; no fresh upstream/browser request or claim of current/complete bill history. FL remains available.",
+    "worker_cutover": "Old Scout positively absent, no active work, configured300secondgrace and zerooverlap, two readiness samples beforeAPI. Initial API checker caught draining predecessor; later provider check showed only intended deployedAPI and a fresh healthwindow passed.",
+    "health": "16 passing samples spanning more than15minutes; no critical/error report defects",
+    "monitor_feature": "Not included in these deployed artifacts; separate0031 review and backup/restore underway"
   }
 }
