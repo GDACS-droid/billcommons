@@ -13,12 +13,12 @@ in the original checkout are preserved. The canonical inventory covers 50 states
 plus DC. Generic website observation is never treated as proof of statewide
 semantic freshness or completeness.
 
-## Acceptance and present limits — 2026-09-08 10:03 UTC
+## Acceptance and present limits — 2026-09-08 10:54 UTC
 
 The deployed and hash-bound release status is recorded in
 [data-reliability-control-plane.md](data-reliability-control-plane.md) and its
 [sanitized deployment summary](evidence/reliability-20260908/deployment-summary.json).
-API and sync run `c05ae42`; web runs `f610d67`; the recurring official worker
+API and Scout run `5126bec`; sync runs `c05ae42`; web runs `f610d67` with Scout enabled; the recurring official worker
 runs `e155da7`. The additive migrations through `0030` are applied, and the
 initial UTC-day source budget was conservatively seeded at its full
 225-request allowance. The official worker has completed two healthy cycles
@@ -32,6 +32,35 @@ after the 59-target inventory was restored and enabled.
 | Prove updates | Public exact-byte/hash APIs and versioned CA comparison/update ledgers; 1,418 completed CA bill/archive comparisons with sampled public replay; one public Florida source-only snapshot replay | Generic-worker forward evidence rollout; no retroactive proof for untracked historical updates; declared external snapshot inputs |
 | Operate autonomously | Dedicated recurring worker, durable schedule/backoff, 300-second hard observation deadline, real claim pause and graceful shutdown; two healthy `e155da7` cycles after all 59 targets were enabled | Broader semantic state coverage, automatic discrepancy remediation, durable saved-topic product workflow |
 | Deploy | API, web, sync and official worker deployed with immutable source/archive/image bindings, restored backup and post-deploy runtime/browser proof | Generic-worker cutover and held TX repair; the full objective remains active |
+
+### Florida Scout vote evidence and public web — 10:54 UTC
+
+API and Scout source `5126bec` are deployed. The completed owner request for
+HB 625 returned four findings, including one official House vote PDF, using
+four external requests and no browser requests. The vote source SHA-256 is
+`0e788cee07ffb5861b9cf857f5c94285b742cd6b24fcab7c70405224c26ed7ea`;
+its raw bytes, stored source hash and public evidence response agreed. No vote
+tally or chamber was inferred from unrelated page text. The backend sustained
+16 passing samples over 15 minutes with no critical/error report defects.
+
+The old Scout process was positively stopped using the provider's
+`deploymentStopped` field. Applying the configured 300-second drain and zero
+overlap unexpectedly generated an intermediate provider deployment. That
+intermediate was identified and stopped before the reviewed source was
+uploaded. The final worker runs one replica. The public API cohort was restored
+after exact-artifact readiness proof; no account or email was created.
+
+The first public Scout browser attempt exposed a web build flag that still
+returned 404. The same reviewed web source `f610d67` was staged with
+`NEXT_PUBLIC_SCOUT_ENABLED=true`, checked through owner-authenticated rendered
+HTML, then promoted to `dpl_HSW3n7vpBKA8ji9hw1UWS75e7Rex`. A real public browser
+typed HB 625 and clicked Run research, reused the exact completed job, displayed
+all four findings, and verified the vote PDF link and retained excerpt at desktop
+and mobile widths. Job count stayed at nine; no page, console or HTTP errors
+were observed. The production project flag is now persisted for future builds.
+The previous deployment remains recorded for rollback. These checks establish
+one bounded FL research path; deep California and comprehensive Florida
+material discovery remain acceptance gaps.
 
 ## Current release gates
 

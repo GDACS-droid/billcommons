@@ -2,7 +2,7 @@
 
 Bill Commons now has a deployed data-health report, durable official-source
 observations, public evidence endpoints, and a shared upstream request budget.
-The official observer has attempted all 58 registered targets across the 50
+The official observer has attempted all 59 registered targets across the 50
 states and DC. This is an operational slice of the autonomous intelligence
 mission, not a claim of statewide completeness, autonomous repair in every
 state, or a freshness SLA.
@@ -11,10 +11,11 @@ state, or a freshness SLA.
 
 | Unit | Source | Deployment | Evidence |
 | --- | --- | --- | --- |
-| API | `c05ae429bb1f` | `34230f24-3cc3-45fd-86ff-111bf02a1260` | 16 passing samples over 15 minutes; health, readiness, report, ordinary bill, web, MCP and new evidence endpoints |
+| API | `5126becb1fb9` | `cc670ca3-a419-4072-a03a-bdcf46e70f94` | 16 passing samples over 15 minutes; health, readiness, report, bill, web and MCP; live Scout owner canary |
 | Sync worker | `c05ae429bb1f` | `2a8f43f3-912a-41c5-94c5-37374872ea3c` | Old deployment absent through its nominal wake; new bounded cycle and stable follow-up samples |
-| Web | `3758f5114284` | `dpl_H7wqdC5NuYdB6y4saDeKSZCDvFT3` | Promoted production domain; live desktop/mobile browser interactions passed |
-| Official observer | `cff56b07d608` | `67e37132-0196-43ce-9411-0ab0c7fe61c5` | Safe pause, old deployment removed, two startup cycles, 346 exact-input canary comparisons, 58 targets restored and two subsequent cycles |
+| Web | `f610d67c7e4e` | `dpl_HSW3n7vpBKA8ji9hw1UWS75e7Rex` | Scout-enabled build promoted; actual desktop/mobile research, cache reuse and vote evidence link passed |
+| Official observer | `e155da72e7a8` | `a19bbb06-8a15-49ed-ad56-9d0e1daf0c32` | CA content comparisons plus FL source-only snapshot; all 59 targets restored and two healthy subsequent cycles |
+| Scout worker | `5126becb1fb9` | `163338d8-a618-4642-a878-4a992dd184f5` | Exact old/intermediate process absence, bounded readiness, completed owner vote canary and cached public UI proof |
 
 The additive migration from `0025` through `0030` was applied after creating a
 3,211,108,251-byte backup and restoring it into an owned PostgreSQL 18 cluster.

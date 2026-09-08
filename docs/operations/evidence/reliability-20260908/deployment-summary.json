@@ -1,12 +1,14 @@
 {
-  "checked_at": "2026-09-08T10:03:23Z",
+  "checked_at": "2026-09-08T10:54:35.384479+00:00",
   "goal_status": "active; full autonomous 50-state semantic intelligence not complete",
   "units": {
     "api": {
-      "source_sha": "c05ae429bb1f70fe9656464eac71efbbf0f9b40e",
-      "deployment_id": "34230f24-3cc3-45fd-86ff-111bf02a1260",
-      "image_digest": "sha256:d4a7b3e7ed2540d81e5e63480e91605c2ab890da531141422499ddce732ba31f",
-      "archive_sha256": "e87652c353293139c6ea084689179ed56cf6097e39f176ac0f6cc849dd46af51"
+      "deployment_id": "cc670ca3-a419-4072-a03a-bdcf46e70f94",
+      "dockerfile": "infra/docker/Dockerfile.api",
+      "image_digest": "sha256:c10efa8cbf3720fd9c96904882d4fc2b51b4ab2593699f091a7a88c3df8bd96b",
+      "service_id": "d2b00b96-950a-4adc-8d82-87c09b1ce3d6",
+      "source_sha": "5126becb1fb9066c7c080e35148a7a1435b91adc",
+      "archive_sha256": "b60e27a5003b2acedc7eb911c54fa19b70471b59e844c81e6e5e55282c915dce"
     },
     "sync_worker": {
       "source_sha": "c05ae429bb1f70fe9656464eac71efbbf0f9b40e",
@@ -22,8 +24,17 @@
     },
     "web": {
       "source_sha": "f610d67c7e4e7b4910ba483bac5779cd407b095f",
-      "deployment_id": "dpl_3TrSjdBRXHobJSimpppoj27U9WbJ",
-      "archive_sha256": "36cd3245de93a6999b080ec9d245ec7e562d54ac4988c4952de8f49d8a1265c7"
+      "deployment_id": "dpl_HSW3n7vpBKA8ji9hw1UWS75e7Rex",
+      "archive_sha256": "36cd3245de93a6999b080ec9d245ec7e562d54ac4988c4952de8f49d8a1265c7",
+      "scout_enabled": true
+    },
+    "scout_worker": {
+      "deployment_id": "163338d8-a618-4642-a878-4a992dd184f5",
+      "dockerfile": "infra/docker/Dockerfile.scout-worker",
+      "image_digest": "sha256:534045d5cf9187820274ed6eaa0e9462b48d98c344122385291fabfb1085b6e3",
+      "service_id": "1f614208-b5dd-4f0e-b087-aa5d726bf3e7",
+      "source_sha": "5126becb1fb9066c7c080e35148a7a1435b91adc",
+      "archive_sha256": "b60e27a5003b2acedc7eb911c54fa19b70471b59e844c81e6e5e55282c915dce"
     }
   },
   "migration": {
@@ -167,7 +178,7 @@
     "web_browser_errors": 0,
     "web_http_errors": 0,
     "official_post_activation_cycles": 2,
-    "latest_health_checked_at": "2026-09-08T08:41:16.496358+00:00",
+    "latest_health_checked_at": "2026-09-08T10:49:52.517877+00:00",
     "official_e155_post_restore_cycles": 2,
     "official_e155_cycle_monitor": "fl-semantic-live-monitor-e155da7.json: success"
   },
@@ -247,5 +258,43 @@
       "evidence": "fl-semantic-review-accepted-e155da7.json",
       "scope": "Three-review chain plus actual PG16 transaction/lock/identity proof; final raw BLOCK preserved and adjudicated against real flush-before-refresh call order."
     }
+  },
+  "previous_units": {
+    "api_before_scout_vote": {
+      "source_sha": "c05ae429bb1f70fe9656464eac71efbbf0f9b40e",
+      "deployment_id": "34230f24-3cc3-45fd-86ff-111bf02a1260",
+      "image_digest": "sha256:d4a7b3e7ed2540d81e5e63480e91605c2ab890da531141422499ddce732ba31f",
+      "archive_sha256": "e87652c353293139c6ea084689179ed56cf6097e39f176ac0f6cc849dd46af51"
+    },
+    "web_before_scout_enabled": {
+      "source_sha": "f610d67c7e4e7b4910ba483bac5779cd407b095f",
+      "deployment_id": "dpl_3TrSjdBRXHobJSimpppoj27U9WbJ",
+      "archive_sha256": "36cd3245de93a6999b080ec9d245ec7e562d54ac4988c4952de8f49d8a1265c7"
+    }
+  },
+  "scout_vote_release": {
+    "review_evidence": "scout-vote-review-accepted-5126bec.json",
+    "owner_canary": "passed; four findings including one official vote PDF; four external requests and zero browser requests",
+    "live_browser": {
+      "status": "passed",
+      "checked_at": "2026-09-08T10:53:28.615064+00:00",
+      "source_sha": "5126becb1fb9066c7c080e35148a7a1435b91adc",
+      "web_deployment_id": "dpl_HSW3n7vpBKA8ji9hw1UWS75e7Rex",
+      "job_id": "b8b282b2-fe11-4596-ab0b-8e512cc78677",
+      "findings": 4,
+      "vote_source_hash": "0e788cee07ffb5861b9cf857f5c94285b742cd6b24fcab7c70405224c26ed7ea",
+      "job_count_before": 9,
+      "job_count_after": 9,
+      "checks": [
+        "typed HB625 and clicked Run research; liveAPI reused exact completed job; four findings and vote PDF evidence visible",
+        "desktop and mobile vote finding, retained excerpt and exact official document link verified; no horizontal overflow",
+        "durable Scout job count unchanged after UI cache request"
+      ],
+      "errors": []
+    },
+    "production_web_flag": "NEXT_PUBLIC_SCOUT_ENABLED=true; deployment override and production project default",
+    "scope": "One bounded FL related-vote record per job; exact retained bytes and provenance; no comprehensive FL or CA coverage claim",
+    "worker_cutover": "Old process and config-generated intermediate positively stopped before reviewed replacement; drain 300, overlap 0, one replica",
+    "public_api_restoration": "Previously public cohort restored after worker readiness; no additional customers or communications"
   }
 }
