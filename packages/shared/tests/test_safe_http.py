@@ -28,7 +28,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from billcommons_shared import safe_http
+from billcommons_shared import official_tls, safe_http
 
 TEST_HOSTNAME = "webhook-test.billcommons.internal"
 
@@ -1131,3 +1131,43 @@ def test_production_factory_has_the_guard_enabled():
     client = safe_http.new_safe_http_client()
     with pytest.raises(safe_http.SsrfRejected):
         client.fetch("https://localhost/hook", body=b"{}")
+
+# ---------------------------------------------------------------------------
+# Official-source TLS context hook: a caller may add reviewed intermediates,
+# but may not weaken the pinned client's TLS properties.
+# ---------------------------------------------------------------------------
+
+
+def test_tls_context_factory_cannot_disable_hostname_or_chain_verification():
+    insecure = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    insecure.check_hostname = False
+    insecure.verify_mode = ssl.CERT_NONE
+    with pytest.raises(ValueError, match="verified host certificates"):
+        safe_http._make_ssl_context("official.example", lambda _host: insecure)
+
+
+def test_tls_context_factory_cannot_enable_partial_chain_validation():
+    partial_chain = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+    if not partial_chain:
+        pytest.skip("OpenSSL does not expose partial-chain mode")
+    context = ssl.create_default_context()
+    context.verify_flags |= partial_chain
+    with pytest.raises(ValueError, match="partial certificate chains"):
+        safe_http._make_ssl_context("official.example", lambda _host: context)
+
+
+def test_reviewed_context_factory_does_not_trust_an_unreviewed_self_signed_host(https_server):
+    def behavior(handler):
+        handler.send_response(200)
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+
+    port, _cert_pem = https_server(behavior)
+    client = safe_http.SafeHttpClient(
+        resolver=_resolver_for(),
+        port=port,
+        address_policy=_allow_all_policy,
+        ssl_context_factory=official_tls.reviewed_context_for_host,
+    )
+    with pytest.raises(safe_http.TlsFailure):
+        client.fetch(f"https://{TEST_HOSTNAME}/hook", body=b"{}")

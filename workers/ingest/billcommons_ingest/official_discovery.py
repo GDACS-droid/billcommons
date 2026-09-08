@@ -20,6 +20,7 @@ from urllib.robotparser import RobotFileParser
 
 from billcommons_shared.data_health import PUBLIC_JURISDICTION_CODES
 from billcommons_shared.httpc import USER_AGENT
+from billcommons_shared.official_tls import reviewed_context_for_host
 from billcommons_shared.safe_http import SafeHttpError, SafeResponse, admit_url, new_safe_http_client
 from billcommons_shared.source_budget import consume_request
 
@@ -174,7 +175,10 @@ def discover_material_links(raw: bytes, *, source_url: str) -> tuple[tuple[Mater
 
 
 def _fetch(url: str, max_body_bytes: int) -> SafeResponse:
-    return new_safe_http_client(max_body_bytes=max_body_bytes).fetch(
+    return new_safe_http_client(
+        max_body_bytes=max_body_bytes,
+        ssl_context_factory=reviewed_context_for_host,
+    ).fetch(
         url, method="GET", headers={"User-Agent": USER_AGENT, "Accept": "text/html,text/plain,*/*;q=0.1"},
         require_body=True,
     )

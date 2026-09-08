@@ -75,6 +75,7 @@ USER_AGENT = "BillCommons-Webhooks/1.0"
 #: a fake one mapping a test hostname to 127.0.0.1 to hit a local server, or
 #: to something that flips between calls to prove re-vetting.
 Resolver = Callable[[str], list[str]]
+SslContextFactory = Callable[[str], ssl.SSLContext | None]
 
 _NAT64_NETWORKS = (
     ipaddress.ip_network("64:ff9b::/96"),
@@ -549,8 +550,25 @@ def _resolve_and_vet_within_budget(
         raise DnsFailure("resolution_exceeded_budget") from exc
 
 
-def _make_ssl_context() -> ssl.SSLContext:
-    context = ssl.create_default_context()
+def _make_ssl_context(
+    hostname: str,
+    ssl_context_factory: SslContextFactory | None = None,
+) -> ssl.SSLContext:
+    """Build the verified TLS context for one already-admitted hostname.
+
+    A small number of reviewed official sources need a bundled intermediate.
+    The factory can only *add* that pre-reviewed material: this boundary still
+    rejects a context without full verification or one that enables OpenSSL's
+    partial-chain mode, then enforces the transport TLS/ALPN constraints.
+    """
+    context = ssl_context_factory(hostname) if ssl_context_factory is not None else None
+    if context is None:
+        context = ssl.create_default_context()
+    partial_chain = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+    if context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname:
+        raise ValueError("SSL context must require verified host certificates")
+    if partial_chain and context.verify_flags & partial_chain:
+        raise ValueError("SSL context must not allow partial certificate chains")
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     # Restrict ALPN to HTTP/1.1 only. Not merely "we happen to speak 1.1" --
     # this makes HTTP/2 unnegotiable even if the receiver would otherwise
@@ -586,6 +604,7 @@ class SafeHttpClient:
         port: int = DEFAULT_PORT,
         address_policy: AddressPolicy = _is_publicly_routable,
         max_body_bytes: int = MAX_BODY_BYTES,
+        ssl_context_factory: SslContextFactory | None = None,
     ) -> None:
         if max_body_bytes <= 0:
             raise ValueError("max_body_bytes must be positive")
@@ -593,6 +612,7 @@ class SafeHttpClient:
         self._port = port
         self._address_policy = address_policy
         self._max_body_bytes = max_body_bytes
+        self._ssl_context_factory = ssl_context_factory
 
     def fetch(
         self,
@@ -690,9 +710,9 @@ class SafeHttpClient:
                 # verification checks against -- the ORIGINAL hostname, never
                 # the pinned IP. This is the entire pinning mechanism: connect
                 # by IP, verify by name.
-                sock = _make_ssl_context().wrap_socket(
-                    raw_sock, server_hostname=admitted.hostname
-                )
+                sock = _make_ssl_context(
+                    admitted.hostname, self._ssl_context_factory
+                ).wrap_socket(raw_sock, server_hostname=admitted.hostname)
             except (TimeoutError, socket.timeout) as exc:
                 raise TimeoutFailure("tls_handshake_timeout") from exc
             except ssl.SSLError as exc:
@@ -854,18 +874,22 @@ def new_safe_http_client(
     port: int = DEFAULT_PORT,
     address_policy: AddressPolicy = _is_publicly_routable,
     max_body_bytes: int = MAX_BODY_BYTES,
+    ssl_context_factory: SslContextFactory | None = None,
 ) -> SafeHttpClient:
     """Production entrypoint. The dispatcher calls this with no arguments,
     which wires in `default_resolver`, the real `_is_publicly_routable`
     policy, and port 443 -- real getaddrinfo plus full address vetting,
-    connecting only to the standard HTTPS port. All three parameters exist
-    only so tests can override them the same way `SafeHttpClient(...)` does;
-    there is no other way to bypass the guard, and in particular no
-    environment variable does it.
+    connecting only to the standard HTTPS port. The optional context factory
+    exists for the reviewed official-source intermediate bundle; it remains
+    subject to the verification, complete-chain, TLS-version and ALPN checks
+    in `_make_ssl_context`. The remaining parameters let tests override the
+    same dependencies as `SafeHttpClient(...)`; no environment variable can
+    bypass the guard.
     """
     return SafeHttpClient(
         resolver=resolver if resolver is not None else default_resolver,
         port=port,
         address_policy=address_policy,
         max_body_bytes=max_body_bytes,
+        ssl_context_factory=ssl_context_factory,
     )

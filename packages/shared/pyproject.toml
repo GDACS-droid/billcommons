@@ -28,6 +28,7 @@ dependencies = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["billcommons_shared"]
+artifacts = ["billcommons_shared/certs/official_discovery/*.pem"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

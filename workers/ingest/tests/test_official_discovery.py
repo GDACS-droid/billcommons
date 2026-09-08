@@ -114,3 +114,23 @@ def test_crawl_delay_is_honored_after_reading_policy():
         fetch=fetch, budget=lambda url: None, sleep=lambda seconds: calls.append(seconds))
     assert capture.error_class is None
     assert calls[1] == 10
+
+
+def test_discovery_uses_the_host_scoped_reviewed_tls_factory(monkeypatch):
+    from billcommons_ingest import official_discovery as module
+    from billcommons_shared.official_tls import reviewed_context_for_host
+
+    options = {}
+
+    class Client:
+        def fetch(self, *args, **kwargs):
+            return SafeResponse(200, {}, b"")
+
+    def create_client(**kwargs):
+        options.update(kwargs)
+        return Client()
+
+    monkeypatch.setattr(module, "new_safe_http_client", create_client)
+    module._fetch("https://www.cga.ct.gov/robots.txt", 123)
+    assert options["max_body_bytes"] == 123
+    assert options["ssl_context_factory"] is reviewed_context_for_host
