@@ -1,6 +1,8 @@
 import pytest
 
 from billcommons_shared.scout import (
+    CALIFORNIA,
+    SCOUT_CA_RETAINED_CACHE_NAMESPACE,
     SCOUT_CACHE_NAMESPACE,
     ScoutSettings,
     ScoutPolicyError,
@@ -9,14 +11,46 @@ from billcommons_shared.scout import (
     classify_direct_response,
     content_changed,
     content_hash,
+    extract_california_bill_query,
     discover_florida_senate_related_documents,
     discover_florida_senate_vote_records,
     is_pdf_attachment_payload,
     normalize_query,
     scout_cache_key,
+    scout_cache_namespace,
     summarize_content_change,
     topical_search_terms,
 )
+
+
+def test_california_retained_query_requires_an_explicit_current_session():
+    regular = extract_california_bill_query("AB 00123 2025-2026")
+    assert regular is not None
+    assert (regular.identifier, regular.session_identifier, regular.official_bill_id) == (
+        "AB 123", "2025-2026 Regular Session", "202520260AB123",
+    )
+    # A compact bill identifier remains unambiguous when the session year is
+    # separated; the alphabetic measure group cannot consume its number.
+    compact = extract_california_bill_query("AB123 2025-2026")
+    assert compact is not None
+    assert compact.official_bill_id == "202520260AB123"
+    special = extract_california_bill_query("SB 9 2025-2026 Special Session 1")
+    assert special is not None
+    assert (special.identifier, special.session_identifier, special.official_bill_id) == (
+        "SB 9", "2025-2026 Special Session 1", "202520261SB9",
+    )
+    for unsupported in (
+        "AB 123", "AB 123 2023-2024", "housing 2025-2026", "AB 123 Special Session 1",
+        "AB12 3 2025-2026", "ZZ 12 2025-2026", "AB 0 2025-2026",
+    ):
+        assert extract_california_bill_query(unsupported) is None
+
+
+def test_california_retained_cache_namespace_cannot_coalesce_with_florida():
+    assert scout_cache_namespace(CALIFORNIA) == SCOUT_CA_RETAINED_CACHE_NAMESPACE
+    assert scout_cache_key("AB 1 2025-2026", "CA", freshness_bucket=scout_cache_namespace("CA")) != scout_cache_key(
+        "AB 1 2025-2026", "CA", freshness_bucket=SCOUT_CACHE_NAMESPACE
+    )
 
 
 def test_scout_settings_reject_daily_browser_cap_below_one_job_reservation():

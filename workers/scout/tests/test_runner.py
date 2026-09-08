@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import hashlib
+import io
 import os
 import re
 import sys
@@ -9,6 +10,7 @@ import threading
 import types
 import asyncio
 import time
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -23,6 +25,7 @@ from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFin
 from billcommons_shared.rawstore import FilesystemRawStore
 from billcommons_shared.db import _use_psycopg3
 from billcommons_shared.safe_http import SsrfRejected
+from billcommons_shared.ca_official_actions import BILL_COLUMNS, HISTORY_COLUMNS, ca_delta_url
 from billcommons_shared.scout import BrowserCapture, BrowserRequest, ScoutSettings, content_hash
 from billcommons_scout.providers import MockResearchBrowserProvider
 from billcommons_scout.providers import ProviderSessionPersistenceError
@@ -30,6 +33,7 @@ from billcommons_scout.providers import SolariProviderError
 from billcommons_scout.providers import SolariResearchBrowserProvider
 from billcommons_scout.providers import resolve_solari_api_key
 from billcommons_scout.runner import ScoutRunner, _bounded_call, describe_related_document, safe_direct_fetch
+import billcommons_scout.runner as scout_runner_module
 import billcommons_scout.__main__ as scout_cli
 
 
@@ -86,6 +90,392 @@ def _pdf_with_text(value: str) -> bytes:
     document.extend(b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets[1:]))
     document.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
     return bytes(document)
+
+
+def _ca_archive(official_bill_id: str = "202520260AB123", action: str = "Read first time.") -> bytes:
+    bill = {
+        "bill_id": official_bill_id,
+        "session_year": "20252026",
+        "session_num": "0",
+        "measure_type": "AB",
+        "measure_num": "123",
+    }
+    history = {
+        "bill_id": official_bill_id,
+        "bill_history_id": "1001",
+        "action_date": "2026-01-15",
+        "action": action,
+        "trans_update_dt": "2026-01-15T12:00:00",
+        "action_sequence": "1",
+    }
+    def row(columns, values):
+        return "\t".join(values.get(column, "") for column in columns).encode() + b"\n"
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("BILL_TBL.dat", row(BILL_COLUMNS, bill))
+        archive.writestr("BILL_HISTORY_TBL.dat", row(HISTORY_COLUMNS, history))
+    return output.getvalue()
+
+
+def _seed_ca_retained_archive(sessions, raw: bytes, *, source_url: str | None = None):
+    """Use a minimal SQLite schema so this stays independent of PG-only checks."""
+    engine = sessions.kw["bind"]
+    jurisdiction_id, session_id, bill_id, target_id, observation_id = [uuid.uuid4() for _ in range(5)]
+    digest = content_hash(raw)
+    observed_at = datetime(2026, 1, 16, 15, 30, tzinfo=timezone.utc)
+    source_url = source_url or ca_delta_url("Mon")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE IF NOT EXISTS jurisdictions (id CHAR(32) PRIMARY KEY, abbreviation TEXT NOT NULL)"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS sessions (id CHAR(32) PRIMARY KEY, jurisdiction_id CHAR(32) NOT NULL, identifier TEXT NOT NULL)"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS bills (id CHAR(32) PRIMARY KEY, jurisdiction_id CHAR(32) NOT NULL, session_id CHAR(32) NOT NULL, identifier_norm TEXT NOT NULL)"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS official_raw_blobs (sha256 TEXT PRIMARY KEY, data BLOB NOT NULL)"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS official_source_targets (id CHAR(32) PRIMARY KEY, jurisdiction_id CHAR(32) NOT NULL, adapter_name TEXT NOT NULL)"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS official_source_observations (id CHAR(32) PRIMARY KEY, target_id CHAR(32) NOT NULL, adapter_name TEXT NOT NULL, status TEXT NOT NULL, raw_sha256 TEXT, source_url TEXT NOT NULL, retrieved_at DATETIME NOT NULL, upstream_updated_at DATETIME, http_status INTEGER)"))
+        conn.execute(text("INSERT INTO jurisdictions (id, abbreviation) VALUES (:id, 'CA')"), {"id": str(jurisdiction_id)})
+        conn.execute(text("INSERT INTO sessions (id, jurisdiction_id, identifier) VALUES (:id, :jurisdiction_id, '2025-2026 Regular Session')"), {"id": str(session_id), "jurisdiction_id": str(jurisdiction_id)})
+        conn.execute(text("INSERT INTO bills (id, jurisdiction_id, session_id, identifier_norm) VALUES (:id, :jurisdiction_id, :session_id, 'AB 123')"), {"id": str(bill_id), "jurisdiction_id": str(jurisdiction_id), "session_id": str(session_id)})
+        conn.execute(text("INSERT INTO official_raw_blobs (sha256, data) VALUES (:sha256, :data)"), {"sha256": digest, "data": raw})
+        conn.execute(text("INSERT INTO official_source_targets (id, jurisdiction_id, adapter_name) VALUES (:id, :jurisdiction_id, 'ca_official_actions')"), {"id": str(target_id), "jurisdiction_id": str(jurisdiction_id)})
+        conn.execute(text("INSERT INTO official_source_observations (id, target_id, adapter_name, status, raw_sha256, source_url, retrieved_at, http_status) VALUES (:id, :target_id, 'ca_official_actions', 'succeeded', :sha256, :source_url, :retrieved_at, 200)"), {"id": str(observation_id), "target_id": str(target_id), "sha256": digest, "source_url": source_url, "retrieved_at": observed_at})
+    return bill_id, observation_id, observed_at
+
+
+def test_california_retained_archive_creates_evidence_without_fetch_or_browser(tmp_path):
+    def forbidden_fetch(_url):
+        raise AssertionError("CA retained Scout must not fetch")
+
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), forbidden_fetch)
+    raw = _ca_archive()
+    bill_id, observation_id, observed_at = _seed_ca_retained_archive(sessions, raw)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        source = db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalar_one()
+        finding = db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalar_one()
+        assert (job.status, job.error_class, job.usage) == ("completed", None, {})
+        assert (source.official, source.retrieval_mechanism, source.canonical_url, source.http_status) == (
+            True, "official_retained_archive", ca_delta_url("Mon"), 200,
+        )
+        assert source.retrieved_at.replace(tzinfo=timezone.utc) == observed_at
+        assert source.raw_ref and runner.rawstore.get(source.raw_ref) == raw
+        assert (finding.bill_id, finding.relevant_date, finding.confidence) == (bill_id, date(2026, 1, 15), "high")
+        assert finding.excerpt == "AB 123 — 2026-01-15: Read first time."
+        assert "does not establish a current or comprehensive" in finding.why_it_matters
+        selected = db.execute(select(ScoutJobEvent).where(ScoutJobEvent.job_id == job_id, ScoutJobEvent.kind == "retained_official_archive_selected")).scalar_one()
+        assert selected.detail == {"observation_id": str(observation_id), "coverage": "delta_only"}
+
+
+def test_california_retained_archive_over_job_cap_is_truthful_partial_and_not_copied(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _seed_ca_retained_archive(sessions, raw)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw) - 1}
+        db.commit()
+
+    statements: list[str] = []
+    engine = sessions.kw["bind"]
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert (job.status, job.error_class, job.partial_success) == (
+            "partial", "retained_archive_exceeds_job_limit", False,
+        )
+        assert db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalars().all() == []
+        assert db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalars().all() == []
+    # The admission query obtains only SQL-computed length metadata. It must
+    # not issue the separate blob-value query once the newest archive is over
+    # the job's cap.
+    assert not any(re.search(r"SELECT\s+official_raw_blobs\.data\s+FROM", statement) for statement in statements)
+
+
+def test_california_retained_parse_budget_exhaustion_is_truthful_partial(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _seed_ca_retained_archive(sessions, raw)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw), "max_ca_parse_seconds": 0}
+        db.commit()
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert (job.status, job.error_class, job.partial_success) == (
+            "partial", "retained_archive_unavailable", False,
+        )
+        assert db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalars().all() == []
+
+
+def test_california_retained_newest_match_ignores_older_missing_and_oversized_archives(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _bill_id, observation_id, observed_at = _seed_ca_retained_archive(sessions, raw)
+    oversized = raw + b"x"
+    engine = sessions.kw["bind"]
+    with engine.begin() as conn:
+        target_id = conn.execute(text("SELECT id FROM official_source_targets")).scalar_one()
+        oversized_hash = content_hash(oversized)
+        conn.execute(text("INSERT INTO official_raw_blobs (sha256, data) VALUES (:sha256, :data)"), {"sha256": oversized_hash, "data": oversized})
+        conn.execute(
+            text("INSERT INTO official_source_observations (id, target_id, adapter_name, status, raw_sha256, source_url, retrieved_at, http_status) VALUES (:id, :target_id, 'ca_official_actions', 'succeeded', :sha256, :source_url, :retrieved_at, 200)"),
+            [
+                {"id": str(uuid.uuid4()), "target_id": target_id, "sha256": oversized_hash, "source_url": ca_delta_url("Thu"), "retrieved_at": observed_at - timedelta(minutes=2)},
+                {"id": str(uuid.uuid4()), "target_id": target_id, "sha256": "e" * 64, "source_url": ca_delta_url("Fri"), "retrieved_at": observed_at - timedelta(minutes=1)},
+            ],
+        )
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        source = db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalar_one()
+        selected = db.execute(select(ScoutJobEvent).where(
+            ScoutJobEvent.job_id == job_id,
+            ScoutJobEvent.kind == "retained_official_archive_selected",
+        )).scalar_one()
+        assert job.status == "completed"
+        assert source.canonical_url == ca_delta_url("Mon")
+        assert selected.detail["observation_id"] == str(observation_id)
+
+
+def test_california_retained_newer_absent_bill_allows_older_matching_delta(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    older_raw = _ca_archive()
+    _bill_id, _observation_id, observed_at = _seed_ca_retained_archive(sessions, older_raw)
+    newer_raw = _ca_archive("202520260AB124")
+    engine = sessions.kw["bind"]
+    with engine.begin() as conn:
+        target_id = conn.execute(text("SELECT id FROM official_source_targets")).scalar_one()
+        newer_hash = content_hash(newer_raw)
+        conn.execute(text("INSERT INTO official_raw_blobs (sha256, data) VALUES (:sha256, :data)"), {"sha256": newer_hash, "data": newer_raw})
+        conn.execute(
+            text("INSERT INTO official_source_observations (id, target_id, adapter_name, status, raw_sha256, source_url, retrieved_at, http_status) VALUES (:id, :target_id, 'ca_official_actions', 'succeeded', :sha256, :source_url, :retrieved_at, 200)"),
+            {"id": str(uuid.uuid4()), "target_id": target_id, "sha256": newer_hash, "source_url": ca_delta_url("Tue"), "retrieved_at": observed_at + timedelta(minutes=1)},
+        )
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": max(len(older_raw), len(newer_raw))}
+        db.commit()
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        source = db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalar_one()
+        assert job.status == "completed"
+        assert source.canonical_url == ca_delta_url("Mon")
+        assert source.raw_ref == content_hash(older_raw)
+
+
+def test_california_retained_missing_newest_raw_is_integrity_partial_without_older_copy(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _bill_id, _observation_id, observed_at = _seed_ca_retained_archive(sessions, raw)
+    engine = sessions.kw["bind"]
+    with engine.begin() as conn:
+        target_id = conn.execute(text("SELECT id FROM official_source_targets")).scalar_one()
+        conn.execute(
+            text("INSERT INTO official_source_observations (id, target_id, adapter_name, status, raw_sha256, source_url, retrieved_at, http_status) VALUES (:id, :target_id, 'ca_official_actions', 'succeeded', :sha256, :source_url, :retrieved_at, 200)"),
+            {
+                "id": str(uuid.uuid4()), "target_id": target_id, "sha256": "f" * 64,
+                "source_url": ca_delta_url("Tue"), "retrieved_at": observed_at + timedelta(minutes=1),
+            },
+        )
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert (job.status, job.error_class, job.partial_success) == (
+            "partial", "retained_archive_integrity_failed", False,
+        )
+        assert db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalars().all() == []
+        assert db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalars().all() == []
+
+
+def test_california_retained_parse_starts_after_candidate_transaction_commits(tmp_path, monkeypatch):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _seed_ca_retained_archive(sessions, raw)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    committed = False
+    @event.listens_for(sessions.kw["bind"], "commit")
+    def record_commit(_connection):
+        nonlocal committed
+        committed = True
+
+    real_parse = scout_runner_module.parse_ca_official_actions_zip
+    def parse_after_commit(*args, **kwargs):
+        assert committed
+        return real_parse(*args, **kwargs)
+    monkeypatch.setattr(scout_runner_module, "parse_ca_official_actions_zip", parse_after_commit)
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        assert db.get(ScoutResearchJob, job_id).status == "completed"
+
+
+def test_california_retained_capacity_failure_remains_failed_once(tmp_path, monkeypatch):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _seed_ca_retained_archive(sessions, raw)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    monkeypatch.setattr(runner.rawstore, "put", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("scout_rawstore_capacity_exceeded")))
+    runner.process(job_id, "initial-claim")
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        events = db.execute(select(ScoutJobEvent).where(
+            ScoutJobEvent.job_id == job_id,
+            ScoutJobEvent.kind == "rawstore_capacity_exceeded",
+        )).scalars().all()
+        assert (job.status, job.error_class, job.partial_success) == (
+            "failed", "rawstore_capacity_exceeded", False,
+        )
+        assert len(events) == 1
+
+
+def test_california_retained_final_commit_failure_reclaim_creates_one_finding(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _seed_ca_retained_archive(sessions, raw)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    engine = sessions.kw["bind"]
+    fail_once = True
+    @event.listens_for(engine, "before_cursor_execute")
+    def fail_terminal_update(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal fail_once
+        if fail_once and "UPDATE scout_research_jobs SET status" in statement:
+            fail_once = False
+            raise RuntimeError("simulated crash before CA final commit")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert job.status == "running"
+        assert db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalars().all() == []
+        job.claim_token = "reclaimed-claim"
+        job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        db.commit()
+
+    runner.process(job_id, "reclaimed-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        final_sources = db.execute(select(ScoutSource).where(
+            ScoutSource.job_id == job_id,
+            ScoutSource.retrieval_mechanism == "official_retained_archive",
+        )).scalars().all()
+        findings = db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalars().all()
+        assert job.status == "completed"
+        assert len(final_sources) == len(findings) == 1
+
+
+def test_california_retained_fence_loss_keeps_unverified_raw_reference(tmp_path, monkeypatch):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    raw = _ca_archive()
+    _seed_ca_retained_archive(sessions, raw)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "AB 123 2025-2026"
+        job.limits = {"max_direct_bytes": len(raw)}
+        db.commit()
+
+    real_put = runner.rawstore.put
+    def cancel_after_put(body, metadata):
+        raw_ref = real_put(body, metadata)
+        with sessions() as db:
+            job = db.get(ScoutResearchJob, job_id)
+            job.status = "canceled"
+            job.claim_token = None
+            db.commit()
+        return raw_ref
+    monkeypatch.setattr(runner.rawstore, "put", cancel_after_put)
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        source = db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalar_one()
+        assert job.status == "canceled"
+        assert (source.official, source.retrieval_mechanism, source.raw_ref) == (
+            False, "staged", content_hash(raw),
+        )
+        assert db.execute(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).scalars().all() == []
+
+
+def test_california_retained_archive_rejects_topical_or_ambiguous_queries_without_network(tmp_path):
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.jurisdiction = "CA"
+        job.original_query = "housing"
+        db.commit()
+
+    runner.process(job_id, "initial-claim")
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert (job.status, job.error_class, job.partial_success) == ("partial", "unsupported_query", False)
+        assert db.execute(select(ScoutSource).where(ScoutSource.job_id == job_id)).scalars().all() == []
 
 
 def test_rejected_failed_url_is_event_only_and_never_persisted_as_clickable_source(tmp_path):

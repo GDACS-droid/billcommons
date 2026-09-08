@@ -159,7 +159,7 @@ class PostgresScoutHarness:
             legislative_session = LegislativeSession(
                 id=uuid.uuid4(),
                 jurisdiction_id=florida.id,
-                identifier=f"scout-pg-{uuid.uuid4().hex}",
+                identifier=f"2026-scout-pg-{uuid.uuid4().hex}",
                 name="Scout PostgreSQL fixture",
                 classification="primary",
                 active=True,
