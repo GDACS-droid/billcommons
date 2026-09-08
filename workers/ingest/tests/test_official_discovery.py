@@ -116,6 +116,57 @@ def test_crawl_delay_is_honored_after_reading_policy():
     assert calls[1] == 10
 
 
+def test_unreviewed_host_with_120_second_crawl_delay_is_rejected(monkeypatch):
+    from billcommons_ingest import official_discovery as module
+
+    source_url = "https://unreviewed.example/"
+    monkeypatch.setattr(module, "official_source_inventory", lambda: {"AZ": source_url})
+    calls = []
+
+    def fetch(url, cap):
+        calls.append(url)
+        return SafeResponse(200, {}, b"User-agent: *\nAllow: /\nCrawl-delay: 120\n")
+
+    capture = capture_official_landing_page("AZ", source_url, fetch=fetch, budget=lambda url: None)
+
+    assert capture.error_class == "robots_slow_cadence_review_required"
+    assert calls == ["https://unreviewed.example/robots.txt"]
+
+
+def test_reviewed_arizona_120_second_crawl_delay_is_honored():
+    source_url = official_source_inventory()["AZ"]
+    calls = []
+    sleeps = []
+
+    def fetch(url, cap):
+        calls.append(url)
+        if url.endswith("robots.txt"):
+            return SafeResponse(200, {}, b"User-agent: *\nAllow: /\nCrawl-delay: 120\n")
+        return SafeResponse(200, {"content-type": "text/html"}, b"<html></html>")
+
+    capture = capture_official_landing_page(
+        "AZ", source_url, fetch=fetch, budget=lambda url: None, sleep=sleeps.append
+    )
+
+    assert capture.error_class is None
+    assert sleeps == [120]
+    assert calls == ["https://www.azleg.gov/robots.txt", source_url]
+
+
+def test_reviewed_arizona_crawl_delay_above_120_seconds_is_rejected():
+    source_url = official_source_inventory()["AZ"]
+    calls = []
+
+    def fetch(url, cap):
+        calls.append(url)
+        return SafeResponse(200, {}, b"User-agent: *\nAllow: /\nCrawl-delay: 121\n")
+
+    capture = capture_official_landing_page("AZ", source_url, fetch=fetch, budget=lambda url: None)
+
+    assert capture.error_class == "robots_slow_cadence_review_required"
+    assert calls == ["https://www.azleg.gov/robots.txt"]
+
+
 def test_discovery_uses_the_host_scoped_reviewed_tls_factory(monkeypatch):
     from billcommons_ingest import official_discovery as module
     from billcommons_shared.official_tls import reviewed_context_for_host

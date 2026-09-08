@@ -34,6 +34,15 @@ MAX_LINKS = 40
 MAX_SCANNED_ANCHORS = 2000
 MAX_URL_LENGTH = 1024
 MAX_LABEL_LENGTH = 160
+MAX_CRAWL_DELAY_SECONDS = 60
+MAX_OBSERVATION_SECONDS = 300
+# The generic observer rejects a delay above one minute. Arizona's published
+# robots policy permits the reviewed homepage at a 120-second cadence. Keep
+# the exception tied to the exact reviewed state and URL, and below the
+# worker's transaction deadline.
+_REVIEWED_CRAWL_DELAY_LIMITS: dict[tuple[str, str], int] = {
+    ("AZ", "https://www.azleg.gov/"): 120,
+}
 _MATERIAL_WORDS = re.compile(
     r"bill|legislation|journal|calendar|committee|report|analysis|analyses|amendment|download|data|feed",
     re.IGNORECASE,
@@ -190,6 +199,16 @@ def _budget(url: str) -> None:
                     daily_limit=24, minimum_interval_seconds=2, maximum_wait_seconds=30)
 
 
+def _maximum_crawl_delay_seconds(jurisdiction: str, source_url: str) -> int:
+    """Return the delay cap for one reviewed source, otherwise the global cap."""
+    maximum = _REVIEWED_CRAWL_DELAY_LIMITS.get(
+        (jurisdiction, source_url), MAX_CRAWL_DELAY_SECONDS
+    )
+    if not MAX_CRAWL_DELAY_SECONDS <= maximum < MAX_OBSERVATION_SECONDS:
+        raise RuntimeError("reviewed crawl-delay cap must fit the observation deadline")
+    return maximum
+
+
 def capture_official_landing_page(
     jurisdiction: str, source_url: str, *,
     fetch: Callable[[str, int], SafeResponse] = _fetch,
@@ -229,7 +248,7 @@ def capture_official_landing_page(
             rate = policy.request_rate(USER_AGENT)
             if rate and rate.requests > 0:
                 crawl_delay = max(crawl_delay, rate.seconds / rate.requests)
-            if crawl_delay > 60:
+            if crawl_delay > _maximum_crawl_delay_seconds(jurisdiction, source_url):
                 return OfficialDiscoveryCapture(**evidence, error_class="robots_slow_cadence_review_required")
             if crawl_delay > 0:
                 sleep(crawl_delay)
