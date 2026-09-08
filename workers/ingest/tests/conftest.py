@@ -1,10 +1,9 @@
 """Shared pytest fixtures for billcommons_ingest tests.
 
 `db_session` runs each test inside an outer transaction + SAVEPOINT that is
-always rolled back, so tests exercise the real live schema (per the
-project's "0001 schema already applied" live DB) without leaving any rows
-behind. This mirrors the standard SQLAlchemy "join a session to an external
-transaction" test pattern.
+always rolled back, so tests exercise the disposable test schema without
+leaving any rows behind. This mirrors the standard SQLAlchemy "join a session
+to an external transaction" test pattern.
 """
 from __future__ import annotations
 
@@ -34,9 +33,19 @@ def _require_safe_test_database() -> None:
         not (scheme == "postgres" or scheme == "postgresql" or scheme.startswith("postgresql+"))
         or hostname not in {"localhost", "127.0.0.1", "::1"}
         or not database_name.endswith(("_test", "_staging"))
+        or parsed.query
+        or parsed.fragment
     ):
         raise RuntimeError(
-            "ingest tests require DATABASE_URL to target a loopback PostgreSQL test database"
+            "ingest tests require DATABASE_URL to target a loopback PostgreSQL test database without query or fragment overrides"
+        )
+    if (
+        os.environ.get("PGSERVICE")
+        or os.environ.get("PGSERVICEFILE")
+        or os.environ.get("PGHOSTADDR", "") not in {"", "localhost", "127.0.0.1", "::1"}
+    ):
+        raise RuntimeError(
+            "ingest tests refuse PostgreSQL service or non-loopback host overrides"
         )
     if os.environ.get("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE") != "1":
         raise RuntimeError(
@@ -48,14 +57,9 @@ _require_safe_test_database()
 
 # Label every connection this test process opens, BEFORE the engine is built.
 #
-# These tests share a database with the running production workers, so
-# `pg_stat_activity` shows their connections too -- and a test that asserts
-# something about "connections left open" cannot tell its own from a crawl
-# worker's without a label. One such test tried to separate them by matching
-# on query text (`'jurisdictions' in query`), which fails whenever a
-# production worker is legitimately mid-transaction on that table, i.e. at
-# random. libpq reads PGAPPNAME, so this costs nothing and gives every
-# assertion an exact filter.
+# `pg_stat_activity` can contain connections from other local test processes,
+# and assertions about connections left open need an exact filter. libpq reads
+# PGAPPNAME, so this costs nothing and gives every assertion that filter.
 TEST_APPLICATION_NAME = "billcommons-tests"
 os.environ.setdefault("PGAPPNAME", TEST_APPLICATION_NAME)
 
@@ -66,18 +70,16 @@ from sqlalchemy.orm import Session  # noqa: E402
 from billcommons_shared.db import get_engine  # noqa: E402
 from billcommons_shared.rawstore import FilesystemRawStore  # noqa: E402
 
-# Tests run against the real live DB (per the module docstring above), which
-# can carry orphaned idle-in-transaction connections holding row locks (see
-# FIX 2 in billcommons_shared/db.py). A 30s statement_timeout means a test
-# that collides with a pre-existing lock fails fast with a clear DB error
-# instead of hanging indefinitely.
+# A 30s statement_timeout means a test that collides with a pre-existing lock
+# in the disposable cluster fails fast with a clear DB error instead of
+# hanging indefinitely.
 TEST_STATEMENT_TIMEOUT_MS = 30_000
 
 # Test-fixture jurisdiction abbreviations use these prefixes (see unique_abbr).
 # Most tests roll back via db_session, but any test that drives the REAL
 # `bootstrap`/ingest path opens its own committing sessions, so those rows
 # survive rollback and must be swept at end of the run — otherwise a
-# test jurisdiction (with bills/votes/coverage) leaks into the shared live DB.
+# test jurisdiction (with bills/votes/coverage) leaks into the test database.
 _TEST_ABBR_PREFIXES = ("ZZ_", "ZQ_")
 
 
@@ -124,7 +126,7 @@ def _purge_test_jurisdictions() -> None:
 def _sweep_leaked_test_jurisdictions():
     """Belt-and-suspenders: sweep any ZZ_/ZQ_ test jurisdictions that a
     committing bootstrap/ingest test left behind, at the end of the session,
-    so test data never accumulates in the shared live DB."""
+    so test data never accumulates in the test database."""
     yield
     _purge_test_jurisdictions()
 
@@ -148,8 +150,8 @@ def db_session(tmp_path):
 def unique_abbr():
     """A fresh, collision-proof jurisdiction abbreviation for tests that
     insert a Jurisdiction row -- fixed fake abbreviations (e.g. "ZQ_COV")
-    can hang indefinitely if a pre-existing orphaned transaction on the
-    shared live DB holds a lock on that exact row (see FIX 3)."""
+    can hang indefinitely if a pre-existing orphaned transaction holds a lock
+    on that exact row (see FIX 3)."""
 
     def _make(prefix: str = "ZZ") -> str:
         return f"{prefix}_{uuid.uuid4().hex[:8].upper()}"
@@ -166,11 +168,8 @@ def rawstore(tmp_path):
 def unique_kind():
     """A fresh, collision-proof ingest_jobs `kind` string for queue tests
     (test_queue.py) that need to scope `claim_job`/`enqueue` to just their
-    own fixture rows -- this test suite runs against a live, shared
-    `ingest_jobs` table the production worker is concurrently
-    enqueueing/claiming real jobs against (see test_queue.py's module
-    docstring), so a fixed kind like "bootstrap" is not enough isolation on
-    its own."""
+    own fixture rows, so a fixed kind like "bootstrap" is not enough
+    isolation on its own."""
 
     def _make(prefix: str = "test_kind") -> str:
         return f"{prefix}_{uuid.uuid4().hex[:8]}"
