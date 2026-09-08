@@ -134,6 +134,31 @@ That test result is rejected. A fail-closed conftest gate and runner guards now
 reject ambient targets and service/host overrides before database helpers load;
 normal verification uses disposable `pg_virtualenv` clusters.
 
+## Failure repair lab — local follow-up, not yet deployed
+
+`python -m billcommons_ingest.official_repair_plan OBSERVATION_UUID` requires an
+explicit database target and opens a repeatable-read, read-only transaction.
+The planner verifies retained blob hashes and size limits before replaying a
+failed CA archive under the current parser. Output records the parser source
+hash, current replay outcome, and a bounded recommendation. It never fetches
+upstream material, advances a retry, changes a target or writes corpus data.
+A successful local replay is a candidate for review and a bounded canary.
+Superseded failures become regression fixtures; they are not retry candidates.
+The old Sunday failure has no retained response or HTTP status, so its cause
+remains unknown until a scheduled capture provides stronger evidence.
+
+New observations will carry bounded structured diagnoses in `scope.failure`:
+a version, processing stage, code, recommendation, and optional whitelisted
+numeric measurements. Exception text, headers and raw response bodies are not
+copied into diagnostic metadata. This preserves historical observations and
+uses the existing schema. Production still runs the earlier observer artifact.
+
+CA history IDs and sequence numbers are not durable cross-archive identities.
+The deployed comparator's missing/local-only counts must not authorize action
+mutation. The follow-up must preserve old recorded comparisons and replay,
+version its new content semantics, and explicitly separate content agreement
+from proof that two records represent the same occurrence.
+
 ## Next actions for the full objective
 
 1. Resolve the generic-worker handoff and the separate TX review gate without
@@ -144,7 +169,7 @@ normal verification uses disposable `pg_virtualenv` clusters.
 3. Turn CA comparisons into bounded discrepancy-repair proposals with before/
    after proof, then deepen FL and CA Scout beyond landing-page links.
 4. Expand semantic source adapters and a factual cross-state benchmark; preserve
-   official occurrence identities, ambiguity, lineage and scope.
+   source identity limitations, ambiguity, lineage and scope.
 5. Productize saved issue monitoring and evidence-backed team/CRM workflows for
    the intended government-technology buyer. Current usage is not proof of demand.
 

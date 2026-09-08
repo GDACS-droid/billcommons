@@ -73,10 +73,13 @@ proof that every route and device has been tested.
   hashes, source timestamps when supplied, and explicit outcomes. The observer
   uses a per-target row lock, a bounded observation transaction, and shutdown
   handling that stops new claims and allows the current observation to finish.
-- California action deltas can be compared with local action records using
-  immutable history IDs. Reconciliation retains the official archive, local
-  snapshot and structured diff. Ambiguous identities remain ambiguous; absence
-  from a weekday delta is not evidence of deletion.
+- California action comparisons retain the official archive, local snapshot
+  and structured diff. A newly confirmed source limitation is that history IDs
+  change across archives, including for unchanged historical action content;
+  sequence numbers can also change. The deployed comparator still assumes
+  durable history IDs, so its missing/local-only counts are not proof that
+  actions need insertion or deletion. A versioned content comparison is being
+  developed; no automatic CA action mutation is enabled.
 - Public official-evidence and bill-history endpoints expose retained source
   observations, comparisons and update evidence. Evidence added prospectively
   does not reconstruct provenance that older ingestion never stored.
