@@ -476,6 +476,41 @@ def test_total_deadline_preserves_a_durable_continuation_cursor(db_session, uniq
     assert target.next_check_at == NOW + timedelta(seconds=300)
 
 
+def test_continuation_replay_failure_keeps_old_raw_without_claiming_http_response(
+    db_session, unique_abbr, monkeypatch
+):
+    """A failed replay is a local attempt, not a second source HTTP 200."""
+    _, target = _target(db_session, unique_abbr)
+    raw = _archive_many(observer.MAX_RECONCILIATIONS_PER_OBSERVATION + 1)
+    captures = []
+    monkeypatch.setattr(
+        observer, "_capture_ca_response", lambda day: (captures.append(day), _captured(raw))[1]
+    )
+
+    first = observer.observe_due_target(db_session, now=NOW)
+    assert first and first.status == "continuing"
+    source = db_session.scalar(select(OfficialSourceObservation).where(
+        OfficialSourceObservation.status == "succeeded"
+    ))
+    assert source.raw_sha256 and source.http_status == 200
+
+    def malformed_replay(*_args, **_kwargs):
+        raise ca_actions.OfficialCaActionsError("fixture parser failure")
+
+    monkeypatch.setattr(ca_actions, "parse_ca_official_actions_zip", malformed_replay)
+    result = observer.observe_due_target(db_session, now=NOW + timedelta(seconds=1))
+    assert result and result.status == "failed"
+    failures = list(db_session.scalars(select(OfficialSourceObservation).where(
+        OfficialSourceObservation.status == "failed"
+    )))
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure.raw_sha256 == source.raw_sha256
+    assert failure.http_status is None
+    assert failure.retrieved_at == NOW + timedelta(seconds=1)
+    assert captures == ["Mon"]
+
+
 def test_continuation_replays_exact_archive_after_rollback_without_refetching(monkeypatch):
     """A committed cursor resumes each official bill exactly once after rollback."""
 

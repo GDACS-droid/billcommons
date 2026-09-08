@@ -300,6 +300,7 @@ def _add_observation(
     adapter_name: str = ADAPTER_NAME,
     adapter_version: str = ca_actions.ADAPTER_VERSION,
     http_status: int | None = None,
+    source_response_observed: bool = True,
 ) -> OfficialSourceObservation:
     observation = OfficialSourceObservation(
         target_id=target.id,
@@ -309,7 +310,14 @@ def _add_observation(
         scope=scope,
         retrieved_at=retrieved_at,
         upstream_updated_at=upstream_updated_at,
-        http_status=http_status if http_status is not None else 200 if raw_sha256 is not None else None,
+        # A retained raw hash can be provenance from an earlier source
+        # response (CA continuation replay), rather than a response received
+        # during this observation attempt.  Never manufacture HTTP 200 there.
+        http_status=(
+            http_status if http_status is not None
+            else 200 if raw_sha256 is not None and source_response_observed
+            else None
+        ),
         raw_sha256=raw_sha256,
         status=status,
         error_class=error_class,
@@ -572,6 +580,7 @@ def _resume_ca_continuation(
             status="failed",
             raw_sha256=continuation.raw_sha256 if raw_blob is not None else None,
             error_class=_safe_error_class(exc),
+            source_response_observed=False,
         )
         _schedule_failure(target, observed_at)
         return OfficialObservationResult(target.id, failure.status, None, 0)
