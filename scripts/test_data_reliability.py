@@ -49,6 +49,8 @@ def main() -> int:
     groups = [
         ["workers/ingest/tests/test_scheduler.py",
          "workers/ingest/tests/test_tls_repair.py",
+         "workers/ingest/tests/test_repair_transport.py",
+         "workers/ingest/tests/test_url_resolvers.py",
          "workers/ingest/tests/test_recompute_status.py",
          "workers/ingest/tests/test_fulltext.py",
          "workers/ingest/tests/test_browser_fetch.py",

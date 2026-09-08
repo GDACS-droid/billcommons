@@ -6,7 +6,6 @@ import json
 import signal
 from pathlib import Path
 
-import httpx
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -14,6 +13,8 @@ import pytest
 from sqlalchemy import select
 
 from billcommons_ingest import fulltext, tls_repair
+from billcommons_ingest.repair_transport import new_repair_fetcher
+from billcommons_shared.safe_http import SafeResponse
 from billcommons_ingest.queue import enqueue
 from billcommons_schema.models import (
     Bill,
@@ -437,14 +438,16 @@ def test_tx_repair_real_resolver_extraction_and_retained_evidence(db_session, ra
     body = (Path(__file__).parent / "fixtures/tx_witness_89r_HB00576H.html").read_bytes()
     assert hashlib.sha256(body).hexdigest() == "f7ae367343adc5c6835d43f81302453c626ebb46633147b165af9a07c6de4880"
     requested = []
-    def wire(request):
-        requested.append(str(request.url))
-        if str(request.url) == "https://capitol.texas.gov/robots.txt":
-            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
-        assert str(request.url) == target_url
-        return httpx.Response(200, content=body, headers={"content-type": "text/html"})
-    client = httpx.Client(transport=httpx.MockTransport(wire))
-    fetcher = fulltext.FullTextFetcher(client=client)
+    class WireClient:
+        def fetch(self, url, *, method, headers, require_body):
+            assert method == "GET" and require_body
+            requested.append(url)
+            if url == "https://capitol.texas.gov/robots.txt":
+                return SafeResponse(200, {"content-type": "text/plain"}, b"User-agent: *\nAllow: /\n")
+            assert url == target_url
+            return SafeResponse(200, {"content-type": "text/html"}, body)
+    client = WireClient()
+    fetcher = new_repair_fetcher(document_client=client, robots_client=client)
     assert tls_repair.seed_tx_candidates(db_session, now=NOW) == 1
     reservation = tls_repair.reserve_one_due_repair(db_session, now=NOW, reason=tls_repair.TX_REPAIR_REASON)
     assert tls_repair.execute_reserved_repair(db_session, reservation, fetcher=fetcher, rawstore=rawstore, now=NOW) == "succeeded"
@@ -463,4 +466,3 @@ def test_tx_repair_real_resolver_extraction_and_retained_evidence(db_session, ra
     assert after["document"]["extracted_text"] == document.extracted_text
     assert source.status == "dead" and source.last_error == "unsupported_redirect_scheme"
     assert _outcomes(db_session) == ["admitted", "succeeded"]
-    client.close()

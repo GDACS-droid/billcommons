@@ -37,6 +37,7 @@ from billcommons_schema.models import (
     TlsFulltextRepairAttempt,
 )
 from billcommons_shared.db import get_session
+from billcommons_ingest.repair_transport import new_repair_fetcher
 from billcommons_shared.rawstore import FilesystemRawStore, RawStore
 
 
@@ -769,7 +770,7 @@ def run_due_repairs(
 ) -> RepairCycleResult:
     """Reserve, commit, then run at most ``limit`` bounded repairs."""
     limit = _bounded_limit(limit)
-    active_fetcher = fetcher or fulltext.FullTextFetcher()
+    active_fetcher = fetcher or new_repair_fetcher()
     active_rawstore = rawstore or FilesystemRawStore()
     counts = {"succeeded": 0, "failed": 0, "skipped": 0, "expired": 0}
     for _ in range(limit):

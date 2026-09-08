@@ -23,6 +23,7 @@ from billcommons_shared.db import get_session
 from billcommons_ingest.official_ca_actions import ca_delta_url
 from billcommons_ingest import official_discovery as discovery
 from billcommons_ingest import fulltext, tls_repair
+from billcommons_ingest.repair_transport import new_repair_fetcher
 from billcommons_shared.rawstore import FilesystemRawStore, RawStore
 
 
@@ -249,7 +250,7 @@ def run_cycle(*, stop: threading.Event, max_observations: int,
     # the observation transactions above have committed.
     if tls_repair_enabled and not stop.is_set():
         runner = tls_repair_runner or _run_tls_repair_cycle
-        active_fetcher = tls_repair_fetcher or fulltext.FullTextFetcher()
+        active_fetcher = tls_repair_fetcher or new_repair_fetcher()
         active_rawstore = tls_repair_rawstore or FilesystemRawStore()
         try:
             counts = runner(
@@ -269,7 +270,7 @@ def run_cycle(*, stop: threading.Event, max_observations: int,
         try:
             counts = runner(
                 session_factory=session_factory,
-                fetcher=tls_repair_fetcher or fulltext.FullTextFetcher(),
+                fetcher=tls_repair_fetcher or new_repair_fetcher(),
                 rawstore=tls_repair_rawstore or FilesystemRawStore(),
                 limit=TLS_REPAIR_CYCLE_LIMIT,
             )
@@ -314,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     tx_repair_enabled = _tx_repair_enabled_from_env()
     # Construct once per process so the repair path retains its rate limiter,
     # robots cache, AIA cache, and optional filesystem archive across cycles.
-    tls_repair_fetcher = fulltext.FullTextFetcher() if tls_repair_enabled or tx_repair_enabled else None
+    tls_repair_fetcher = new_repair_fetcher() if tls_repair_enabled or tx_repair_enabled else None
     tls_repair_rawstore = FilesystemRawStore() if tls_repair_enabled or tx_repair_enabled else None
     previous = {}
     for signum in (signal.SIGTERM, signal.SIGINT):
