@@ -1205,3 +1205,114 @@ def test_postgres_saved_monitor_defers_when_shared_daily_admission_refuses(
         monitor = db.get(ScoutMonitor, monitor_id)
     assert deferred is not None and deferred.error_class == "scout_daily_job_limit"
     assert monitor.consecutive_deferrals == 1
+
+
+
+def test_postgres_monitor_scheduler_and_ad_hoc_admission_share_owner_and_platform_locks(
+    monkeypatch, pg_scout: PostgresScoutHarness, scout_api, tmp_path
+):
+    """A due monitor and a direct request contend safely without queue bypass or deadlock."""
+    customer = pg_scout.customer("monitor-admission-race")
+    baseline = _terminal_monitor_baseline(pg_scout, customer)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_DAILY_BROWSER_SECONDS", "800")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_PLATFORM_MAX_DAILY_BROWSER_SECONDS", "800")
+    with TestClient(scout_api) as client:
+        saved = client.post(
+            f"/api/v1/scout/jobs/{baseline.id}/monitor", json={},
+            headers={"x-test-customer": str(customer.id)},
+        )
+        assert saved.status_code == 201
+        monitor_id = uuid.UUID(saved.json()["monitor"]["id"])
+    with pg_scout.sessions() as db:
+        monitor = db.get(ScoutMonitor, monitor_id)
+        monitor.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+    runner = ScoutRunner(
+        pg_scout.sessions, FilesystemRawStore(tmp_path / "monitor-admission-race"), MockResearchBrowserProvider(),
+        # Use the same environment-derived limits as the API contestant.
+        settings=ScoutSettings.from_env(),
+    )
+    barrier = threading.Barrier(2)
+
+    def schedule() -> bool:
+        barrier.wait(timeout=10)
+        return runner.schedule_one_due_monitor()
+
+    def submit() -> str:
+        with pg_scout.sessions() as db:
+            barrier.wait(timeout=10)
+            result = scout.create_job(
+                scout.CreateScoutJob(query="HB 626", jurisdiction="FL"),
+                _direct_request_for(customer), Response(), db,
+            )
+            return "created" if not result["coalesced"] else "coalesced"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        scheduled, submitted = list(pool.map(lambda fn: fn(), (schedule, submit)))
+    assert scheduled is True and submitted == "created"
+    with pg_scout.sessions() as db:
+        active = db.scalars(select(ScoutResearchJob).where(
+            ScoutResearchJob.customer_id == customer.id,
+            ScoutResearchJob.status.in_(("queued", "running")),
+        )).all()
+        monitor_runs = db.scalars(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.monitor_id == monitor_id, ScoutMonitorRun.status == "queued"
+        )).all()
+    assert len(active) == 2
+    assert len(monitor_runs) == 1 and monitor_runs[0].job_id in {job.id for job in active}
+
+
+def test_postgres_pause_while_monitor_job_active_finalizes_that_run_once(
+    pg_scout: PostgresScoutHarness, scout_api, tmp_path
+):
+    customer = pg_scout.customer("monitor-pause-active")
+    baseline = _terminal_monitor_baseline(pg_scout, customer)
+    headers = {"x-test-customer": str(customer.id)}
+    with TestClient(scout_api) as client:
+        saved = client.post(f"/api/v1/scout/jobs/{baseline.id}/monitor", json={}, headers=headers)
+        assert saved.status_code == 201
+        monitor_id = uuid.UUID(saved.json()["monitor"]["id"])
+    with pg_scout.sessions() as db:
+        monitor = db.get(ScoutMonitor, monitor_id)
+        monitor.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+    runner = ScoutRunner(
+        pg_scout.sessions, FilesystemRawStore(tmp_path / "monitor-pause-active"), MockResearchBrowserProvider(),
+        settings=ScoutSettings(enabled=True, allow_public_rollout=True),
+    )
+    assert runner.schedule_one_due_monitor() is True
+    with pg_scout.sessions() as db:
+        run = db.scalar(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.monitor_id == monitor_id, ScoutMonitorRun.status == "queued"
+        ))
+        assert run is not None
+        job_id = run.job_id
+    with TestClient(scout_api) as client:
+        paused = client.patch(f"/api/v1/scout/monitors/{monitor_id}", json={"active": False}, headers=headers)
+        assert paused.status_code == 200 and paused.json()["monitor"]["active"] is False
+    claim = runner.claim_next("monitor-pause-test")
+    assert claim is not None and claim.job_id == job_id
+    with pg_scout.sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        source = ScoutSource(
+            job_id=job.id, canonical_url="https://www.flsenate.gov/Session/Bill/2026/625",
+            official=True, retrieval_mechanism="direct", content_hash="c" * 64, raw_ref="c" * 64,
+        )
+        db.add(source)
+        db.flush()
+        db.add(ScoutFinding(
+            job_id=job.id, source_id=source.id, title="HB 625", what_happened="Finalized after pause.",
+            confidence="high", extractor_version="monitor-test",
+        ))
+        runner._finish(db, job, claim.token, "completed", None, False)
+        runner._finish(db, job, claim.token, "completed", None, False)
+    with pg_scout.sessions() as db:
+        monitor = db.get(ScoutMonitor, monitor_id)
+        runs = db.scalars(select(ScoutMonitorRun).where(ScoutMonitorRun.job_id == job_id)).all()
+        finished = db.scalars(select(ScoutJobEvent).where(
+            ScoutJobEvent.job_id == job_id, ScoutJobEvent.kind == "finished"
+        )).all()
+    assert monitor.active is False
+    assert len(runs) == 1 and runs[0].status == "completed"
+    assert len(finished) == 1
+    assert runner.schedule_one_due_monitor() is False

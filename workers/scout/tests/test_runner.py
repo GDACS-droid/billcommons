@@ -21,7 +21,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from billcommons_schema.base import Base
-from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutRawBlob, ScoutResearchJob, ScoutSource
+from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutMonitor, ScoutMonitorRun, ScoutRawBlob, ScoutResearchJob, ScoutSource
 from billcommons_shared.rawstore import FilesystemRawStore
 from billcommons_shared.db import _use_psycopg3
 from billcommons_shared.safe_http import SsrfRejected
@@ -46,7 +46,7 @@ def _runner(tmp_path, provider, fetcher, *, settings=None, limits=None):
 
     tables = [Base.metadata.tables[name] for name in (
         "api_customers", "scout_research_jobs", "scout_job_events", "scout_sources",
-        "scout_findings", "scout_browser_sessions",
+        "scout_findings", "scout_browser_sessions", "scout_monitors", "scout_monitor_runs",
     )]
     Base.metadata.create_all(engine, tables=tables)
     sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)

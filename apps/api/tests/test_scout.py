@@ -14,7 +14,7 @@ from billcommons_api.app import create_app
 from billcommons_api.deps import get_db
 from billcommons_api.routers import scout
 from billcommons_schema.base import Base
-from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutJobEvent, ScoutResearchJob, ScoutSource
+from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutJobEvent, ScoutMonitor, ScoutMonitorRun, ScoutResearchJob, ScoutSource
 from billcommons_shared.scout import scout_cache_key
 from billcommons_shared.scout_admission import admit_scout_job
 
@@ -28,7 +28,7 @@ def _app(monkeypatch):
 
     tables = [Base.metadata.tables[name] for name in (
         "api_customers", "scout_research_jobs", "scout_job_events", "scout_sources",
-        "scout_findings", "scout_browser_sessions",
+        "scout_findings", "scout_browser_sessions", "scout_monitors", "scout_monitor_runs",
         # New-job admission totals durable raw evidence before it writes a
         # queue row, so the router fixture needs the production dependency.
         "scout_raw_blobs",
