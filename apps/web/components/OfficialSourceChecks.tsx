@@ -28,6 +28,15 @@ function stateLabel(state: string): string {
     observed: "Source observed" } as Record<string, string>)[state] ?? "Check status unavailable";
 }
 
+function sourceLabel(target: OfficialTarget): string {
+  if (target.adapter_name === "ca_official_actions") {
+    return `California action delta${target.scope.day ? ` · ${target.scope.day}` : ""}`;
+  }
+  if (target.adapter_name === "fl_senate_bill_history") return "Florida bill history";
+  if (target.adapter_name === "official_link_discovery") return "Official website links";
+  return "Official source";
+}
+
 function timestamp(value: string | null): string {
   if (!value) return "Not recorded";
   const date = new Date(value);
@@ -52,7 +61,7 @@ export default function OfficialSourceChecks({ jurisdiction, targets }: {
     <h3 className="font-semibold text-slate-950">Official-source checks</h3>
     <p className="mt-1 text-sm text-slate-600">
       Website-link checks discover material; action-delta checks compare a limited published archive.
-      Neither establishes statewide completeness.
+      Bill-history checks retain facts from one official bill page. These checks do not establish statewide completeness.
     </p>
     {targets.length === 0 ? <p className="mt-3">No official-source targets are recorded for this jurisdiction.</p> :
       <ul className="mt-3 divide-y divide-slate-200">
@@ -60,7 +69,7 @@ export default function OfficialSourceChecks({ jurisdiction, targets }: {
           const sourceUrl = officialUrl(target.source_url);
           return <li key={target.target_id} className="py-3">
             <p className="font-medium text-slate-900">
-              {target.adapter_name === "ca_official_actions" ? `California action delta${target.scope.day ? ` · ${target.scope.day}` : ""}` : "Official website links"}
+              {sourceLabel(target)}
               {" — "}{stateLabel(target.state)}
             </p>
             <p className="mt-1 text-sm tabular-nums text-slate-600">
