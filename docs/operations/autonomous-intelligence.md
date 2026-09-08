@@ -153,7 +153,20 @@ numeric measurements. Exception text, headers and raw response bodies are not
 copied into diagnostic metadata. This preserves historical observations and
 uses the existing schema. Production still runs the earlier observer artifact.
 
-CA history IDs and sequence numbers are not durable cross-archive identities.
+The root integration run passed 79 focused tests on disposable PostgreSQL 16
+through migration `0030`. A production read-only transaction then classified
+all 15 retained failures: five superseded parser failures as regression
+fixtures, five scheduled retries, two access-policy reviews, one endpoint
+review, one browser-adapter review and one capture needing better diagnosis.
+No upstream request, schedule update or corpus write was made. See the
+[read-only lab proof](evidence/reliability-20260908/repair-lab-production-readonly-proof.json).
+
+
+The independently reproduced [source-only proof](evidence/reliability-20260908/ca-history-id-instability-root-proof.json)
+finds 237 common bill/date/text/sequence facts across the retained Mon and Thu
+archives: all 237 have different history IDs. Five other common bill/date/text
+facts changed sequence. CA history IDs and sequence numbers are therefore not
+durable cross-archive identities.
 The deployed comparator's missing/local-only counts must not authorize action
 mutation. The follow-up must preserve old recorded comparisons and replay,
 version its new content semantics, and explicitly separate content agreement

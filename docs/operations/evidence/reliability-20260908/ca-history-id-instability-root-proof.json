@@ -1,0 +1,174 @@
+{
+  "canonical_fact": [
+    "bill_id",
+    "action_date",
+    "normalized_action",
+    "action_sequence"
+  ],
+  "changed_history_id_examples": [
+    {
+      "action_sequence": "1",
+      "bill_id": "202520260AB282",
+      "date": "2025-01-22",
+      "description": "read first time. to print.",
+      "mon_history_id": "118908472",
+      "thu_history_id": "118942571"
+    },
+    {
+      "action_sequence": "2",
+      "bill_id": "202520260AB282",
+      "date": "2025-01-23",
+      "description": "from printer. may be heard in committee february 22.",
+      "mon_history_id": "118908473",
+      "thu_history_id": "118942572"
+    },
+    {
+      "action_sequence": "3",
+      "bill_id": "202520260AB282",
+      "date": "2025-02-18",
+      "description": "referred to coms. on h. & c.d. and jud.",
+      "mon_history_id": "118908474",
+      "thu_history_id": "118942573"
+    },
+    {
+      "action_sequence": "4",
+      "bill_id": "202520260AB282",
+      "date": "2025-03-26",
+      "description": "coauthors revised.",
+      "mon_history_id": "118908475",
+      "thu_history_id": "118942574"
+    },
+    {
+      "action_sequence": "4",
+      "bill_id": "202520260AB282",
+      "date": "2025-03-26",
+      "description": "from committee: do pass and re-refer to com. on jud. (ayes 8. noes 2.) (march 26). re-referred to com. on jud.",
+      "mon_history_id": "118908476",
+      "thu_history_id": "118942575"
+    },
+    {
+      "action_sequence": "5",
+      "bill_id": "202520260AB282",
+      "date": "2025-04-09",
+      "description": "from committee: amend, and do pass as amended and re-refer to com. on appr. (ayes 9. noes 3.) (april 8).",
+      "mon_history_id": "118908477",
+      "thu_history_id": "118942576"
+    },
+    {
+      "action_sequence": "6",
+      "bill_id": "202520260AB282",
+      "date": "2025-04-10",
+      "description": "read second time and amended.",
+      "mon_history_id": "118908478",
+      "thu_history_id": "118942577"
+    },
+    {
+      "action_sequence": "7",
+      "bill_id": "202520260AB282",
+      "date": "2025-04-21",
+      "description": "re-referred to com. on appr.",
+      "mon_history_id": "118908479",
+      "thu_history_id": "118942578"
+    },
+    {
+      "action_sequence": "8",
+      "bill_id": "202520260AB282",
+      "date": "2025-04-23",
+      "description": "from committee: do pass. (ayes 11. noes 4.) (april 23).",
+      "mon_history_id": "118908480",
+      "thu_history_id": "118942579"
+    },
+    {
+      "action_sequence": "9",
+      "bill_id": "202520260AB282",
+      "date": "2025-04-24",
+      "description": "read second time. ordered to third reading.",
+      "mon_history_id": "118908481",
+      "thu_history_id": "118942580"
+    }
+  ],
+  "common_exact_canonical_facts": 237,
+  "history_id_changed": 237,
+  "history_id_unchanged": 0,
+  "interpretation": "Source-only retained-archive comparison. Matching content does not prove a durable occurrence identity.",
+  "multiplicity_cases": 0,
+  "schema_version": 1,
+  "sequence_change_examples": [
+    {
+      "bill_id": "202520260SB1009",
+      "date": "2026-08-17",
+      "description": "read third time and amended.",
+      "mon_sequences": [
+        "21"
+      ],
+      "thu_sequences": [
+        "20"
+      ]
+    },
+    {
+      "bill_id": "202520260SB1009",
+      "date": "2026-08-17",
+      "description": "ordered to third reading.",
+      "mon_sequences": [
+        "21"
+      ],
+      "thu_sequences": [
+        "20"
+      ]
+    },
+    {
+      "bill_id": "202520260SB1009",
+      "date": "2026-08-30",
+      "description": "read third time. passed. ordered to the senate.",
+      "mon_sequences": [
+        "22"
+      ],
+      "thu_sequences": [
+        "21"
+      ]
+    },
+    {
+      "bill_id": "202520260SB1009",
+      "date": "2026-08-30",
+      "description": "in senate. concurrence in assembly amendments pending.",
+      "mon_sequences": [
+        "23"
+      ],
+      "thu_sequences": [
+        "22"
+      ]
+    },
+    {
+      "bill_id": "202520260SB1009",
+      "date": "2026-08-31",
+      "description": "assembly amendments concurred in. (ayes 25. noes 11.) ordered to engrossing and enrolling.",
+      "mon_sequences": [
+        "24"
+      ],
+      "thu_sequences": [
+        "23"
+      ]
+    }
+  ],
+  "sequence_changed_for_shared_bill_date_text": 5,
+  "snapshots": {
+    "mon": {
+      "blob_bytes": 4851719,
+      "history_rows": 7094,
+      "observation_id": "37d75a7c-9068-4aa3-a13d-7513276855f4",
+      "sha256": "0a0bff772076a5879238cf3e1c69c02000b4a4ed2653bd4ca7192fdfc91ce7b8",
+      "source_url": "https://downloads.leginfo.legislature.ca.gov/pubinfo_Mon.zip",
+      "unique_canonical_facts": 7094,
+      "upstream_last_modified": "2026-09-01T04:20:08+00:00"
+    },
+    "thu": {
+      "blob_bytes": 1051005,
+      "history_rows": 8521,
+      "observation_id": "8589d72e-7061-4d77-985c-ab61658bd487",
+      "sha256": "9e0cdaf9757a6903198cf2ab65ad574691521e4613ffbc98b8cb59b5f72e8999",
+      "source_url": "https://downloads.leginfo.legislature.ca.gov/pubinfo_Thu.zip",
+      "unique_canonical_facts": 8521,
+      "upstream_last_modified": "2026-09-04T04:20:07+00:00"
+    }
+  }
+}
