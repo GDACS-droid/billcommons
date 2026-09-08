@@ -22,6 +22,7 @@ from billcommons_ingest.official_observer import (
 )
 from billcommons_schema.models import OfficialRawBlob, OfficialReconciliationRun, OfficialSourceObservation
 from billcommons_shared.reconciliation import reconcile_events
+from billcommons_ingest.official_ca_reconciliation import reconcile_ca_action_content
 
 
 class EvidenceReplayError(ValueError):
@@ -49,7 +50,7 @@ def replay_reconciliation(db, reconciliation_id: uuid.UUID) -> dict:
     if (observation is None or observation.status != 'succeeded'
             or observation.adapter_name != ADAPTER_NAME
             or observation.adapter_version != ca.ADAPTER_VERSION
-            or run.comparator_version != COMPARATOR_VERSION):
+            or run.comparator_version not in {"reconcile-events/1", COMPARATOR_VERSION}):
         raise EvidenceReplayError('unsupported recorded adapter/comparator version or outcome')
     raw = _load_blob(db, observation.raw_sha256)
     local_bytes = _load_blob(db, run.local_snapshot_sha256)
@@ -61,7 +62,15 @@ def replay_reconciliation(db, reconciliation_id: uuid.UUID) -> dict:
         raise EvidenceReplayError('recorded bill is absent from retained archive')
     mapping = ca.map_official_bill_id(run.official_bill_id)
     official = {'events': _official_events(events, mapping)}
-    reproduced = reconcile_events(official, json.loads(local_bytes))
+    if run.comparator_version == "reconcile-events/1":
+        # Preserve exact historical bytes even though the old CA identity
+        # assumption is now known to be unsuitable for cross-snapshot repair.
+        reproduced = reconcile_events(official, json.loads(local_bytes))
+    else:
+        reproduced = reconcile_ca_action_content(official, json.loads(local_bytes), scope={
+            "jurisdiction": "CA", "session": mapping.session_identifier,
+            "bill_id": mapping.official_bill_id,
+        })
     reproduced_bytes = _canonical_json_bytes(reproduced)
     if reproduced_bytes != stored_diff or reproduced['summary'] != run.summary:
         raise EvidenceReplayError('recorded reconciliation does not reproduce')
@@ -72,7 +81,9 @@ def replay_reconciliation(db, reconciliation_id: uuid.UUID) -> dict:
             'raw_sha256': observation.raw_sha256,
             'local_snapshot_sha256': run.local_snapshot_sha256,
             'diff_sha256': run.diff_sha256, 'summary': reproduced['summary'],
-            'interpretation': 'Exact replay of retained evidence; no current-source freshness claim.'}
+            'interpretation': ('Exact historical replay; legacy CA identity differences do not establish missing actions.'
+                               if run.comparator_version == 'reconcile-events/1' else
+                               'Exact replay of retained content comparison; no occurrence or current-source freshness proof.')}
 
 
 def main() -> int:

@@ -47,10 +47,10 @@ from billcommons_schema.models import (
     Session as SessionModel,
 )
 from billcommons_shared.normalize import normalize_bill_number
-from billcommons_shared.reconciliation import ReconciliationInputError, reconcile_events
+from billcommons_shared.reconciliation import ReconciliationInputError
+from billcommons_ingest.official_ca_reconciliation import COMPARATOR_VERSION, reconcile_ca_action_content
 
 ADAPTER_NAME = "ca_official_actions"
-COMPARATOR_VERSION = "reconcile-events/1"
 CA_JURISDICTION = "CA"
 CA_HISTORY_PREFIX = "ca-history:"
 CA_HISTORY_NAMESPACE = "ca-leginfo-pubinfo-history"
@@ -409,9 +409,8 @@ def _local_events(db: OrmSession, bill: Bill, mapping) -> list[dict[str, Any]]:
         is_ca_history = isinstance(action.upstream_id, str) and action.upstream_id.startswith(CA_HISTORY_PREFIX)
         events.append(
             {
-                # Only California's immutable history IDs may pair. Other
-                # local records remain inspectable ambiguous evidence rather
-                # than becoming a text/date match by accident.
+                # Preserve legacy IDs as evidence references. The versioned CA
+                # comparator does not treat them as durable occurrence IDs.
                 "occurrence_id": action.upstream_id if is_ca_history else None,
                 "source_identity": action.upstream_id if is_ca_history else None,
                 "source_namespace": CA_HISTORY_NAMESPACE if is_ca_history else None,
@@ -477,7 +476,10 @@ def _reconcile_batch(
             official_fixture = {"events": _official_events(batch.events_by_official_bill_id[official_bill_id], mapping)}
             local_fixture = {"events": _local_events(db, bill, mapping)}
             local_sha256 = store_official_raw_blob(db, _canonical_json_bytes(local_fixture), "application/json")
-            report = reconcile_events(official_fixture, local_fixture)
+            report = reconcile_ca_action_content(official_fixture, local_fixture, scope={
+                "jurisdiction": CA_JURISDICTION, "session": mapping.session_identifier,
+                "bill_id": mapping.official_bill_id,
+            })
             diff_sha256 = store_official_raw_blob(db, _canonical_json_bytes(report), "application/json")
             db.add(
                 OfficialReconciliationRun(

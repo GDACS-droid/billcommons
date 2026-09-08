@@ -161,9 +161,9 @@ def test_success_records_verified_raw_replayable_diff_and_never_mutates_actions(
     assert run.bill_id == bill.id
     assert run.local_snapshot_sha256 and run.diff_sha256
     report = json.loads(db_session.get(OfficialRawBlob, run.diff_sha256).data)
-    assert report["summary"]["matched"] == 1
+    assert report["summary"]["content_agreement"] == 1
     assert report["summary"]["local_records"] == 2
-    assert report["summary"]["ambiguous_identities"] == 1
+    assert report["summary"]["local_only_content"] == 1
     assert db_session.get(BillAction, local.id).description == "Read first time."
     assert db_session.get(BillAction, ignored.id).description == "Other source fact"
     assert target.consecutive_failures == 0
@@ -416,7 +416,7 @@ def test_repeated_unchanged_capture_reuses_content_addressed_evidence(db_session
     assert db_session.scalar(select(func.count()).select_from(OfficialRawBlob)) == 3
 
 
-def test_explicit_ca_history_identity_reports_unpaired_events_without_guessing(db_session, unique_abbr, monkeypatch):
+def test_changed_history_id_agrees_on_content_without_occurrence_proof(db_session, unique_abbr, monkeypatch):
     jurisdiction, _ = _target(db_session, unique_abbr)
     bill = _local_bill(db_session, jurisdiction)
     db_session.add(
@@ -436,9 +436,10 @@ def test_explicit_ca_history_identity_reports_unpaired_events_without_guessing(d
     assert result and result.status == "succeeded"
     run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
     report = json.loads(db_session.get(OfficialRawBlob, run.diff_sha256).data)
-    assert report["summary"]["matched"] == 0
-    assert report["summary"]["missing_from_local"] == 1
-    assert report["summary"]["local_only_not_deletion"] == 1
+    assert report["summary"]["content_agreement"] == 1
+    assert report["summary"]["official_only_content"] == 0
+    assert report["summary"]["local_only_content"] == 0
+    assert report["content_agreement"][0]["occurrence_proof"] is False
 
 
 def test_nested_scope_values_are_invalid_not_a_worker_crash(db_session, unique_abbr, monkeypatch):
@@ -538,7 +539,7 @@ def test_non_ca_local_action_is_retained_as_unpaired_snapshot_evidence(db_sessio
     assert local_event["occurrence_id"] is None
     assert local_event["local_record_id"] == str(unknown.id)
     report = json.loads(db_session.get(OfficialRawBlob, run.diff_sha256).data)
-    assert report["summary"]["ambiguous_identities"] == 1
+    assert report["summary"]["local_only_content"] == 1
 
 
 def test_total_deadline_preserves_a_durable_continuation_cursor(db_session, unique_abbr, monkeypatch):

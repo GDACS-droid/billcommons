@@ -88,3 +88,28 @@ def test_missing_scope_and_too_many_events_fail_closed():
         reconcile_ca_action_content([missing], [])
     with pytest.raises(ReconciliationInputError, match="event safety cap"):
         reconcile_ca_action_content([event() for _ in range(MAX_EVENTS_PER_SIDE + 1)], [])
+
+
+def test_empty_histories_require_explicit_consistent_bill_scope():
+    scope = {k: event()[k] for k in ('jurisdiction', 'session', 'bill_id')}
+    report = reconcile_ca_action_content([], [], scope=scope)
+    assert report['summary']['official_records'] == report['summary']['local_records'] == 0
+    with pytest.raises(ReconciliationInputError, match='scope evidence'):
+        reconcile_ca_action_content([], [])
+    with pytest.raises(ReconciliationInputError, match='mixed jurisdiction'):
+        reconcile_ca_action_content([event()], [], scope={**scope, 'bill_id': '202520260AB13'})
+
+
+def test_report_is_deterministic_under_input_permutations():
+    official = [event(history_id='a'), event(history_id='b', date='2026-09-02'), event(history_id='c', date=None)]
+    local = [event(history_id='d'), event(history_id='e', date='2026-09-03')]
+    assert reconcile_ca_action_content(official, local) == reconcile_ca_action_content(official[::-1], local[::-1])
+
+
+def test_record_and_output_size_caps_fail_closed(monkeypatch):
+    from billcommons_ingest import official_ca_reconciliation as comparator
+    with pytest.raises(ReconciliationInputError, match='evidence safety cap'):
+        reconcile_ca_action_content([event(extra='x' * comparator.MAX_EVENT_BYTES)], [])
+    monkeypatch.setattr(comparator, 'MAX_REPORT_BYTES', 100)
+    with pytest.raises(ReconciliationInputError, match='report exceeds'):
+        reconcile_ca_action_content([event()], [event()])

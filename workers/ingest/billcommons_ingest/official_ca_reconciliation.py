@@ -11,7 +11,7 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from billcommons_shared.reconciliation import (
     MAX_EVENT_BYTES,
@@ -127,7 +127,7 @@ def _ambiguous_reason(event: _Event) -> str:
     return "missing_exact_day" if event.date is None else "missing_description"
 
 
-def reconcile_ca_action_content(official_fixture: Any, local_fixture: Any) -> dict[str, Any]:
+def reconcile_ca_action_content(official_fixture: Any, local_fixture: Any, *, scope: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Compare one CA bill/session's action-content multisets without matching occurrences.
 
     A record joins a content multiset only with an exact ISO day and a nonblank
@@ -137,6 +137,8 @@ def reconcile_ca_action_content(official_fixture: Any, local_fixture: Any) -> di
     """
     official, local = _events(official_fixture, "official"), _events(local_fixture, "local")
     scopes = {event.scope for event in official + local}
+    if scope is not None:
+        scopes.add(_event(dict(scope)).scope)
     if not scopes:
         raise ReconciliationInputError("CA content comparison requires scope evidence")
     if len(scopes) != 1:
