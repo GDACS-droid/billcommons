@@ -164,6 +164,67 @@ def test_scout_california_terminal_evidence_can_be_saved_as_a_monitor(monkeypatc
     assert original.limits["max_ca_parse_seconds"] == 5
 
 
+def test_scout_partial_monitor_snapshot_excludes_unverified_stages(monkeypatch):
+    """A partial result may retain final sources, but never staging barriers."""
+    app, owner, _other, sessions = _app(monkeypatch)
+    with sessions() as db:
+        job = ScoutResearchJob(
+            customer_id=owner.id, original_query="AB 123 2025-2026", normalized_query="ab 123 2025-2026",
+            jurisdiction="CA", cache_key="partial-monitor-stages", status="partial",
+            strategy={"adapter": "california_retained_p0", "mode": "retained_official_archive"},
+            limits={}, usage={}, completed_at=datetime.now(timezone.utc),
+        )
+        db.add(job)
+        db.flush()
+        evidenced = ScoutSource(
+            job_id=job.id, canonical_url="https://www.leginfo.ca.gov/retained/evidenced.zip",
+            official=True, retrieval_mechanism="official_retained_archive",
+            content_hash="a" * 64, raw_ref="a" * 64,
+        )
+        no_finding = ScoutSource(
+            job_id=job.id, canonical_url="https://www.leginfo.ca.gov/retained/no-finding.zip",
+            official=True, retrieval_mechanism="official_retained_archive",
+            content_hash="b" * 64, raw_ref="b" * 64,
+        )
+        # First staging barrier: RawStore has not accepted the bytes yet.
+        unresolved_stage = ScoutSource(
+            job_id=job.id, canonical_url="https://www.leginfo.ca.gov/retained/unresolved.zip",
+            official=False, retrieval_mechanism="staged",
+        )
+        # Reclaimed claim: a stage can keep its hash/ref for garbage collection
+        # after a fenced worker loses ownership. It is still not final evidence.
+        reclaimed_stage = ScoutSource(
+            job_id=job.id, canonical_url="https://www.leginfo.ca.gov/retained/reclaimed.zip",
+            official=False, retrieval_mechanism="staged",
+            content_hash="c" * 64, raw_ref="c" * 64,
+        )
+        incomplete_final = ScoutSource(
+            job_id=job.id, canonical_url="https://www.leginfo.ca.gov/retained/incomplete.zip",
+            official=True, retrieval_mechanism="official_retained_archive",
+        )
+        db.add_all((evidenced, no_finding, unresolved_stage, reclaimed_stage, incomplete_final))
+        db.flush()
+        db.add(ScoutFinding(
+            job_id=job.id, source_id=evidenced.id, title="AB 123", what_happened="Retained action.",
+            confidence="high", extractor_version="partial-monitor-test",
+        ))
+        db.commit()
+        job_id = job.id
+    headers = {"x-test-customer": str(owner.id)}
+    with TestClient(app) as client:
+        created = client.post(f"/api/v1/scout/jobs/{job_id}/monitor", json={}, headers=headers)
+        assert created.status_code == 201
+        monitor_id = created.json()["monitor"]["id"]
+        history = client.get(f"/api/v1/scout/monitors/{monitor_id}/runs", headers=headers)
+    snapshot = history.json()["runs"][0]["source_snapshot"]
+    by_url = {source["canonical_url"]: source for source in snapshot["sources"]}
+    assert set(by_url) == {
+        "https://www.leginfo.ca.gov/retained/evidenced.zip",
+        "https://www.leginfo.ca.gov/retained/no-finding.zip",
+    }
+    assert by_url["https://www.leginfo.ca.gov/retained/no-finding.zip"]["finding_ids"] == []
+
+
 def test_scout_creation_snapshots_document_processing_caps(monkeypatch):
     app, owner, _other, sessions = _app(monkeypatch)
     monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_RELATED_DOCUMENTS", "1")

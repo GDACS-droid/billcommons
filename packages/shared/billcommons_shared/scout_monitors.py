@@ -13,6 +13,12 @@ from sqlalchemy.orm import Session
 from billcommons_schema.models import ScoutFinding, ScoutMonitor, ScoutMonitorRun, ScoutResearchJob, ScoutSource
 
 _MAX_SNAPSHOT_SOURCES = 32
+_FINAL_RETRIEVAL_MECHANISMS = frozenset({
+    "direct",
+    "browser",
+    "reused",
+    "official_retained_archive",
+})
 
 
 def is_operator_strategy(job: ScoutResearchJob) -> bool:
@@ -22,9 +28,20 @@ def is_operator_strategy(job: ScoutResearchJob) -> bool:
 
 
 def source_snapshot(db: Session, job_id) -> dict:
-    sources = list(db.scalars(select(ScoutSource).where(ScoutSource.job_id == job_id).order_by(
-        ScoutSource.canonical_url, ScoutSource.id
-    )).all())
+    # Staged rows are deliberately durable while a raw-store write is in
+    # flight or after a fenced claim is reclaimed.  They are not evidence:
+    # some legitimately have no hash/ref and others retain a hash/ref only so
+    # the staging reaper can safely account for the bytes.  A monitor must
+    # snapshot only finalized official source versions.  Findings are not part
+    # of this predicate: a retained final source can be useful provenance even
+    # when its extraction did not produce a finding.
+    sources = list(db.scalars(select(ScoutSource).where(
+        ScoutSource.job_id == job_id,
+        ScoutSource.official.is_(True),
+        ScoutSource.retrieval_mechanism.in_(_FINAL_RETRIEVAL_MECHANISMS),
+        ScoutSource.content_hash.is_not(None),
+        ScoutSource.raw_ref.is_not(None),
+    ).order_by(ScoutSource.canonical_url, ScoutSource.id)).all())
     if len(sources) > _MAX_SNAPSHOT_SOURCES:
         raise ValueError("monitor_snapshot_source_limit")
     findings = list(db.scalars(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).all())
