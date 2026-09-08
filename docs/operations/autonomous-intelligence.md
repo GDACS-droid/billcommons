@@ -59,11 +59,79 @@ and the safe disposable harness passes. Normal checks use `pg_virtualenv`.
 
 ## Next implementation
 
-Implement a durable shared upstream quota and source observation/reconciliation
-ledger. Retain exact bounded response bytes independently of Scout tenancy.
-Declare official adapter capability only where a source-specific parser and
-fixtures exist. Use CA then FL to exercise the common contract, then extend
-source-by-source until all-state acceptance is actually proven.
+The shared upstream quota and corpus-owned observation/reconciliation ledger
+are implemented locally, with additive migrations `0026` and `0027`. The
+official worker has a five-minute transaction deadline, target row locking,
+durable retry schedules and graceful stop between claims. It registers seven
+California daily-action delta targets and 51 reviewed official landing-page
+targets. Registration and enablement are explicit operator switches.
+
+California comparisons retain the exact archive, local action input and diff.
+Each observation compares at most 500 bills and records an explicit partial
+remainder when that limit is reached. That remainder still needs resumable
+processing before claiming exhaustive reconciliation. Generic discovery retains
+robots and page bytes plus a replayable, bounded same-origin link comparison;
+it does not parse legislative facts or establish statewide freshness.
+
+Next: complete staged deployment and health proof; make comparison remainders
+resumable; retain before/after and source-response evidence on the existing
+all-state incremental/document mutation paths; extend source-specific semantic
+adapters and bounded repair workflows. The full user objective remains active.
+
+## Implementation and release checkpoint — 2026-09-08 02:03 UTC
+
+- Main integration branch: `mission-reliability-20260908`, implementation
+  through `baaf830`. Original user worktree remains separate.
+- The second canonical nine-family review of aggregate `1171a6e` completed
+  with seven SHIP and two BLOCK verdicts. The BLOCKs were substantive:
+  missing/empty canonical jurisdictions, undated successful syncs, wrong age
+  for quota-delayed queues, unbounded historical ORM materialization, and no
+  cooldown after failed public report scans. These were repaired and tested.
+- Revised first-stage source: `5fc1b07e725c0f92c4e77939f65018bd0e90e8f3`.
+  Aggregate `4590b5fcef61b67470d0ae0f0e929795378df55d` has the exact same full
+  binary diff from `26e99e2`. Its canonical review is running at
+  `/home/alberto/verify-runs/20260908T015852Z-4590b5f`.
+- First-stage checkout independently passed 80 worker/shared and 8 API tests
+  on disposable PostgreSQL 16. Main integration independently passed 206
+  worker/shared and 17 API tests, including real PostgreSQL evidence pagination,
+  exact-byte HTTP retrieval, failure cleanup, lock contention and deadline tests.
+  The existing Starlette/httpx deprecation warning remains.
+- Live read-only recheck at 02:03:38 UTC: revision `0025`, 51 public
+  jurisdictions, 17 warnings, no critical/error defects, and no pending
+  API-sync jobs. This report is local ingestion evidence, not proof of official
+  source freshness. Recheck immediately before production cutover.
+- No production deployment or migration has occurred in this implementation arc.
+
+## Retained all-state source probe
+
+One bounded read-only probe completed at 01:57:18 UTC: all 51 jurisdictions,
+85 HTTP requests, 30 observable pages and 547 candidate links. The remaining
+outcomes were 10 rejected redirects, 5 TLS failures, 2 robots denials,
+2 unavailable robots policies, 1 slow crawl-policy restriction and 1 JavaScript
+requirement. No production database was accessed. Exact public page/policy
+bytes and hashes are retained in restricted local evidence storage at
+`/home/alberto/.local/share/billcommons/official-inventory-probe-20260908`.
+
+The checked-in override registry corrects Kansas and Indiana destinations only
+after following their primary government endpoints: the
+[Kansas legislature](https://www.kslegislature.org/) redirects to its `.gov`
+session site, and [Indiana's state legislature link](https://www.in.gov/legislative/)
+redirects to `iga.in.gov`. Other rejected redirects remain visible failures;
+the transport does not follow unreviewed destinations or weaken TLS.
+
+## Backup proof in progress
+
+The snapshot-consistent PostgreSQL 18 dump completed at 01:56:38 UTC:
+3,211,108,251 bytes, mode `0600`, catalog valid, SHA-256
+`1125ea521522c7034e13c1f8a267d79175992549339642f35190fc332632d0a6`.
+Snapshot counts include 210,504 bills, 1,673,590 actions, 741,902 documents and
+10 Scout raw blobs. Restore verification is still running and is not yet a pass.
+
+The host had PostgreSQL 18 clients but no matching server. An official PGDG
+18.6 server package and its liburing dependency were unpacked into private
+task storage; no system package installation or existing cluster restart was
+needed. The restore runs in a disposable loopback-only server and will check
+snapshot counts, Alembic revision, every Scout raw hash and actual API reads.
 
 ## Live release preflight evidence
 
