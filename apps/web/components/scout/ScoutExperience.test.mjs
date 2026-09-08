@@ -44,3 +44,12 @@ test("linked monitor evidence loads an existing job without creating research an
   assert.match(pageSource, /searchParams: Promise<\{ job\?: string \| string\[\] \}>/);
   assert.match(pageSource, /initialJobId=\{jobId\}/);
 });
+
+test("Scout polling only applies results from the active request generation", () => {
+  assert.match(source, /const \[jobGeneration, setJobGeneration\] = useState\(0\)/);
+  assert.match(source, /setJobGeneration\(generation\)/);
+  assert.match(source, /const generation = jobGeneration/);
+  assert.match(source, /jobRequest\.current\.generation !== generation/);
+  assert.match(source, /\[jobGeneration, pollJobId, pollJobStatus\]/);
+  assert.match(source, /const request = beginJobRequest\(\);\n    setJob\(null\);/);
+});

@@ -417,6 +417,7 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
   const [canceling, setCanceling] = useState(false);
   const [error, setError] = useState("");
   const [refreshError, setRefreshError] = useState("");
+  const [jobGeneration, setJobGeneration] = useState(0);
   const trackedFacts = useRef(new Set<string>());
   const unknownPolls = useRef(0);
   const jobRequest = useRef<{ generation: number; controller?: AbortController }>({ generation: 0 });
@@ -425,6 +426,7 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
     const controller = new AbortController();
     const generation = jobRequest.current.generation + 1;
     jobRequest.current = { generation, controller };
+    setJobGeneration(generation);
     return { generation, controller };
   }, []);
   const pollJobId = job?.id;
@@ -516,6 +518,7 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
 
   useEffect(() => {
     if (!pollJobId || !pollJobStatus || isScoutTerminal(pollJobStatus)) return;
+    const generation = jobGeneration;
     let active = true;
     const controller = new AbortController();
     let timer: number | undefined;
@@ -523,20 +526,20 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
     const schedule = (status: ScoutJob["status"]) => {
       unknownPolls.current = status === "unknown" ? unknownPolls.current + 1 : 0;
       const delay = scoutPollRetryDelay(status, unknownPolls.current);
-      if (delay === undefined && status === "unknown" && active) {
+      if (delay === undefined && status === "unknown" && active && jobRequest.current.generation === generation) {
         setRefreshError("Scout returned an unrecognized status repeatedly. Refresh the page to try again.");
       }
-      if (delay !== undefined && active) timer = window.setTimeout(poll, delay);
+      if (delay !== undefined && active && jobRequest.current.generation === generation) timer = window.setTimeout(poll, delay);
     };
     const poll = async () => {
       try {
         const next = await getScoutJob(pollJobId, controller.signal);
-        if (!active) return;
+        if (!active || jobRequest.current.generation !== generation) return;
         setJob(next);
         setRefreshError("");
         schedule(next.status);
       } catch (reason) {
-        if (!active || (reason instanceof DOMException && reason.name === "AbortError")) return;
+        if (!active || jobRequest.current.generation !== generation || (reason instanceof DOMException && reason.name === "AbortError")) return;
         setRefreshError(reason instanceof Error ? reason.message : "Scout could not refresh this job. Retrying shortly.");
         schedule(pollJobStatus);
       }
@@ -548,7 +551,7 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
       if (timer !== undefined) window.clearTimeout(timer);
       controller.abort();
     };
-  }, [pollJobId, pollJobStatus]);
+  }, [jobGeneration, pollJobId, pollJobStatus]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -562,6 +565,7 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
       return;
     }
     const request = beginJobRequest();
+    setJob(null);
     setSubmitting(true);
     setError("");
     setRefreshError("");

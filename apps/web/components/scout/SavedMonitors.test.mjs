@@ -30,3 +30,13 @@ test("saved monitor UI distinguishes pending, unavailable, missing, and zero-cou
   assert.match(source, /listStatus === "ready" && !monitors\.length/);
   assert.match(source, /monitorVersion\.current !== version/);
 });
+
+test("acknowledged monitor mutations merge locally before one authoritative post-settlement refresh", () => {
+  assert.match(source, /const pendingMutations = useRef\(0\)/);
+  assert.match(source, /function beginMutation\(\)/);
+  assert.match(source, /function settleMutation\(\)/);
+  assert.match(source, /if \(!pendingMutations\.current\) void refresh\(\)/);
+  assert.match(source, /acceptMonitor\(result\.monitor\)/);
+  assert.match(source, /onMutationStart=\{beginMutation\}/);
+  assert.match(source, /onMutationSettled=\{settleMutation\}/);
+});

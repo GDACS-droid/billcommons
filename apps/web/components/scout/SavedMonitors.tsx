@@ -117,15 +117,16 @@ function MonitorHistory({ monitor }: { monitor: ScoutMonitor }) {
   );
 }
 
-function MonitorRow({ monitor, onChange }: { monitor: ScoutMonitor; onChange: (monitor: ScoutMonitor) => void }) {
+function MonitorRow({ monitor, onChange, onMutationStart, onMutationSettled }: { monitor: ScoutMonitor; onChange: (monitor: ScoutMonitor) => void; onMutationStart: () => void; onMutationSettled: () => void }) {
   const [cadence, setCadence] = useState(monitor.cadenceSeconds);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   async function update(change: { active?: boolean; cadenceSeconds?: number }) {
+    onMutationStart();
     setSaving(true); setError("");
     try { const next = await updateScoutMonitor(monitor.id, change); setCadence(next.cadenceSeconds); onChange(next); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "Scout could not update this monitor."); }
-    finally { setSaving(false); }
+    finally { onMutationSettled(); setSaving(false); }
   }
   return <li className="border-t border-slate-200 py-5 first:border-t-0 first:pt-0">
     <div className="flex flex-wrap items-start justify-between gap-4">
@@ -156,6 +157,7 @@ export default function SavedMonitors({ job }: { job?: ScoutJob }) {
   const [cadence, setCadence] = useState(CADENCES[1].seconds);
   const [saving, setSaving] = useState(false);
   const monitorVersion = useRef(0);
+  const pendingMutations = useRef(0);
   const eligible = job ? isScoutMonitorEligible(job) : false;
 
   const refresh = useCallback(async () => {
@@ -177,28 +179,32 @@ export default function SavedMonitors({ job }: { job?: ScoutJob }) {
   useEffect(() => { void refresh(); }, [refresh]);
 
   function acceptMonitor(next: ScoutMonitor) {
+    setMonitors((current) => current.some((item) => item.id === next.id)
+      ? current.map((item) => item.id === next.id ? next : item)
+      : [next, ...current]);
+  }
+
+  function beginMutation() {
     monitorVersion.current += 1;
-    setMonitors((current) => current.map((item) => item.id === next.id ? next : item));
-    setListStatus("ready");
-    setListError("");
+    pendingMutations.current += 1;
+  }
+
+  function settleMutation() {
+    pendingMutations.current -= 1;
+    if (!pendingMutations.current) void refresh();
   }
 
   async function save() {
     if (!job || !eligible) return;
-    const version = monitorVersion.current + 1;
-    monitorVersion.current = version;
+    beginMutation();
     setSaving(true); setSaveError("");
     try {
       const result = await saveScoutMonitor(job.id, cadence);
-      if (monitorVersion.current !== version) return;
-      setMonitors((current) => [result.monitor, ...current.filter((item) => item.id !== result.monitor.id)]);
-      setListStatus("loading");
-      setListError("");
+      acceptMonitor(result.monitor);
     } catch (reason) {
-      if (monitorVersion.current !== version) return;
       setSaveError(reason instanceof Error ? reason.message : "Scout could not save this monitor.");
     } finally {
-      if (monitorVersion.current === version) await refresh();
+      settleMutation();
       setSaving(false);
     }
   }
@@ -210,7 +216,7 @@ export default function SavedMonitors({ job }: { job?: ScoutJob }) {
     {job ? <div className="mt-5 border-t border-slate-200 pt-4"><p className="text-sm font-semibold text-slate-900">Save this research result</p>{eligible ? <div className="mt-3 flex flex-wrap items-end gap-3"><label className="text-sm text-slate-700">Cadence<select value={cadence} onChange={(event) => setCadence(Number(event.target.value))} className="ml-2 rounded-sm border border-slate-400 bg-white px-2 py-1.5 text-sm text-slate-950">{CADENCES.map((item) => <option key={item.seconds} value={item.seconds}>{item.label}</option>)}</select></label><button type="button" disabled={saving || limitReached} onClick={() => void save()} className="rounded-sm bg-slate-950 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50">{saving ? "Saving…" : limitReached ? "Monitor limit reached" : "Save monitor"}</button></div> : <p className="mt-2 text-sm leading-6 text-slate-600">Only completed or partial results with retained findings can become monitors. Operator and canary research cannot be saved.</p>}</div> : null}
     {listStatus === "loading" ? <p className="mt-6 text-sm text-slate-600">Loading saved monitors…</p> : null}
     {listStatus === "ready" && !monitors.length ? <p className="mt-6 text-sm text-slate-600">No saved monitors yet. Save an eligible evidence result to begin a bounded comparison history.</p> : null}
-    {monitors.length ? <ul className="mt-6">{monitors.map((monitor) => <MonitorRow key={monitor.id} monitor={monitor} onChange={acceptMonitor} />)}</ul> : null}
+    {monitors.length ? <ul className="mt-6">{monitors.map((monitor) => <MonitorRow key={monitor.id} monitor={monitor} onChange={acceptMonitor} onMutationStart={beginMutation} onMutationSettled={settleMutation} />)}</ul> : null}
     {listError ? <p role="alert" className="mt-4 text-sm text-red-800">{listError}</p> : null}
     {saveError ? <p role="alert" className="mt-4 text-sm text-red-800">{saveError}</p> : null}
   </section>;
