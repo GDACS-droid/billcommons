@@ -431,6 +431,7 @@ def test_fl_robots_denial_retains_policy_and_backoff_without_parsing(db_session,
     observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
     assert observation.raw_sha256 is None
     assert observation.error_class == "robots_disallowed"
+    assert observation.scope["semantic_label"] == "not_established"
     assert observation.scope["robots"]["raw_sha256"] == hashlib.sha256(policy).hexdigest()
     assert observation.scope["failure"]["stage"] == "capture"
     assert target.consecutive_failures == 1
@@ -453,6 +454,7 @@ def test_fl_scope_mismatch_is_invalid_before_capture_and_backs_off(db_session, u
     observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
     assert observation.error_class == "InvalidOfficialTarget"
     assert observation.adapter_version == observer.fl_actions.ADAPTER_VERSION
+    assert observation.scope["semantic_label"] == "not_established"
     assert db_session.scalar(select(func.count()).select_from(OfficialRawBlob)) == 0
     assert target.consecutive_failures == 1
     assert target.next_check_at == NOW + timedelta(seconds=300)
@@ -484,8 +486,59 @@ def test_fl_malformed_or_capped_parse_retains_raw_and_never_writes_actions(db_se
     assert db_session.get(OfficialRawBlob, observation.raw_sha256).data == raw
     assert observation.error_class == "OfficialFloridaSenateActionsError"
     assert observation.scope["failure"]["stage"] == "parse"
+    assert observation.scope["semantic_label"] == "not_established"
     assert "parsed_snapshot_sha256" not in observation.scope
     assert db_session.scalar(select(func.count()).select_from(BillAction)) == before_actions
+    assert target.consecutive_failures == 1
+
+
+def test_fl_empty_robots_policy_is_valid_and_retained_as_zero_byte_evidence(db_session, unique_abbr, monkeypatch):
+    _, target = _fl_target(db_session, unique_abbr)
+    raw = FL_FIXTURE.read_bytes()
+    monkeypatch.setattr(
+        observer,
+        "_capture_fl_senate_detail",
+        lambda source_url: _fl_captured(raw, robots=b""),
+    )
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and (result.status, result.record_count) == ("succeeded", 46)
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    assert observation.scope["semantic_label"] == "observed_bill_history_snapshot"
+    assert observation.scope["robots"] == {
+        "source_url": "https://www.flsenate.gov/robots.txt",
+        "http_status": 404,
+        "raw_sha256": None,
+        "body_bytes": 0,
+    }
+    assert db_session.scalar(select(func.count()).select_from(OfficialRawBlob)) == 2
+    assert target.consecutive_failures == 0
+
+
+def test_fl_malformed_robots_retains_independently_valid_page_raw_before_failure(db_session, unique_abbr, monkeypatch):
+    _, target = _fl_target(db_session, unique_abbr)
+    raw = FL_FIXTURE.read_bytes()
+    malformed_robots = b"x" * (observer.MAX_BLOB_BYTES + 1)
+    monkeypatch.setattr(
+        observer,
+        "_capture_fl_senate_detail",
+        lambda source_url: _fl_captured(raw, robots=malformed_robots),
+    )
+
+    result = observer.observe_due_target(db_session, now=NOW)
+    db_session.flush()
+
+    assert result and result.status == "invalid"
+    observation = db_session.execute(select(OfficialSourceObservation)).scalar_one()
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    assert observation.raw_sha256 == raw_sha256
+    assert db_session.get(OfficialRawBlob, raw_sha256).data == raw
+    assert observation.scope["semantic_label"] == "not_established"
+    assert observation.scope["robots"]["raw_sha256"] is None
+    assert observation.scope["robots"]["body_bytes"] == len(malformed_robots)
+    assert observation.scope["failure"]["stage"] == "capture"
     assert target.consecutive_failures == 1
 
 

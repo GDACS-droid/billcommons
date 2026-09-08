@@ -335,8 +335,14 @@ def _observation_scope(target: OfficialSourceTarget) -> dict[str, Any]:
     else:
         coverage = "not_established"
     result = {**target_scope, "coverage": coverage}
+    if target.adapter_name == FL_ADAPTER_NAME:
+        # A target or failed attempt does not establish a semantic snapshot.
+        result["semantic_label"] = "not_established"
     if len(_canonical_json_bytes(result)) > 60000:
-        return {"coverage": coverage, "target_scope_retained_on_target": True}
+        fallback = {"coverage": coverage, "target_scope_retained_on_target": True}
+        if target.adapter_name == FL_ADAPTER_NAME:
+            fallback["semantic_label"] = "not_established"
+        return fallback
     return result
 
 
@@ -676,9 +682,10 @@ def _fl_observation_scope(
         "source_session_year": source_scope.source_session_year,
         "source_bill_number": source_scope.source_bill_number,
         "coverage": FL_COVERAGE,
-        # This label is intentionally narrower than freshness or corpus
-        # coverage: one retained page says nothing about another FL bill.
-        "semantic_label": "observed_bill_history_snapshot",
+        # This remains deliberately unearned until parsing and snapshot
+        # storage both finish. One target or capture attempt says nothing
+        # semantic about the source bill, much less the statewide corpus.
+        "semantic_label": "not_established",
         "robots": {
             "source_url": f"https://{fl_actions.FL_SENATE_HOST}/robots.txt",
             "http_status": _captured_http_status(captured.robots_status),
@@ -774,8 +781,6 @@ def _observe_fl_senate_target(
     try:
         if raw_bytes is not None and (not isinstance(raw_bytes, bytes) or not 1 <= len(raw_bytes) <= MAX_BLOB_BYTES):
             raise ValueError("Florida Senate raw response violates evidence byte bounds")
-        if robots_bytes is not None and (not isinstance(robots_bytes, bytes) or not 1 <= len(robots_bytes) <= MAX_BLOB_BYTES):
-            raise ValueError("Florida Senate robots response violates evidence byte bounds")
     except (AttributeError, TypeError, ValueError) as exc:
         observation = _add_observation(
             db,
@@ -793,6 +798,32 @@ def _observe_fl_senate_target(
         return OfficialObservationResult(target.id, observation.status, None, 0)
 
     raw_sha256 = store_official_raw_blob(db, raw_bytes, "text/html") if raw_bytes else None
+    try:
+        # An empty robots.txt is a valid allow-all policy. It cannot be stored
+        # in OfficialRawBlob because that shared table intentionally rejects
+        # empty payloads, so retain its zero-byte fact in scope with no hash.
+        if robots_bytes is not None and (not isinstance(robots_bytes, bytes) or len(robots_bytes) > MAX_BLOB_BYTES):
+            raise ValueError("Florida Senate robots response violates evidence byte bounds")
+    except (AttributeError, TypeError, ValueError) as exc:
+        scope = _fl_observation_scope(source_scope, captured, None)
+        scope["failure"] = official_diagnostics.failure_diagnosis(exc, stage="capture")
+        observation = _add_observation(
+            db,
+            target=target,
+            scope=scope,
+            retrieved_at=retrieved_at,
+            status="invalid",
+            raw_sha256=raw_sha256,
+            upstream_updated_at=_upstream_updated_at(captured.upstream_modified),
+            error_class=_safe_error_class(exc),
+            adapter_name=FL_ADAPTER_NAME,
+            adapter_version=fl_actions.ADAPTER_VERSION,
+            http_status=_captured_http_status(captured.http_status),
+            source_response_observed=_captured_http_status(captured.http_status) is not None,
+        )
+        _schedule_failure(target, observed_at)
+        return OfficialObservationResult(target.id, observation.status, None, 0)
+
     robots_sha256 = store_official_raw_blob(db, robots_bytes, "text/plain") if robots_bytes else None
     scope = _fl_observation_scope(source_scope, captured, robots_sha256)
     http_status = _captured_http_status(captured.http_status)
@@ -868,6 +899,9 @@ def _observe_fl_senate_target(
 
     snapshot_sha256 = store_official_raw_blob(db, snapshot, "application/json")
     scope["parsed_snapshot_sha256"] = snapshot_sha256
+    # This label is intentionally narrower than freshness or corpus coverage:
+    # one retained page says nothing about another Florida bill.
+    scope["semantic_label"] = "observed_bill_history_snapshot"
     observation = _add_observation(
         db,
         target=target,
