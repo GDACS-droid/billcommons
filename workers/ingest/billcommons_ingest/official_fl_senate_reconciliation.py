@@ -21,7 +21,8 @@ from billcommons_shared.reconciliation import (
     ReconciliationInputError,
 )
 
-COMPARATOR_VERSION = "fl-senate-action-content-multiset/1"
+LEGACY_COMPARATOR_VERSION = "fl-senate-action-content-multiset/1"
+COMPARATOR_VERSION = "fl-senate-action-content-multiset/2"
 FL_JURISDICTION = "fl"
 
 
@@ -146,9 +147,11 @@ def _ambiguous_reason(event: _Event) -> str:
     return "missing_" + "_and_".join(missing)
 
 
-def reconcile_fl_senate_action_content(official_fixture: Any, local_fixture: Any, *, scope: Mapping[str, str] | None = None) -> dict[str, Any]:
+def reconcile_fl_senate_action_content(official_fixture: Any, local_fixture: Any, *, scope: Mapping[str, str] | None = None, comparator_version: str = COMPARATOR_VERSION) -> dict[str, Any]:
     """Compare one exact Florida regular-session bill without occurrence claims."""
 
+    if comparator_version not in {LEGACY_COMPARATOR_VERSION, COMPARATOR_VERSION}:
+        raise ReconciliationInputError("unsupported Florida comparator version")
     official, local = _events(official_fixture, "official"), _events(local_fixture, "local")
     scopes = {event.scope for event in official + local}
     if scope is not None:
@@ -196,7 +199,7 @@ def reconcile_fl_senate_action_content(official_fixture: Any, local_fixture: Any
 
     report = {
         "schema_version": 1,
-        "comparator_version": COMPARATOR_VERSION,
+        "comparator_version": comparator_version,
         "interpretation": "Counts compare retained records from one exact Florida regular-session bill, not identified occurrences. Content agreement requires exact day, chamber, and description; row and bullet positions remain observation-local evidence. A record with no chamber stays ambiguous. Local-only content does not imply deletion, and official-only content does not authorize insertion.",
         "scope": {"jurisdiction": resolved_scope[0].upper(), "session": resolved_scope[1], "bill_id": resolved_scope[2]},
         "summary": {"official_records": len(official), "local_records": len(local), "content_agreement": len(agreement),
@@ -207,6 +210,15 @@ def reconcile_fl_senate_action_content(official_fixture: Any, local_fixture: Any
         "local_only_content": local_only,
         "ambiguous_insufficient_evidence": sorted(ambiguous, key=_canonical_json),
     }
+    if comparator_version == COMPARATOR_VERSION:
+        shared_keys = set(official_groups) & set(local_groups)
+        report["summary"].update({
+            "shared_content_keys": len(shared_keys),
+            "content_overlap_records": sum(min(len(official_groups[key]), len(local_groups[key])) for key in shared_keys),
+            "official_surplus_records": sum(item["unmatched_count"] for item in official_only),
+            "local_surplus_records": sum(item["unmatched_count"] for item in local_only),
+        })
+        report["interpretation"] += " Content agreement and side-only content counters count content groups; agreement counts only equal multiplicities. Shared content keys and overlap records also include unequal multiplicities. Surplus records count the excess among comparable records; ambiguous records are excluded, so a surplus does not prove an absent occurrence."
     if len(_canonical_json(report).encode("utf-8")) > MAX_REPORT_BYTES:
         raise ReconciliationInputError(f"Florida content report exceeds the {MAX_REPORT_BYTES}-byte safety cap")
     return report

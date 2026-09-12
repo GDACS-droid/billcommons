@@ -35,6 +35,10 @@ def test_row_and_bullet_positions_are_evidence_not_content_identity():
         "official_records": 1,
         "local_records": 1,
         "content_agreement": 1,
+        "shared_content_keys": 1,
+        "content_overlap_records": 1,
+        "official_surplus_records": 0,
+        "local_surplus_records": 0,
         "official_only_content": 0,
         "local_only_content": 0,
         "ambiguous_insufficient_evidence": 0,
@@ -78,3 +82,27 @@ def test_same_day_and_text_in_different_chambers_are_distinct_content():
 def test_unknown_chamber_stays_ambiguous():
     report = reconcile_fl_senate_action_content([event(chamber=None)], [], scope=SCOPE)
     assert report["ambiguous_insufficient_evidence"][0]["reason"] == "missing_chamber"
+
+
+@pytest.mark.parametrize("official_count,local_count", [(3, 1), (1, 3)])
+def test_unequal_multiplicities_report_overlap_and_surplus_without_occurrence_claims(official_count, local_count):
+    report = reconcile_fl_senate_action_content(
+        [event(row=n) for n in range(official_count)],
+        [event(row=n) for n in range(local_count)] + [event(chamber=None)], scope=SCOPE,
+    )
+    summary = report["summary"]
+    assert summary["content_agreement"] == 0
+    assert summary["shared_content_keys"] == 1
+    assert summary["content_overlap_records"] == 1
+    assert summary["official_surplus_records"] == max(0, official_count - local_count)
+    assert summary["local_surplus_records"] == max(0, local_count - official_count)
+    assert summary["ambiguous_insufficient_evidence"] == 1
+    assert "surplus does not prove an absent occurrence" in report["interpretation"]
+
+
+def test_version_one_retains_its_original_report_shape_and_interpretation():
+    report = reconcile_fl_senate_action_content([event()], [event()], scope=SCOPE,
+        comparator_version="fl-senate-action-content-multiset/1")
+    assert report["summary"] == {"official_records": 1, "local_records": 1, "content_agreement": 1,
+        "official_only_content": 0, "local_only_content": 0, "ambiguous_insufficient_evidence": 0}
+    assert report["interpretation"] == "Counts compare retained records from one exact Florida regular-session bill, not identified occurrences. Content agreement requires exact day, chamber, and description; row and bullet positions remain observation-local evidence. A record with no chamber stays ambiguous. Local-only content does not imply deletion, and official-only content does not authorize insertion."

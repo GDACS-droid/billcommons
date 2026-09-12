@@ -41,13 +41,24 @@ handoff; do not mislabel a pause as completion.
   `/tmp/bc_combined_followup_root_pg_20260912.log`, and
   `/tmp/bc_api_scout_root_pg_20260912.log`. The middle run's API guard refused a
   missing explicit test URL; the final run supplied the local URL and passed.
-- **REVIEW:** the earlier Florida-only canonical run was interrupted at the
-  user's request to drop Kimi. Its artifacts remain at
-  `/home/alberto/verify-runs/20260912T034200Z-1d30343`; it is not a passing run.
-  Kimi is now opt-in in `verify-ship`. Ox exhausted its 8192-token output limit;
-  a bounded higher output limit is available for the next coherent review.
-  Checked reviewer claims are reconciled against source in the restricted
-  release directory's `fl-reconciliation-review-20260912.md`.
+- **REVIEW:** the complete integrated Florida/bundle review at
+  `/home/alberto/verify-runs/20260912T040456Z-16d7e7c` ended **HALT**:
+  three SHIP, three BLOCK, and one dead Ox leg. No majority-vote approval.
+  Kimi remains opt-in at the user's request. Ox exhausted 16,384 output tokens;
+  its blind automatic retry was stopped. Confirmed issues have local fixes:
+  source-grounded chamber mapping, deterministic action ordering, retained
+  replay tests after action mutations, validation before bundle publication,
+  generated-test integrity, and deferred local snapshot storage after successful
+  comparison. Florida comparator version two distinguishes partial duplicate
+  overlap from equal multiplicity and preserves version-one replay.
+- **LATEST LOCAL CHECKS:** 120 tests passed in the final disposable-PG16 run,
+  including the full bulk importer test file, both Florida comparator versions
+  after action updates/deletions/insertions, all bundle cases, and the offline
+  factual benchmark. Log: `/tmp/bc_final_arc_root_pg_20260912.log`; the cluster
+  was dropped. Five version-one report cases were also byte-identical to the
+  pre-change comparator in `d09135f`. It pins one derived Florida fixture and checks direct bill,
+  action, referral and vote facts; it is not a nightly, live-source, corpus or
+  50-state benchmark. See [its contract](official-factual-benchmark.md).
 - **HEALTHY AT CHECK:** at 2026-09-12 03:40 UTC (September 11 Eastern), public
   health, readiness, Data Health and a real bill read returned HTTP 200.
   There were 58 official observations in the preceding 24 hours and 59 enabled
@@ -59,8 +70,17 @@ handoff; do not mislabel a pause as completion.
 - **BLOCKED:** the supplied Gojiberry key previously returned HTTP 401 on four
   read endpoints. A replacement key is needed; account capacity remains
   unknown. No outreach or IQ Dominoes configuration was changed.
-- **NEXT:** review the complete integrated change without Kimi; reconcile the
-  verdict against source. Resolve the operator question and refresh recovery
+- **REAL RETAINED FIXTURE:** a read-only production transaction materialized
+  historical CA observation `fdb506fb-9f9a-4ca4-818d-e1f703de7212` into
+  `/home/alberto/.local/share/billcommons/reliability-release-20260908/ca-retained-failure-bundle-20260912`.
+  Its 4,851,719-byte archive hash was verified. The current parser accepted
+  275 scoped bills and 7,094 events; its bounded sample covers 20 bills.
+  The generated regression passed offline (1 test). This failure is superseded
+  and its historical parser-source hash is unavailable; the bundle says so.
+  No old parser was rerun, no source was fetched, and no production data or
+  target was changed. It remains a local review artifact, not patch authorship
+  or promotion approval.
+- **NEXT:** review the complete tested fix arc without Kimi. Resolve the operator question and refresh recovery
   evidence before production metadata repair or deployment. Honor the cutoff.
 
 Restart inspection:

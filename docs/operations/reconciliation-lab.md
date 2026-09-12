@@ -95,10 +95,19 @@ run; it never falls back to the same bill number in another session. The
 Florida comparator compares a multiset of exact day, chamber, and normalized
 description. Source row and bullet positions, local record IDs, and upstream
 IDs remain evidence only, never occurrence identities. Local actions without
-a same-jurisdiction, exact House/Senate organization stay ambiguous, and a
+an organization linked to the same jurisdiction with `lower`/`upper`
+classification stay ambiguous; display names do not determine chamber. Bulk
+imports preserve explicit, resolvable source jurisdiction IDs and reject
+conflicting attribution before changing organization rows. They never infer
+jurisdiction from the selected session. A
 cross-jurisdiction organization rejects the comparison. Agreement does not
 prove an occurrence match, source completeness, statewide coverage, freshness,
-or authorize an insertion or deletion. Replay parses the retained page and
+or authorize an insertion or deletion. Version two adds separate shared-content,
+overlap-record and surplus-record counters so unequal duplicate counts expose
+their overlap. Existing agreement counters still count equal-multiplicity
+content groups. Ambiguous records are excluded from these counters, and a
+surplus does not prove an absent occurrence. Version-one reports retain their
+original shape and replay path. Replay parses the retained page and
 uses the recorded local snapshot and diff only; it never reads current corpus
 actions. The current 2025 HB 7031 target remains a partial comparison until a
 matching ``2025 Regular Session`` local bill exists.

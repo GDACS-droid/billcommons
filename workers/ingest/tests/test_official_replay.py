@@ -87,30 +87,59 @@ def test_legacy_comparison_replays_under_its_recorded_version(db_session, comple
 
 
 
-def test_florida_replay_uses_retained_page_and_local_snapshot_after_corpus_changes(db_session, unique_abbr, monkeypatch):
+@pytest.mark.parametrize('comparator_version', ['fl-senate-action-content-multiset/1', 'fl-senate-action-content-multiset/2'])
+@pytest.mark.parametrize('action_change', ['update', 'delete', 'insert'])
+def test_florida_replay_uses_retained_page_and_local_snapshot_after_corpus_changes(db_session, unique_abbr, monkeypatch, action_change, comparator_version):
     jurisdiction, _ = _fl_target(db_session, unique_abbr)
     bill = _fl_local_bill(db_session, jurisdiction)
     from billcommons_ingest import official_fl_senate_actions as fl
     parsed = fl.parse_florida_senate_bill_history(FL_FIXTURE.read_bytes(), source_url=FL_SOURCE_URL)
-    db_session.add(BillAction(
+    original_action = BillAction(
         bill_id=bill.id,
         organization_id=_fl_chamber(db_session, jurisdiction, parsed.actions[0].chamber).id,
         description=parsed.actions[0].description,
         action_date=parsed.actions[0].action_date,
         source_name='retained-import',
         upstream_id='old-local-id',
-    ))
+    )
+    db_session.add(original_action)
     monkeypatch.setattr(observer, '_capture_fl_senate_detail', lambda source_url: _fl_captured(FL_FIXTURE.read_bytes()))
     observer.observe_due_target(db_session, now=NOW)
     db_session.flush()
     run = db_session.scalar(select(OfficialReconciliationRun))
     assert run and run.status == 'completed'
 
+    if comparator_version.endswith('/1'):
+        import json
+        from billcommons_ingest.official_fl_senate_reconciliation import reconcile_fl_senate_action_content
+        official = {"events": observer._fl_official_events(parsed, session_identifier="2025 Regular Session")}
+        local = json.loads(db_session.get(OfficialRawBlob, run.local_snapshot_sha256).data)
+        legacy = reconcile_fl_senate_action_content(official, local,
+            scope={"jurisdiction": "FL", "session": "2025 Regular Session", "bill_id": parsed.bill_identifier},
+            comparator_version=comparator_version)
+        run.comparator_version = comparator_version
+        run.summary = legacy["summary"]
+        run.diff_sha256 = observer.store_official_raw_blob(db_session, observer._canonical_json_bytes(legacy), "application/json")
+        db_session.flush()
+
     bill.title = 'Changed after stored Florida comparison'
+    if action_change == 'update':
+        original_action.description = 'Changed after the retained snapshot'
+    elif action_change == 'delete':
+        db_session.delete(original_action)
+    else:
+        db_session.add(BillAction(
+            bill_id=bill.id,
+            organization_id=original_action.organization_id,
+            description='Added after the retained snapshot',
+            action_date=original_action.action_date,
+            source_name='later-import',
+            upstream_id='new-local-id',
+        ))
     db_session.flush()
     result = replay_reconciliation(db_session, run.id)
 
     assert result['status'] == 'reproduced'
-    assert result['comparator_version'] == 'fl-senate-action-content-multiset/1'
+    assert result['comparator_version'] == comparator_version
     assert result['diff_sha256'] == run.diff_sha256
     assert 'occurrence' in result['interpretation']

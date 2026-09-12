@@ -419,7 +419,7 @@ def test_fl_detail_success_retains_one_bill_snapshot_without_local_mutation(db_s
     run = db_session.execute(select(OfficialReconciliationRun)).scalar_one()
     assert run.status == "partial"
     assert run.bill_id is None
-    assert run.comparator_version == "fl-senate-action-content-multiset/1"
+    assert run.comparator_version == "fl-senate-action-content-multiset/2"
     assert run.summary == {"reason": "local_fl_regular_session_missing_or_ambiguous"}
     snapshot = json.loads(db_session.get(OfficialRawBlob, observation.scope["parsed_snapshot_sha256"]).data)
     assert snapshot["source_raw_sha256"] == observation.raw_sha256
@@ -626,6 +626,13 @@ def test_fl_comparison_deadline_creates_a_failed_run_without_corpus_mutation(db_
     assert run.status == "failed" and run.summary == {"reason": "comparison_failed"}
     assert run.error_class == "ObservationDeadlineExceeded"
     assert db_session.get(BillAction, local.id).description == action.description
+    uncommitted_snapshot = {"events": observer._fl_local_events(
+        db_session, bill, jurisdiction_id=jurisdiction.id,
+        session_identifier=observer._fl_regular_session_identifier(parsed.session_year),
+        bill_identifier=parsed.bill_identifier,
+    )}
+    snapshot_digest = hashlib.sha256(observer._canonical_json_bytes(uncommitted_snapshot)).hexdigest()
+    assert db_session.get(OfficialRawBlob, snapshot_digest) is None
 
 
 def test_fl_robots_denial_retains_policy_and_backoff_without_parsing(db_session, unique_abbr, monkeypatch):
@@ -1192,3 +1199,29 @@ def test_continuation_replays_exact_archive_after_rollback_without_refetching(mo
 def test_explicit_malformed_continuation_is_rejected(value):
     with pytest.raises(observer.InvalidOfficialTarget):
         observer._continuation_from_scope({'continuation': value})
+
+
+@pytest.mark.parametrize("name,classification,known_jurisdiction,expected_chamber", [
+    ("Florida House of Representatives", "lower", True, "House"),
+    ("Florida Senate", "upper", True, "Senate"),
+    ("House", "lower", False, None),
+    ("House", "committee", True, None),
+])
+def test_fl_local_chamber_requires_resolved_jurisdiction_and_classification(
+    db_session, unique_abbr, name, classification, known_jurisdiction, expected_chamber,
+):
+    jurisdiction, _ = _fl_target(db_session, unique_abbr)
+    bill = _fl_local_bill(db_session, jurisdiction)
+    organization = Organization(name=name, classification=classification,
+        jurisdiction_id=jurisdiction.id if known_jurisdiction else None)
+    db_session.add(organization)
+    db_session.flush()
+    db_session.add(BillAction(bill_id=bill.id, organization_id=organization.id,
+        description="Read first time.", action_date=NOW.date(), source_name="test"))
+    db_session.flush()
+    events = observer._fl_local_events(db_session, bill, jurisdiction_id=jurisdiction.id,
+        session_identifier="2025 Regular Session", bill_identifier="HB 7031")
+    assert events[0]["chamber"] == expected_chamber
+    assert events[0]["local_organization_name"] == name
+    assert events[0]["local_organization_classification"] == classification
+    assert events[0]["local_organization_id"] == str(organization.id)

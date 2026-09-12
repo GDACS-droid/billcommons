@@ -84,7 +84,7 @@ def _replay_fl(
     raw: bytes,
     local_bytes: bytes,
 ) -> tuple[dict, str]:
-    if observation.adapter_version != fl.ADAPTER_VERSION or run.comparator_version != FL_COMPARATOR_VERSION:
+    if observation.adapter_version != fl.ADAPTER_VERSION or run.comparator_version not in {FL_COMPARATOR_VERSION, 'fl-senate-action-content-multiset/1'}:
         raise EvidenceReplayError('unsupported recorded adapter/comparator version or outcome')
     try:
         source_scope = fl_capture.detail_scope(observation.source_url)
@@ -102,7 +102,7 @@ def _replay_fl(
     official = {'events': _fl_official_events(parsed, session_identifier=session_identifier)}
     reproduced = reconcile_fl_senate_action_content(official, json.loads(local_bytes), scope={
         'jurisdiction': 'FL', 'session': session_identifier, 'bill_id': parsed.bill_identifier,
-    })
+    }, comparator_version=run.comparator_version)
     return reproduced, 'Exact replay of retained Florida content comparison; no occurrence, current-source freshness, or completeness proof.'
 
 

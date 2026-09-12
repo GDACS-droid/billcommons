@@ -279,7 +279,7 @@ def test_retained_ca_parser_regression(monkeypatch):
 '''
 
 
-def _write_bundle(output_dir: Path, manifest: dict[str, object], raw: bytes) -> None:
+def _write_bundle(output_dir: Path, manifest: dict[str, object], raw: bytes) -> dict[str, object]:
     """Stage known files beside the destination, then atomically publish them."""
 
     stage = output_dir.parent / f".{output_dir.name}.repair-bundle-{uuid.uuid4().hex}"
@@ -289,15 +289,21 @@ def _write_bundle(output_dir: Path, manifest: dict[str, object], raw: bytes) -> 
         created_stage = True
         fixture = stage / FIXTURE_NAME
         fixture.write_bytes(raw)
-        (stage / MANIFEST_NAME).write_bytes(_canonical_json_bytes(manifest) + b"\n")
+        encoded_manifest = _canonical_json_bytes(manifest) + b"\n"
+        if len(encoded_manifest) > MAX_MANIFEST_BYTES:
+            raise RepairBundleError("bundle manifest exceeds the local size bound")
+        (stage / MANIFEST_NAME).write_bytes(encoded_manifest)
         (stage / TEST_NAME).write_text(_generated_test(), encoding="utf-8")
+        validated = validate_repair_bundle(stage)
         if output_dir.exists():
             # It was preflighted as empty. Recheck immediately before replacing
             # so a concurrent writer cannot have its content discarded.
             if output_dir.is_symlink() or not output_dir.is_dir() or any(output_dir.iterdir()):
                 raise RepairBundleError("refusing to overwrite a changed output directory")
-            output_dir.rmdir()
+            # POSIX rename replaces an empty directory atomically. Keeping it
+            # present also preserves it if publication fails.
         os.replace(stage, output_dir)
+        return validated
     except Exception:
         if created_stage and stage.exists() and stage.is_dir() and not stage.is_symlink():
             shutil.rmtree(stage)
@@ -331,6 +337,17 @@ def validate_repair_bundle(bundle_dir: str | Path) -> dict[str, object]:
     if root.is_symlink() or not root.is_dir():
         raise RepairBundleError("bundle directory is absent or unsafe")
     manifest = _read_manifest(root)
+    test_path = root / TEST_NAME
+    expected_test = _generated_test().encode("utf-8")
+    if test_path.is_symlink() or not test_path.is_file():
+        raise RepairBundleError("bundle regression test is absent or unsafe")
+    try:
+        with test_path.open("rb") as stream:
+            actual_test = stream.read(len(expected_test) + 1)
+    except OSError as exc:
+        raise RepairBundleError("bundle regression test is unreadable") from exc
+    if actual_test != expected_test:
+        raise RepairBundleError("bundle regression test does not match the fixed generator")
     if manifest.get("promotion_state") != "requires_human_review" or manifest.get("execution_authorized") is not False:
         raise RepairBundleError("bundle cannot authorize execution or promotion")
     fixture = manifest.get("fixture")
@@ -396,8 +413,7 @@ def build_repair_bundle(db, observation_id: uuid.UUID, output_dir: str | Path) -
     if raw is None:
         raise RepairBundleError("a verified retained CA fixture is required")
     manifest = _manifest_for(plan, observation, raw)
-    _write_bundle(destination, manifest, raw)
-    return validate_repair_bundle(destination)
+    return _write_bundle(destination, manifest, raw)
 
 
 create_repair_bundle = build_repair_bundle

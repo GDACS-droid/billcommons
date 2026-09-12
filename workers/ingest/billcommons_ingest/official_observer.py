@@ -845,7 +845,7 @@ def _fl_local_events(
             select(BillAction, Organization)
             .outerjoin(Organization, BillAction.organization_id == Organization.id)
             .where(BillAction.bill_id == bill.id)
-            .order_by(BillAction.action_date.asc().nulls_first(), BillAction.upstream_id.asc())
+            .order_by(BillAction.action_date.asc().nulls_first(), BillAction.upstream_id.asc(), BillAction.id.asc())
             .limit(MAX_LOCAL_ACTIONS_PER_BILL + 1)
         ).all()
     )
@@ -856,11 +856,10 @@ def _fl_local_events(
         if action.organization_id is not None:
             if organization is None:
                 raise ValueError("local Florida action organization is missing")
-            if organization.jurisdiction_id != jurisdiction_id:
+            if organization.jurisdiction_id is not None and organization.jurisdiction_id != jurisdiction_id:
                 raise ValueError("local Florida action organization belongs to another jurisdiction")
-            chamber = {("House", "lower"): "House", ("Senate", "upper"): "Senate"}.get(
-                (organization.name, organization.classification)
-            )
+            chamber = ({"lower": "House", "upper": "Senate"}.get(organization.classification)
+                       if organization.jurisdiction_id == jurisdiction_id else None)
         else:
             chamber = None
         events.append(
@@ -877,6 +876,9 @@ def _fl_local_events(
                 "local_record_id": str(action.id),
                 "local_source_name": action.source_name,
                 "local_upstream_id": action.upstream_id,
+                "local_organization_id": str(organization.id) if organization else None,
+                "local_organization_classification": organization.classification if organization else None,
+                "local_organization_name": organization.name if organization else None,
             }
         )
     return events
@@ -906,13 +908,13 @@ def _reconcile_fl_history(
             db, bill, jurisdiction_id=target.jurisdiction_id,
             session_identifier=session_identifier, bill_identifier=parsed.bill_identifier,
         )}
-        local_sha256 = store_official_raw_blob(db, _canonical_json_bytes(local_fixture), "application/json")
         report = reconcile_fl_senate_action_content(
             official_fixture,
             local_fixture,
             scope={"jurisdiction": FL_JURISDICTION, "session": session_identifier, "bill_id": parsed.bill_identifier},
         )
         _require_deadline(started_at)
+        local_sha256 = store_official_raw_blob(db, _canonical_json_bytes(local_fixture), "application/json")
         diff_sha256 = store_official_raw_blob(db, _canonical_json_bytes(report), "application/json")
         db.add(
             OfficialReconciliationRun(

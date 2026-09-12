@@ -109,10 +109,13 @@ def _failure_db(*, raw: bytes | None = None, parser_digest: str | None = None, a
     return _FakeDb(target, observation, blob, latest_id=latest_id), observation
 
 
-def test_bundle_is_deterministic_and_generated_regression_runs_without_database_or_network(tmp_path):
+@pytest.mark.parametrize("existing_empty", [False, True])
+def test_bundle_is_deterministic_and_generated_regression_runs_without_database_or_network(tmp_path, existing_empty):
     digest = parser_source_sha256(observer.ca_actions.parse_ca_official_actions_zip)
     db, observation = _failure_db(raw=_archive(), parser_digest=digest)
     output = tmp_path / "bundle"
+    if existing_empty:
+        output.mkdir()
 
     manifest = build_repair_bundle(db, observation.id, output)
 
@@ -206,6 +209,8 @@ def test_rejected_replay_keeps_a_safe_diagnosis_without_echoing_fixture_bytes(tm
     assert manifest["candidate_replay"]["result"] == "rejected"
     assert manifest["candidate_replay"]["failure"]["stage"] == "parse"
     assert b"private retained payload" not in (tmp_path / "rejected" / MANIFEST_NAME).read_bytes()
+    completed = _run_generated_test(tmp_path / "rejected")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_forward_ca_parse_failure_scope_binds_the_loaded_shared_parser_source():
@@ -286,3 +291,48 @@ def test_content_sample_detects_same_count_changes_and_caps_events():
     assert _sample_digest(batch([event])) != _sample_digest(batch([replace(event, description="Changed action.")]))
     assert _sample_digest(batch([event] * MAX_SAMPLE_EVENTS_PER_BILL)) == _sample_digest(
         batch([event] * (MAX_SAMPLE_EVENTS_PER_BILL + 1)))
+
+
+@pytest.mark.parametrize("alteration", ["delete", "replace"])
+def test_bundle_validation_rejects_missing_or_modified_generated_test(tmp_path, alteration):
+    db, observation = _failure_db(raw=_archive())
+    output = tmp_path / "bundle"
+    build_repair_bundle(db, observation.id, output)
+    if alteration == "delete":
+        (output / TEST_NAME).unlink()
+    else:
+        (output / TEST_NAME).write_text("raise RuntimeError('modified test')\n")
+    with pytest.raises(RepairBundleError, match="regression test"):
+        validate_repair_bundle(output)
+
+
+@pytest.mark.parametrize("existing_empty", [False, True])
+def test_staging_validation_failure_does_not_publish_or_remove_destination(tmp_path, monkeypatch, existing_empty):
+    db, observation = _failure_db(raw=_archive())
+    output = tmp_path / "bundle"
+    if existing_empty:
+        output.mkdir()
+    def reject_stage(path):
+        assert path != output
+        assert (path / MANIFEST_NAME).is_file()
+        raise RepairBundleError("injected staged validation failure")
+    monkeypatch.setattr("billcommons_ingest.official_repair_bundle.validate_repair_bundle", reject_stage)
+    with pytest.raises(RepairBundleError, match="injected staged validation failure"):
+        build_repair_bundle(db, observation.id, output)
+    assert output.exists() == existing_empty
+    assert list(tmp_path.iterdir()) == ([output] if existing_empty else [])
+    if existing_empty:
+        assert list(output.iterdir()) == []
+
+
+def test_publication_failure_preserves_existing_empty_destination(tmp_path, monkeypatch):
+    db, observation = _failure_db(raw=_archive())
+    output = tmp_path / "bundle"
+    output.mkdir()
+    def fail_rename(source, destination):
+        raise OSError("injected publication failure")
+    monkeypatch.setattr("billcommons_ingest.official_repair_bundle.os.replace", fail_rename)
+    with pytest.raises(OSError, match="injected publication failure"):
+        build_repair_bundle(db, observation.id, output)
+    assert output.is_dir() and list(output.iterdir()) == []
+    assert list(tmp_path.iterdir()) == [output]
