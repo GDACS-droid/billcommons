@@ -138,6 +138,11 @@ seconds even though scheduling policy expresses finer targets. This release
 therefore does not promise those finer execution cadences. Pending age never
 authorizes reclaiming work from a live owner.
 
+The September 12 [cadence capacity analysis](sync-cadence-capacity.md) also
+shows that the current tier targets require at least 700.86 requests per day
+on average before pagination and retries, against a configured 225-request
+allowance. Faster worker wake-ups alone cannot satisfy those targets.
+
 ## Remaining release gates
 
 The final Texas nested FTP-to-HTTPS repair fix passed 70 focused PostgreSQL 16
