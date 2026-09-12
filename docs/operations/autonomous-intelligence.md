@@ -13,7 +13,7 @@ in the original checkout are preserved. The canonical inventory covers 50 states
 plus DC. Generic website observation is never treated as proof of statewide
 semantic freshness or completeness.
 
-## Resumed September 11 — Florida reconciliation review pending
+## Resumed September 11 — Florida reconciliation review held
 
 Work resumed September 11 after the September 8 pause. The full objective
 remains incomplete; the deployment holds below still apply.
@@ -31,8 +31,13 @@ remains incomplete; the deployment holds below still apply.
   The change requires exact source-year regular-session mapping, preserves
   chamber uncertainty, rejects foreign-jurisdiction organizations, and replays
   retained evidence without consulting current corpus actions. It is not yet
-  integrated or deployed. Canonical multi-model review is running on the full
-  single commit; `/tmp/bc_fl_verify_20260912.log` records its result location.
+  integrated or deployed. Canonical review of the full commit was interrupted at the user
+  request to drop Kimi. Completed artifacts remain in
+  `/home/alberto/verify-runs/20260912T034200Z-1d30343`. Ox returned no verdict
+  after reaching its output limit; the run is not a verification pass. Kimi is
+  now opt-in in `verify-ship`. Checked reviewer claims and source evidence are
+  recorded in the restricted release directory,
+  `fl-reconciliation-review-20260912.md`.
 - **HEALTHY AT CHECK:** at 2026-09-12 03:40 UTC (September 11 Eastern), public
   health, readiness, Data Health and a real bill read returned HTTP 200.
   There were 58 official observations in the preceding 24 hours and 59 enabled
