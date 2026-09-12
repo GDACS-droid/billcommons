@@ -554,3 +554,32 @@ def parse_ca_official_actions_zip(
         scoped_bill_ids=tuple(parsed),
         events_by_official_bill_id=MappingProxyType(events),
     )
+
+
+# Retain a bounded import-time witness for the pure parser exported through
+# the ingest transport module.  ``official_parser_provenance`` validates both
+# this witness and the exact function/code pair before it reports a source
+# digest; it does not attempt to attest arbitrary Python callables.
+_PARSER_SOURCE_WITNESS_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _parser_source_witness() -> str | None:
+    try:
+        with open(__file__, "rb") as source:
+            source_bytes = source.read(_PARSER_SOURCE_WITNESS_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(source_bytes) > _PARSER_SOURCE_WITNESS_MAX_BYTES:
+        return None
+    return hashlib.sha256(source_bytes).hexdigest()
+
+
+__billcommons_parser_source_sha256__ = _parser_source_witness()
+del _parser_source_witness
+
+__billcommons_parser_source_callables__ = MappingProxyType({
+    "parse_ca_official_actions_zip": (
+        parse_ca_official_actions_zip,
+        parse_ca_official_actions_zip.__code__,
+    ),
+})
