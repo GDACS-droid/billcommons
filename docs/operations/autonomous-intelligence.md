@@ -149,8 +149,11 @@ roots; a live full-chain/hostname-verified handshake passed. The production
 capture path then passed locally: robots 200, permitted page 200, 17 links,
 two requests at least two seconds apart, retained bodies and hashes. The TLS
 and SafeHTTP suites passed 67 tests; a local test-server request diagnostic
-appeared but pytest passed. No new wheel was built because local build tooling
-is absent. The PEM is tracked and covered by the existing package artifact rule.
+appeared but pytest passed. An isolated `pip wheel --no-deps` build then passed;
+the new PEM was byte-identical in the wheel, and an import from the extracted
+wheel created the verified Illinois context while rejecting the unreviewed
+apex. Wheel SHA-256:
+`8b9b20aa85e2f83f29d404e28563ef4e72740753f164e4f56999b2bf27abcdc7`.
 This fix remains undeployed and has no new canonical SHIP verdict.
 
 Delaware's robots endpoint returned a same-host 302 to a branded missing-page
