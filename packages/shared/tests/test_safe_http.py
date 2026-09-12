@@ -21,6 +21,7 @@ import socket
 import ssl
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 from cryptography import x509
@@ -575,6 +576,72 @@ def test_header_drip_obeys_total_deadline_and_closes_response_stream(
     assert time.monotonic() - started < 0.7, "0.3s budget must not wait for complete slow headers"
     assert len(streams) == 1 and streams[0].closed
     assert sockets[0].fileno() == -1, "the response file must not retain the socket descriptor"
+
+
+@pytest.mark.parametrize("stage", ["headers", "body_boundary", "body_receive"])
+@pytest.mark.parametrize("require_body", [True, False])
+def test_direct_deadline_expiry_preserves_timeout_and_delivery_contract(
+    https_server, trust_test_ca, monkeypatch, stage, require_body,
+):
+    """Force expiry without relying on which real socket timeout wins a race."""
+    clock = SimpleNamespace(now=0.0, phase="headers")
+    monkeypatch.setattr(safe_http, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    original_begin = safe_http.http.client.HTTPResponse.begin
+    original_readinto = safe_http._DeadlineResponseReader.readinto
+    original_makefile = safe_http._DeadlineResponseSocket.makefile
+    streams, sockets = [], []
+
+    def capture_stream(self, mode):
+        stream = original_makefile(self, mode)
+        streams.append(stream)
+        sockets.append(self._sock)
+        return stream
+
+    def begin(self):
+        result = original_begin(self)
+        clock.phase = "body"
+        if stage == "body_boundary":
+            clock.now = safe_http.TOTAL_BUDGET_SECONDS + 1
+        return result
+
+    def readinto(self, buffer):
+        if (stage == "headers" and clock.phase == "headers") or (
+            stage == "body_receive" and clock.phase == "body"
+        ):
+            clock.now = safe_http.TOTAL_BUDGET_SECONDS + 1
+        return original_readinto(self, buffer)
+
+    monkeypatch.setattr(safe_http._DeadlineResponseSocket, "makefile", capture_stream)
+    monkeypatch.setattr(safe_http.http.client.HTTPResponse, "begin", begin)
+    monkeypatch.setattr(safe_http._DeadlineResponseReader, "readinto", readinto)
+
+    def behavior(handler):
+        payload = b"x" * 20000  # Requires another raw receive after parsing headers.
+        try:
+            handler.send_response(200)
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+        except OSError:
+            pass  # The forced header deadline may close the client first.
+
+    port, cert_pem = https_server(behavior)
+    trust_test_ca(cert_pem)
+    client = safe_http.SafeHttpClient(
+        resolver=_resolver_for(), port=port, address_policy=_allow_all_policy,
+    )
+    if stage == "headers" or require_body:
+        with pytest.raises(safe_http.TimeoutFailure) as exc:
+            client.fetch(f"https://{TEST_HOSTNAME}/hook", require_body=require_body)
+        assert exc.value.reason == "wall_clock_budget_exceeded"
+    else:
+        response = client.fetch(f"https://{TEST_HOSTNAME}/hook", require_body=False)
+        assert response.status == 200 and response.body is None
+    assert clock.now > safe_http.TOTAL_BUDGET_SECONDS
+    assert len(streams) == 1 and streams[0].closed
+    assert sockets[0].fileno() == -1
+    streams[0].close()  # Repeated close remains safe after a deadline failure.
+    sockets[0].close()
 
 
 def test_proxy_env_vars_are_never_consulted(https_server, trust_test_ca, monkeypatch):

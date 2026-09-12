@@ -70,3 +70,37 @@ that bound. This is landing-page discovery, not statewide semantic freshness.
 Idaho separately passed using the unchanged defaults; no Idaho-specific
 exception or production backoff reset was made. Neither these local probes
 nor the test results are deployment proof or a canonical SHIP verdict.
+
+## Canonical review disposition — 06:40 UTC
+
+Run `/home/alberto/verify-runs/20260912T063242Z-00115d5` reviewed the exact
+transport commit and returned **HALT**: Codex, Muse and Deepseek BLOCK; AGY,
+Grok and Opus SHIP; Ox dead. Ox's first attempt returned code 6 after 71 seconds.
+The bounded guard stopped its identical automatic retry; the summary therefore
+records code 143 for that cancelled retry. The advocate was skipped. The guard
+and canonical runner have both terminated. No new verifier loop is planned.
+
+The owner checked the blocking mechanisms against the full source:
+
+- Muse/Deepseek assume `remaining()` can return zero or a negative timeout.
+  It instead raises `TimeoutFailure("wall_clock_budget_exceeded")` before
+  returning, so those values cannot reach `socket.settimeout()`.
+- Codex assumes direct `TimeoutFailure` from a body receive escapes the delivery
+  handler. The outer body `try` includes both the loop-boundary deadline check
+  and `response.read()`; its `except (TimeoutFailure, ConnectionFailure)` returns
+  the received status with `body=None` when the body is optional.
+- Muse's cleanup claim supplies no concrete double-close path that raises
+  `ValueError`. The reader guards its closed state, standard stream/socket
+  closure is idempotent, and the observed descriptor tests pass. No confirmed
+  cleanup defect was found.
+
+Six added deterministic boundary cases force the clock past its deadline before
+header reception, at the body-loop boundary, and inside the next body receive,
+each with both body modes. They pass without depending on which socket timeout
+wins a race, assert the exact typed failure or status-only success, and check
+closed streams/descriptors plus repeated close. The final shared TLS/transport
+suite passed **84 tests** in 18.38 seconds:
+`/tmp/bc_http_review_shared_final_20260912.log`. Together with the unchanged
+consumer validation above, this is 403 focused checks. Production code did not
+change after the review. These findings do not turn HALT into SHIP; the failed
+required reviewer still blocks verification and the change remains undeployed.

@@ -197,10 +197,32 @@ certificate compared byte-for-byte with the pinned commit. Wheel SHA-256:
 `1f2daebbfa6330bea22989f2f39ebcbe7ee9fad9f60b253bbfe129bfa47af3aa`.
 See [response deadlines and evidence](official-response-timeouts.md).
 Because this newly discovered defect affects shared webhook transport, a
-bounded canonical review of this fix arc is running at
-`/home/alberto/verify-runs/20260912T063242Z-00115d5`. It does not re-review or
-approve the earlier Alaska/Florida/parser changes. Identical automatic retries
-are guarded, and the user's hard stop still applies. No deployment occurred.
+bounded canonical review of this fix arc ran at
+`/home/alberto/verify-runs/20260912T063242Z-00115d5`: **HALT**, three SHIP,
+three BLOCK and dead Ox. Its identical retry was stopped; both runner and guard
+terminated. The blocking mechanisms do not match the full source's positive
+remaining-time guard and outer body-exception handler. Six deterministic forced
+expiry cases passed; the final shared suite passed 84 tests (403 focused checks
+with the unchanged consumer results). No post-review production code changed.
+This does not approve this arc or the earlier Alaska/Florida/parser changes.
+No new verifier loop or deployment is planned before the user's hard stop.
+
+### Fresh public status — September 12, 06:40 UTC
+
+The correctly prefixed `/api/v1/health` and `/api/v1/ready` returned HTTP 200
+with database `ok` and readiness true. The first probe mistakenly used root
+`/health` and `/ready`; both return 404, and that diagnostic is retained.
+Data Health returned 200 with two defects, both Alaska: one dead API-sync job
+and overdue successful local sync. The earlier 17 overdue-jurisdiction warnings
+are no longer the current report. This is an observed report change, not a
+claim that the local fixes caused production recovery.
+
+The separate official inventory still has 59 targets: 48 observed, one newly
+overdue and ten failed. Illinois retried on the existing production bundle at
+06:35 UTC and still reports `TlsFailure`, with next eligibility September 16.
+The local certificate fix remains undeployed. Official observation status does
+not establish statewide semantic freshness. Timestamped public JSON and the
+route-correction diagnostic are retained in the release evidence directory.
 
 Restart inspection:
 
