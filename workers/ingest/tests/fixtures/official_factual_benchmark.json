@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "benchmark_version": "official-factual-benchmark/1",
+  "cases": [
+    {
+      "case_id": "fl-senate-2025-hb-7031",
+      "adapter": "fl-senate-bill-history",
+      "jurisdiction": "FL",
+      "source": {
+        "url": "https://www.flsenate.gov/Session/Bill/2025/7031",
+        "recorded_original_capture_sha256": "e57e81a8826451dba2b758771274715dd3d8377582fecec54272b3ba9bb73698"
+      },
+      "fixture": {
+        "path": "fl_senate_detail_2025_7031.html",
+        "sha256": "3e543da731b746162a92f71c193de5cede4a3bdfa6d059edd0491e4f477c4480",
+        "kind": "derived_public_fixture"
+      },
+      "facts": [
+        {
+          "field": "identity",
+          "expected": {
+            "session_year": "2025",
+            "bill_number": "7031",
+            "bill_identifier": "HB 7031"
+          }
+        },
+        {"field": "title", "expected": "Taxation"},
+        {"field": "table_row_count", "expected": 17},
+        {"field": "action_count", "expected": 46},
+        {
+          "field": "contains_action",
+          "expected": {
+            "date": "2025-04-10",
+            "chamber": "Senate",
+            "description": "Referred to Appropriations"
+          }
+        },
+        {
+          "field": "contains_action",
+          "expected": {
+            "date": "2025-06-05",
+            "chamber": "Senate",
+            "description": "Favorable with 1 amendment(s) by- Appropriations (535388); YEAS 17 NAYS 0"
+          }
+        },
+        {
+          "field": "contains_action",
+          "expected": {
+            "date": "2025-06-16",
+            "chamber": "House",
+            "description": "Passed as amended by Conference Committee Report; YEAS 93, NAYS 7"
+          }
+        },
+        {
+          "field": "final_action",
+          "expected": {
+            "date": "2026-06-18",
+            "chamber": "House",
+            "description": "Veto Message transmitted to Secretary of State"
+          }
+        }
+      ]
+    }
+  ]
+}
