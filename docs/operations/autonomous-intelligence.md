@@ -13,45 +13,55 @@ in the original checkout are preserved. The canonical inventory covers 50 states
 plus DC. Generic website observation is never treated as proof of statewide
 semantic freshness or completeness.
 
-## Resumed September 11 — Florida reconciliation review held
+## Active work — hard stop September 12 at 03:00 Eastern
 
-Work resumed September 11 after the September 8 pause. The full objective
-remains incomplete; the deployment holds below still apply.
+The user requested pausing goal pursuit at **2026-09-12 03:00 America/New_York
+(07:00 UTC)**. Stop implementation, reviews, polling and deployment at that
+cutoff until an explicit user resumption. Automatic goal continuations do not
+revoke this stop point. Keep the full objective incomplete and preserve the
+handoff; do not mislabel a pause as completion.
 
 - **LIVE:** the last recorded release includes the 51-jurisdiction Data Health
   report, recurring official-source observations, source evidence APIs, and
   bounded public Florida/California Scout. This does not establish full
   50-state semantic freshness or autonomous parser repair.
-- **VERIFIED LOCALLY:** Florida history reconciliation is committed separately
-  at `1d30343d4ff3c4fd01fee9432fcb447a36a4d807`, parent `1989ff9`, in
-  `/home/alberto/codingProjects/billcommons-fl-reconciliation-20260908`.
-  Root ran all official-source tests against a new disposable PostgreSQL 16
-  database on port 55493: **184 passed**; the cluster was dropped afterward.
-  Evidence: `/tmp/bc_fl_reconciliation_root_pg_20260912.log`.
-  The change requires exact source-year regular-session mapping, preserves
-  chamber uncertainty, rejects foreign-jurisdiction organizations, and replays
-  retained evidence without consulting current corpus actions. It is not yet
-  integrated or deployed. Canonical review of the full commit was interrupted at the user
-  request to drop Kimi. Completed artifacts remain in
-  `/home/alberto/verify-runs/20260912T034200Z-1d30343`. Ox returned no verdict
-  after reaching its output limit; the run is not a verification pass. Kimi is
-  now opt-in in `verify-ship`. Checked reviewer claims and source evidence are
-  recorded in the restricted release directory,
-  `fl-reconciliation-review-20260912.md`.
+- **INTEGRATED LOCALLY:** Florida history reconciliation from `1d30343` is
+  integrated as `2be9ddd`. CA parser-repair bundles from `8c75e16` are integrated
+  as `b2446de`, with subsequent root hardening of evidence reads, generated
+  tests, bounded content samples and provenance-failure handling. Neither is
+  deployed. The bundle creates replayable regression evidence; automated patch
+  authorship and controlled promotion remain separate unfinished work.
+- **VALIDATION:** root's first combined disposable-PG16 ingestion run passed
+  676 tests and exposed one clock-dependent Data Health fixture. Its undated
+  run now has explicit creation time. The follow-up passed 203 official-source
+  and Data Health tests, then 57 API tests and 107 Scout tests. One optional
+  PostgreSQL source-history concurrency test was skipped because its separate
+  opt-in variable was unset. Deprecation warnings remain. All disposable
+  clusters were dropped. Logs: `/tmp/bc_reliability_combined_root_pg_20260912.log`,
+  `/tmp/bc_combined_followup_root_pg_20260912.log`, and
+  `/tmp/bc_api_scout_root_pg_20260912.log`. The middle run's API guard refused a
+  missing explicit test URL; the final run supplied the local URL and passed.
+- **REVIEW:** the earlier Florida-only canonical run was interrupted at the
+  user's request to drop Kimi. Its artifacts remain at
+  `/home/alberto/verify-runs/20260912T034200Z-1d30343`; it is not a passing run.
+  Kimi is now opt-in in `verify-ship`. Ox exhausted its 8192-token output limit;
+  a bounded higher output limit is available for the next coherent review.
+  Checked reviewer claims are reconciled against source in the restricted
+  release directory's `fl-reconciliation-review-20260912.md`.
 - **HEALTHY AT CHECK:** at 2026-09-12 03:40 UTC (September 11 Eastern), public
   health, readiness, Data Health and a real bill read returned HTTP 200.
   There were 58 official observations in the preceding 24 hours and 59 enabled
   official targets. These checks do not prove statewide completeness.
 - **BLOCKED:** production migration metadata still has zero revision rows and
-  the saved-monitor tables remain absent. The concurrent-operator question
-  is unanswered. No marker restoration, migration or deployment was performed.
+  saved-monitor tables remain absent. The concurrent-operator question is
+  unanswered. No marker restoration, migration or deployment was performed.
   Saved monitors and Florida bill-text source `e415bc7` remain undeployed.
 - **BLOCKED:** the supplied Gojiberry key previously returned HTTP 401 on four
   read endpoints. A replacement key is needed; account capacity remains
   unknown. No outreach or IQ Dominoes configuration was changed.
-- **NEXT:** reconcile the pinned review verdict before integration. Resolve
-  the operator question and refresh the documented recovery evidence before
-  any production metadata repair or later deployment.
+- **NEXT:** review the complete integrated change without Kimi; reconcile the
+  verdict against source. Resolve the operator question and refresh recovery
+  evidence before production metadata repair or deployment. Honor the cutoff.
 
 Restart inspection:
 

@@ -23,13 +23,17 @@ publishes the directory once complete.
 `recorded_not_rerun: true`, separately from the current candidate replay. It
 contains the retained-fixture hash and size, the source hash of the **loaded
 shared parser callable**, accepted or rejected replay evidence, bounded counts,
-and a digest of a deterministic bounded action-content sample. The raw archive
+and a digest of a deterministic action-content sample (at most 20 bills and
+50 actions per sampled bill). This sample detects changes in the sampled
+content; it is not a full-corpus equivalence claim. The raw archive
 is stored only as `retained-ca-archive.zip`; it is never printed by the command.
 
 Old observations predate parser-source provenance. Their bundles remain useful
 when their invalid status and `OfficialCaActionsError` support a CA parse
 failure, but the manifest says `historical_parser_source_not_recorded`. The lab
 never substitutes today's parser as an invented historical baseline.
+If source fingerprinting is unavailable during a new observation, the original
+parse failure and its backoff still persist; provenance is explicitly unavailable.
 Both the latest eligible failure and a superseded eligible failure may produce
 this regression artifact. A superseded record stays marked as such in
 `recorded_before`; it cannot trigger a retry or target enablement.

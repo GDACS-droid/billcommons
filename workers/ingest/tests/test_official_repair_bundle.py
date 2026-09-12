@@ -135,6 +135,11 @@ def test_bundle_is_deterministic_and_generated_regression_runs_without_database_
     for filename in (FIXTURE_NAME, MANIFEST_NAME, TEST_NAME):
         assert (repeat / filename).read_bytes() == (output / filename).read_bytes()
 
+    completed = _run_generated_test(output)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def _run_generated_test(output):
     root = Path(__file__).resolve().parents[3]
     env = os.environ.copy()
     env.pop("DATABASE_URL", None)
@@ -149,7 +154,7 @@ def test_bundle_is_deterministic_and_generated_regression_runs_without_database_
         capture_output=True,
         check=False,
     )
-    assert completed.returncode == 0, completed.stdout + completed.stderr
+    return completed
 
 
 def test_tampered_blob_and_loaded_source_evidence_are_rejected(tmp_path, monkeypatch):
@@ -247,3 +252,37 @@ def test_bundle_refuses_unusable_input_traversal_and_overwrite(tmp_path):
         build_repair_bundle(db, observation.id, populated)
     with pytest.raises(RepairBundleError, match="traversal"):
         build_repair_bundle(db, observation.id, tmp_path / "safe" / ".." / "escape")
+
+
+@pytest.mark.parametrize("tamper", ["fixture_path", "parser_hash", "sample_hash"])
+def test_generated_regression_rejects_changed_evidence(tmp_path, tamper):
+    db, observation = _failure_db(raw=_archive())
+    output = tmp_path / "bundle"
+    manifest = build_repair_bundle(db, observation.id, output)
+    if tamper == "fixture_path":
+        manifest["fixture"]["filename"] = "../outside.zip"
+    elif tamper == "parser_hash":
+        manifest["candidate_parser"]["source_sha256"] = "0" * 64
+    else:
+        manifest["candidate_replay"]["sample_sha256"] = "0" * 64
+    (output / MANIFEST_NAME).write_text(json.dumps(manifest))
+    with pytest.raises(RepairBundleError):
+        validate_repair_bundle(output)
+    completed = _run_generated_test(output)
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+
+
+def test_content_sample_detects_same_count_changes_and_caps_events():
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from billcommons_ingest.official_repair_bundle import _sample_digest, MAX_SAMPLE_EVENTS_PER_BILL
+    parsed = observer.ca_actions.parse_ca_official_actions_zip(
+        _archive(), source_url=observer.ca_actions.ca_delta_url("Mon"), retrieved_at=NOW,
+    )
+    bill_id = parsed.scoped_bill_ids[0]
+    event = parsed.events_by_official_bill_id[bill_id][0]
+    def batch(events):
+        return SimpleNamespace(scoped_bill_ids=[bill_id], events_by_official_bill_id={bill_id: events})
+    assert _sample_digest(batch([event])) != _sample_digest(batch([replace(event, description="Changed action.")]))
+    assert _sample_digest(batch([event] * MAX_SAMPLE_EVENTS_PER_BILL)) == _sample_digest(
+        batch([event] * (MAX_SAMPLE_EVENTS_PER_BILL + 1)))

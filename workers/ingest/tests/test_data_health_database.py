@@ -81,6 +81,9 @@ def test_session_coverage_and_source_specific_sync_health_use_real_postgres_rows
                 status="success",
                 started_at=None,
                 finished_at=None,
+                # The collector uses creation time to order undated runs.
+                # Keep this older fixture independent of the database clock.
+                created_at=NOW - timedelta(minutes=10),
             ),
             IngestionRun(
                 jurisdiction_id=jurisdiction.id,

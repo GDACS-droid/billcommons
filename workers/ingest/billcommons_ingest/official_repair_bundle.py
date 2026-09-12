@@ -39,6 +39,7 @@ FIXTURE_NAME = "retained-ca-archive.zip"
 MANIFEST_NAME = "manifest.json"
 TEST_NAME = "test_repair_bundle_regression.py"
 MAX_SAMPLE_BILLS = 20
+MAX_SAMPLE_EVENTS_PER_BILL = 50
 MAX_MANIFEST_BYTES = 64 * 1024
 _CA_DELTA_URLS = frozenset(ca.ca_delta_url(day) for day in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
 
@@ -70,7 +71,7 @@ def _sample_digest(batch) -> tuple[int, str]:
                     "description": event.description,
                     "source_identity": event.occurrence_id,
                 }
-                for event in events
+                for event in events[:MAX_SAMPLE_EVENTS_PER_BILL]
             ],
         })
     return len(sample), hashlib.sha256(_canonical_json_bytes(sample)).hexdigest()
@@ -169,7 +170,7 @@ def _reject_symlink_path(path: Path) -> None:
     parts = path.parts[1:] if path.is_absolute() else path.parts
     for part in parts:
         current /= part
-        if current.exists() and current.is_symlink():
+        if current.is_symlink():
             raise RepairBundleError("output path must not traverse a symlink")
 
 
@@ -201,6 +202,7 @@ import hashlib
 import json
 from pathlib import Path
 import socket
+import stat
 
 import pytest
 
@@ -213,9 +215,12 @@ ROOT = Path(__file__).parent
 
 def _bounded_read(path, maximum):
     assert not path.is_symlink()
-    stat = path.stat()
-    assert stat.st_size <= maximum
-    return path.read_bytes()
+    info = path.stat()
+    assert stat.S_ISREG(info.st_mode)
+    with path.open("rb") as stream:
+        data = stream.read(maximum + 1)
+    assert len(data) <= maximum
+    return data
 
 
 MANIFEST = json.loads(_bounded_read(ROOT / "manifest.json", 65536).decode("utf-8"))
@@ -233,7 +238,7 @@ def _sample_digest(batch):
                     "description": event.description,
                     "source_identity": event.occurrence_id,
                 }
-                for event in batch.events_by_official_bill_id.get(bill_id, ())
+                for event in batch.events_by_official_bill_id.get(bill_id, ())[:50]
             ],
         })
     encoded = json.dumps(sample, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -245,7 +250,11 @@ def test_retained_ca_parser_regression(monkeypatch):
         raise AssertionError("generated parser regression test must not use network")
 
     monkeypatch.setattr(socket.socket, "connect", forbidden_network)
-    raw = _bounded_read(ROOT / MANIFEST["fixture"]["filename"], 8 * 1024 * 1024)
+    assert MANIFEST["bundle_version"] == "official-repair-bundle/1"
+    assert MANIFEST["fixture"]["filename"] == "retained-ca-archive.zip"
+    assert MANIFEST["promotion_state"] == "requires_human_review"
+    assert MANIFEST["execution_authorized"] is False
+    raw = _bounded_read(ROOT / "retained-ca-archive.zip", 8 * 1024 * 1024)
     assert len(raw) == MANIFEST["fixture"]["byte_count"]
     assert hashlib.sha256(raw).hexdigest() == MANIFEST["fixture"]["sha256"]
     assert hashlib.sha256(Path(parser_module.__file__).read_bytes()).hexdigest() == MANIFEST["candidate_parser"]["source_sha256"]
@@ -302,7 +311,11 @@ def _read_manifest(bundle_dir: Path) -> dict[str, object]:
     try:
         if manifest_path.stat().st_size > MAX_MANIFEST_BYTES:
             raise RepairBundleError("bundle manifest exceeds the local size bound")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        with manifest_path.open("rb") as stream:
+            encoded = stream.read(MAX_MANIFEST_BYTES + 1)
+        if len(encoded) > MAX_MANIFEST_BYTES:
+            raise RepairBundleError("bundle manifest exceeds the local size bound")
+        manifest = json.loads(encoded.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RepairBundleError("bundle manifest is invalid") from exc
     if not isinstance(manifest, dict) or manifest.get("bundle_version") != BUNDLE_VERSION:
@@ -318,6 +331,8 @@ def validate_repair_bundle(bundle_dir: str | Path) -> dict[str, object]:
     if root.is_symlink() or not root.is_dir():
         raise RepairBundleError("bundle directory is absent or unsafe")
     manifest = _read_manifest(root)
+    if manifest.get("promotion_state") != "requires_human_review" or manifest.get("execution_authorized") is not False:
+        raise RepairBundleError("bundle cannot authorize execution or promotion")
     fixture = manifest.get("fixture")
     candidate = manifest.get("candidate_parser")
     if not isinstance(fixture, dict) or fixture.get("filename") != FIXTURE_NAME:
@@ -330,7 +345,8 @@ def validate_repair_bundle(bundle_dir: str | Path) -> dict[str, object]:
     try:
         if fixture_path.stat().st_size > MAX_BLOB_BYTES:
             raise RepairBundleError("bundle fixture exceeds the local size bound")
-        raw = fixture_path.read_bytes()
+        with fixture_path.open("rb") as stream:
+            raw = stream.read(MAX_BLOB_BYTES + 1)
     except OSError as exc:
         raise RepairBundleError("bundle fixture is unreadable") from exc
     if len(raw) > MAX_BLOB_BYTES or fixture.get("byte_count") != len(raw) or fixture.get("sha256") != hashlib.sha256(raw).hexdigest():
@@ -341,6 +357,18 @@ def validate_repair_bundle(bundle_dir: str | Path) -> dict[str, object]:
         raise RepairBundleError("candidate parser source is unavailable") from exc
     if current_digest != candidate["source_sha256"]:
         raise RepairBundleError("candidate parser source evidence does not verify")
+    replay_input = manifest.get("replay_input")
+    if not isinstance(replay_input, dict) or replay_input.get("source_url") not in _CA_DELTA_URLS:
+        raise RepairBundleError("bundle replay source is invalid")
+    try:
+        retrieved_at = datetime.fromisoformat(replay_input["retrieved_at"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RepairBundleError("bundle replay timestamp is invalid") from exc
+    if retrieved_at.tzinfo is None or retrieved_at.utcoffset() is None:
+        raise RepairBundleError("bundle replay timestamp must include its timezone")
+    reproduced = _candidate_replay(raw, source_url=replay_input["source_url"], retrieved_at=retrieved_at)
+    if reproduced != manifest.get("candidate_replay"):
+        raise RepairBundleError("candidate replay evidence does not reproduce")
     return manifest
 
 

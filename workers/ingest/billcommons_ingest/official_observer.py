@@ -38,7 +38,7 @@ from billcommons_ingest import official_diagnostics
 from billcommons_ingest import official_discovery as discovery
 from billcommons_ingest import official_fl_senate_actions as fl_actions
 from billcommons_ingest import official_fl_senate_capture as fl_capture
-from billcommons_ingest.official_parser_provenance import parser_source_sha256
+from billcommons_ingest.official_parser_provenance import ParserProvenanceError, parser_source_sha256
 from billcommons_schema.models import (
     Bill,
     BillAction,
@@ -150,9 +150,14 @@ def _failure_scope(target: OfficialSourceTarget, error: BaseException, *, stage:
     if target.adapter_name == ADAPTER_NAME and stage == "parse":
         # The transport adapter re-exports the shared pure parser. Bind the
         # observed failure to that callable's source file, not this wrapper.
-        failure["parser_source_sha256"] = parser_source_sha256(
-            ca_actions.parse_ca_official_actions_zip
-        )
+        try:
+            failure["parser_source_sha256"] = parser_source_sha256(
+                ca_actions.parse_ca_official_actions_zip
+            )
+        except ParserProvenanceError:
+            # Provenance collection must not discard the original retained
+            # failure or prevent its normal scheduling/backoff.
+            failure["parser_source_status"] = "unavailable"
     return {**_observation_scope(target), "failure": failure}
 
 

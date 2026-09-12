@@ -62,6 +62,8 @@ def _recorded_parser_provenance(observation: OfficialSourceObservation) -> dict[
 
     scope = observation.scope if isinstance(observation.scope, dict) else {}
     failure = scope.get('failure')
+    if isinstance(failure, dict) and failure.get('parser_source_status') == 'unavailable':
+        return {'status': 'unavailable', 'reason': 'parser_source_unavailable_at_observation'}
     if isinstance(failure, dict) and 'parser_source_sha256' in failure:
         digest = failure['parser_source_sha256']
         if is_sha256(digest):

@@ -219,10 +219,15 @@ def test_success_records_verified_raw_replayable_diff_and_never_mutates_actions(
     assert db_session.scalar(text("SHOW idle_in_transaction_session_timeout")) in {"240s", "4min"}
 
 
-def test_malformed_archive_retains_raw_invalid_observation_and_backoff(db_session, unique_abbr, monkeypatch):
+@pytest.mark.parametrize("provenance_available", [True, False])
+def test_malformed_archive_retains_raw_invalid_observation_and_backoff(db_session, unique_abbr, monkeypatch, provenance_available):
     _, target = _target(db_session, unique_abbr)
     raw = b"not a ZIP"
     monkeypatch.setattr(observer, "_capture_ca_response", lambda day: _captured(raw))
+    if not provenance_available:
+        def unavailable_source(parser):
+            raise observer.ParserProvenanceError("unavailable")
+        monkeypatch.setattr(observer, "parser_source_sha256", unavailable_source)
 
     result = observer.observe_due_target(db_session, now=NOW)
     db_session.flush()
@@ -233,6 +238,9 @@ def test_malformed_archive_retains_raw_invalid_observation_and_backoff(db_sessio
     assert observation.raw_sha256 == hashlib.sha256(raw).hexdigest()
     assert db_session.get(OfficialRawBlob, observation.raw_sha256).data == raw
     assert observation.error_class == "OfficialCaActionsError"
+    if not provenance_available:
+        assert observation.scope["failure"]["parser_source_status"] == "unavailable"
+        assert "parser_source_sha256" not in observation.scope["failure"]
     assert target.consecutive_failures == 1
     assert target.next_check_at == NOW + timedelta(seconds=300)
 
