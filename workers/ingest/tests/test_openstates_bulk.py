@@ -348,6 +348,82 @@ def test_ingest_organizations_rejects_conflicting_source_rows_before_null_repair
     assert foreign_source_id in str(exc_info.value)
 
 
+def test_ingest_organizations_rejects_known_and_unresolved_duplicate_sources_in_any_order(
+    db_session, rawstore
+):
+    known_source_id = f"ocd-jurisdiction/local-{uuid.uuid4().hex}"
+    unresolved_source_id = f"ocd-jurisdiction/not-loaded-{uuid.uuid4().hex}"
+    session_row = _make_session_row(db_session, openstates_id=known_source_id)
+
+    for source_ids in (
+        (known_source_id, unresolved_source_id),
+        (unresolved_source_id, known_source_id),
+    ):
+        organization = _seed_organization(
+            db_session,
+            openstates_id=f"ocd-organization/known-unresolved-{uuid.uuid4().hex}",
+        )
+        with pytest.raises(ValueError, match="organization jurisdiction conflict") as exc_info:
+            ingest_session_csv_zip(
+                db_session,
+                _organization_fixture_zip(
+                    [
+                        _organization_row(organization.openstates_id, source_ids[0]),
+                        _organization_row(organization.openstates_id, source_ids[1]),
+                    ]
+                ),
+                session_row=session_row,
+                rawstore=rawstore,
+            )
+
+        organization_id = organization.id
+        db_session.commit()
+        db_session.expire_all()
+        assert db_session.get(Organization, organization_id).jurisdiction_id is None
+        assert known_source_id in str(exc_info.value)
+        assert unresolved_source_id in str(exc_info.value)
+
+
+def test_ingest_organizations_coalesces_identical_duplicate_new_rows(db_session, rawstore):
+    session_row = _make_session_row(db_session)
+    organization_id = f"ocd-organization/identical-{uuid.uuid4().hex}"
+    duplicate_row = _organization_row(organization_id, "")
+    archive = _organization_fixture_zip([duplicate_row, duplicate_row.copy()])
+
+    first = ingest_session_csv_zip(db_session, archive, session_row=session_row, rawstore=rawstore)
+    second = ingest_session_csv_zip(db_session, archive, session_row=session_row, rawstore=rawstore)
+
+    assert first.organizations == 1
+    assert second.organizations == 0
+    assert len(
+        db_session.execute(
+            select(Organization.id).where(Organization.openstates_id == organization_id)
+        ).all()
+    ) == 1
+
+
+def test_ingest_organizations_rejects_differing_duplicate_rows(db_session, rawstore):
+    session_row = _make_session_row(db_session)
+    organization_id = f"ocd-organization/different-{uuid.uuid4().hex}"
+    with pytest.raises(ValueError, match="duplicate organization rows differ"):
+        ingest_session_csv_zip(
+            db_session,
+            _organization_fixture_zip(
+                [
+                    _organization_row(organization_id, "", name="First House"),
+                    _organization_row(organization_id, "", name="Second House"),
+                ]
+            ),
+            session_row=session_row,
+            rawstore=rawstore,
+        )
+
+    db_session.commit()
+    assert db_session.execute(
+        select(Organization.id).where(Organization.openstates_id == organization_id)
+    ).all() == []
+
+
 def test_ingest_creates_bills_with_normalized_identifiers(db_session, rawstore):
     session_row = _make_session_row(db_session)
     zip_bytes = build_fixture_zip_bytes()

@@ -393,11 +393,38 @@ def ingest_session_csv_zip(
             ).scalars():
                 org_cache[org.openstates_id] = org
 
-        # Validate the complete set of resolvable source attributions before
-        # assigning any legacy NULLs. The caller records and commits failures,
-        # so discovering a later conflict after an earlier assignment could
-        # otherwise persist a partial jurisdiction repair.
-        resolved_source_jurisdictions_by_org_id: dict[str, tuple[uuid.UUID, str]] = {}
+        # Validate the complete set of explicit source attributions before
+        # resolving or assigning any legacy NULLs. The caller records and
+        # commits failures, so discovering a later conflict after an earlier
+        # assignment could otherwise persist a partial jurisdiction repair.
+        # Compare the raw, non-empty OCD identifiers too: an unknown value is
+        # still contradictory evidence when another row for this organization
+        # carries a different known identifier.
+        source_jurisdiction_openstates_id_by_org_id: dict[str, str] = {}
+        for row in org_rows:
+            openstates_id = row.get("id")
+            if not openstates_id:
+                continue
+            source_jurisdiction_openstates_id = (row.get("jurisdiction_id") or "").strip()
+            if not source_jurisdiction_openstates_id:
+                continue
+            prior_source_jurisdiction_openstates_id = (
+                source_jurisdiction_openstates_id_by_org_id.get(openstates_id)
+            )
+            if (
+                prior_source_jurisdiction_openstates_id is not None
+                and prior_source_jurisdiction_openstates_id != source_jurisdiction_openstates_id
+            ):
+                raise ValueError(
+                    "organization jurisdiction conflict for "
+                    f"{openstates_id}: source {prior_source_jurisdiction_openstates_id} "
+                    f"differs from source {source_jurisdiction_openstates_id}; "
+                    "no organization changes applied"
+                )
+            source_jurisdiction_openstates_id_by_org_id[openstates_id] = (
+                source_jurisdiction_openstates_id
+            )
+
         for row in org_rows:
             openstates_id = row.get("id")
             if not openstates_id:
@@ -408,18 +435,6 @@ def ingest_session_csv_zip(
             )
             if source_jurisdiction_id is None:
                 continue
-
-            prior_source = resolved_source_jurisdictions_by_org_id.get(openstates_id)
-            if prior_source is not None and prior_source[0] != source_jurisdiction_id:
-                raise ValueError(
-                    "organization jurisdiction conflict for "
-                    f"{openstates_id}: source {prior_source[1]} differs from source "
-                    f"{source_jurisdiction_openstates_id}; no organization changes applied"
-                )
-            resolved_source_jurisdictions_by_org_id[openstates_id] = (
-                source_jurisdiction_id,
-                source_jurisdiction_openstates_id,
-            )
 
             org = org_cache.get(openstates_id)
             if (
@@ -433,8 +448,26 @@ def ingest_session_csv_zip(
                     f"{source_jurisdiction_openstates_id}; no organization changes applied"
                 )
 
-        new_org_rows: list[dict] = []
+        # A repeated row is only safe to coalesce if every field agrees.
+        # Otherwise choosing the first or last row would discard source data.
+        coalesced_org_rows: list[dict[str, str]] = []
+        organization_row_by_openstates_id: dict[str, dict[str, str]] = {}
         for row in org_rows:
+            openstates_id = row.get("id")
+            if not openstates_id:
+                continue
+            prior_row = organization_row_by_openstates_id.get(openstates_id)
+            if prior_row is None:
+                organization_row_by_openstates_id[openstates_id] = row
+                coalesced_org_rows.append(row)
+            elif prior_row != row:
+                raise ValueError(
+                    "duplicate organization rows differ for "
+                    f"{openstates_id}; no organization changes applied"
+                )
+
+        new_org_rows: list[dict] = []
+        for row in coalesced_org_rows:
             openstates_id = row.get("id")
             if not openstates_id:
                 continue
