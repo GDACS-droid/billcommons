@@ -61,6 +61,8 @@ def main() -> int:
          "workers/ingest/tests/test_official_replay.py",
          "workers/ingest/tests/test_official_diagnostics.py",
          "workers/ingest/tests/test_official_repair_plan.py",
+         "workers/ingest/tests/test_official_repair_parser_provenance.py",
+         "workers/ingest/tests/test_official_repair_bundle.py",
          "workers/ingest/tests/test_official_ca_reconciliation.py",
          "workers/ingest/tests/test_official_worker.py",
          "workers/ingest/tests/test_source_budget.py",

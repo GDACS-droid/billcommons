@@ -38,6 +38,7 @@ from billcommons_ingest import official_diagnostics
 from billcommons_ingest import official_discovery as discovery
 from billcommons_ingest import official_fl_senate_actions as fl_actions
 from billcommons_ingest import official_fl_senate_capture as fl_capture
+from billcommons_ingest.official_parser_provenance import parser_source_sha256
 from billcommons_schema.models import (
     Bill,
     BillAction,
@@ -145,7 +146,14 @@ def _safe_error_class(error: BaseException) -> str:
 def _failure_scope(target: OfficialSourceTarget, error: BaseException, *, stage: str) -> dict[str, Any]:
     """Add a public-safe diagnosis to this observation only, never its target."""
 
-    return {**_observation_scope(target), "failure": official_diagnostics.failure_diagnosis(error, stage=stage)}
+    failure = official_diagnostics.failure_diagnosis(error, stage=stage)
+    if target.adapter_name == ADAPTER_NAME and stage == "parse":
+        # The transport adapter re-exports the shared pure parser. Bind the
+        # observed failure to that callable's source file, not this wrapper.
+        failure["parser_source_sha256"] = parser_source_sha256(
+            ca_actions.parse_ca_official_actions_zip
+        )
+    return {**_observation_scope(target), "failure": failure}
 
 
 def _observed_http_status(error: BaseException) -> int | None:

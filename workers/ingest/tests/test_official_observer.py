@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from billcommons_ingest import official_ca_actions as ca_actions
 from billcommons_ingest import official_discovery as discovery
 from billcommons_ingest import official_observer as observer
+from billcommons_ingest.official_parser_provenance import parser_source_sha256
 from billcommons_schema.models import (
     Bill,
     BillAction,
@@ -342,6 +343,7 @@ def test_member_count_parse_cap_keeps_raw_and_diagnosis_without_corpus_writes(
         "code": "archive_member_count_limit_exceeded",
         "recommended_action": "review_parser_limit",
         "details": {"observed": 257, "limit": ca_actions.MAX_ZIP_MEMBERS},
+        "parser_source_sha256": parser_source_sha256(ca_actions.parse_ca_official_actions_zip),
     }
     assert "failure" not in target.scope
     assert db_session.scalar(select(func.count()).select_from(OfficialRawBlob)) == 1

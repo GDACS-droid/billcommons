@@ -8,11 +8,8 @@ candidate must still pass source review and a bounded production canary.
 from __future__ import annotations
 
 import argparse
-import hashlib
-import inspect
 import json
 import os
-from pathlib import Path
 import uuid
 
 from sqlalchemy import select, text
@@ -21,6 +18,11 @@ from billcommons_ingest import official_ca_actions as ca
 from billcommons_ingest.official_discovery import ADAPTER_NAME as DISCOVERY_ADAPTER
 from billcommons_ingest.official_diagnostics import failure_diagnosis
 from billcommons_ingest.official_observer import ADAPTER_NAME
+from billcommons_ingest.official_parser_provenance import (
+    ParserProvenanceError,
+    is_sha256,
+    parser_source_sha256,
+)
 from billcommons_ingest.official_replay import EvidenceReplayError, _load_blob
 from billcommons_schema.models import OfficialSourceObservation, OfficialSourceTarget
 
@@ -42,21 +44,30 @@ _DISCOVERY_ACTIONS = {
 
 
 def _candidate_parser_sha256(parser: object) -> str:
-    """Fingerprint the file which supplied the callable used for replay.
+    """Fingerprint the actual shared callable used by the local replay."""
 
-    ``official_ca_actions`` is a transport-compatible wrapper.  Its parser is
-    imported from the shared module, so hashing the wrapper would not attest a
-    pure-parser change.  Resolve the callable's loaded module instead and
-    fail closed if Python cannot identify a regular source file.
-    """
-    module = inspect.getmodule(parser)
-    source_file = getattr(module, "__file__", None) if module is not None else None
-    if not isinstance(source_file, str) or not source_file:
-        raise EvidenceReplayError("candidate parser source is unavailable")
     try:
-        return hashlib.sha256(Path(source_file).read_bytes()).hexdigest()
-    except OSError as exc:
+        return parser_source_sha256(parser)
+    except ParserProvenanceError as exc:
         raise EvidenceReplayError("candidate parser source is unavailable") from exc
+
+
+def _recorded_parser_provenance(observation: OfficialSourceObservation) -> dict[str, str]:
+    """Describe recorded parser evidence without manufacturing a baseline.
+
+    Parser-source digests were added after some observations already existed.
+    Their retained archives remain useful, but an absent value is explicitly
+    historical absence rather than an invitation to substitute today's parser.
+    """
+
+    scope = observation.scope if isinstance(observation.scope, dict) else {}
+    failure = scope.get('failure')
+    if isinstance(failure, dict) and 'parser_source_sha256' in failure:
+        digest = failure['parser_source_sha256']
+        if is_sha256(digest):
+            return {'status': 'recorded', 'parser_source_sha256': digest}
+        return {'status': 'invalid', 'reason': 'recorded_parser_source_invalid'}
+    return {'status': 'unavailable', 'reason': 'historical_parser_source_not_recorded'}
 
 
 def plan_observation_repair(db, observation_id: uuid.UUID) -> dict:
@@ -105,6 +116,8 @@ def plan_observation_repair(db, observation_id: uuid.UUID) -> dict:
             pass  # Legacy/malformed metadata never becomes an instruction.
         else:
             plan['recorded_failure'] = safe_failure
+    if observation.adapter_name == ADAPTER_NAME:
+        plan['recorded_parser_provenance'] = _recorded_parser_provenance(observation)
     raw = _load_blob(db, observation.raw_sha256) if observation.raw_sha256 else None
     if raw is not None:
         plan['raw_integrity'] = 'verified'
