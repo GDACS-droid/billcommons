@@ -173,6 +173,35 @@ passed 33 tests. A [dated retirement plan](ca-sunday-target-retirement.md)
 identifies the exact production target and preserves all historical evidence.
 No target was disabled or reset in production.
 
+### Response-deadline follow-up — September 12, 06:36 UTC
+
+Idaho passed a fresh robots-respecting probe with the existing five-second
+read timeout. Montana reproduced a response-header timeout; its exact reviewed
+homepage now selects a ten-second response-read timeout within the unchanged
+fifteen-second total budget. The final production-code path returned robots/page
+200 and 20 bounded links in a 12.36-second page request. Its 2,002,734-byte page
+is close to the unchanged 2 MiB cap. Neither probe establishes statewide
+semantic completeness or clears production backoff.
+
+The investigation also reproduced a shared HTTP deadline defect: repeated
+receives inside a single header/body read could exceed the overall budget.
+Commit `00115d5` checks the remaining deadline before each underlying receive
+and closes the response stream explicitly. Webhook delivery's status-only
+success contract remains covered. Final focused checks passed 397 tests across
+shared transport, ingestion, webhook API, dispatcher and Scout, including the
+separately gated PostgreSQL source-history concurrency test. A pre-existing
+Scout SQLite fixture race was repaired separately in `3fad1b2`.
+
+The shared wheel was built and its transport code, TLS registry and Illinois
+certificate compared byte-for-byte with the pinned commit. Wheel SHA-256:
+`1f2daebbfa6330bea22989f2f39ebcbe7ee9fad9f60b253bbfe129bfa47af3aa`.
+See [response deadlines and evidence](official-response-timeouts.md).
+Because this newly discovered defect affects shared webhook transport, a
+bounded canonical review of this fix arc is running at
+`/home/alberto/verify-runs/20260912T063242Z-00115d5`. It does not re-review or
+approve the earlier Alaska/Florida/parser changes. Identical automatic retries
+are guarded, and the user's hard stop still applies. No deployment occurred.
+
 Restart inspection:
 
 ```bash
