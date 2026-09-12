@@ -13,46 +13,40 @@ in the original checkout are preserved. The canonical inventory covers 50 states
 plus DC. Generic website observation is never treated as proof of statewide
 semantic freshness or completeness.
 
-## Paused at user request — resume Friday, 2026-09-11
+## Resumed September 11 — Florida reconciliation review pending
 
-The user explicitly stopped further work on September 8 to conserve usage.
-Do not resume implementation, reviews, polling or deployment until requested.
-The full objective above remains incomplete; this is a handoff, not completion.
+Work resumed September 11 after the September 8 pause. The full objective
+remains incomplete; the deployment holds below still apply.
 
-- **DONE:** the last recorded live release includes the 51-jurisdiction Data
-  Health report, recurring official-source observations, source evidence APIs,
-  and bounded public Florida/California Scout. The dated evidence below defines
-  the actual limits. Do not advertise full 50-state semantic freshness or
-  autonomous parser repair as delivered.
-- **DONE:** integrated source is on `mission-reliability-20260908`, at `1989ff9`
-  before this handoff edit. The latest functional fix is `eb1edf2`, which hashes
-  the loaded CA repair parser. The original user checkout remains separate.
-- **BLOCKED:** saved monitors plus Florida bill-text source `e415bc7` have local
-  release evidence but are not deployed. The missing production migration
-  marker and unanswered concurrent-operator question below still hold repair
-  and deployment. No marker restoration was performed.
-- **BLOCKED:** Gojiberry account inspection returned HTTP 401 on all four read
-  endpoints using the user-supplied protected key file. A replacement key was
-  requested. No campaign, agent, contact, subscription or IQ Dominoes outreach
-  configuration was changed. Account capacity and upgrade need remain unknown.
-- **PENDING:** Florida history reconciliation is separate unfinished work in
-  `/home/alberto/codingProjects/billcommons-fl-reconciliation-20260908`, clean
-  at WIP commit `ee7042d` (parent `1989ff9`). It adds observer/comparator/replay code and tests; it is not
-  integrated, reviewed or deployed. Exact source-year mapping is mandatory:
-  read-only evidence found no 2025 FL session and found HB 7031 only in
-  `2026 Regular Session`. Never compare that bill with the retained 2025 page.
-  Agent-reported checks: static compilation and diff whitespace passed; the
-  earlier disposable PG16 run had **5 failures and 43 passes**. No test rerun
-  followed the latest fixes. Root-requested committee-substitute prefix lookup,
-  bulk organization loading and deadline handling landed but remain unverified.
-  Remaining work includes chamber-aware comparator fixtures, testing foreign
-  organization rejection, the replay return annotation and documentation.
-- **NEXT:** after the user resumes, inspect the main and WIP Git states and
-  read the WIP commit before deciding the next code change. Resolve the
-  production operator question before any database repair. The prepared
-  `/tmp/bc_fl_reconciliation_root_pg.py` harness has not been run; it requires
-  an owned disposable PostgreSQL cluster on port 55493 and is not proof of
-  passing tests. All tests must use an explicit disposable local database.
+- **LIVE:** the last recorded release includes the 51-jurisdiction Data Health
+  report, recurring official-source observations, source evidence APIs, and
+  bounded public Florida/California Scout. This does not establish full
+  50-state semantic freshness or autonomous parser repair.
+- **VERIFIED LOCALLY:** Florida history reconciliation is committed separately
+  at `1d30343d4ff3c4fd01fee9432fcb447a36a4d807`, parent `1989ff9`, in
+  `/home/alberto/codingProjects/billcommons-fl-reconciliation-20260908`.
+  Root ran all official-source tests against a new disposable PostgreSQL 16
+  database on port 55493: **184 passed**; the cluster was dropped afterward.
+  Evidence: `/tmp/bc_fl_reconciliation_root_pg_20260912.log`.
+  The change requires exact source-year regular-session mapping, preserves
+  chamber uncertainty, rejects foreign-jurisdiction organizations, and replays
+  retained evidence without consulting current corpus actions. It is not yet
+  integrated or deployed. Canonical multi-model review is running on the full
+  single commit; `/tmp/bc_fl_verify_20260912.log` records its result location.
+- **HEALTHY AT CHECK:** at 2026-09-12 03:40 UTC (September 11 Eastern), public
+  health, readiness, Data Health and a real bill read returned HTTP 200.
+  There were 58 official observations in the preceding 24 hours and 59 enabled
+  official targets. These checks do not prove statewide completeness.
+- **BLOCKED:** production migration metadata still has zero revision rows and
+  the saved-monitor tables remain absent. The concurrent-operator question
+  is unanswered. No marker restoration, migration or deployment was performed.
+  Saved monitors and Florida bill-text source `e415bc7` remain undeployed.
+- **BLOCKED:** the supplied Gojiberry key previously returned HTTP 401 on four
+  read endpoints. A replacement key is needed; account capacity remains
+  unknown. No outreach or IQ Dominoes configuration was changed.
+- **NEXT:** reconcile the pinned review verdict before integration. Resolve
+  the operator question and refresh the documented recovery evidence before
+  any production metadata repair or later deployment.
 
 Restart inspection:
 
