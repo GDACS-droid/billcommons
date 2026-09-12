@@ -150,7 +150,7 @@ def _action_tuple(value: Any, label: str) -> dict[str, str | None]:
     if parsed_date.isoformat() != raw_date:
         raise OfficialFactualBenchmarkError(f"{label}.date must be an exact ISO day")
     chamber = value["chamber"]
-    if chamber not in {None, "House", "Senate"}:
+    if chamber is not None and chamber not in ("House", "Senate"):
         raise OfficialFactualBenchmarkError(f"{label}.chamber must be House, Senate, or null")
     return {"date": raw_date, "chamber": chamber, "description": _string(value["description"], f"{label}.description")}
 
@@ -184,6 +184,8 @@ def _validate_fact(fact: Any, case_label: str) -> dict[str, Any]:
 
 def _safe_fixture_path(manifest_dir: Path, raw_path: Any) -> Path:
     value = _string(raw_path, "fixture.path", maximum=MAX_PATH_CHARS)
+    if "\x00" in value:
+        raise OfficialFactualBenchmarkError("fixture.path must not contain a NUL character")
     candidate_path = PurePath(value)
     if candidate_path.is_absolute() or any(part in {"", ".", ".."} for part in candidate_path.parts):
         raise OfficialFactualBenchmarkError("fixture.path must be a safe relative path inside the manifest directory")
@@ -209,7 +211,12 @@ def _safe_fixture_path(manifest_dir: Path, raw_path: Any) -> Path:
 
 def _validate_manifest(manifest: dict[str, Any], manifest_dir: Path) -> list[dict[str, Any]]:
     _exact_keys(manifest, {"schema_version", "benchmark_version", "cases"}, "manifest")
-    if manifest["schema_version"] != MANIFEST_SCHEMA_VERSION:
+    schema_version = manifest["schema_version"]
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != MANIFEST_SCHEMA_VERSION
+    ):
         raise OfficialFactualBenchmarkError(f"manifest schema_version must be {MANIFEST_SCHEMA_VERSION}")
     if manifest["benchmark_version"] != RUNNER_VERSION:
         raise OfficialFactualBenchmarkError(f"manifest benchmark_version must be {RUNNER_VERSION!r}")

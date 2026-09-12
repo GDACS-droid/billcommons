@@ -35,6 +35,23 @@ def _write_manifest(path: Path, content: dict) -> None:
     path.write_text(json.dumps(content), encoding="utf-8")
 
 
+def _run_cli(path: Path) -> subprocess.CompletedProcess[str]:
+    root = Path(__file__).resolve().parents[3]
+    environment = os.environ.copy()
+    environment.pop("DATABASE_URL", None)
+    environment.pop("BILLCOMMONS_TEST_DATABASE_URL", None)
+    environment.pop("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE", None)
+    environment["PYTHONPATH"] = str(root / "workers" / "ingest")
+    return subprocess.run(
+        [sys.executable, "-m", "billcommons_ingest.official_factual_benchmark", str(path)],
+        cwd=path.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def test_real_captured_case_passes_with_scoped_coverage_and_honest_provenance():
     report = benchmark.run_official_factual_benchmark(MANIFEST)
 
@@ -139,26 +156,50 @@ def test_duplicate_json_keys_and_nonfinite_numbers_are_rejected(tmp_path):
         benchmark.run_official_factual_benchmark(nonfinite)
 
 
+@pytest.mark.parametrize(
+    ("malformation", "message"),
+    [
+        ("list_chamber", "chamber must be House, Senate, or null"),
+        ("object_chamber", "chamber must be House, Senate, or null"),
+        ("boolean_schema_version", "schema_version must be 1"),
+        ("float_schema_version", "schema_version must be 1"),
+        ("nul_fixture_path", "must not contain a NUL character"),
+    ],
+)
+def test_malformed_manifest_values_have_controlled_api_and_cli_failures(tmp_path, malformation, message):
+    path = _copy_case(tmp_path)
+    manifest = _manifest(path)
+    if malformation == "list_chamber":
+        manifest["cases"][0]["facts"][-1]["expected"]["chamber"] = []
+    elif malformation == "object_chamber":
+        manifest["cases"][0]["facts"][-1]["expected"]["chamber"] = {}
+    elif malformation == "boolean_schema_version":
+        manifest["schema_version"] = True
+    elif malformation == "float_schema_version":
+        manifest["schema_version"] = 1.0
+    else:
+        manifest["cases"][0]["fixture"]["path"] = "fixture\u0000.html"
+    _write_manifest(path, manifest)
+
+    with pytest.raises(benchmark.OfficialFactualBenchmarkError, match=message):
+        benchmark.run_official_factual_benchmark(path)
+
+    completed = _run_cli(path)
+    assert completed.returncode == 2
+    assert completed.stderr == ""
+    report = json.loads(completed.stdout)
+    assert report["valid"] is False
+    assert report["passed"] is False
+    assert message in report["error"]["message"]
+
+
 def test_report_is_deterministic_and_cli_smoke_is_offline(tmp_path):
     path = _copy_case(tmp_path)
     first = benchmark.run_official_factual_benchmark(path)
     second = benchmark.run_official_factual_benchmark(path)
     assert first == second
 
-    root = Path(__file__).resolve().parents[3]
-    environment = os.environ.copy()
-    environment.pop("DATABASE_URL", None)
-    environment.pop("BILLCOMMONS_TEST_DATABASE_URL", None)
-    environment.pop("BILLCOMMONS_TEST_DB_ALLOW_DESTRUCTIVE", None)
-    environment["PYTHONPATH"] = str(root / "workers" / "ingest")
-    completed = subprocess.run(
-        [sys.executable, "-m", "billcommons_ingest.official_factual_benchmark", str(path)],
-        cwd=tmp_path,
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    completed = _run_cli(path)
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout) == first
     assert completed.stderr == ""
