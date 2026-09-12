@@ -13,6 +13,7 @@ from billcommons_shared.data_health import (
     CoverageEvidence,
     JurisdictionEvidence,
     RunEvidence,
+    SnapshotBlockerEvidence,
     build_report,
     exit_code,
 )
@@ -51,6 +52,45 @@ def test_local_success_is_explicitly_not_laundered_into_official_freshness():
     assert report["jurisdictions"][0]["official_reconciliation"]["state"] == "unavailable"
     assert "not official-source freshness" in report["jurisdictions"][0]["local_ingestion"]["interpretation"]
     assert report["defects"] == []
+
+
+def test_snapshot_blocker_remains_visible_despite_a_newer_success():
+    sample = SnapshotBlockerEvidence(
+        blocker_id="00000000-0000-0000-0000-000000000001",
+        bill_id=None, component="actions", record_cap=1000,
+        first_seen_at=NOW - timedelta(days=1), last_seen_at=NOW,
+    )
+    report = build_report([_evidence(
+        active_snapshot_blockers=1,
+        snapshot_blockers_without_local_bill=1,
+        snapshot_blocker_samples=(sample,),
+    )], now=NOW)
+
+    defect, = report["defects"]
+    assert defect["code"] == "API_SYNC_SNAPSHOT_BLOCKED"
+    assert defect["severity"] == "error"
+    assert exit_code(report, "error") == 1
+    public = report["jurisdictions"][0]["source_health"]["snapshot_blockers"]
+    assert defect["evidence"] == public
+    assert public["active_count"] == public["without_local_bill_count"] == 1
+    assert public["samples"][0]["bill_id"] is None
+    assert public["samples_truncated"] is False
+    assert report["honesty"]["official_freshness"] == "unverified"
+
+
+def test_snapshot_blocker_rendering_bounds_samples_and_preserves_total():
+    sample = SnapshotBlockerEvidence(
+        blocker_id="00000000-0000-0000-0000-000000000001",
+        bill_id=None, component="actions", record_cap=1000,
+        first_seen_at=NOW, last_seen_at=NOW,
+    )
+    report = build_report([_evidence(
+        active_snapshot_blockers=9, snapshot_blocker_samples=(sample,) * 9,
+    )], now=NOW)
+    public = report["jurisdictions"][0]["source_health"]["snapshot_blockers"]
+    assert public["active_count"] == 9
+    assert len(public["samples"]) == public["sample_limit"] == 5
+    assert public["samples_truncated"] is True
 
 
 def test_ledger_orders_operational_failures_by_severity_then_jurisdiction():

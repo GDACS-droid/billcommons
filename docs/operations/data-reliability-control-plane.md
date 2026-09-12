@@ -143,6 +143,30 @@ shows that the current tier targets require at least 700.86 requests per day
 on average before pagination and retries, against a configured 225-request
 allowance. Faster worker wake-ups alone cannot satisfy those targets.
 
+### Local candidate: bill evidence snapshot blockers
+
+The undeployed snapshot-isolation candidate adds an additive
+`source_health.snapshot_blockers` object and the error-severity defect
+`API_SYNC_SNAPSHOT_BLOCKED`. It reports all active blockers for the incremental
+sync source, including blockers created in an earlier pagination chunk or
+cycle. A later successful ingestion record cannot hide an unresolved blocker.
+
+Each jurisdiction includes a complete active count, a count without a current
+local bill reference, and at most five samples ordered by first detection and
+blocker UUID. Samples include blocker/bill UUIDs, the overflowing component,
+the configured record cap, and first/last detection times. The report does not
+include raw source identities, request windows, source payloads or exception
+text. A null bill reference can represent a rolled-back new bill or a bill
+whose local reference was subsequently deleted; it is not a fabricated bill.
+The total remains visible when the sample is truncated. Resolved blockers are
+excluded from the current report.
+
+This candidate requires the additive snapshot-blocker migration before the
+new API or sync worker is started. It does not change the live service or
+authorize deployment. Missing schema fails the report visibly rather than
+returning an empty blocker count. The existing read-only transaction, bounded
+statement timeout and report-cache failure behavior remain in effect.
+
 ## Remaining release gates
 
 The final Texas nested FTP-to-HTTPS repair fix passed 70 focused PostgreSQL 16

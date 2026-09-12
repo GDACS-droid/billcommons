@@ -360,6 +360,12 @@ def cmd_api_sync(args: argparse.Namespace) -> int:
             print(f"api-sync {args.state}: {len(result.warnings)} warning(s):")
             for warning in result.warnings[:20]:
                 print(f"  - {warning}")
+        if result.snapshot_blockers_remaining:
+            print(
+                f"api-sync {args.state}: INCOMPLETE -- successful bill writes committed; "
+                "unresolved evidence snapshot blockers prevent a successful sync watermark"
+            )
+            return 1
         return 0
     except Exception:
         db.rollback()

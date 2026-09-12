@@ -25,6 +25,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_schema.models import (
+    ApiSyncSnapshotBlocker,
     Bill,
     IngestJob,
     IngestionRun,
@@ -66,6 +67,7 @@ RECENTLY_ADJOURNED_WINDOW_DAYS = 30
 # small allowance for clock propagation or a report captured across a boundary,
 # but surface a materially future local success rather than treating it as fresh.
 MAX_FUTURE_SYNC_SKEW_MINUTES = 5
+MAX_SNAPSHOT_BLOCKER_SAMPLES = 5
 
 SEVERITY_ORDER = {"critical": 0, "error": 1, "warning": 2, "info": 3}
 FAIL_ON_ORDER = {"critical": 0, "error": 1, "warning": 2}
@@ -113,6 +115,16 @@ class RefreshTarget:
 
 
 @dataclass(frozen=True)
+class SnapshotBlockerEvidence:
+    blocker_id: str
+    bill_id: str | None
+    component: str
+    record_cap: int
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+
+@dataclass(frozen=True)
 class JurisdictionEvidence:
     abbreviation: str
     name: str
@@ -133,6 +145,9 @@ class JurisdictionEvidence:
     oldest_running_api_sync_at: datetime | None = None
     deferred_api_sync_jobs: int = 0
     next_deferred_api_sync_at: datetime | None = None
+    active_snapshot_blockers: int = 0
+    snapshot_blockers_without_local_bill: int = 0
+    snapshot_blocker_samples: tuple[SnapshotBlockerEvidence, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -258,6 +273,17 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
                 jurisdiction,
                 "API sync jobs reached the dead-letter state.",
                 {"dead_job_count": evidence.dead_api_sync_jobs},
+            )
+        )
+
+    if evidence.active_snapshot_blockers:
+        defects.append(
+            Defect(
+                "error",
+                "API_SYNC_SNAPSHOT_BLOCKED",
+                jurisdiction,
+                "Some bills exceed the complete-evidence snapshot limit; incremental sync remains incomplete.",
+                _snapshot_blockers_dict(evidence),
             )
         )
 
@@ -487,6 +513,7 @@ def build_report(evidence: Iterable[JurisdictionEvidence], *, now: datetime | No
                     "oldest_running_api_sync_at": _timestamp(item.oldest_running_api_sync_at),
                     "deferred_api_sync_jobs": item.deferred_api_sync_jobs,
                     "next_deferred_api_sync_at": _timestamp(item.next_deferred_api_sync_at),
+                    "snapshot_blockers": _snapshot_blockers_dict(item),
                 },
                 "parser_health": asdict(item.bills),
                 "coverage": asdict(item.coverage) if item.coverage else None,
@@ -520,6 +547,31 @@ def build_report(evidence: Iterable[JurisdictionEvidence], *, now: datetime | No
         },
         "jurisdictions": rows,
         "defects": [asdict(defect) for defect in defects],
+    }
+
+
+def _snapshot_blockers_dict(item: JurisdictionEvidence) -> dict[str, Any]:
+    samples = item.snapshot_blocker_samples[:MAX_SNAPSHOT_BLOCKER_SAMPLES]
+    return {
+        "active_count": item.active_snapshot_blockers,
+        "without_local_bill_count": item.snapshot_blockers_without_local_bill,
+        "sample_limit": MAX_SNAPSHOT_BLOCKER_SAMPLES,
+        "samples_truncated": item.active_snapshot_blockers > len(samples),
+        "samples": [
+            {
+                "blocker_id": sample.blocker_id,
+                "bill_id": sample.bill_id,
+                "component": sample.component,
+                "record_cap": sample.record_cap,
+                "first_seen_at": _timestamp(sample.first_seen_at),
+                "last_seen_at": _timestamp(sample.last_seen_at),
+            }
+            for sample in samples
+        ],
+        "interpretation": (
+            "Unresolved local ingestion blockers, not proof of duplicate source events. "
+            "A null bill_id means the blocker has no current local bill reference."
+        ),
     }
 
 
@@ -759,6 +811,48 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
             )
             jobs_by_state[str(row.state).upper()][row.status] = (int(row.count), oldest_at)
 
+    blocker_counts: dict[Any, tuple[int, int]] = {}
+    blocker_samples: dict[Any, list[SnapshotBlockerEvidence]] = defaultdict(list)
+    if jurisdiction_ids:
+        active_blockers = (
+            ApiSyncSnapshotBlocker.jurisdiction_id.in_(jurisdiction_ids),
+            ApiSyncSnapshotBlocker.source_name == API_SYNC_SOURCE,
+            ApiSyncSnapshotBlocker.active.is_(True),
+        )
+        for row in db.execute(
+            select(
+                ApiSyncSnapshotBlocker.jurisdiction_id,
+                func.count().label("active_count"),
+                func.count().filter(ApiSyncSnapshotBlocker.bill_id.is_(None)).label("without_bill_count"),
+            ).where(*active_blockers).group_by(ApiSyncSnapshotBlocker.jurisdiction_id)
+        ):
+            blocker_counts[row.jurisdiction_id] = (int(row.active_count), int(row.without_bill_count))
+
+        # Bound returned rows per jurisdiction in SQL. Counts above retain the
+        # complete signal even when only a small, deterministic sample is shown.
+        ranked = select(
+            ApiSyncSnapshotBlocker.id,
+            ApiSyncSnapshotBlocker.jurisdiction_id,
+            ApiSyncSnapshotBlocker.bill_id,
+            ApiSyncSnapshotBlocker.component,
+            ApiSyncSnapshotBlocker.record_cap,
+            ApiSyncSnapshotBlocker.first_seen_at,
+            ApiSyncSnapshotBlocker.last_seen_at,
+            func.row_number().over(
+                partition_by=ApiSyncSnapshotBlocker.jurisdiction_id,
+                order_by=(ApiSyncSnapshotBlocker.first_seen_at, ApiSyncSnapshotBlocker.id),
+            ).label("sample_rank"),
+        ).where(*active_blockers).subquery()
+        for row in db.execute(
+            select(ranked).where(ranked.c.sample_rank <= MAX_SNAPSHOT_BLOCKER_SAMPLES)
+            .order_by(ranked.c.jurisdiction_id, ranked.c.sample_rank)
+        ):
+            blocker_samples[row.jurisdiction_id].append(SnapshotBlockerEvidence(
+                blocker_id=str(row.id), bill_id=str(row.bill_id) if row.bill_id is not None else None,
+                component=row.component, record_cap=row.record_cap,
+                first_seen_at=row.first_seen_at, last_seen_at=row.last_seen_at,
+            ))
+
     result = []
     for abbreviation in canonical_codes:
         jurisdiction = jurisdictions_by_code.get(abbreviation)
@@ -813,6 +907,9 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
                 oldest_running_api_sync_at=jobs.get("running", (0, None))[1],
                 deferred_api_sync_jobs=deferred_by_state.get(abbreviation, (0, None))[0],
                 next_deferred_api_sync_at=deferred_by_state.get(abbreviation, (0, None))[1],
+                active_snapshot_blockers=blocker_counts.get(jurisdiction.id, (0, 0))[0],
+                snapshot_blockers_without_local_bill=blocker_counts.get(jurisdiction.id, (0, 0))[1],
+                snapshot_blocker_samples=tuple(blocker_samples.get(jurisdiction.id, ())),
             )
         )
     return result

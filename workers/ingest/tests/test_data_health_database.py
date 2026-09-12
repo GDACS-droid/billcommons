@@ -7,10 +7,14 @@ semantics rather than a mocked query result.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+import hashlib
+import json
 
 import pytest
+from sqlalchemy import select
 
 from billcommons_schema.models import (
+    ApiSyncSnapshotBlocker,
     Bill,
     IngestJob,
     IngestionRun,
@@ -57,6 +61,65 @@ def _seed_current_session(db_session, abbreviation: str):
 
 def _report_row(report, abbreviation):
     return next(row for row in report["jurisdictions"] if row["jurisdiction"] == abbreviation)
+
+
+def test_snapshot_blocker_report_counts_all_active_and_bounds_each_jurisdiction(db_session):
+    first, _ = _seed_current_session(db_session, "AK")
+    second, _ = _seed_current_session(db_session, "AL")
+    bill_id = db_session.scalar(select(Bill.id).where(Bill.jurisdiction_id == first.id))
+    added = []
+    for jurisdiction, count in ((first, 8), (second, 2)):
+        for index in range(count):
+            added.append(ApiSyncSnapshotBlocker(
+                jurisdiction_id=jurisdiction.id,
+                bill_id=bill_id if jurisdiction is first and index == 0 else None,
+                source_name="openstates_api_sync",
+                source_identity_sha256=hashlib.sha256(f"{jurisdiction.id}:{index}".encode()).hexdigest(),
+                component="actions", record_cap=1000, active=True,
+                first_seen_at=NOW - timedelta(minutes=count-index), last_seen_at=NOW,
+                processing_version="private-version-not-for-public-report",
+                cycle_started_at=NOW - timedelta(hours=1), cycle_start_page=1,
+                updated_since_sha256="a" * 64,
+            ))
+    resolved = ApiSyncSnapshotBlocker(
+        jurisdiction_id=first.id, bill_id=bill_id, source_name="openstates_api_sync",
+        source_identity_sha256="f" * 64, component="actions", record_cap=1000,
+        active=False, resolved_at=NOW, first_seen_at=NOW, last_seen_at=NOW,
+        processing_version="private-version-not-for-public-report", cycle_start_page=1,
+    )
+    unrelated_source = ApiSyncSnapshotBlocker(
+        jurisdiction_id=first.id, bill_id=bill_id, source_name="other_adapter",
+        source_identity_sha256="f" * 64, component="actions", record_cap=1000,
+        active=True, first_seen_at=NOW, last_seen_at=NOW,
+        processing_version="other_adapter/1", cycle_start_page=1,
+    )
+    db_session.add_all([*added, resolved, unrelated_source])
+    db_session.flush()
+
+    report = collect_report(db_session, now=NOW)
+    assert not db_session.new and not db_session.dirty and not db_session.deleted
+    ak = _report_row(report, "AK")["source_health"]["snapshot_blockers"]
+    al = _report_row(report, "AL")["source_health"]["snapshot_blockers"]
+    assert ak["active_count"] == 8 and ak["without_local_bill_count"] == 7
+    assert len(ak["samples"]) == 5 and ak["samples_truncated"] is True
+    assert [s["blocker_id"] for s in ak["samples"]] == [str(row.id) for row in added[:5]]
+    assert ak["samples"][0]["bill_id"] == str(bill_id)
+    assert al["active_count"] == len(al["samples"]) == 2
+    assert al["samples_truncated"] is False
+    assert str(resolved.id) not in json.dumps(report)
+    assert str(unrelated_source.id) not in json.dumps(report)
+    assert "private-version-not-for-public-report" not in json.dumps(report)
+    assert "a" * 64 not in json.dumps(report)
+    defects = [d for d in report["defects"] if d["code"] == "API_SYNC_SNAPSHOT_BLOCKED"]
+    assert {d["jurisdiction"] for d in defects} == {"AK", "AL"}
+
+    for blocker in added:
+        blocker.active = False
+        blocker.resolved_at = NOW
+    db_session.flush()
+    refreshed = collect_report(db_session, now=NOW)
+    assert not any(d["code"] == "API_SYNC_SNAPSHOT_BLOCKED" for d in refreshed["defects"])
+    assert _report_row(refreshed, "AK")["source_health"]["snapshot_blockers"]["samples"] == []
 
 
 def test_session_coverage_and_source_specific_sync_health_use_real_postgres_rows(
