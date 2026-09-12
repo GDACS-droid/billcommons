@@ -54,6 +54,7 @@ from billcommons_schema.models import (
     BillIdentifier,
     BillSubject,
     BillVersion,
+    Jurisdiction,
     Organization,
     RelatedBill,
     Session as SessionModel,
@@ -367,6 +368,25 @@ def ingest_session_csv_zip(
         org_rows = _read_csv_rows(zf, ["_organizations.csv"])
         org_cache: dict[str, Organization] = {}
         wanted_org_ids = {row.get("id") for row in org_rows if row.get("id")}
+        # An organization row carries the authoritative Open States
+        # jurisdiction OCD identifier. Resolve the whole archive's explicit
+        # values once; neither the selected session nor an organization name
+        # is evidence that an organization belongs to a jurisdiction.
+        wanted_jurisdiction_openstates_ids = {
+            jurisdiction_id
+            for row in org_rows
+            if (jurisdiction_id := (row.get("jurisdiction_id") or "").strip())
+        }
+        jurisdiction_id_by_openstates_id: dict[str, uuid.UUID] = {}
+        if wanted_jurisdiction_openstates_ids:
+            jurisdiction_id_by_openstates_id = {
+                openstates_id: jurisdiction_id
+                for jurisdiction_id, openstates_id in db.execute(
+                    select(Jurisdiction.id, Jurisdiction.openstates_id).where(
+                        Jurisdiction.openstates_id.in_(wanted_jurisdiction_openstates_ids)
+                    )
+                )
+            }
         if wanted_org_ids:
             for org in db.execute(
                 select(Organization).where(Organization.openstates_id.in_(wanted_org_ids))
@@ -378,6 +398,10 @@ def ingest_session_csv_zip(
             if not openstates_id:
                 continue
             org = org_cache.get(openstates_id)
+            source_jurisdiction_openstates_id = (row.get("jurisdiction_id") or "").strip()
+            source_jurisdiction_id = jurisdiction_id_by_openstates_id.get(
+                source_jurisdiction_openstates_id
+            )
             name = row.get("name") or (org.name if org else None) or "Unknown organization"
             classification = row.get("classification") or None
             checksum = hashlib.sha256(f"{name}|{classification}".encode("utf-8")).hexdigest()
@@ -386,6 +410,9 @@ def ingest_session_csv_zip(
                     {
                         "id": uuid.uuid4(),
                         "openstates_id": openstates_id,
+                        # Missing or unresolvable source evidence stays NULL;
+                        # do not infer the session's jurisdiction here.
+                        "jurisdiction_id": source_jurisdiction_id,
                         "name": name,
                         "classification": classification,
                         "source_name": SOURCE_NAME,
@@ -395,6 +422,21 @@ def ingest_session_csv_zip(
                 )
                 result.organizations += 1
             else:
+                if source_jurisdiction_id is not None:
+                    if org.jurisdiction_id is None:
+                        # A legacy NULL can safely be repaired when the
+                        # current source row identifies one known jurisdiction.
+                        org.jurisdiction_id = source_jurisdiction_id
+                    elif org.jurisdiction_id != source_jurisdiction_id:
+                        # Do not move an established organization across
+                        # jurisdictions, or present a contradictory archive
+                        # as a successful import.
+                        raise ValueError(
+                            "organization jurisdiction conflict for "
+                            f"{openstates_id}: existing {org.jurisdiction_id} "
+                            f"differs from source {source_jurisdiction_openstates_id}; "
+                            "preserved existing mapping"
+                        )
                 org.name = name
                 org.classification = classification
                 org.source_name = SOURCE_NAME

@@ -16,9 +16,13 @@ underlying semantics regress, not just if syntax breaks):
 """
 from __future__ import annotations
 
+import csv
+import io
 import uuid
+import zipfile
 from datetime import date, datetime, timezone
 
+import pytest
 from sqlalchemy import func, select
 
 from billcommons_ingest.openstates_bulk import _vote_event_detail, ingest_session_csv_zip
@@ -30,6 +34,7 @@ from billcommons_schema.models import (
     BillSubject,
     BillVersion,
     Jurisdiction,
+    Organization,
     Session as SessionModel,
     Sponsorship,
     VoteEvent,
@@ -38,9 +43,12 @@ from billcommons_schema.models import (
 from tests.fixtures.build_fixture_zip import build_fixture_zip_bytes
 
 
-def _make_session_row(db_session) -> SessionModel:
+def _make_session_row(db_session, *, openstates_id: str | None = None) -> SessionModel:
     jurisdiction = Jurisdiction(
-        name="Test State", abbreviation=f"ZZ_TEST_{uuid.uuid4().hex[:8].upper()}", classification="state"
+        name="Test State",
+        abbreviation=f"ZZ_TEST_{uuid.uuid4().hex[:8].upper()}",
+        classification="state",
+        openstates_id=openstates_id,
     )
     db_session.add(jurisdiction)
     db_session.flush()
@@ -52,6 +60,202 @@ def _make_session_row(db_session) -> SessionModel:
     db_session.add(session_row)
     db_session.flush()
     return session_row
+
+
+def _make_jurisdiction(db_session, *, openstates_id: str) -> Jurisdiction:
+    jurisdiction = Jurisdiction(
+        name="Foreign Test State",
+        abbreviation=f"ZZ_TEST_{uuid.uuid4().hex[:8].upper()}",
+        classification="state",
+        openstates_id=openstates_id,
+    )
+    db_session.add(jurisdiction)
+    db_session.flush()
+    return jurisdiction
+
+
+def _organization_fixture_zip(organizations: list[dict[str, str]]) -> bytes:
+    """Build the smallest archive that exercises the organization phase."""
+    prefix = "ZZ/2026 Test Session/ZZ_2026 Test Session"
+    bills = io.StringIO()
+    csv.DictWriter(
+        bills,
+        fieldnames=[
+            "id",
+            "identifier",
+            "title",
+            "classification",
+            "subject",
+            "session_identifier",
+            "jurisdiction",
+            "organization_classification",
+        ],
+    ).writeheader()
+    bills.write(
+        "ocd-bill/organization-fixture,HB 99,Organization fixture,['bill'],[],"
+        "2026 Test Session,Test State,lower\n"
+    )
+
+    org_csv = io.StringIO()
+    writer = csv.DictWriter(
+        org_csv,
+        fieldnames=["id", "name", "classification", "jurisdiction_id"],
+    )
+    writer.writeheader()
+    writer.writerows(organizations)
+
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(f"{prefix}_bills.csv", bills.getvalue())
+        zf.writestr(f"{prefix}_organizations.csv", org_csv.getvalue())
+    return archive.getvalue()
+
+
+def _organization_row(
+    openstates_id: str, jurisdiction_openstates_id: str, *, name: str = "Test House"
+) -> dict[str, str]:
+    return {
+        "id": openstates_id,
+        "name": name,
+        "classification": "lower",
+        "jurisdiction_id": jurisdiction_openstates_id,
+    }
+
+
+def test_ingest_organizations_use_explicit_source_jurisdiction_including_foreign_rows(
+    db_session, rawstore
+):
+    local_source_id = f"ocd-jurisdiction/local-{uuid.uuid4().hex}"
+    foreign_source_id = f"ocd-jurisdiction/foreign-{uuid.uuid4().hex}"
+    session_row = _make_session_row(db_session, openstates_id=local_source_id)
+    foreign_jurisdiction = _make_jurisdiction(db_session, openstates_id=foreign_source_id)
+    local_organization_id = f"ocd-organization/local-{uuid.uuid4().hex}"
+    foreign_organization_id = f"ocd-organization/foreign-{uuid.uuid4().hex}"
+    archive = _organization_fixture_zip(
+        [
+            _organization_row(local_organization_id, local_source_id),
+            _organization_row(foreign_organization_id, foreign_source_id),
+        ]
+    )
+
+    first = ingest_session_csv_zip(db_session, archive, session_row=session_row, rawstore=rawstore)
+    organizations = {
+        organization.openstates_id: organization
+        for organization in db_session.execute(
+            select(Organization).where(
+                Organization.openstates_id.in_({local_organization_id, foreign_organization_id})
+            )
+        ).scalars()
+    }
+
+    assert first.organizations == 2
+    assert organizations[local_organization_id].jurisdiction_id == session_row.jurisdiction_id
+    assert organizations[foreign_organization_id].jurisdiction_id == foreign_jurisdiction.id
+
+    second = ingest_session_csv_zip(db_session, archive, session_row=session_row, rawstore=rawstore)
+    assert second.organizations == 0
+    assert len(
+        db_session.execute(
+            select(Organization.id).where(
+                Organization.openstates_id.in_({local_organization_id, foreign_organization_id})
+            )
+        ).all()
+    ) == 2
+
+
+def test_ingest_organizations_fills_legacy_null_only_from_resolvable_source_evidence(
+    db_session, rawstore
+):
+    source_jurisdiction_id = f"ocd-jurisdiction/local-{uuid.uuid4().hex}"
+    session_row = _make_session_row(db_session, openstates_id=source_jurisdiction_id)
+    organization_id = f"ocd-organization/legacy-{uuid.uuid4().hex}"
+
+    ingest_session_csv_zip(
+        db_session,
+        _organization_fixture_zip([_organization_row(organization_id, "")]),
+        session_row=session_row,
+        rawstore=rawstore,
+    )
+    organization = db_session.execute(
+        select(Organization).where(Organization.openstates_id == organization_id)
+    ).scalar_one()
+    assert organization.jurisdiction_id is None
+
+    ingest_session_csv_zip(
+        db_session,
+        _organization_fixture_zip([_organization_row(organization_id, source_jurisdiction_id)]),
+        session_row=session_row,
+        rawstore=rawstore,
+    )
+    assert organization.jurisdiction_id == session_row.jurisdiction_id
+
+    # Later source rows that have no resolvable jurisdiction must not erase
+    # the now-established mapping.
+    ingest_session_csv_zip(
+        db_session,
+        _organization_fixture_zip([_organization_row(organization_id, "ocd-jurisdiction/unknown")]),
+        session_row=session_row,
+        rawstore=rawstore,
+    )
+    assert organization.jurisdiction_id == session_row.jurisdiction_id
+
+
+def test_ingest_organizations_leave_new_unknown_or_missing_source_jurisdiction_unresolved(
+    db_session, rawstore
+):
+    session_row = _make_session_row(
+        db_session, openstates_id=f"ocd-jurisdiction/local-{uuid.uuid4().hex}"
+    )
+    missing_organization_id = f"ocd-organization/missing-{uuid.uuid4().hex}"
+    unknown_organization_id = f"ocd-organization/unknown-{uuid.uuid4().hex}"
+    ingest_session_csv_zip(
+        db_session,
+        _organization_fixture_zip(
+            [
+                _organization_row(missing_organization_id, ""),
+                _organization_row(unknown_organization_id, "ocd-jurisdiction/not-loaded"),
+            ]
+        ),
+        session_row=session_row,
+        rawstore=rawstore,
+    )
+
+    organizations = db_session.execute(
+        select(Organization).where(
+            Organization.openstates_id.in_({missing_organization_id, unknown_organization_id})
+        )
+    ).scalars()
+    assert {organization.jurisdiction_id for organization in organizations} == {None}
+
+
+def test_ingest_organizations_preserves_existing_mapping_on_source_conflict(db_session, rawstore):
+    local_source_id = f"ocd-jurisdiction/local-{uuid.uuid4().hex}"
+    foreign_source_id = f"ocd-jurisdiction/foreign-{uuid.uuid4().hex}"
+    session_row = _make_session_row(db_session, openstates_id=local_source_id)
+    foreign_jurisdiction = _make_jurisdiction(db_session, openstates_id=foreign_source_id)
+    organization_id = f"ocd-organization/conflict-{uuid.uuid4().hex}"
+
+    ingest_session_csv_zip(
+        db_session,
+        _organization_fixture_zip([_organization_row(organization_id, foreign_source_id)]),
+        session_row=session_row,
+        rawstore=rawstore,
+    )
+    with pytest.raises(ValueError, match="organization jurisdiction conflict") as exc_info:
+        ingest_session_csv_zip(
+            db_session,
+            _organization_fixture_zip([_organization_row(organization_id, local_source_id)]),
+            session_row=session_row,
+            rawstore=rawstore,
+        )
+    organization = db_session.execute(
+        select(Organization).where(Organization.openstates_id == organization_id)
+    ).scalar_one()
+
+    assert organization.jurisdiction_id == foreign_jurisdiction.id
+    assert organization_id in str(exc_info.value)
+    assert local_source_id in str(exc_info.value)
+    assert "preserved existing mapping" in str(exc_info.value)
 
 
 def test_ingest_creates_bills_with_normalized_identifiers(db_session, rawstore):
