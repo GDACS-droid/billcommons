@@ -42,7 +42,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest.openstates_api import OpenStatesClient, RetainedOpenStatesResponse
@@ -54,6 +54,7 @@ from billcommons_schema.models import (
     BillAction,
     BillDocument,
     BillVersion,
+    ApiSyncSnapshotBlocker,
     IngestionRun,
     Jurisdiction,
     Session as SessionModel,
@@ -67,6 +68,7 @@ CA_OFFICIAL_ACTION_SOURCE_PREFIX = "ca_official_action_sweep/"
 DEFAULT_PER_PAGE = 20
 MAX_PAGES_PER_RUN = 10
 INCLUDE = ["sponsorships", "actions", "sources", "versions", "documents", "abstracts"]
+SNAPSHOT_BLOCKER_PROCESSING_VERSION = "openstates_api_sync_snapshot_overflow/1"
 
 
 def _normalize_action_description(value: str | None) -> str:
@@ -120,6 +122,115 @@ class ApiSyncResult:
     # The status worker receives this map only after committing the job, so it
     # never guesses from historical evidence when it records a derivation.
     corpus_evidence_by_bill: dict = field(default_factory=dict)
+    # Typed evidence-cap failures are isolated bill-by-bill.  This count is
+    # operational context only; the durable blocker is the authority that
+    # prevents a cycle from becoming a successful watermark.
+    snapshot_overflows: int = 0
+    # Set by the job wrapper after it queries durable blockers for the whole
+    # jurisdiction/source, including blockers created by an earlier chunk.
+    snapshot_blockers_remaining: bool = False
+
+
+def _snapshot_blocker_identity(*, session_id: object, identifier_norm: str) -> str:
+    """Return a safe, deterministic identity for an overflowed source bill."""
+    # This natural key deliberately remains stable if Open States later adds
+    # an id to a previously id-less response.  A changed identifier/session
+    # is a different source identity and must not clear an older blocker.
+    identity = f"local-natural-key\x00{session_id}\x00{identifier_norm}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _record_snapshot_overflow_blocker(
+    db: OrmSession,
+    *,
+    jurisdiction: Jurisdiction,
+    bill_id: uuid.UUID | None,
+    source_identity_sha256: str,
+    component: str,
+    record_cap: int,
+    seen_at: datetime,
+    cycle_started_at: datetime,
+    cycle_start_page: int,
+    updated_since: str | None,
+) -> None:
+    """Upsert the bounded operational record outside the failed bill savepoint."""
+    blocker = db.execute(
+        select(ApiSyncSnapshotBlocker).where(
+            ApiSyncSnapshotBlocker.jurisdiction_id == jurisdiction.id,
+            ApiSyncSnapshotBlocker.source_name == SOURCE_NAME,
+            ApiSyncSnapshotBlocker.source_identity_sha256 == source_identity_sha256,
+        )
+    ).scalar_one_or_none()
+    updated_since_sha256 = (
+        hashlib.sha256(updated_since.encode("utf-8")).hexdigest()
+        if updated_since is not None
+        else None
+    )
+    if blocker is None:
+        db.add(
+            ApiSyncSnapshotBlocker(
+                jurisdiction_id=jurisdiction.id,
+                bill_id=bill_id,
+                source_name=SOURCE_NAME,
+                source_identity_sha256=source_identity_sha256,
+                component=component,
+                record_cap=record_cap,
+                first_seen_at=seen_at,
+                last_seen_at=seen_at,
+                active=True,
+                processing_version=SNAPSHOT_BLOCKER_PROCESSING_VERSION,
+                cycle_started_at=cycle_started_at,
+                cycle_start_page=cycle_start_page,
+                updated_since_sha256=updated_since_sha256,
+            )
+        )
+        return
+    blocker.bill_id = bill_id or blocker.bill_id
+    blocker.component = component
+    blocker.record_cap = record_cap
+    blocker.last_seen_at = seen_at
+    blocker.active = True
+    blocker.resolved_at = None
+    blocker.processing_version = SNAPSHOT_BLOCKER_PROCESSING_VERSION
+    blocker.cycle_started_at = cycle_started_at
+    blocker.cycle_start_page = cycle_start_page
+    blocker.updated_since_sha256 = updated_since_sha256
+
+
+def _resolve_snapshot_overflow_blocker(
+    db: OrmSession,
+    *,
+    jurisdiction: Jurisdiction,
+    bill_id: uuid.UUID,
+    source_identity_sha256: str,
+    resolved_at: datetime,
+) -> None:
+    """Resolve only the matching blocker after its full snapshot succeeded."""
+    for blocker in db.execute(
+        select(ApiSyncSnapshotBlocker).where(
+            ApiSyncSnapshotBlocker.jurisdiction_id == jurisdiction.id,
+            ApiSyncSnapshotBlocker.source_name == SOURCE_NAME,
+            ApiSyncSnapshotBlocker.active.is_(True),
+            or_(
+                ApiSyncSnapshotBlocker.source_identity_sha256 == source_identity_sha256,
+                ApiSyncSnapshotBlocker.bill_id == bill_id,
+            ),
+        )
+    ).scalars():
+        blocker.active = False
+        blocker.resolved_at = resolved_at
+
+
+def _has_active_snapshot_blockers(db: OrmSession, jurisdiction: Jurisdiction) -> bool:
+    return db.execute(
+        select(ApiSyncSnapshotBlocker.id)
+        .where(
+            ApiSyncSnapshotBlocker.jurisdiction_id == jurisdiction.id,
+            ApiSyncSnapshotBlocker.source_name == SOURCE_NAME,
+            ApiSyncSnapshotBlocker.active.is_(True),
+        )
+        .limit(1)
+    ).scalar_one_or_none() is not None
 
 
 def _bill_checksum(payload: dict) -> str:
@@ -259,6 +370,8 @@ def sync_state(
     start_page: int = 1,
     session: str | None = None,
     identifier: str | None = None,
+    cycle_started_at: datetime | None = None,
+    isolate_snapshot_overflows: bool = False,
 ) -> ApiSyncResult:
     """Incrementally sync one jurisdiction via the v3 API. Caller commits.
 
@@ -284,6 +397,10 @@ def sync_state(
     `session` and `identifier` optionally narrow the upstream search for a
     bounded repair/replay.  Omitting both preserves the ordinary statewide
     incremental query exactly.
+
+    Direct callers retain fail-closed behavior for evidence snapshot caps by
+    default.  The worker wrapper opts into per-bill isolation only when it can
+    persist and check the durable blocker that makes the cycle incomplete.
 
     Absent an override, `updated_since` is THIS sync pipeline's own watermark: the `started_at`
     (NOT `finished_at`) of the jurisdiction's most recent SUCCESSFUL
@@ -324,6 +441,12 @@ def sync_state(
     client = client or OpenStatesClient()
     result = ApiSyncResult(state=jurisdiction.abbreviation)
     retrieved_at = datetime.now(timezone.utc)
+    if cycle_started_at is None:
+        cycle_started_at = retrieved_at
+    elif cycle_started_at.tzinfo is None:
+        raise ValueError("cycle_started_at must be timezone-aware")
+    else:
+        cycle_started_at = cycle_started_at.astimezone(timezone.utc)
 
     if updated_since_override is not None:
         updated_since = updated_since_override
@@ -470,10 +593,54 @@ def sync_state(
             if bill is None and session_row is not None:
                 bill = bill_by_session_and_identifier_norm.get((session_row.id, identifier_norm))
 
+            # Evidence snapshots are allowed to reject one pathological bill
+            # at their fixed record cap.  Everything this payload can mutate
+            # lives behind this savepoint, including blobs and ledger rows.
+            # A bill-local result and deferred cache publication ensure that
+            # savepoint rollback cannot leak work into later siblings.
+            bill_savepoint = db.begin_nested()
+            existing_bill_id = bill.id if bill is not None else None
+            source_identity_sha256 = _snapshot_blocker_identity(
+                session_id=session_row.id,
+                identifier_norm=identifier_norm,
+            )
+            bill_result = ApiSyncResult(state=jurisdiction.abbreviation)
+
+            def isolate_snapshot_overflow(exc: corpus_update_evidence.SnapshotRecordLimitExceeded) -> None:
+                bill_savepoint.rollback()
+                _record_snapshot_overflow_blocker(
+                    db,
+                    jurisdiction=jurisdiction,
+                    bill_id=existing_bill_id,
+                    source_identity_sha256=source_identity_sha256,
+                    component=exc.component,
+                    record_cap=exc.cap,
+                    seen_at=retrieved_at,
+                    cycle_started_at=cycle_started_at,
+                    cycle_start_page=start_page,
+                    updated_since=updated_since,
+                )
+                result.snapshot_overflows += 1
+                result.warnings.append(
+                    "api-sync evidence snapshot overflow isolated "
+                    f"(component={exc.component}, cap={exc.cap})"
+                )
+                db.flush()
+
             # Take the complete local view before any core or child upsert.
             # The evidence serializer will compare this to a post-upsert view;
             # unchanged payloads therefore retain neither blob nor ledger row.
-            before = corpus_update_evidence.snapshot_bill(db, bill) if bill is not None else None
+            try:
+                before = corpus_update_evidence.snapshot_bill(db, bill) if bill is not None else None
+            except corpus_update_evidence.SnapshotRecordLimitExceeded as exc:
+                if not isolate_snapshot_overflows:
+                    bill_savepoint.rollback()
+                    raise
+                isolate_snapshot_overflow(exc)
+                continue
+            except Exception:
+                bill_savepoint.rollback()
+                raise
             original_bill_upstream_id = (
                 (bill.upstream_id or bill.openstates_id) if bill is not None else openstates_id
             )
@@ -498,14 +665,11 @@ def sync_state(
                 )
                 db.add(bill)
                 db.flush()
-                if openstates_id:
-                    bill_by_openstates_id[openstates_id] = bill
-                bill_by_session_and_identifier_norm[(session_row.id, identifier_norm)] = bill
-                result.bills_created += 1
-                result.touched_bill_ids.add(bill.id)
+                bill_result.bills_created += 1
+                bill_result.touched_bill_ids.add(bill.id)
                 events.record_event(db, bill.id, events.CREATED, identifier_raw)
             elif bill.checksum == checksum:
-                result.bills_unchanged += 1
+                bill_result.bills_unchanged += 1
                 # Unchanged -- but v3 pagination is newest-updated-first, so
                 # once we've hit a batch of all-unchanged bills we've likely
                 # walked past the `updated_since` boundary; still let this
@@ -524,7 +688,6 @@ def sync_state(
                 if openstates_id and not bill.openstates_id:
                     bill.openstates_id = openstates_id
                     bill.upstream_id = openstates_id
-                    bill_by_openstates_id[openstates_id] = bill
             else:
                 bill.title = bill_payload.get("title") or bill.title
                 abstract = _resolve_abstract(bill_payload)
@@ -540,11 +703,9 @@ def sync_state(
                 bill.checksum = checksum
                 bill.parser_version = "openstates_api_sync/1"
                 bill.source_url = bill.source_url or _resolve_source_url(bill_payload)
-                result.bills_updated += 1
-                result.touched_bill_ids.add(bill.id)
+                bill_result.bills_updated += 1
+                bill_result.touched_bill_ids.add(bill.id)
                 events.record_event(db, bill.id, events.METADATA)
-                if bill.openstates_id:
-                    bill_by_openstates_id[bill.openstates_id] = bill
 
             # Called for EVERY bill on the page, including the
             # checksum-unchanged branch above: `_bill_checksum` covers only
@@ -552,22 +713,56 @@ def sync_state(
             # core fields didn't move can still have a new version or
             # document upstream.
             _upsert_versions_and_documents(
-                db, bill, bill_payload.get("versions") or [], bill_payload.get("documents") or [], result, retrieved_at
+                db, bill, bill_payload.get("versions") or [], bill_payload.get("documents") or [], bill_result, retrieved_at
             )
-            _upsert_actions(db, bill, bill_payload.get("actions") or [], result, retrieved_at)
-            _upsert_sponsorships(db, bill, bill_payload.get("sponsorships") or [], result, retrieved_at)
+            _upsert_actions(db, bill, bill_payload.get("actions") or [], bill_result, retrieved_at)
+            _upsert_sponsorships(db, bill, bill_payload.get("sponsorships") or [], bill_result, retrieved_at)
             db.flush()
-            evidence = corpus_update_evidence.record_update_evidence(
-                db,
-                bill=bill,
-                original_bill_upstream_id=original_bill_upstream_id,
-                response=response,
-                before=before,
-                after=corpus_update_evidence.snapshot_bill(db, bill),
-                retrieved_at=retrieved_at,
-            )
+            try:
+                evidence = corpus_update_evidence.record_update_evidence(
+                    db,
+                    bill=bill,
+                    original_bill_upstream_id=original_bill_upstream_id,
+                    response=response,
+                    before=before,
+                    after=corpus_update_evidence.snapshot_bill(db, bill),
+                    retrieved_at=retrieved_at,
+                )
+            except corpus_update_evidence.SnapshotRecordLimitExceeded as exc:
+                if not isolate_snapshot_overflows:
+                    bill_savepoint.rollback()
+                    raise
+                isolate_snapshot_overflow(exc)
+                continue
+            except Exception:
+                bill_savepoint.rollback()
+                raise
             if evidence is not None:
-                result.corpus_evidence_by_bill[bill.id] = evidence.id
+                bill_result.corpus_evidence_by_bill[bill.id] = evidence.id
+            _resolve_snapshot_overflow_blocker(
+                db,
+                jurisdiction=jurisdiction,
+                bill_id=bill.id,
+                source_identity_sha256=source_identity_sha256,
+                resolved_at=retrieved_at,
+            )
+            bill_savepoint.commit()
+            for name in (
+                "bills_created",
+                "bills_updated",
+                "bills_unchanged",
+                "actions",
+                "sponsorships",
+                "versions",
+                "documents",
+            ):
+                setattr(result, name, getattr(result, name) + getattr(bill_result, name))
+            result.touched_bill_ids.update(bill_result.touched_bill_ids)
+            result.corpus_evidence_by_bill.update(bill_result.corpus_evidence_by_bill)
+            result.warnings.extend(bill_result.warnings)
+            if bill.openstates_id:
+                bill_by_openstates_id[bill.openstates_id] = bill
+            bill_by_session_and_identifier_norm[(session_row.id, identifier_norm)] = bill
 
         if page >= upstream_max_page:
             result.next_page = None
@@ -1006,19 +1201,25 @@ def run_api_sync_job(
             client=client,
             start_page=start_page,
             updated_since_override=updated_since_override,
+            cycle_started_at=cycle_started_at,
+            isolate_snapshot_overflows=True,
         )
         result.cycle_started_at = cycle_started_at
-        if result.next_page is None:
+        result.snapshot_blockers_remaining = _has_active_snapshot_blockers(db, jurisdiction)
+        if result.next_page is None and not result.snapshot_blockers_remaining:
             run.status = "success"
         else:
             # Persist bounded, idempotent page writes, but never let an
             # incomplete offset-pagination scan become the normal watermark.
             # The next normal scan safely overlaps from the last real success.
             run.status = "failed"
-            run.error = (
-                f"pagination truncated before upstream completion: next_page={result.next_page}, "
-                f"max_page_seen={result.max_page_seen}"
-            )
+            if result.next_page is not None:
+                run.error = (
+                    f"pagination truncated before upstream completion: next_page={result.next_page}, "
+                    f"max_page_seen={result.max_page_seen}"
+                )
+            else:
+                run.error = "snapshot evidence blockers remain unresolved"
         run.finished_at = datetime.now(timezone.utc)
         run.bills_created = result.bills_created
         run.bills_updated = result.bills_updated

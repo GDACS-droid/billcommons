@@ -815,6 +815,70 @@ class IngestionRun(UUIDPkMixin, TimestampMixin, Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class ApiSyncSnapshotBlocker(UUIDPkMixin, TimestampMixin, Base):
+    """A bounded, durable record of one API bill whose evidence snapshot overflowed.
+
+    The source identity is a SHA-256 fingerprint because a newly-created Bill
+    row is intentionally rolled back with its failed savepoint.  Keeping the
+    blocker outside that savepoint makes the incomplete scan visible without
+    storing source payloads, URLs, or exception text.
+    """
+
+    __tablename__ = "api_sync_snapshot_blockers"
+
+    jurisdiction_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("jurisdictions.id"), nullable=False
+    )
+    bill_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bills.id", ondelete="SET NULL"), nullable=True
+    )
+    source_name: Mapped[str] = mapped_column(Text, nullable=False)
+    source_identity_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    component: Mapped[str] = mapped_column(Text, nullable=False)
+    record_cap: Mapped[int] = mapped_column(Integer, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    processing_version: Mapped[str] = mapped_column(Text, nullable=False)
+    cycle_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cycle_start_page: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_since_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "jurisdiction_id",
+            "source_name",
+            "source_identity_sha256",
+            name="uq_api_sync_snapshot_blocker_identity",
+        ),
+        CheckConstraint("record_cap >= 1", name="ck_api_sync_snapshot_blocker_cap"),
+        CheckConstraint("cycle_start_page >= 1", name="ck_api_sync_snapshot_blocker_page"),
+        CheckConstraint(
+            "component IN ('actions', 'sponsorships', 'versions', 'documents')",
+            name="ck_api_sync_snapshot_blocker_component",
+        ),
+        CheckConstraint(
+            "(active AND resolved_at IS NULL) OR (NOT active AND resolved_at IS NOT NULL)",
+            name="ck_api_sync_snapshot_blocker_resolution",
+        ),
+        CheckConstraint(
+            "source_identity_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_api_sync_snapshot_blocker_identity_hash",
+        ),
+        CheckConstraint(
+            "updated_since_sha256 IS NULL OR updated_since_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_api_sync_snapshot_blocker_window_hash",
+        ),
+        Index(
+            "ix_api_sync_snapshot_blocker_active",
+            "jurisdiction_id",
+            "source_name",
+            postgresql_where=text("active"),
+        ),
+    )
+
+
 class ValidationRun(UUIDPkMixin, TimestampMixin, Base):
     """A validation pass over ingested data for a jurisdiction/session."""
 

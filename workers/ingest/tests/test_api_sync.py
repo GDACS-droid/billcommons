@@ -36,7 +36,9 @@ from billcommons_schema.models import (
     Bill,
     BillAction,
     BillDocument,
+    BillEvent,
     BillVersion,
+    ApiSyncSnapshotBlocker,
     CorpusUpdateEvidence,
     IngestJob,
     IngestionRun,
@@ -270,7 +272,7 @@ def test_sync_state_rolls_back_local_mutation_when_evidence_storage_fails(db_ses
     assert set(db_session.scalars(select(OfficialRawBlob.sha256))) == initial_blob_hashes
 
 
-def test_snapshot_child_cap_fails_closed_without_mutation_or_evidence(db_session, monkeypatch):
+def test_snapshot_child_cap_isolates_existing_bill_and_commits_healthy_sibling(db_session, monkeypatch):
     initial_blob_hashes = set(db_session.scalars(select(OfficialRawBlob.sha256)))
     initial_evidence_ids = set(db_session.scalars(select(CorpusUpdateEvidence.id)))
     jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
@@ -300,6 +302,94 @@ def test_snapshot_child_cap_fails_closed_without_mutation_or_evidence(db_session
         title="Must not be written",
     )
 
+    healthy = _v3_bill_payload(
+        openstates_id="ocd-bill/evidence-healthy", identifier="HB 906", title="Healthy sibling"
+    )
+    result = sync_state(
+        db_session,
+        jurisdiction,
+        client=_client_with_pages(
+            {1: {"results": [payload, healthy], "pagination": {"max_page": 1}}}
+        ),
+        isolate_snapshot_overflows=True,
+    )
+
+    db_session.refresh(bill)
+    assert bill.title == "Before cap failure"
+    healthy_bill = db_session.execute(
+        select(Bill).where(Bill.openstates_id == "ocd-bill/evidence-healthy")
+    ).scalar_one()
+    evidence_rows = db_session.execute(select(CorpusUpdateEvidence)).scalars().all()
+    assert len(evidence_rows) == len(initial_evidence_ids) + 1
+    assert {row.bill_id for row in evidence_rows} == {healthy_bill.id}
+    assert len(set(db_session.scalars(select(OfficialRawBlob.sha256)))) > len(initial_blob_hashes)
+    blocker = db_session.execute(select(ApiSyncSnapshotBlocker)).scalar_one()
+    assert result.snapshot_overflows == 1
+    assert result.bills_created == 1
+    assert result.touched_bill_ids == {healthy_bill.id}
+    assert set(result.corpus_evidence_by_bill) == {healthy_bill.id}
+    assert (blocker.bill_id, blocker.component, blocker.record_cap, blocker.active) == (
+        bill.id,
+        "sponsorships",
+        1,
+        True,
+    )
+
+
+def test_new_bill_snapshot_overflow_rolls_back_children_and_persists_safe_blocker(db_session, monkeypatch):
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+    initial_blob_hashes = set(db_session.scalars(select(OfficialRawBlob.sha256)))
+    initial_event_ids = set(db_session.scalars(select(BillEvent.seq)))
+    monkeypatch.setattr(corpus_update_evidence, "MAX_CHILD_RECORDS_PER_COMPONENT", 1)
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/new-overflow",
+        identifier="HB 907",
+        title="Must roll back completely",
+    )
+    payload["sponsorships"].append(
+        {"name": "Second Sponsor", "classification": "cosponsor", "primary": False}
+    )
+
+    result = sync_state(
+        db_session,
+        jurisdiction,
+        client=_client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}}),
+        isolate_snapshot_overflows=True,
+    )
+
+    assert result.snapshot_overflows == 1
+    assert result.bills_created == 0
+    assert result.actions == 0
+    assert result.sponsorships == 0
+    assert result.touched_bill_ids == set()
+    assert result.corpus_evidence_by_bill == {}
+    assert db_session.execute(
+        select(Bill).where(Bill.openstates_id == "ocd-bill/new-overflow")
+    ).scalar_one_or_none() is None
+    assert db_session.execute(select(BillAction).join(Bill)).scalars().all() == []
+    assert db_session.execute(select(Sponsorship).join(Bill)).scalars().all() == []
+    assert db_session.execute(select(CorpusUpdateEvidence)).scalars().all() == []
+    assert set(db_session.scalars(select(OfficialRawBlob.sha256))) == initial_blob_hashes
+    assert set(db_session.scalars(select(BillEvent.seq))) == initial_event_ids
+    blocker = db_session.execute(select(ApiSyncSnapshotBlocker)).scalar_one()
+    assert blocker.bill_id is None
+    assert len(blocker.source_identity_sha256) == 64
+    assert all(character in "0123456789abcdef" for character in blocker.source_identity_sha256)
+    assert "new-overflow" not in blocker.source_identity_sha256
+
+
+def test_direct_sync_state_snapshot_overflow_still_raises_and_creates_no_blocker(db_session, monkeypatch):
+    jurisdiction, _ = _make_jurisdiction_with_active_session(db_session)
+    monkeypatch.setattr(corpus_update_evidence, "MAX_CHILD_RECORDS_PER_COMPONENT", 1)
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/direct-overflow",
+        identifier="HB 908",
+        title="Direct caller remains fail-closed",
+    )
+    payload["sponsorships"].append(
+        {"name": "Second Sponsor", "classification": "cosponsor", "primary": False}
+    )
+
     with pytest.raises(corpus_update_evidence.SnapshotRecordLimitExceeded) as raised:
         with db_session.begin_nested():
             sync_state(
@@ -309,10 +399,212 @@ def test_snapshot_child_cap_fails_closed_without_mutation_or_evidence(db_session
             )
 
     assert (raised.value.component, raised.value.cap) == ("sponsorships", 1)
-    db_session.refresh(bill)
-    assert bill.title == "Before cap failure"
-    assert set(db_session.scalars(select(CorpusUpdateEvidence.id))) == initial_evidence_ids
-    assert set(db_session.scalars(select(OfficialRawBlob.sha256))) == initial_blob_hashes
+    assert db_session.execute(
+        select(Bill).where(Bill.openstates_id == "ocd-bill/direct-overflow")
+    ).scalar_one_or_none() is None
+    assert db_session.execute(select(ApiSyncSnapshotBlocker)).scalars().all() == []
+
+
+def test_same_page_retries_new_overflowed_bill_without_phantom_cache_entry(db_session, monkeypatch):
+    jurisdiction, _ = _make_jurisdiction_with_active_session(db_session)
+    monkeypatch.setattr(corpus_update_evidence, "MAX_CHILD_RECORDS_PER_COMPONENT", 1)
+    overflow = _v3_bill_payload(
+        openstates_id="ocd-bill/cache-retry",
+        identifier="HB 909",
+        title="First payload overflows",
+    )
+    overflow["sponsorships"].append(
+        {"name": "Second Sponsor", "classification": "cosponsor", "primary": False}
+    )
+    repaired = _v3_bill_payload(
+        openstates_id="ocd-bill/cache-retry",
+        identifier="HB 909",
+        title="Second payload fits",
+    )
+
+    result = run_api_sync_job(
+        db_session,
+        jurisdiction.abbreviation,
+        client=_client_with_pages(
+            {1: {"results": [overflow, repaired], "pagination": {"max_page": 1}}}
+        ),
+    )
+
+    bills = db_session.execute(
+        select(Bill).where(Bill.openstates_id == "ocd-bill/cache-retry")
+    ).scalars().all()
+    blocker = db_session.execute(select(ApiSyncSnapshotBlocker)).scalar_one()
+    assert result.snapshot_overflows == 1
+    assert result.bills_created == 1
+    assert result.snapshot_blockers_remaining is False
+    assert len(bills) == 1
+    assert bills[0].title == "Second payload fits"
+    assert blocker.active is False
+
+
+def test_unexpected_bill_error_escapes_opted_in_run_and_outer_rollback_removes_siblings(db_session, monkeypatch):
+    jurisdiction, _ = _make_jurisdiction_with_active_session(db_session)
+    first = _v3_bill_payload(
+        openstates_id="ocd-bill/outer-rollback-one", identifier="HB 910", title="First sibling"
+    )
+    second = _v3_bill_payload(
+        openstates_id="ocd-bill/outer-rollback-two", identifier="HB 911", title="Second sibling"
+    )
+    real_record = corpus_update_evidence.record_update_evidence
+    calls = 0
+
+    def fail_second_evidence(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected evidence storage outage")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(corpus_update_evidence, "record_update_evidence", fail_second_evidence)
+    with pytest.raises(RuntimeError, match="injected evidence storage outage"):
+        with db_session.begin_nested():
+            run_api_sync_job(
+                db_session,
+                jurisdiction.abbreviation,
+                client=_client_with_pages({1: {"results": [first, second], "pagination": {"max_page": 1}}}),
+            )
+
+    assert db_session.execute(
+        select(Bill).where(Bill.jurisdiction_id == jurisdiction.id)
+    ).scalars().all() == []
+    assert db_session.execute(select(CorpusUpdateEvidence)).scalars().all() == []
+    assert db_session.execute(select(ApiSyncSnapshotBlocker)).scalars().all() == []
+
+
+def test_snapshot_overflow_blocker_is_idempotent_and_successful_repair_resolves_it(db_session, monkeypatch):
+    jurisdiction, _ = _make_jurisdiction_with_active_session(db_session)
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/repaired-overflow",
+        identifier="HB 908",
+        title="Initially too large for evidence",
+    )
+    payload["sponsorships"].append(
+        {"name": "Second Sponsor", "classification": "cosponsor", "primary": False}
+    )
+    monkeypatch.setattr(corpus_update_evidence, "MAX_CHILD_RECORDS_PER_COMPONENT", 1)
+    first = run_api_sync_job(
+        db_session,
+        jurisdiction.abbreviation,
+        client=_client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}}),
+    )
+    first_blocker = db_session.execute(select(ApiSyncSnapshotBlocker)).scalar_one()
+    first_seen = first_blocker.first_seen_at
+    assert first.snapshot_overflows == 1
+    assert first.snapshot_blockers_remaining is True
+    assert db_session.execute(select(IngestionRun).order_by(IngestionRun.created_at)).scalar_one().status == "failed"
+
+    second = run_api_sync_job(
+        db_session,
+        jurisdiction.abbreviation,
+        client=_client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}}),
+    )
+    blockers = db_session.execute(select(ApiSyncSnapshotBlocker)).scalars().all()
+    assert second.snapshot_overflows == 1
+    assert len(blockers) == 1
+    assert blockers[0].first_seen_at == first_seen
+    assert blockers[0].active is True
+
+    repaired_payload = _v3_bill_payload(
+        openstates_id="ocd-bill/repaired-overflow",
+        identifier="HB 908",
+        title="Repair now fits the fixed evidence cap",
+    )
+    repaired = run_api_sync_job(
+        db_session,
+        jurisdiction.abbreviation,
+        client=_client_with_pages({1: {"results": [repaired_payload], "pagination": {"max_page": 1}}}),
+    )
+    db_session.flush()
+    blocker = db_session.execute(select(ApiSyncSnapshotBlocker)).scalar_one()
+    runs = db_session.execute(select(IngestionRun)).scalars().all()
+    assert repaired.snapshot_overflows == 0
+    assert repaired.snapshot_blockers_remaining is False
+    assert repaired.bills_created == 1
+    assert blocker.active is False
+    assert blocker.resolved_at is not None
+    assert any(run.status == "success" for run in runs)
+
+
+def test_early_page_snapshot_blocker_prevents_final_continuation_watermark(db_session, monkeypatch):
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+    prior_watermark = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    cycle_started_at = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+    db_session.add(
+        IngestionRun(
+            jurisdiction_id=jurisdiction.id,
+            session_id=session_row.id,
+            source_name="openstates_api_sync",
+            started_at=prior_watermark,
+            finished_at=prior_watermark,
+            status="success",
+        )
+    )
+    db_session.flush()
+    monkeypatch.setattr(corpus_update_evidence, "MAX_CHILD_RECORDS_PER_COMPONENT", 1)
+    overflow = _v3_bill_payload(
+        openstates_id="ocd-bill/continuation-overflow",
+        identifier="HB 909",
+        title="Overflow on first page",
+    )
+    overflow["sponsorships"].append(
+        {"name": "Second Sponsor", "classification": "cosponsor", "primary": False}
+    )
+    pages = {
+        page: {
+            "results": [
+                overflow
+                if page == 1
+                else _v3_bill_payload(
+                    openstates_id=f"ocd-bill/continuation-{page}",
+                    identifier=f"HB {909 + page}",
+                    title=f"Healthy page {page}",
+                )
+            ],
+            "pagination": {"max_page": 11},
+        }
+        for page in range(1, 12)
+    }
+    first = run_api_sync_job(
+        db_session,
+        jurisdiction.abbreviation,
+        client=_client_with_pages(pages),
+        updated_since_override=prior_watermark.isoformat(),
+        cycle_started_at=cycle_started_at,
+    )
+    assert first.next_page == 11
+    final = run_api_sync_job(
+        db_session,
+        jurisdiction.abbreviation,
+        client=_client_with_pages(pages),
+        start_page=first.next_page,
+        updated_since_override=first.updated_since_used,
+        cycle_started_at=first.cycle_started_at,
+    )
+    assert final.next_page is None
+    assert final.snapshot_blockers_remaining is True
+    cycle_runs = db_session.execute(
+        select(IngestionRun)
+        .where(IngestionRun.started_at == cycle_started_at)
+        .order_by(IngestionRun.created_at.desc())
+    ).scalars().all()
+    assert len(cycle_runs) == 2
+    assert all(run.status == "failed" for run in cycle_runs)
+    assert any(run.error == "snapshot evidence blockers remain unresolved" for run in cycle_runs)
+
+    seen_updated_since: list = []
+    sync_state(
+        db_session,
+        jurisdiction,
+        client=_client_recording_updated_since(
+            {1: {"results": [], "pagination": {"max_page": 1}}}, seen_updated_since
+        ),
+    )
+    assert [datetime.fromisoformat(value) for value in seen_updated_since] == [prior_watermark]
 
 
 def test_sync_state_creates_new_bill(db_session):
