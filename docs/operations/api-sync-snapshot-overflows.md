@@ -47,22 +47,32 @@ Before either direct or queued callers read the API-sync watermark, they take
 a transaction-scoped PostgreSQL advisory lock for the jurisdiction and source.
 The lock lasts through snapshot mutation, blocker resolution, and the caller's
 commit. A concurrent caller receives a bounded `ApiSyncConcurrencyBusy` error;
-the queue records its normal failed attempt/backoff and direct callers must
+the dedicated queue worker rolls back its claim and makes it eligible again
+after 30–90 seconds (actual pickup follows the worker's configured cycle)
+without spending an attempt. A fresh transaction locks the queue row and
+defers only if no competing worker has reclaimed it. Both ownership and budget
+deferrals count toward the worker's per-cycle job limit. Direct callers must
 retry. It never returns an empty or successful result while another snapshot
 transaction is active.
 
 The manual `api-sync` command commits healthy progress and returns a nonzero
-exit status with `INCOMPLETE` when unresolved blockers remain. The scheduled
+exit status with `INCOMPLETE` when source pages or unresolved blockers remain. The scheduled
 worker completes that queue attempt while retaining the failed ingestion run,
 so retries do not repeatedly spend attempts on the same deterministic cap.
 
 ## Local validation
 
 The integrated worker, scheduler, quota, Data Health database/CLI, shared
-report and API checks passed 158 tests on an owned disposable PostgreSQL 16
+report and API checks passed 171 tests on an owned disposable PostgreSQL 16
 cluster. The new migration upgraded, downgraded to `0030`, and upgraded again
 in that same disposable cluster. Log:
-`/tmp/bc_snapshot_isolation_root_pg_20260912.log`. One existing FastAPI/httpx
+`/tmp/bc_snapshot_concurrency_root_pg_20260912.log`. This includes concurrent
+connection coverage, stale ORM reactivation, strict source-identity resolution,
+and bounded worker deferral. A final CLI-only disposable-PG run passed 13 tests
+after adding the manual busy-result check:
+`/tmp/bc_snapshot_cli_final_pg_20260912.log`. Its initial direct invocation was
+refused by the explicit-local-database guard; the disposable-cluster run passed.
+One existing FastAPI/httpx
 deprecation warning remains. This is local validation, not a deployment or
 proof that the production Alaska corpus has been repaired.
 

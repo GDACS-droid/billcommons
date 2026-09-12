@@ -154,8 +154,8 @@ def _api_sync_lock_key(jurisdiction_id: uuid.UUID) -> int:
 def _acquire_api_sync_snapshot_lock(db: OrmSession, jurisdiction: Jurisdiction) -> None:
     """Acquire the transaction-scoped snapshot lock or reject a concurrent scan.
 
-    This is deliberately nonblocking.  Queue callers record the ordinary job
-    failure/backoff; direct callers receive a typed exception and must retry.
+    This is deliberately nonblocking. Queue workers defer without spending an
+    attempt; direct callers receive a typed exception and must retry.
     Returning a partial/success result while another transaction owns the
     snapshot would permit an unsafe watermark advance.
     """

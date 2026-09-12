@@ -104,6 +104,41 @@ handoff; do not mislabel a pause as completion.
   Resolve the operator question and refresh recovery evidence before production
   metadata repair or deployment. Honor the cutoff.
 
+### Alaska isolation follow-up — September 12, 06:09 UTC
+
+The Alaska dead-job cause is an evidence snapshot overflow. Local isolation now
+rolls back only the overflowing bill and retains a durable blocker while healthy
+bills commit. Any active blocker prevents a successful API-sync watermark.
+Data Health includes bounded blocker samples, including failures before a new
+local Bill UUID exists. No source cap, stored history, queue attempts or
+production data was reset.
+
+Canonical review `/home/alberto/verify-runs/20260912T055327Z-18728e0` ended HALT:
+five BLOCK legs and two dead legs. Opus timed out; Ox failed; identical automatic
+retries were stopped. Confirmed findings prompted strict source-identity
+resolution, atomic blocker reactivation, and a jurisdiction/source transaction
+lock before watermark reads or source fetches. The dedicated worker defers lock
+contention without spending attempts, guarded against a concurrent queue claim;
+deferrals count toward its cycle limit. Manual sync reports unfinished pagination
+or blockers as incomplete after committing healthy progress.
+
+The integrated PostgreSQL checks passed **171 tests**, including real concurrent
+connections, stale ORM reactivation, the worker dispatch and report/API behavior.
+The additive migration upgraded, downgraded and upgraded again in the disposable
+cluster, which was dropped. Log:
+`/tmp/bc_snapshot_concurrency_root_pg_20260912.log`. One existing FastAPI/httpx
+deprecation warning remains. Follow-up fixes do not have a new canonical SHIP
+verdict. The final CLI-only disposable-PG check passed 13 tests after adding
+manual busy-result coverage; its initial direct invocation was refused by the
+explicit-local-database guard. Production Alaska remains unrepaired. See
+[snapshot overflow operations](api-sync-snapshot-overflows.md).
+
+Cadence analysis also found the current target mix needs at least 700.857 API
+requests/day averaged over a week, before pagination, retries or date top-ups,
+against the configured 225-request daily brake. This is a capacity mismatch,
+not authorization to change quotas or schedules. See
+[cadence capacity](sync-cadence-capacity.md).
+
 Restart inspection:
 
 ```bash

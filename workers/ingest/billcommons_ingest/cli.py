@@ -360,13 +360,23 @@ def cmd_api_sync(args: argparse.Namespace) -> int:
             print(f"api-sync {args.state}: {len(result.warnings)} warning(s):")
             for warning in result.warnings[:20]:
                 print(f"  - {warning}")
+        incomplete_reasons = []
+        if result.next_page is not None:
+            incomplete_reasons.append(f"source pages remain (next_page={result.next_page})")
         if result.snapshot_blockers_remaining:
+            incomplete_reasons.append("unresolved evidence snapshot blockers remain")
+        if incomplete_reasons:
             print(
                 f"api-sync {args.state}: INCOMPLETE -- successful bill writes committed; "
-                "unresolved evidence snapshot blockers prevent a successful sync watermark"
+                + "; ".join(incomplete_reasons)
+                + "; no successful sync watermark recorded"
             )
             return 1
         return 0
+    except api_sync_mod.ApiSyncConcurrencyBusy:
+        db.rollback()
+        print(f"api-sync {args.state}: another sync owns this jurisdiction; retry later")
+        return 1
     except Exception:
         db.rollback()
         traceback.print_exc()
@@ -1459,11 +1469,22 @@ def defer_job_for_budget(
     run_after: datetime,
     session_factory=get_session,
 ) -> bool:
-    """Requeue a claimed job that hit OpenStatesDailyBudgetExceeded without
-    burning an attempt.
+    """Defer budget exhaustion without spending an attempt."""
+    return _defer_unclaimed_job(
+        job_id, job_cls, claimed_attempts=claimed_attempts,
+        run_after=run_after, session_factory=session_factory,
+    )
 
-    Budget exhaustion is an outage of our own making, not the job's fault --
-    the invariant is that it must never contribute to dead-lettering. Runs
+
+def _defer_unclaimed_job(
+    job_id,
+    job_cls,
+    *,
+    claimed_attempts: int,
+    run_after: datetime,
+    session_factory=get_session,
+) -> bool:
+    """Defer a rolled-back claim without spending an attempt. Runs
     in a FRESH session for the same reason `record_job_failure` does: the
     claiming transaction already rolled back and expired that instance.
     `claimed_attempts` is `claim_job`'s post-increment count; the row's
@@ -2554,7 +2575,8 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
             # never one long transaction spanning every state's HTTP.
             processed = 0
             failed = 0
-            while processed + failed < max_jobs:
+            deferred_count = 0
+            while processed + failed + deferred_count < max_jobs:
                 db = get_session()
                 try:
                     job = queue_mod.claim_job(
@@ -2597,11 +2619,28 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                         )
                         for warning in result.warnings:
                             print(f"api-sync WARNING: {warning}", flush=True)
+                    except api_sync_mod.ApiSyncConcurrencyBusy:
+                        db.rollback()
+                        deferred_count += 1
+                        run_after = datetime.now(timezone.utc) + timedelta(
+                            seconds=random.randint(30, 90)
+                        )
+                        deferred = _defer_unclaimed_job(
+                            job_id, IngestJob, claimed_attempts=claimed_attempts,
+                            run_after=run_after,
+                        )
+                        print(
+                            f"api-sync OWNERSHIP: {state} "
+                            + (f"deferred to {run_after}" if deferred else
+                               "defer skipped (row re-claimed concurrently)"),
+                            flush=True,
+                        )
                     except OpenStatesDailyBudgetExceeded:
                         # Not a job failure -- our own daily brake tripped.
                         # Requeue for tomorrow without touching `attempts`,
                         # so budget exhaustion can never dead-letter a job.
                         db.rollback()
+                        deferred_count += 1
                         run_after = _next_utc_midnight_with_jitter()
                         deferred = defer_job_for_budget(
                             job_id,
@@ -2636,7 +2675,8 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                     db.close()
 
             print(
-                f"sync-worker {worker_id}: cycle done -- {processed} synced, {failed} failed",
+                f"sync-worker {worker_id}: cycle done -- {processed} synced, "
+                f"{failed} failed, {deferred_count} deferred",
                 flush=True,
             )
 
