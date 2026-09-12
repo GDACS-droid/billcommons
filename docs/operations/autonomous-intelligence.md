@@ -13,7 +13,20 @@ in the original checkout are preserved. The canonical inventory covers 50 states
 plus DC. Generic website observation is never treated as proof of statewide
 semantic freshness or completeness.
 
-## Active work — hard stop September 12 at 03:00 Eastern
+## Resumed September 12 — next natural stopping point
+
+Alberto explicitly resumed work after the overnight stop and requested a
+concrete account of net-new capabilities and demonstrations. The bounded
+resumption verified public demo endpoints and a retained Florida response hash,
+reran the California retained regression and Florida factual case, and produced
+[the show-and-tell guide](intelligence-demo.md). At approximately 15:09 UTC,
+Data Health reported 19 defects (two errors and 17 warnings); official targets
+were 49 observed and 10 failed. Health and readiness returned HTTP 200.
+These fresh checks supersede earlier health counts, not release provenance.
+The concurrent database-operator question was asked again; deployment remains
+held pending coordination and fresh schema/release evidence.
+
+## Previous stop — September 12 at 03:00 Eastern
 
 The user requested pausing goal pursuit at **2026-09-12 03:00 America/New_York
 (07:00 UTC)**. Stop implementation, reviews, polling and deployment at that
