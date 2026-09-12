@@ -43,6 +43,14 @@ been fixed; successful evidence capture resolves the matching row.
 it also persists and checks the durable blocker before recording a successful
 watermark.
 
+Before either direct or queued callers read the API-sync watermark, they take
+a transaction-scoped PostgreSQL advisory lock for the jurisdiction and source.
+The lock lasts through snapshot mutation, blocker resolution, and the caller's
+commit. A concurrent caller receives a bounded `ApiSyncConcurrencyBusy` error;
+the queue records its normal failed attempt/backoff and direct callers must
+retry. It never returns an empty or successful result while another snapshot
+transaction is active.
+
 The manual `api-sync` command commits healthy progress and returns a nonzero
 exit status with `INCOMPLETE` when unresolved blockers remain. The scheduled
 worker completes that queue attempt while retaining the failed ingestion run,

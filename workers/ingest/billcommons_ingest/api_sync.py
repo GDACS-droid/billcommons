@@ -42,7 +42,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select, text, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session as OrmSession
 
 from billcommons_ingest.openstates_api import OpenStatesClient, RetainedOpenStatesResponse
@@ -69,6 +70,10 @@ DEFAULT_PER_PAGE = 20
 MAX_PAGES_PER_RUN = 10
 INCLUDE = ["sponsorships", "actions", "sources", "versions", "documents", "abstracts"]
 SNAPSHOT_BLOCKER_PROCESSING_VERSION = "openstates_api_sync_snapshot_overflow/1"
+
+
+class ApiSyncConcurrencyBusy(RuntimeError):
+    """Another transaction is already snapshotting this jurisdiction/source."""
 
 
 def _normalize_action_description(value: str | None) -> str:
@@ -140,6 +145,30 @@ def _snapshot_blocker_identity(*, session_id: object, identifier_norm: str) -> s
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+def _api_sync_lock_key(jurisdiction_id: uuid.UUID) -> int:
+    """Stable signed bigint advisory-lock key for one jurisdiction/source."""
+    digest = hashlib.sha256(f"{SOURCE_NAME}\x00{jurisdiction_id}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+
+def _acquire_api_sync_snapshot_lock(db: OrmSession, jurisdiction: Jurisdiction) -> None:
+    """Acquire the transaction-scoped snapshot lock or reject a concurrent scan.
+
+    This is deliberately nonblocking.  Queue callers record the ordinary job
+    failure/backoff; direct callers receive a typed exception and must retry.
+    Returning a partial/success result while another transaction owns the
+    snapshot would permit an unsafe watermark advance.
+    """
+    acquired = db.execute(
+        text("SELECT pg_try_advisory_xact_lock(:lock_key)"),
+        {"lock_key": _api_sync_lock_key(jurisdiction.id)},
+    ).scalar_one()
+    if not acquired:
+        raise ApiSyncConcurrencyBusy(
+            "api-sync snapshot is already running for this jurisdiction and source"
+        )
+
+
 def _record_snapshot_overflow_blocker(
     db: OrmSession,
     *,
@@ -153,72 +182,69 @@ def _record_snapshot_overflow_blocker(
     cycle_start_page: int,
     updated_since: str | None,
 ) -> None:
-    """Upsert the bounded operational record outside the failed bill savepoint."""
-    blocker = db.execute(
-        select(ApiSyncSnapshotBlocker).where(
-            ApiSyncSnapshotBlocker.jurisdiction_id == jurisdiction.id,
-            ApiSyncSnapshotBlocker.source_name == SOURCE_NAME,
-            ApiSyncSnapshotBlocker.source_identity_sha256 == source_identity_sha256,
-        )
-    ).scalar_one_or_none()
+    """Atomically create or reactivate the record outside the failed savepoint."""
     updated_since_sha256 = (
         hashlib.sha256(updated_since.encode("utf-8")).hexdigest()
         if updated_since is not None
         else None
     )
-    if blocker is None:
-        db.add(
-            ApiSyncSnapshotBlocker(
-                jurisdiction_id=jurisdiction.id,
-                bill_id=bill_id,
-                source_name=SOURCE_NAME,
-                source_identity_sha256=source_identity_sha256,
-                component=component,
-                record_cap=record_cap,
-                first_seen_at=seen_at,
-                last_seen_at=seen_at,
-                active=True,
-                processing_version=SNAPSHOT_BLOCKER_PROCESSING_VERSION,
-                cycle_started_at=cycle_started_at,
-                cycle_start_page=cycle_start_page,
-                updated_since_sha256=updated_since_sha256,
-            )
+    statement = insert(ApiSyncSnapshotBlocker).values(
+        jurisdiction_id=jurisdiction.id,
+        bill_id=bill_id,
+        source_name=SOURCE_NAME,
+        source_identity_sha256=source_identity_sha256,
+        component=component,
+        record_cap=record_cap,
+        first_seen_at=seen_at,
+        last_seen_at=seen_at,
+        active=True,
+        processing_version=SNAPSHOT_BLOCKER_PROCESSING_VERSION,
+        cycle_started_at=cycle_started_at,
+        cycle_start_page=cycle_start_page,
+        updated_since_sha256=updated_since_sha256,
+    )
+    db.execute(
+        statement.on_conflict_do_update(
+            index_elements=(
+                ApiSyncSnapshotBlocker.jurisdiction_id,
+                ApiSyncSnapshotBlocker.source_name,
+                ApiSyncSnapshotBlocker.source_identity_sha256,
+            ),
+            set_={
+                "bill_id": func.coalesce(statement.excluded.bill_id, ApiSyncSnapshotBlocker.bill_id),
+                "component": statement.excluded.component,
+                "record_cap": statement.excluded.record_cap,
+                "last_seen_at": statement.excluded.last_seen_at,
+                "active": True,
+                "resolved_at": None,
+                "processing_version": statement.excluded.processing_version,
+                "cycle_started_at": statement.excluded.cycle_started_at,
+                "cycle_start_page": statement.excluded.cycle_start_page,
+                "updated_since_sha256": statement.excluded.updated_since_sha256,
+                "updated_at": func.now(),
+            },
         )
-        return
-    blocker.bill_id = bill_id or blocker.bill_id
-    blocker.component = component
-    blocker.record_cap = record_cap
-    blocker.last_seen_at = seen_at
-    blocker.active = True
-    blocker.resolved_at = None
-    blocker.processing_version = SNAPSHOT_BLOCKER_PROCESSING_VERSION
-    blocker.cycle_started_at = cycle_started_at
-    blocker.cycle_start_page = cycle_start_page
-    blocker.updated_since_sha256 = updated_since_sha256
+    )
 
 
 def _resolve_snapshot_overflow_blocker(
     db: OrmSession,
     *,
     jurisdiction: Jurisdiction,
-    bill_id: uuid.UUID,
     source_identity_sha256: str,
     resolved_at: datetime,
 ) -> None:
     """Resolve only the matching blocker after its full snapshot succeeded."""
-    for blocker in db.execute(
-        select(ApiSyncSnapshotBlocker).where(
+    db.execute(
+        update(ApiSyncSnapshotBlocker)
+        .where(
             ApiSyncSnapshotBlocker.jurisdiction_id == jurisdiction.id,
             ApiSyncSnapshotBlocker.source_name == SOURCE_NAME,
             ApiSyncSnapshotBlocker.active.is_(True),
-            or_(
-                ApiSyncSnapshotBlocker.source_identity_sha256 == source_identity_sha256,
-                ApiSyncSnapshotBlocker.bill_id == bill_id,
-            ),
+            ApiSyncSnapshotBlocker.source_identity_sha256 == source_identity_sha256,
         )
-    ).scalars():
-        blocker.active = False
-        blocker.resolved_at = resolved_at
+        .values(active=False, resolved_at=resolved_at, updated_at=func.now())
+    )
 
 
 def _has_active_snapshot_blockers(db: OrmSession, jurisdiction: Jurisdiction) -> bool:
@@ -438,6 +464,7 @@ def sync_state(
     if max_pages < 1:
         raise ValueError(f"max_pages must be >= 1, got {max_pages!r}")
 
+    _acquire_api_sync_snapshot_lock(db, jurisdiction)
     client = client or OpenStatesClient()
     result = ApiSyncResult(state=jurisdiction.abbreviation)
     retrieved_at = datetime.now(timezone.utc)
@@ -742,7 +769,6 @@ def sync_state(
             _resolve_snapshot_overflow_blocker(
                 db,
                 jurisdiction=jurisdiction,
-                bill_id=bill.id,
                 source_identity_sha256=source_identity_sha256,
                 resolved_at=retrieved_at,
             )

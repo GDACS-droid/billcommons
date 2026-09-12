@@ -12,20 +12,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
 from billcommons_ingest import cli as cli_mod
 from billcommons_ingest import corpus_update_evidence
 from billcommons_ingest.status import ActionRow, PASSED_BOTH, derive_status
 from billcommons_ingest.api_sync import (
+    ApiSyncConcurrencyBusy,
     ApiSyncResult,
     _bill_checksum,
+    _record_snapshot_overflow_blocker,
     _resolve_session_row,
+    _snapshot_blocker_identity,
     run_api_sync_job,
     sync_state,
 )
@@ -605,6 +609,226 @@ def test_early_page_snapshot_blocker_prevents_final_continuation_watermark(db_se
         ),
     )
     assert [datetime.fromisoformat(value) for value in seen_updated_since] == [prior_watermark]
+
+
+def test_successful_snapshot_resolves_only_its_exact_blocker_identity(db_session):
+    jurisdiction, session_row = _make_jurisdiction_with_active_session(db_session)
+    bill = Bill(
+        jurisdiction_id=jurisdiction.id,
+        session_id=session_row.id,
+        identifier="HB 912",
+        identifier_norm="HB912",
+        title="Existing bill",
+        openstates_id="ocd-bill/strict-blocker",
+        upstream_id="ocd-bill/strict-blocker",
+        checksum="before",
+    )
+    db_session.add(bill)
+    db_session.flush()
+    now = datetime.now(timezone.utc)
+    matching_identity = _snapshot_blocker_identity(session_id=session_row.id, identifier_norm="HB 912")
+    other_identity = hashlib.sha256(b"different-source-identity").hexdigest()
+    db_session.add_all(
+        [
+            ApiSyncSnapshotBlocker(
+                jurisdiction_id=jurisdiction.id,
+                bill_id=bill.id,
+                source_name="openstates_api_sync",
+                source_identity_sha256=identity,
+                component="sponsorships",
+                record_cap=1,
+                first_seen_at=now,
+                last_seen_at=now,
+                active=True,
+                processing_version="test",
+                cycle_start_page=1,
+            )
+            for identity in (matching_identity, other_identity)
+        ]
+    )
+    db_session.flush()
+    payload = _v3_bill_payload(
+        openstates_id="ocd-bill/strict-blocker", identifier="HB 912", title="Recovered"
+    )
+
+    sync_state(
+        db_session,
+        jurisdiction,
+        client=_client_with_pages({1: {"results": [payload], "pagination": {"max_page": 1}}}),
+    )
+    blockers = {
+        blocker.source_identity_sha256: blocker
+        for blocker in db_session.execute(select(ApiSyncSnapshotBlocker)).scalars()
+    }
+    assert blockers[matching_identity].active is False
+    assert blockers[other_identity].active is True
+
+    result = run_api_sync_job(
+        db_session,
+        jurisdiction.abbreviation,
+        client=_client_with_pages({1: {"results": [], "pagination": {"max_page": 1}}}),
+    )
+    assert result.snapshot_blockers_remaining is True
+    assert db_session.execute(
+        select(IngestionRun).where(IngestionRun.status == "success")
+    ).scalars().all() == []
+
+
+def test_real_connections_reject_concurrent_snapshot_without_false_watermark(unique_abbr):
+    setup = real_get_session()
+    try:
+        jurisdiction = Jurisdiction(name="Concurrent Sync State", abbreviation=unique_abbr("ZQ_LOCK"), classification="state")
+        setup.add(jurisdiction)
+        setup.flush()
+        setup.add(SessionModel(jurisdiction_id=jurisdiction.id, identifier="2026 Session", active=True))
+        setup.commit()
+        jurisdiction_id = jurisdiction.id
+        abbreviation = jurisdiction.abbreviation
+    finally:
+        setup.close()
+
+    first_db = real_get_session()
+    second_db = real_get_session()
+    try:
+        first = run_api_sync_job(
+            first_db,
+            abbreviation,
+            client=_client_with_pages({1: {"results": [], "pagination": {"max_page": 1}}}),
+        )
+        with pytest.raises(ApiSyncConcurrencyBusy):
+            run_api_sync_job(
+                second_db,
+                abbreviation,
+                client=_client_with_pages({1: {"results": [], "pagination": {"max_page": 1}}}),
+            )
+        second_db.commit()
+        first_db.commit()
+
+        check = real_get_session()
+        try:
+            runs = check.execute(
+                select(IngestionRun)
+                .where(IngestionRun.jurisdiction_id == jurisdiction_id)
+                .order_by(IngestionRun.created_at)
+            ).scalars().all()
+            successful = [run for run in runs if run.status == "success"]
+            assert len(successful) == 1
+            assert successful[0].started_at == first.cycle_started_at
+            assert len([run for run in runs if run.status == "failed"]) == 1
+        finally:
+            check.close()
+    finally:
+        first_db.close()
+        second_db.close()
+        cleanup = real_get_session()
+        try:
+            cleanup.execute(text("DELETE FROM ingestion_runs WHERE jurisdiction_id=:j"), {"j": jurisdiction_id})
+            cleanup.execute(text("DELETE FROM sessions WHERE jurisdiction_id=:j"), {"j": jurisdiction_id})
+            cleanup.execute(text("DELETE FROM jurisdictions WHERE id=:j"), {"j": jurisdiction_id})
+            cleanup.commit()
+        finally:
+            cleanup.close()
+
+
+def test_atomic_blocker_upsert_reactivates_stale_orm_cache_and_concurrent_creation(unique_abbr):
+    setup = real_get_session()
+    try:
+        jurisdiction = Jurisdiction(name="Atomic Blocker State", abbreviation=unique_abbr("ZQ_ATOMIC"), classification="state")
+        setup.add(jurisdiction)
+        setup.commit()
+        jurisdiction_id = jurisdiction.id
+    finally:
+        setup.close()
+
+    identity = hashlib.sha256(b"atomic-blocker-identity").hexdigest()
+    now = datetime.now(timezone.utc)
+
+    def record(db):
+        _record_snapshot_overflow_blocker(
+            db,
+            jurisdiction=Jurisdiction(id=jurisdiction_id),
+            bill_id=None,
+            source_identity_sha256=identity,
+            component="actions",
+            record_cap=1,
+            seen_at=now,
+            cycle_started_at=now,
+            cycle_start_page=1,
+            updated_since=None,
+        )
+
+    first = real_get_session()
+    second_error: list[Exception] = []
+    second_started = threading.Event()
+    second_finished = threading.Event()
+    try:
+        record(first)
+
+        def concurrent_create() -> None:
+            db = real_get_session()
+            try:
+                second_started.set()
+                record(db)
+                db.commit()
+            except Exception as exc:  # pragma: no cover - asserted from caller
+                second_error.append(exc)
+            finally:
+                db.close()
+                second_finished.set()
+
+        thread = threading.Thread(target=concurrent_create)
+        thread.start()
+        assert second_started.wait(timeout=1)
+        assert not second_finished.wait(timeout=0.2)
+        first.commit()
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+        assert second_error == []
+    finally:
+        first.close()
+
+    stale = real_get_session()
+    resolver = real_get_session()
+    try:
+        cached = stale.execute(
+            select(ApiSyncSnapshotBlocker).where(
+                ApiSyncSnapshotBlocker.jurisdiction_id == jurisdiction_id
+            )
+        ).scalar_one()
+        assert cached.active is True
+        resolver.execute(
+            update(ApiSyncSnapshotBlocker)
+            .where(ApiSyncSnapshotBlocker.id == cached.id)
+            .values(active=False, resolved_at=now)
+        )
+        resolver.commit()
+
+        record(stale)
+        stale.commit()
+        check = real_get_session()
+        try:
+            blocker = check.execute(
+                select(ApiSyncSnapshotBlocker).where(
+                    ApiSyncSnapshotBlocker.jurisdiction_id == jurisdiction_id
+                )
+            ).scalar_one()
+            assert blocker.active is True
+            assert blocker.resolved_at is None
+        finally:
+            check.close()
+    finally:
+        stale.close()
+        resolver.close()
+        cleanup = real_get_session()
+        try:
+            cleanup.execute(
+                text("DELETE FROM api_sync_snapshot_blockers WHERE jurisdiction_id=:j"),
+                {"j": jurisdiction_id},
+            )
+            cleanup.execute(text("DELETE FROM jurisdictions WHERE id=:j"), {"j": jurisdiction_id})
+            cleanup.commit()
+        finally:
+            cleanup.close()
 
 
 def test_sync_state_creates_new_bill(db_session):
