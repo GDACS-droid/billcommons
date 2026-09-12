@@ -51,14 +51,30 @@ handoff; do not mislabel a pause as completion.
   generated-test integrity, and deferred local snapshot storage after successful
   comparison. Florida comparator version two distinguishes partial duplicate
   overlap from equal multiplicity and preserves version-one replay.
-- **LATEST LOCAL CHECKS:** 120 tests passed in the final disposable-PG16 run,
-  including the full bulk importer test file, both Florida comparator versions
-  after action updates/deletions/insertions, all bundle cases, and the offline
-  factual benchmark. Log: `/tmp/bc_final_arc_root_pg_20260912.log`; the cluster
-  was dropped. Five version-one report cases were also byte-identical to the
-  pre-change comparator in `d09135f`. It pins one derived Florida fixture and checks direct bill,
-  action, referral and vote facts; it is not a nightly, live-source, corpus or
-  50-state benchmark. See [its contract](official-factual-benchmark.md).
+- **LATEST LOCAL CHECKS:** 140 tests passed in the follow-up disposable-PG16
+  run, covering the complete bulk importer test file, Florida comparison and
+  retained replay, observer provenance, versioned repair bundles and the offline
+  factual benchmark. Log: `/tmp/bc_review_followup3_root_pg_20260912.log`; the
+  cluster was dropped. The preceding run exposed a swallowed replay-domain
+  error and one stale error-message assertion; both were corrected. Five
+  version-one Florida report cases were previously byte-identical to the
+  pre-change comparator in `d09135f`. The benchmark pins one derived Florida
+  fixture and checks direct bill, action, referral and vote facts; it is not a
+  nightly, live-source, corpus or 50-state benchmark. See
+  [its contract](official-factual-benchmark.md).
+- **FINAL REVIEW DISPOSITION:** canonical run
+  `/home/alberto/verify-runs/20260912T052201Z-dc2b48a` ended **HALT**: Codex,
+  Muse, Grok and Deepseek BLOCK; AGY and Opus SHIP; Ox dead. Confirmed findings
+  prompted local fixes for contradictory/duplicate organization inputs,
+  import-time parser provenance, historical bundle metadata validation and
+  manifest binding, replay-domain errors, and benchmark file-read errors.
+  Reports alleging an empty parsed Florida action list overlook the parser's
+  existing rejection; the alleged Florida comparator dispatch mismatch also
+  does not match the code. Grok reported review-input truncation rather than a
+  code defect. These dispositions do not convert the run to approval. Ox again
+  exhausted its response budget; its retry was stopped and no further verifier
+  loop is planned for this work period. Follow-up fixes have deterministic
+  checks but have not received a new canonical SHIP verdict.
 - **HEALTHY AT CHECK:** at 2026-09-12 03:40 UTC (September 11 Eastern), public
   health, readiness, Data Health and a real bill read returned HTTP 200.
   There were 58 official observations in the preceding 24 hours and 59 enabled
@@ -71,17 +87,22 @@ handoff; do not mislabel a pause as completion.
   read endpoints. A replacement key is needed; account capacity remains
   unknown. No outreach or IQ Dominoes configuration was changed.
 - **REAL RETAINED FIXTURE:** a read-only production transaction materialized
-  historical CA observation `fdb506fb-9f9a-4ca4-818d-e1f703de7212` into
-  `/home/alberto/.local/share/billcommons/reliability-release-20260908/ca-retained-failure-bundle-20260912`.
-  Its 4,851,719-byte archive hash was verified. The current parser accepted
-  275 scoped bills and 7,094 events; its bounded sample covers 20 bills.
-  The generated regression passed offline (1 test). This failure is superseded
-  and its historical parser-source hash is unavailable; the bundle says so.
-  No old parser was rerun, no source was fetched, and no production data or
-  target was changed. It remains a local review artifact, not patch authorship
+  historical CA observation `fdb506fb-9f9a-4ca4-818d-e1f703de7212` into a new
+  version-two bundle at
+  `/home/alberto/.local/share/billcommons/reliability-release-20260908/ca-retained-failure-bundle-v2-20260912`.
+  Its verified 4,851,719-byte archive yields 275 scoped bills and 7,094 events;
+  the bounded sample covers 20 bills. The generated regression passed offline
+  (1 test; a pytest cache-path warning), and validation passed against the
+  separately retained canonical manifest digest
+  `5cb8c7d7b701c334a6809b274ddb2bb634ea2da042a422fde8d80c4d7da1e106`.
+  This failure is superseded and its historical parser-source hash is explicitly
+  unavailable. The earlier version-one artifact remains preserved for its
+  original parser revision. No old parser was rerun and no production data or
+  target was changed. This supplies regression evidence, not patch authorship
   or promotion approval.
-- **NEXT:** review the complete tested fix arc without Kimi. Resolve the operator question and refresh recovery
-  evidence before production metadata repair or deployment. Honor the cutoff.
+- **NEXT:** work down the current defect ledger with bounded local changes.
+  Resolve the operator question and refresh recovery evidence before production
+  metadata repair or deployment. Honor the cutoff.
 
 Restart inspection:
 

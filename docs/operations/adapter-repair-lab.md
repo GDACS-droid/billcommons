@@ -19,6 +19,22 @@ records whose source URL or retrieval timestamp is not an exact reviewed CA
 delta input. It stages the three output files beside the destination and only
 publishes the directory once complete.
 
+New artifacts use `official-repair-bundle/2`. Validation checks the historical
+adapter, status, error class, observation identifiers, supersession fields,
+diagnosis and provenance as well as the replay. The fixed generated regression
+test pins the canonical manifest SHA-256, so editing historical metadata also
+breaks validation. Duplicate JSON keys, non-finite numbers and excessive nesting
+are rejected. Version 1 artifacts remain readable with their original fixed
+test format; that format did not retain the historical error class or pin the
+whole manifest, so it cannot provide those version 2 checks.
+
+The CLI reports `manifest_sha256`. Retain that digest separately in a trusted
+review record and pass it as `expected_manifest_sha256` to
+`validate_repair_bundle` when verifying against that record. The generated test
+and manifest establish internal consistency; replacing both together can only
+be detected against a separately trusted digest. Offline validation does not
+authenticate the originating database or rerun the historical parser.
+
 `manifest.json` records the original observation as `recorded_before`, with
 `recorded_not_rerun: true`, separately from the current candidate replay. It
 contains the retained-fixture hash and size, the source hash of the **loaded
@@ -37,6 +53,12 @@ parse failure and its backoff still persist; provenance is explicitly unavailabl
 Both the latest eligible failure and a superseded eligible failure may produce
 this regression artifact. A superseded record stays marked as such in
 `recorded_before`; it cannot trigger a retry or target enablement.
+
+The loaded parser's module retains a bounded import-time source digest and the
+registered callable/code identities. Validation rejects source-file edits after
+import, including edits confined to helpers, and unregistered replacement
+callables. This is a source-provenance check, not general runtime attestation:
+arbitrary in-memory changes to helper globals are outside its contract.
 
 `test_repair_bundle_regression.py` is generated from fixed code and runs the
 normal `billcommons_shared.ca_official_actions` parser against the fixture. It

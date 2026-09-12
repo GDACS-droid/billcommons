@@ -143,3 +143,14 @@ def test_florida_replay_uses_retained_page_and_local_snapshot_after_corpus_chang
     assert result['comparator_version'] == comparator_version
     assert result['diff_sha256'] == run.diff_sha256
     assert 'occurrence' in result['interpretation']
+
+
+def test_invalid_retained_scope_raises_controlled_replay_error(db_session, completed_run):
+    import json
+    run, _ = completed_run
+    local = {"events": [{"jurisdiction": "TX", "session": "2025", "bill_id": "HB 1"}]}
+    run.local_snapshot_sha256 = observer.store_official_raw_blob(db_session,
+        json.dumps(local).encode(), "application/json")
+    db_session.flush()
+    with pytest.raises(EvidenceReplayError, match="retained comparison inputs are invalid"):
+        replay_reconciliation(db_session, run.id)

@@ -178,7 +178,7 @@ def test_tampered_blob_and_loaded_source_evidence_are_rejected(tmp_path, monkeyp
         "billcommons_ingest.official_repair_bundle.ca.parse_ca_official_actions_zip",
         lambda *args, **kwargs: None,
     )
-    with pytest.raises(RepairBundleError, match="source evidence"):
+    with pytest.raises(RepairBundleError, match="candidate parser source is unavailable"):
         validate_repair_bundle(output)
 
 
@@ -336,3 +336,76 @@ def test_publication_failure_preserves_existing_empty_destination(tmp_path, monk
         build_repair_bundle(db, observation.id, output)
     assert output.is_dir() and list(output.iterdir()) == []
     assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.parametrize("change", ["missing", "success", "capture", "supersession", "provenance", "identity"])
+def test_bundle_rejects_changed_historical_evidence(tmp_path, change):
+    from billcommons_ingest import official_repair_bundle as bundle
+    db, observation = _failure_db(raw=_archive())
+    output = tmp_path / "bundle"
+    manifest = build_repair_bundle(db, observation.id, output)
+    if change == "missing":
+        del manifest["recorded_before"]
+    elif change == "success":
+        manifest["recorded_before"]["status"] = "succeeded"
+    elif change == "capture":
+        manifest["recorded_before"]["failure"]["stage"] = "capture"
+    elif change == "supersession":
+        manifest["recorded_before"]["superseded"] = True
+    elif change == "provenance":
+        manifest["recorded_before"]["parser_provenance"] = {"status": "recorded", "parser_source_sha256": "invalid"}
+    else:
+        replaced_id = str(uuid.uuid4())
+        manifest["recorded_before"]["observation_id"] = replaced_id
+        manifest["recorded_before"]["latest_observation_id"] = replaced_id
+    (output / MANIFEST_NAME).write_text(json.dumps(manifest))
+    with pytest.raises(RepairBundleError):
+        validate_repair_bundle(output)
+    completed = _run_generated_test(output)
+    assert completed.returncode != 0
+
+
+@pytest.mark.parametrize("kind", ["duplicate", "nonfinite"])
+def test_bundle_rejects_ambiguous_json_in_validator_and_generated_test(tmp_path, kind):
+    db, observation = _failure_db(raw=_archive())
+    output = tmp_path / "bundle"
+    manifest = build_repair_bundle(db, observation.id, output)
+    encoded = json.dumps(manifest)
+    if kind == "duplicate":
+        encoded = '{"bundle_version": "discarded",' + encoded[1:]
+    else:
+        encoded = '{"unused": NaN,' + encoded[1:]
+    (output / MANIFEST_NAME).write_text(encoded)
+    with pytest.raises(RepairBundleError, match="duplicate|non-finite"):
+        validate_repair_bundle(output)
+    assert _run_generated_test(output).returncode != 0
+
+
+def test_version_one_bundle_remains_readable_with_legacy_generated_test(tmp_path):
+    from billcommons_ingest import official_repair_bundle as bundle
+    db, observation = _failure_db(raw=_archive())
+    output = tmp_path / "bundle"
+    manifest = build_repair_bundle(db, observation.id, output)
+    manifest["bundle_version"] = bundle.LEGACY_BUNDLE_VERSION
+    del manifest["recorded_before"]["adapter_name"]
+    del manifest["recorded_before"]["error_class"]
+    (output / MANIFEST_NAME).write_text(json.dumps(manifest))
+    (output / TEST_NAME).write_text(bundle._generated_test())
+    assert validate_repair_bundle(output) == manifest
+    assert _run_generated_test(output).returncode == 0
+
+
+def test_external_manifest_digest_rejects_coordinated_local_replacement(tmp_path):
+    from billcommons_ingest import official_repair_bundle as bundle
+    db, observation = _failure_db(raw=_archive())
+    output = tmp_path / "bundle"
+    manifest = build_repair_bundle(db, observation.id, output)
+    trusted_digest = bundle._manifest_sha256(manifest)
+    assert validate_repair_bundle(output, expected_manifest_sha256=trusted_digest) == manifest
+    new_id = str(uuid.uuid4())
+    manifest["recorded_before"]["observation_id"] = new_id
+    manifest["recorded_before"]["latest_observation_id"] = new_id
+    (output / MANIFEST_NAME).write_text(json.dumps(manifest))
+    (output / TEST_NAME).write_text(bundle._generated_test(bundle._manifest_sha256(manifest)))
+    with pytest.raises(RepairBundleError, match="trusted manifest digest"):
+        validate_repair_bundle(output, expected_manifest_sha256=trusted_digest)

@@ -203,3 +203,23 @@ def test_report_is_deterministic_and_cli_smoke_is_offline(tmp_path):
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout) == first
     assert completed.stderr == ""
+
+
+@pytest.mark.parametrize("failure_point", ["fstat", "read"])
+def test_file_io_failure_uses_controlled_api_error(tmp_path, monkeypatch, failure_point):
+    path = _copy_case(tmp_path)
+    def broken(*args, **kwargs):
+        raise OSError("injected I/O failure")
+    with monkeypatch.context() as patch:
+        if failure_point == "fstat":
+            patch.setattr(benchmark.os, "fstat", broken)
+        else:
+            class BrokenStream:
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    pass
+                read = broken
+            patch.setattr(benchmark.os, "fdopen", lambda *args, **kwargs: BrokenStream())
+        with pytest.raises(benchmark.OfficialFactualBenchmarkError, match="could not be read"):
+            benchmark.run_official_factual_benchmark(path)

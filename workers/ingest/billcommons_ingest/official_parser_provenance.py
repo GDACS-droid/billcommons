@@ -48,7 +48,9 @@ def parser_source_sha256(parser: object) -> str:
 
     This is intentionally narrower than general Python runtime attestation:
     dynamically created callables, modules without the import-time witness,
-    and in-memory code mutation are unavailable rather than guessed.
+    and replacements of the registered callable or its code object are
+    unavailable rather than guessed.  Arbitrary changes to helper globals in
+    memory are outside this source-provenance contract.
     """
 
     if not inspect.isfunction(parser):

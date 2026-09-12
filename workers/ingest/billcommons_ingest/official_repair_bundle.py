@@ -34,7 +34,8 @@ from billcommons_ingest.official_replay import EvidenceReplayError, _load_blob
 from billcommons_schema.models import OfficialSourceObservation
 
 
-BUNDLE_VERSION = "official-repair-bundle/1"
+LEGACY_BUNDLE_VERSION = "official-repair-bundle/1"
+BUNDLE_VERSION = "official-repair-bundle/2"
 FIXTURE_NAME = "retained-ca-archive.zip"
 MANIFEST_NAME = "manifest.json"
 TEST_NAME = "test_repair_bundle_regression.py"
@@ -106,7 +107,9 @@ def _recorded_before(plan: dict, observation: OfficialSourceObservation) -> dict
         "recorded_not_rerun": True,
         "observation_id": str(observation.id),
         "status": observation.status,
+        "adapter_name": observation.adapter_name,
         "adapter_version": observation.adapter_version,
+        "error_class": observation.error_class,
         "superseded": plan["superseded"],
         "latest_observation_id": plan["latest_observation_id"],
         "failure": failure if isinstance(failure, dict) else {"status": "unavailable"},
@@ -191,10 +194,10 @@ def _output_path(output_dir: str | Path) -> Path:
     return path
 
 
-def _generated_test() -> str:
+def _generated_test(manifest_sha256: str | None = None) -> str:
     """Return fixed test code; values are read from the deterministic manifest."""
 
-    return '''"""Generated retained-archive parser regression evidence."""
+    source = '''"""Generated retained-archive parser regression evidence."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -277,6 +280,35 @@ def test_retained_ca_parser_regression(monkeypatch):
             )
         assert failure_diagnosis(raised.value, stage="parse") == replay["failure"]
 '''
+    if manifest_sha256 is None:
+        return source  # Preserve the exact standalone version-one test.
+    if not is_sha256(manifest_sha256):
+        raise RepairBundleError("generated test requires a canonical manifest digest")
+    source = source.replace('assert MANIFEST["bundle_version"] == "official-repair-bundle/1"',
+                            'assert MANIFEST["bundle_version"] == "official-repair-bundle/2"')
+    source = source.replace('MANIFEST = json.loads(_bounded_read(ROOT / "manifest.json", 65536).decode("utf-8"))',
+        '''def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        assert key not in result, "duplicate manifest key"
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite(_value):
+    raise AssertionError("non-finite manifest number")
+
+
+MANIFEST = json.loads(_bounded_read(ROOT / "manifest.json", 65536).decode("utf-8"),
+                      object_pairs_hook=_unique_object, parse_constant=_reject_nonfinite)''')
+    return source.replace('    replay = MANIFEST["candidate_replay"]',
+        '    manifest_bytes = json.dumps(MANIFEST, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")\n'
+        f'    assert hashlib.sha256(manifest_bytes).hexdigest() == "{manifest_sha256}"\n'
+        '    replay = MANIFEST["candidate_replay"]')
+
+
+def _manifest_sha256(manifest: dict) -> str:
+    return hashlib.sha256(_canonical_json_bytes(manifest)).hexdigest()
 
 
 def _write_bundle(output_dir: Path, manifest: dict[str, object], raw: bytes) -> dict[str, object]:
@@ -293,7 +325,7 @@ def _write_bundle(output_dir: Path, manifest: dict[str, object], raw: bytes) -> 
         if len(encoded_manifest) > MAX_MANIFEST_BYTES:
             raise RepairBundleError("bundle manifest exceeds the local size bound")
         (stage / MANIFEST_NAME).write_bytes(encoded_manifest)
-        (stage / TEST_NAME).write_text(_generated_test(), encoding="utf-8")
+        (stage / TEST_NAME).write_text(_generated_test(_manifest_sha256(manifest)), encoding="utf-8")
         validated = validate_repair_bundle(stage)
         if output_dir.exists():
             # It was preflighted as empty. Recheck immediately before replacing
@@ -310,6 +342,19 @@ def _write_bundle(output_dir: Path, manifest: dict[str, object], raw: bytes) -> 
         raise
 
 
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise RepairBundleError("bundle manifest contains duplicate JSON keys")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_json(_value):
+    raise RepairBundleError("bundle manifest contains a non-finite number")
+
+
 def _read_manifest(bundle_dir: Path) -> dict[str, object]:
     manifest_path = bundle_dir / MANIFEST_NAME
     if manifest_path.is_symlink() or not manifest_path.is_file():
@@ -321,24 +366,95 @@ def _read_manifest(bundle_dir: Path) -> dict[str, object]:
             encoded = stream.read(MAX_MANIFEST_BYTES + 1)
         if len(encoded) > MAX_MANIFEST_BYTES:
             raise RepairBundleError("bundle manifest exceeds the local size bound")
-        manifest = json.loads(encoded.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        manifest = json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_json_object,
+                              parse_constant=_reject_nonfinite_json)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise RepairBundleError("bundle manifest is invalid") from exc
-    if not isinstance(manifest, dict) or manifest.get("bundle_version") != BUNDLE_VERSION:
+    if not isinstance(manifest, dict) or manifest.get("bundle_version") not in (LEGACY_BUNDLE_VERSION, BUNDLE_VERSION):
         raise RepairBundleError("bundle manifest version is unsupported")
+    if set(manifest) != {"bundle_version", "fixture", "recorded_before", "candidate_parser", "replay_input",
+                         "candidate_replay", "promotion_state", "execution_authorized", "interpretation"}:
+        raise RepairBundleError("bundle manifest fields are unsupported")
+    pending = [(manifest, 0)]
+    while pending:
+        value, depth = pending.pop()
+        if depth > 32:
+            raise RepairBundleError("bundle manifest exceeds the JSON depth bound")
+        if isinstance(value, dict):
+            pending.extend((child, depth + 1) for child in value.values())
+        elif isinstance(value, list):
+            pending.extend((child, depth + 1) for child in value)
     return manifest
 
 
-def validate_repair_bundle(bundle_dir: str | Path) -> dict[str, object]:
-    """Verify local fixture and loaded-parser evidence without database access."""
+def _validate_recorded_before(manifest: dict) -> None:
+    before = manifest.get("recorded_before")
+    fields = {"recorded_not_rerun", "observation_id", "status", "adapter_version",
+              "superseded", "latest_observation_id", "failure", "parser_provenance"}
+    current = manifest["bundle_version"] == BUNDLE_VERSION
+    if current:
+        fields |= {"adapter_name", "error_class"}
+    if not isinstance(before, dict) or set(before) != fields:
+        raise RepairBundleError("recorded historical evidence has an invalid shape")
+    if before["recorded_not_rerun"] is not True or before["status"] not in ("failed", "invalid"):
+        raise RepairBundleError("recorded historical evidence is not a retained failure")
+    if before["adapter_version"] != ca.ADAPTER_VERSION or (current and before["adapter_name"] != ADAPTER_NAME):
+        raise RepairBundleError("recorded historical adapter is unsupported")
+    try:
+        observation_id = uuid.UUID(before["observation_id"])
+        latest_id = uuid.UUID(before["latest_observation_id"]) if before["latest_observation_id"] is not None else None
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise RepairBundleError("recorded historical observation identity is invalid") from exc
+    if type(before["superseded"]) is not bool or before["superseded"] != (observation_id != latest_id):
+        raise RepairBundleError("recorded historical supersession is inconsistent")
+    failure = before["failure"]
+    if failure == {"status": "unavailable"}:
+        if before["status"] != "invalid" or (current and before["error_class"] != "OfficialCaActionsError"):
+            raise RepairBundleError("recorded historical evidence does not establish a parse failure")
+    else:
+        try:
+            if not isinstance(failure, dict) or failure.get("stage") != "parse":
+                raise ValueError("not a parse failure")
+            normalized = failure_diagnosis(ca.OfficialCaActionsError("recorded failure",
+                code=failure.get("code"), details=failure.get("details")), stage="parse")
+            if normalized != failure:
+                raise ValueError("noncanonical diagnosis")
+        except (ValueError, TypeError) as exc:
+            raise RepairBundleError("recorded historical parse diagnosis is invalid") from exc
+    provenance = before["parser_provenance"]
+    if not isinstance(provenance, dict):
+        raise RepairBundleError("recorded historical parser provenance is invalid")
+    if provenance.get("status") == "recorded":
+        valid = set(provenance) == {"status", "parser_source_sha256"} and is_sha256(provenance.get("parser_source_sha256"))
+    else:
+        valid = (set(provenance) == {"status", "reason"} and provenance.get("status") == "unavailable"
+                 and provenance.get("reason") in ("historical_parser_source_not_recorded", "parser_source_unavailable_at_observation"))
+    if not valid:
+        raise RepairBundleError("recorded historical parser provenance is invalid")
+
+
+def validate_repair_bundle(bundle_dir: str | Path, *, expected_manifest_sha256: str | None = None) -> dict[str, object]:
+    """Verify local consistency; a trusted external digest also binds origin metadata.
+
+    Local files alone cannot authenticate a historical database record if an
+    author replaces the whole bundle. Version two pins its complete canonical
+    manifest in the generated test; callers can retain the builder's reported
+    digest separately and pass it here to detect coordinated file replacement.
+    """
 
     root = Path(bundle_dir).absolute()
     _reject_symlink_path(root)
     if root.is_symlink() or not root.is_dir():
         raise RepairBundleError("bundle directory is absent or unsafe")
     manifest = _read_manifest(root)
+    digest = _manifest_sha256(manifest)
+    if expected_manifest_sha256 is not None and (
+        not is_sha256(expected_manifest_sha256) or digest != expected_manifest_sha256
+    ):
+        raise RepairBundleError("bundle does not match the trusted manifest digest")
+    _validate_recorded_before(manifest)
     test_path = root / TEST_NAME
-    expected_test = _generated_test().encode("utf-8")
+    expected_test = _generated_test(_manifest_sha256(manifest) if manifest["bundle_version"] == BUNDLE_VERSION else None).encode("utf-8")
     if test_path.is_symlink() or not test_path.is_file():
         raise RepairBundleError("bundle regression test is absent or unsafe")
     try:
@@ -435,6 +551,7 @@ def main() -> int:
             manifest = build_repair_bundle(db, args.observation_id, args.output_dir)
         print(json.dumps({
             "bundle_version": manifest["bundle_version"],
+            "manifest_sha256": _manifest_sha256(manifest),
             "promotion_state": manifest["promotion_state"],
             "execution_authorized": manifest["execution_authorized"],
         }, sort_keys=True))

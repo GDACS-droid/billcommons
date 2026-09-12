@@ -98,6 +98,8 @@ def _read_regular_file(path: Path, *, maximum_bytes: int, label: str) -> bytes:
         if len(data) != size or len(data) > maximum_bytes:
             raise OfficialFactualBenchmarkError(f"{label} changed while being read or violates byte cap")
         return data
+    except OSError as exc:
+        raise OfficialFactualBenchmarkError(f"{label} could not be read") from exc
     finally:
         os.close(descriptor)
 

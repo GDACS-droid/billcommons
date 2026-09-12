@@ -117,12 +117,17 @@ def replay_reconciliation(db, reconciliation_id: uuid.UUID) -> dict:
     raw = _load_blob(db, observation.raw_sha256)
     local_bytes = _load_blob(db, run.local_snapshot_sha256)
     stored_diff = _load_blob(db, run.diff_sha256)
-    if observation.adapter_name == ADAPTER_NAME:
-        reproduced, interpretation = _replay_ca(run, observation, raw, local_bytes)
-    elif observation.adapter_name == fl_capture.ADAPTER_NAME:
-        reproduced, interpretation = _replay_fl(run, observation, raw, local_bytes)
-    else:
-        raise EvidenceReplayError('unsupported recorded adapter/comparator version or outcome')
+    try:
+        if observation.adapter_name == ADAPTER_NAME:
+            reproduced, interpretation = _replay_ca(run, observation, raw, local_bytes)
+        elif observation.adapter_name == fl_capture.ADAPTER_NAME:
+            reproduced, interpretation = _replay_fl(run, observation, raw, local_bytes)
+        else:
+            raise EvidenceReplayError('unsupported recorded adapter/comparator version or outcome')
+    except EvidenceReplayError:
+        raise
+    except (ValueError, TypeError, ca.OfficialCaActionsError) as exc:
+        raise EvidenceReplayError('retained comparison inputs are invalid') from exc
     reproduced_bytes = _canonical_json_bytes(reproduced)
     if reproduced_bytes != stored_diff or reproduced['summary'] != run.summary:
         raise EvidenceReplayError('recorded reconciliation does not reproduce')
