@@ -74,6 +74,20 @@ def _make_jurisdiction(db_session, *, openstates_id: str) -> Jurisdiction:
     return jurisdiction
 
 
+def _seed_organization(
+    db_session, *, openstates_id: str, jurisdiction_id: uuid.UUID | None = None
+) -> Organization:
+    organization = Organization(
+        openstates_id=openstates_id,
+        jurisdiction_id=jurisdiction_id,
+        name="Seeded House",
+        classification="lower",
+    )
+    db_session.add(organization)
+    db_session.flush()
+    return organization
+
+
 def _organization_fixture_zip(organizations: list[dict[str, str]]) -> bytes:
     """Build the smallest archive that exercises the organization phase."""
     prefix = "ZZ/2026 Test Session/ZZ_2026 Test Session"
@@ -255,7 +269,83 @@ def test_ingest_organizations_preserves_existing_mapping_on_source_conflict(db_s
     assert organization.jurisdiction_id == foreign_jurisdiction.id
     assert organization_id in str(exc_info.value)
     assert local_source_id in str(exc_info.value)
-    assert "preserved existing mapping" in str(exc_info.value)
+    assert "no organization changes applied" in str(exc_info.value)
+
+
+def test_ingest_organizations_preflights_all_rows_before_repairing_legacy_null(
+    db_session, rawstore
+):
+    local_source_id = f"ocd-jurisdiction/local-{uuid.uuid4().hex}"
+    foreign_source_id = f"ocd-jurisdiction/foreign-{uuid.uuid4().hex}"
+    session_row = _make_session_row(db_session, openstates_id=local_source_id)
+    foreign_jurisdiction = _make_jurisdiction(db_session, openstates_id=foreign_source_id)
+    legacy_organization = _seed_organization(
+        db_session,
+        openstates_id=f"ocd-organization/legacy-{uuid.uuid4().hex}",
+    )
+    conflicting_organization = _seed_organization(
+        db_session,
+        openstates_id=f"ocd-organization/conflict-{uuid.uuid4().hex}",
+        jurisdiction_id=foreign_jurisdiction.id,
+    )
+
+    with pytest.raises(ValueError, match="organization jurisdiction conflict"):
+        ingest_session_csv_zip(
+            db_session,
+            _organization_fixture_zip(
+                [
+                    _organization_row(legacy_organization.openstates_id, local_source_id),
+                    _organization_row(conflicting_organization.openstates_id, local_source_id),
+                ]
+            ),
+            session_row=session_row,
+            rawstore=rawstore,
+        )
+
+    # Match the caller's failure-path commit: the preflight must have left
+    # both rows unmodified before it raised.
+    legacy_organization_id = legacy_organization.id
+    conflicting_organization_id = conflicting_organization.id
+    db_session.commit()
+    db_session.expire_all()
+    assert db_session.get(Organization, legacy_organization_id).jurisdiction_id is None
+    assert (
+        db_session.get(Organization, conflicting_organization_id).jurisdiction_id
+        == foreign_jurisdiction.id
+    )
+
+
+def test_ingest_organizations_rejects_conflicting_source_rows_before_null_repair(
+    db_session, rawstore
+):
+    local_source_id = f"ocd-jurisdiction/local-{uuid.uuid4().hex}"
+    foreign_source_id = f"ocd-jurisdiction/foreign-{uuid.uuid4().hex}"
+    session_row = _make_session_row(db_session, openstates_id=local_source_id)
+    _make_jurisdiction(db_session, openstates_id=foreign_source_id)
+    organization = _seed_organization(
+        db_session,
+        openstates_id=f"ocd-organization/duplicate-{uuid.uuid4().hex}",
+    )
+
+    with pytest.raises(ValueError, match="organization jurisdiction conflict") as exc_info:
+        ingest_session_csv_zip(
+            db_session,
+            _organization_fixture_zip(
+                [
+                    _organization_row(organization.openstates_id, local_source_id),
+                    _organization_row(organization.openstates_id, foreign_source_id),
+                ]
+            ),
+            session_row=session_row,
+            rawstore=rawstore,
+        )
+
+    organization_id = organization.id
+    db_session.commit()
+    db_session.expire_all()
+    assert db_session.get(Organization, organization_id).jurisdiction_id is None
+    assert local_source_id in str(exc_info.value)
+    assert foreign_source_id in str(exc_info.value)
 
 
 def test_ingest_creates_bills_with_normalized_identifiers(db_session, rawstore):

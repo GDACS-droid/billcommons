@@ -392,6 +392,47 @@ def ingest_session_csv_zip(
                 select(Organization).where(Organization.openstates_id.in_(wanted_org_ids))
             ).scalars():
                 org_cache[org.openstates_id] = org
+
+        # Validate the complete set of resolvable source attributions before
+        # assigning any legacy NULLs. The caller records and commits failures,
+        # so discovering a later conflict after an earlier assignment could
+        # otherwise persist a partial jurisdiction repair.
+        resolved_source_jurisdictions_by_org_id: dict[str, tuple[uuid.UUID, str]] = {}
+        for row in org_rows:
+            openstates_id = row.get("id")
+            if not openstates_id:
+                continue
+            source_jurisdiction_openstates_id = (row.get("jurisdiction_id") or "").strip()
+            source_jurisdiction_id = jurisdiction_id_by_openstates_id.get(
+                source_jurisdiction_openstates_id
+            )
+            if source_jurisdiction_id is None:
+                continue
+
+            prior_source = resolved_source_jurisdictions_by_org_id.get(openstates_id)
+            if prior_source is not None and prior_source[0] != source_jurisdiction_id:
+                raise ValueError(
+                    "organization jurisdiction conflict for "
+                    f"{openstates_id}: source {prior_source[1]} differs from source "
+                    f"{source_jurisdiction_openstates_id}; no organization changes applied"
+                )
+            resolved_source_jurisdictions_by_org_id[openstates_id] = (
+                source_jurisdiction_id,
+                source_jurisdiction_openstates_id,
+            )
+
+            org = org_cache.get(openstates_id)
+            if (
+                org is not None
+                and org.jurisdiction_id is not None
+                and org.jurisdiction_id != source_jurisdiction_id
+            ):
+                raise ValueError(
+                    "organization jurisdiction conflict for "
+                    f"{openstates_id}: existing {org.jurisdiction_id} differs from source "
+                    f"{source_jurisdiction_openstates_id}; no organization changes applied"
+                )
+
         new_org_rows: list[dict] = []
         for row in org_rows:
             openstates_id = row.get("id")
@@ -427,16 +468,6 @@ def ingest_session_csv_zip(
                         # A legacy NULL can safely be repaired when the
                         # current source row identifies one known jurisdiction.
                         org.jurisdiction_id = source_jurisdiction_id
-                    elif org.jurisdiction_id != source_jurisdiction_id:
-                        # Do not move an established organization across
-                        # jurisdictions, or present a contradictory archive
-                        # as a successful import.
-                        raise ValueError(
-                            "organization jurisdiction conflict for "
-                            f"{openstates_id}: existing {org.jurisdiction_id} "
-                            f"differs from source {source_jurisdiction_openstates_id}; "
-                            "preserved existing mapping"
-                        )
                 org.name = name
                 org.classification = classification
                 org.source_name = SOURCE_NAME
