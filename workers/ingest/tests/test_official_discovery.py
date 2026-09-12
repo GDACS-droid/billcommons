@@ -9,6 +9,32 @@ from billcommons_ingest.official_discovery import (
 from billcommons_shared.safe_http import SafeResponse, SsrfRejected
 
 
+@pytest.mark.parametrize("url,timeout", [
+    ("https://www.legmt.gov/", 10.0),
+    ("https://www.legmt.gov/robots.txt", None),
+    ("https://www.legmt.gov/bills", None),
+    ("https://legmt.gov/", None),
+    ("https://www.legmt.gov.evil.example/", None),
+    ("https://legislature.idaho.gov/", None),
+])
+def test_montana_read_timeout_is_scoped_to_exact_reviewed_homepage(monkeypatch, url, timeout):
+    from billcommons_ingest import official_discovery as discovery
+
+    class Client:
+        def fetch(self, source_url, *, method, headers, require_body):
+            assert source_url == url and method == "GET" and require_body
+            return SafeResponse(200, {}, b"page")
+
+    def factory(*, max_body_bytes, ssl_context_factory, read_timeout_seconds):
+        assert max_body_bytes == 100
+        assert ssl_context_factory is discovery.reviewed_context_for_host
+        assert read_timeout_seconds == timeout
+        return Client()
+
+    monkeypatch.setattr(discovery, "new_safe_http_client", factory)
+    assert discovery._fetch(url, 100).body == b"page"
+
+
 def test_inventory_is_exactly_50_states_plus_dc_with_reviewed_redirect_corrections():
     inventory = official_source_inventory()
     assert len(inventory) == 51

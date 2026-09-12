@@ -402,6 +402,42 @@ def test_successful_post_round_trips_status_and_body(https_server, trust_test_ca
     assert resp.body == b"ok"
 
 
+@pytest.mark.parametrize("timeout", [0, -1, 15.01, float("inf"), float("nan"), True, "10"])
+def test_response_read_timeout_rejects_unbounded_or_invalid_values(timeout):
+    with pytest.raises(ValueError, match="read_timeout_seconds"):
+        safe_http.new_safe_http_client(read_timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize("override,succeeds", [(None, False), (0.8, True)])
+def test_reviewed_read_timeout_allows_slow_headers_without_changing_default(
+    https_server, trust_test_ca, monkeypatch, override, succeeds,
+):
+    monkeypatch.setattr(safe_http, "READ_TIMEOUT_SECONDS", 0.1)
+
+    def behavior(handler):
+        time.sleep(0.3)
+        try:
+            handler.send_response(200)
+            handler.send_header("Content-Length", "2")
+            handler.end_headers()
+            handler.wfile.write(b"ok")
+        except OSError:
+            pass  # The default-timeout case deliberately disconnects first.
+
+    port, cert_pem = https_server(behavior)
+    trust_test_ca(cert_pem)
+    client = safe_http.new_safe_http_client(
+        resolver=_resolver_for(), port=port, address_policy=_allow_all_policy,
+        read_timeout_seconds=override,
+    )
+    if succeeds:
+        assert client.fetch(f"https://{TEST_HOSTNAME}/hook").body == b"ok"
+    else:
+        with pytest.raises(safe_http.TimeoutFailure, match="request_timeout"):
+            client.fetch(f"https://{TEST_HOSTNAME}/hook")
+    assert safe_http.READ_TIMEOUT_SECONDS == 0.1
+
+
 def test_redirect_is_a_failure_not_followed(https_server, trust_test_ca):
     def behavior(handler):
         handler.send_response(302)
@@ -484,16 +520,61 @@ def test_drip_feed_trips_the_total_wall_clock_budget_not_just_the_read_timeout(
         handler.send_header("Content-Length", "50")
         handler.end_headers()
         for _ in range(50):
-            handler.wfile.write(b"a")
-            handler.wfile.flush()
+            try:
+                handler.wfile.write(b"a")
+                handler.wfile.flush()
+            except OSError:
+                return  # The client must terminate before the drip completes.
             time.sleep(0.05)
 
     port, cert_pem = https_server(behavior)
     trust_test_ca(cert_pem)
 
     client = safe_http.SafeHttpClient(resolver=_resolver_for(), port=port, address_policy=_allow_all_policy)
+    started = time.monotonic()
     with pytest.raises(safe_http.TimeoutFailure):
         client.fetch(f"https://{TEST_HOSTNAME}/hook", body=b"{}")
+    assert time.monotonic() - started < 1.0, "0.6s budget must not wait for the 2.5s body"
+
+
+@pytest.mark.parametrize("require_body", [True, False])
+def test_header_drip_obeys_total_deadline_and_closes_response_stream(
+    https_server, trust_test_ca, monkeypatch, require_body,
+):
+    monkeypatch.setattr(safe_http, "TOTAL_BUDGET_SECONDS", 0.3)
+    streams = []
+    sockets = []
+    original_makefile = safe_http._DeadlineResponseSocket.makefile
+
+    def capture_stream(self, mode):
+        stream = original_makefile(self, mode)
+        streams.append(stream)
+        sockets.append(self._sock)
+        return stream
+
+    monkeypatch.setattr(safe_http._DeadlineResponseSocket, "makefile", capture_stream)
+
+    def behavior(handler):
+        response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Drip: 12345678901234567890\r\n\r\n"
+        for byte in response:
+            try:
+                handler.connection.sendall(bytes([byte]))
+            except OSError:
+                return
+            time.sleep(0.018)
+
+    port, cert_pem = https_server(behavior)
+    trust_test_ca(cert_pem)
+    client = safe_http.SafeHttpClient(
+        resolver=_resolver_for(), port=port, address_policy=_allow_all_policy,
+        read_timeout_seconds=10.0,
+    )
+    started = time.monotonic()
+    with pytest.raises(safe_http.TimeoutFailure):
+        client.fetch(f"https://{TEST_HOSTNAME}/hook", require_body=require_body)
+    assert time.monotonic() - started < 0.7, "0.3s budget must not wait for complete slow headers"
+    assert len(streams) == 1 and streams[0].closed
+    assert sockets[0].fileno() == -1, "the response file must not retain the socket descriptor"
 
 
 def test_proxy_env_vars_are_never_consulted(https_server, trust_test_ca, monkeypatch):
@@ -914,15 +995,20 @@ def test_delivery_swallows_a_body_read_timeout_as_success(https_server, trust_te
         handler.send_header("Content-Length", "50")
         handler.end_headers()
         for _ in range(50):
-            handler.wfile.write(b"a")
-            handler.wfile.flush()
+            try:
+                handler.wfile.write(b"a")
+                handler.wfile.flush()
+            except OSError:
+                return
             time.sleep(0.05)
 
     port, cert_pem = https_server(behavior)
     trust_test_ca(cert_pem)
 
     client = safe_http.SafeHttpClient(resolver=_resolver_for(), port=port, address_policy=_allow_all_policy)
+    started = time.monotonic()
     resp = client.fetch(f"https://{TEST_HOSTNAME}/hook", body=b"{}", require_body=False)
+    assert time.monotonic() - started < 1.0, "delivery success must still respect the 0.6s budget"
     assert resp.status == 200, "a body-read timeout must not fail a delivery whose status was already 200 (fix #9)"
     assert resp.body is None, "the body was never fully read -- distinct from a genuinely empty b''"
 

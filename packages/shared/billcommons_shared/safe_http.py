@@ -42,7 +42,9 @@ own is_global/is_multicast checks.
 from __future__ import annotations
 
 import http.client
+import io
 import ipaddress
+import math
 import re
 import socket
 import ssl
@@ -60,6 +62,7 @@ DEFAULT_PORT = 443
 
 CONNECT_TIMEOUT_SECONDS = 5.0
 READ_TIMEOUT_SECONDS = 5.0
+MAX_READ_TIMEOUT_SECONDS = 15.0
 #: Independent of the per-read timeout above. A receiver that sends one byte
 #: every 4.9 seconds never trips a naive per-read timeout and would otherwise
 #: hold a delivery thread open forever; this is checked before every single
@@ -579,6 +582,56 @@ def _make_ssl_context(
     return context
 
 
+class _DeadlineResponseReader(io.RawIOBase):
+    """Recheck the total deadline before every underlying response receive.
+
+    HTTPResponse.begin/read may perform many receives while parsing a single
+    header or filling one requested chunk. A timeout set only before those
+    higher-level calls allows an indefinitely slow drip to keep making progress.
+    Wrap the unbuffered socket file so BufferedReader cannot hide those receives.
+    """
+
+    def __init__(self, raw, sock, remaining: Callable[[], float], read_timeout: float):
+        super().__init__()
+        self._raw = raw
+        self._sock = sock
+        self._remaining = remaining
+        self._read_timeout = read_timeout
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        if self.closed:
+            raise ValueError("read of closed response stream")
+        self._sock.settimeout(min(self._read_timeout, self._remaining()))
+        return self._raw.readinto(buffer)
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                self._raw.close()
+            finally:
+                super().close()
+
+
+class _DeadlineResponseSocket:
+    """The narrow makefile interface HTTPResponse needs; owns no socket."""
+
+    def __init__(self, sock, remaining: Callable[[], float], read_timeout: float):
+        self._sock = sock
+        self._remaining = remaining
+        self._read_timeout = read_timeout
+
+    def makefile(self, mode: str):
+        if mode != "rb":
+            raise ValueError("response stream must be read-only binary")
+        raw = self._sock.makefile(mode, buffering=0)
+        return io.BufferedReader(
+            _DeadlineResponseReader(raw, self._sock, self._remaining, self._read_timeout)
+        )
+
+
 class SafeHttpClient:
     """SSRF-guarded HTTPS client. One instance is reusable across many
     `fetch()` calls (it holds no per-target state); every call opens its own
@@ -605,14 +658,24 @@ class SafeHttpClient:
         address_policy: AddressPolicy = _is_publicly_routable,
         max_body_bytes: int = MAX_BODY_BYTES,
         ssl_context_factory: SslContextFactory | None = None,
+        read_timeout_seconds: float | None = None,
     ) -> None:
         if max_body_bytes <= 0:
             raise ValueError("max_body_bytes must be positive")
+        read_timeout = READ_TIMEOUT_SECONDS if read_timeout_seconds is None else read_timeout_seconds
+        if (
+            isinstance(read_timeout, bool)
+            or not isinstance(read_timeout, (int, float))
+            or not math.isfinite(read_timeout)
+            or not 0 < read_timeout <= MAX_READ_TIMEOUT_SECONDS
+        ):
+            raise ValueError("read_timeout_seconds must be finite, greater than 0, and at most 15")
         self._resolver = resolver
         self._port = port
         self._address_policy = address_policy
         self._max_body_bytes = max_body_bytes
         self._ssl_context_factory = ssl_context_factory
+        self._read_timeout_seconds = float(read_timeout)
 
     def fetch(
         self,
@@ -703,6 +766,7 @@ class SafeHttpClient:
         # `finally` below closes whichever one actually ended up owning the
         # connection, exactly once, never both.
         sock = None
+        response = None
         try:
             raw_sock.settimeout(min(READ_TIMEOUT_SECONDS, remaining()))
             try:
@@ -755,8 +819,11 @@ class SafeHttpClient:
                 sock.settimeout(min(READ_TIMEOUT_SECONDS, remaining()))
                 sock.sendall(request_bytes)
 
-                response = http.client.HTTPResponse(sock, method=method)
-                sock.settimeout(min(READ_TIMEOUT_SECONDS, remaining()))
+                response = http.client.HTTPResponse(
+                    _DeadlineResponseSocket(sock, remaining, self._read_timeout_seconds),
+                    method=method,
+                )
+                sock.settimeout(min(self._read_timeout_seconds, remaining()))
                 response.begin()
             except (TimeoutError, socket.timeout) as exc:
                 raise TimeoutFailure("request_timeout") from exc
@@ -794,7 +861,7 @@ class SafeHttpClient:
             body_bytes: bytes | None = b""
             try:
                 while True:
-                    sock.settimeout(min(READ_TIMEOUT_SECONDS, remaining()))
+                    sock.settimeout(min(self._read_timeout_seconds, remaining()))
                     try:
                         chunk = response.read(READ_CHUNK_BYTES)
                     except (TimeoutError, socket.timeout) as exc:
@@ -856,6 +923,11 @@ class SafeHttpClient:
                 body=body_bytes,
             )
         finally:
+            if response is not None:
+                try:
+                    response.close()
+                except OSError:
+                    pass
             if sock is not None:
                 try:
                     sock.close()
@@ -875,6 +947,7 @@ def new_safe_http_client(
     address_policy: AddressPolicy = _is_publicly_routable,
     max_body_bytes: int = MAX_BODY_BYTES,
     ssl_context_factory: SslContextFactory | None = None,
+    read_timeout_seconds: float | None = None,
 ) -> SafeHttpClient:
     """Production entrypoint. The dispatcher calls this with no arguments,
     which wires in `default_resolver`, the real `_is_publicly_routable`
@@ -882,8 +955,10 @@ def new_safe_http_client(
     connecting only to the standard HTTPS port. The optional context factory
     exists for the reviewed official-source intermediate bundle; it remains
     subject to the verification, complete-chain, TLS-version and ALPN checks
-    in `_make_ssl_context`. The remaining parameters let tests override the
-    same dependencies as `SafeHttpClient(...)`; no environment variable can
+    in `_make_ssl_context`. A reviewed source may select a bounded response-read
+    timeout without changing the total budget, connection or TLS deadlines.
+    The remaining parameters let tests override the same dependencies as
+    `SafeHttpClient(...)`; no environment variable can
     bypass the guard.
     """
     return SafeHttpClient(
@@ -892,4 +967,5 @@ def new_safe_http_client(
         address_policy=address_policy,
         max_body_bytes=max_body_bytes,
         ssl_context_factory=ssl_context_factory,
+        read_timeout_seconds=read_timeout_seconds,
     )

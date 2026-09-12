@@ -43,6 +43,13 @@ MAX_OBSERVATION_SECONDS = 300
 _REVIEWED_CRAWL_DELAY_LIMITS: dict[tuple[str, str], int] = {
     ("AZ", "https://www.azleg.gov/"): 120,
 }
+# The Montana homepage returned headers after the default five-second read
+# deadline in a September 12 source probe. Ten-second reads completed the
+# robots-authorized capture within the unchanged fifteen-second total budget.
+# This applies only to the exact homepage, never robots, other paths or hosts.
+_REVIEWED_READ_TIMEOUTS: dict[str, float] = {
+    "https://www.legmt.gov/": 10.0,
+}
 _MATERIAL_WORDS = re.compile(
     r"bill|legislation|journal|calendar|committee|report|analysis|analyses|amendment|download|data|feed",
     re.IGNORECASE,
@@ -187,6 +194,7 @@ def _fetch(url: str, max_body_bytes: int) -> SafeResponse:
     return new_safe_http_client(
         max_body_bytes=max_body_bytes,
         ssl_context_factory=reviewed_context_for_host,
+        read_timeout_seconds=_REVIEWED_READ_TIMEOUTS.get(url),
     ).fetch(
         url, method="GET", headers={"User-Agent": USER_AGENT, "Accept": "text/html,text/plain,*/*;q=0.1"},
         require_body=True,
