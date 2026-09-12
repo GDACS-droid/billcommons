@@ -95,6 +95,70 @@ def test_success_retains_exact_page_and_policy_with_bounded_link_claim():
     assert admissions == calls
 
 
+@pytest.mark.parametrize("body", [
+    b'<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"><html>Error</html>',
+    b"<html><body>Page not found</body></html>",
+    b"\xef\xbb\xbf \r\n\t<HTML lang='en'>Error</HTML>",
+    b"\n<!doctype\nhtml><html>Error</html>",
+])
+def test_html_200_robots_retains_evidence_and_never_requests_material(body):
+    calls, admissions = [], []
+    def fetch(url, cap):
+        calls.append(url)
+        assert url.endswith("/robots.txt"), "HTML robots must not permit a material fetch"
+        return SafeResponse(200, {"content-type": "text/plain"}, body)
+    capture = capture_official_landing_page("HI", official_source_inventory()["HI"],
+        fetch=fetch, budget=admissions.append)
+    assert capture.error_class == "robots_html_response"
+    assert capture.robots_status == 200 and capture.robots_bytes == body
+    assert capture.raw_bytes is None and capture.http_status is None
+    assert calls == admissions == ["https://www.capitol.hawaii.gov/robots.txt"]
+
+
+@pytest.mark.parametrize("body", [
+    b"", b"# An empty policy is intentional\n",
+    b"# <html> is mentioned only in this comment\nUser-agent: *\nAllow: /\n",
+    b"User-agent: *\nDisallow: /<html>\nAllow: /\n",
+])
+def test_plain_or_empty_robots_200_remains_compatible(body):
+    calls = []
+    def fetch(url, cap):
+        calls.append(url)
+        if url.endswith("/robots.txt"):
+            return SafeResponse(200, {"content-type": "text/html"}, body)
+        return SafeResponse(200, {"content-type": "text/html"}, b'<a href="/bills">Bills</a>')
+    capture = capture_official_landing_page("HI", official_source_inventory()["HI"],
+        fetch=fetch, budget=lambda url: None)
+    assert capture.error_class is None
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("status,expected_calls", [(404, 2), (410, 2), (403, 1), (503, 1)])
+def test_html_robots_non_200_keeps_existing_status_policy(status, expected_calls):
+    calls = []
+    def fetch(url, cap):
+        calls.append(url)
+        if url.endswith("/robots.txt"):
+            return SafeResponse(status, {"content-type": "text/html"}, b"<!doctype html><html>Error</html>")
+        return SafeResponse(200, {"content-type": "text/html"}, b'<a href="/bills">Bills</a>')
+    capture = capture_official_landing_page("HI", official_source_inventory()["HI"],
+        fetch=fetch, budget=lambda url: None)
+    assert len(calls) == expected_calls
+    assert capture.error_class == (None if status in (404, 410) else "robots_unavailable")
+
+
+def test_utf8_bom_does_not_hide_robots_disallow():
+    calls = []
+    body = b"\xef\xbb\xbfUser-agent: *\nDisallow: /\n"
+    def fetch(url, cap):
+        calls.append(url)
+        return SafeResponse(200, {}, body)
+    capture = capture_official_landing_page("HI", official_source_inventory()["HI"],
+        fetch=fetch, budget=lambda url: None)
+    assert capture.error_class == "robots_disallowed"
+    assert capture.robots_bytes == body and len(calls) == 1
+
+
 def test_redirect_policy_failure_does_not_follow_destination_or_leak_diagnostics():
     calls = []
     def fetch(url, cap):

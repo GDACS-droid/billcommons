@@ -2,6 +2,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy import select
 
 from billcommons_ingest import official_discovery as discovery
@@ -10,6 +11,7 @@ from billcommons_ingest.official_worker import seed_discovery_targets
 from billcommons_schema.models import (
     Jurisdiction, OfficialRawBlob, OfficialSourceObservation, OfficialSourceTarget,
 )
+from billcommons_shared.safe_http import SafeResponse
 
 
 NOW = datetime(2026, 9, 8, tzinfo=timezone.utc)
@@ -29,18 +31,28 @@ def target(db):
     return source
 
 
-def test_failed_policy_is_retained_without_claiming_page_freshness(db_session, monkeypatch):
+@pytest.mark.parametrize("policy,error_class", [
+    (b"User-agent: *\nDisallow: /\n", "robots_disallowed"),
+    (b"<!DOCTYPE html><html>Page not found</html>", "robots_html_response"),
+])
+def test_failed_policy_is_retained_without_claiming_page_freshness(db_session, monkeypatch, policy, error_class):
     source = target(db_session)
-    policy = b"User-agent: *\nDisallow: /\n"
-    captured = discovery.OfficialDiscoveryCapture(source_url=source.source_url, retrieved_at=NOW,
-        robots_url="https://www.ncleg.gov/robots.txt", robots_status=200,
-        robots_bytes=policy, error_class="robots_disallowed")
+    calls = []
+    def fetch(url, cap):
+        calls.append(url)
+        assert url == "https://www.ncleg.gov/robots.txt"
+        return SafeResponse(200, {}, policy)
+    captured = discovery.capture_official_landing_page("NC", source.source_url,
+        fetch=fetch, budget=lambda url: None, now=NOW)
+    assert captured.error_class == error_class
+    assert calls == ["https://www.ncleg.gov/robots.txt"]
     monkeypatch.setattr(discovery, "capture_official_landing_page", lambda *args: captured)
     result = observe_due_target(db_session, now=NOW)
     db_session.flush()
     assert result.status == "failed"
     observation = db_session.scalar(select(OfficialSourceObservation))
     assert observation.adapter_name == discovery.ADAPTER_NAME
+    assert observation.error_class == error_class
     assert observation.raw_sha256 is None
     assert observation.http_status is None
     policy_sha = observation.scope["robots"]["raw_sha256"]

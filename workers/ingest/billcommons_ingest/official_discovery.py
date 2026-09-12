@@ -50,6 +50,7 @@ _REVIEWED_CRAWL_DELAY_LIMITS: dict[tuple[str, str], int] = {
 _REVIEWED_READ_TIMEOUTS: dict[str, float] = {
     "https://www.legmt.gov/": 10.0,
 }
+_HTML_DOCUMENT_START = re.compile(r"^(?:<!doctype\s+html\b|<html(?:\s|>))", re.IGNORECASE)
 _MATERIAL_WORDS = re.compile(
     r"bill|legislation|journal|calendar|committee|report|analysis|analyses|amendment|download|data|feed",
     re.IGNORECASE,
@@ -246,8 +247,14 @@ def _capture_reviewed_html(
         if robots.body is None or len(robots.body) > MAX_ROBOTS_BYTES:
             return OfficialDiscoveryCapture(**evidence, error_class="robots_body_invalid")
         if robots.status == 200:
+            robots_text = robots.body.decode("utf-8-sig", errors="replace")
+            # A retained HI response was an HTML error page with HTTP 200.
+            # RobotFileParser sees no rules in it and would allow a page fetch.
+            # Reject the recognizable document prefix before parsing policy.
+            if _HTML_DOCUMENT_START.match(robots_text.lstrip()):
+                return OfficialDiscoveryCapture(**evidence, error_class="robots_html_response")
             policy = RobotFileParser()
-            policy.parse(robots.body.decode("utf-8", errors="replace").splitlines())
+            policy.parse(robots_text.splitlines())
             if not policy.can_fetch(USER_AGENT, source_url):
                 return OfficialDiscoveryCapture(**evidence, error_class="robots_disallowed")
             crawl_delay = float(policy.crawl_delay(USER_AGENT) or 0)

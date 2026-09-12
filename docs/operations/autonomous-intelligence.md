@@ -231,6 +231,18 @@ exception would not recover it, and an HTML error page is not evidence of a
 valid robots policy. No homepage/material fetch followed this diagnostic.
 Keep discovery blocked; see the [bounded evaluation](delaware-robots-evaluation.md).
 
+### Hawaiʻi policy-evidence fix — September 12, 06:49 UTC
+
+Hawaiʻi's retained HTTP-200 robots blob is also HTML. Offline replay reproduced
+the current parser treating it as an empty policy and attempting the homepage.
+The common capture path now rejects recognizable HTML document prefixes as
+`robots_html_response`, retaining the exact policy bytes and making no material
+request. UTF-8 BOM handling also preserves first-line `Disallow` policy behavior.
+Plain/empty policy and status handling remain covered. The related PostgreSQL
+suites passed 96 tests; four database tests then proved capture-to-observation
+failure evidence and backoff. All clusters were dropped. This narrow local fix
+is unreleased and has no canonical review; see [scope and evidence](robots-html-response-guard.md).
+
 Restart inspection:
 
 ```bash
