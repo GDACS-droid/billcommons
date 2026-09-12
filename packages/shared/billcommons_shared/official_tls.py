@@ -31,11 +31,17 @@ class ReviewedIntermediate:
 
 
 # Source artifacts were fetched from each leaf certificate's public caIssuers
-# repository and reviewed on 2026-09-08.  A context is returned for these
+# repository and reviewed on the dates in certs/official_discovery/README.md.
+# A context is returned for these
 # exact authority names only.  Adding a host requires a new reviewed asset and
 # its DER fingerprint; a certificate presented by a remote server can never
 # extend this list.
 _REVIEWED_HOSTS: dict[str, ReviewedIntermediate] = {
+    "www.ilga.gov": ReviewedIntermediate(
+        "sectigo-public-server-ov-r40.pem",
+        "8eb2f17d668941c39a7fca0cee127ae0ebaf444610631cca3cd19eab46c5824a",
+        "CN=Sectigo Public Server Authentication CA OV R40,O=Sectigo Limited,C=GB",
+    ),
     "www.cga.ct.gov": ReviewedIntermediate(
         "godaddy-secure-g2.pem",
         "973a41276ffd01e027a2aad49e34c37846d3e976ff6a620b6712e33832041aa6",

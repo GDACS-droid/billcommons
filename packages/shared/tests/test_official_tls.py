@@ -10,6 +10,7 @@ from billcommons_shared import official_tls
 
 
 EXPECTED_HOSTS = {
+    "www.ilga.gov": "8eb2f17d668941c39a7fca0cee127ae0ebaf444610631cca3cd19eab46c5824a",
     "www.cga.ct.gov": "973a41276ffd01e027a2aad49e34c37846d3e976ff6a620b6712e33832041aa6",
     "www.legislature.mi.gov": "c8025f9fc65fdfc95b3ca8cc7867b9a587b5277973957917463fc813d0b625a9",
     "www.legislature.ms.gov": "b676ffa3179e8812093a1b5eafee876ae7a6aaf231078dad1bfb21cd2893764a",
@@ -39,6 +40,8 @@ def test_reviewed_contexts_are_exact_host_scoped_and_keep_root_verification(monk
 
 
 def test_unreviewed_host_cannot_receive_a_bundled_intermediate():
+    assert official_tls.reviewed_context_for_host("ilga.gov") is None
+    assert official_tls.reviewed_context_for_host("www.ilga.gov.evil.example") is None
     assert official_tls.reviewed_context_for_host("cga.ct.gov") is None
     assert official_tls.reviewed_context_for_host("www.cga.ct.gov.evil.example") is None
     assert official_tls.reviewed_context_for_host("expired.example") is None
