@@ -224,6 +224,13 @@ The local certificate fix remains undeployed. Official observation status does
 not establish statewide semantic freshness. Timestamped public JSON and the
 route-correction diagnostic are retained in the release evidence directory.
 
+Delaware's follow-up policy diagnostic at 06:43–06:44 UTC disproved the earlier
+terminal-404 inference: `/robots.txt` returns 302 to `/404?...`, which returns
+301 to `/Error/PageNotFound`, which returns HTML with HTTP 200. A one-hop
+exception would not recover it, and an HTML error page is not evidence of a
+valid robots policy. No homepage/material fetch followed this diagnostic.
+Keep discovery blocked; see the [bounded evaluation](delaware-robots-evaluation.md).
+
 Restart inspection:
 
 ```bash
