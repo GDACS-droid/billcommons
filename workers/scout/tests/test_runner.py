@@ -18,7 +18,6 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from billcommons_schema.base import Base
 from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutRawBlob, ScoutResearchJob, ScoutSource
@@ -38,7 +37,14 @@ import billcommons_scout.__main__ as scout_cli
 
 
 def _runner(tmp_path, provider, fetcher, *, settings=None, limits=None):
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    # Cleanup/provider callbacks run in parallel threads. A StaticPool over an
+    # in-memory SQLite database shares one physical connection, so one Session's
+    # rollback can undo another Session's work. Give concurrent sessions separate
+    # connections to the same disposable database, as the real worker has.
+    engine = create_engine(
+        f"sqlite:///{tmp_path / f'runner-{uuid.uuid4().hex}.sqlite3'}",
+        connect_args={"check_same_thread": False},
+    )
 
     @event.listens_for(engine, "connect")
     def uuid_default(conn, _record):
