@@ -139,6 +139,37 @@ against the configured 225-request daily brake. This is a capacity mismatch,
 not authorization to change quotas or schedules. See
 [cadence capacity](sync-cadence-capacity.md).
 
+### Official-access follow-up — September 12, 06:17 UTC
+
+Illinois's `TlsFailure` was reproduced as an omitted issuer certificate
+(verification code 20). Local commit `d53e92c` adds the exact-host, DER-pinned
+Sectigo OV R40 intermediate to the existing reviewed bundle. Offline OpenSSL
+verification used it as an untrusted chain component against existing certifi
+roots; a live full-chain/hostname-verified handshake passed. The production
+capture path then passed locally: robots 200, permitted page 200, 17 links,
+two requests at least two seconds apart, retained bodies and hashes. The TLS
+and SafeHTTP suites passed 67 tests; a local test-server request diagnostic
+appeared but pytest passed. No new wheel was built because local build tooling
+is absent. The PEM is tracked and covered by the existing package artifact rule.
+This fix remains undeployed and has no new canonical SHIP verdict.
+
+Delaware's robots endpoint returned a same-host 302 to a branded missing-page
+route. The global redirect ban and registry remain unchanged. A separate
+investigator homepage probe occurred before robots policy was established;
+the parent stopped further probes and rejected that response as discovery or
+permission evidence. The body was not used or retained. A future robots-only
+redirect design needs its own bounded security review.
+
+The current failed California action target is a different issue from the
+historical parser bundle: `pubinfo_Sun.zip` returns 404. Publisher documentation
+and a retained current directory show six small deltas (Mon–Sat), with Sunday
+available only as a full snapshot outside this adapter's bounds. New target
+registration now creates six delta targets; historical Sunday parsing/replay
+and existing target state remain intact. The worker/adapter PostgreSQL checks
+passed 33 tests. A [dated retirement plan](ca-sunday-target-retirement.md)
+identifies the exact production target and preserves all historical evidence.
+No target was disabled or reset in production.
+
 Restart inspection:
 
 ```bash

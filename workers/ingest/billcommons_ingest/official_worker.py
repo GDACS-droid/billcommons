@@ -27,7 +27,11 @@ from billcommons_ingest.repair_transport import new_repair_fetcher
 from billcommons_shared.rawstore import FilesystemRawStore, RawStore
 
 
-DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+# California publishes small delta archives Monday through Saturday. Sunday
+# has only a separate full-session archive, outside this bounded adapter.
+# Keep legacy Sun parsing/replay compatibility in ca_official_actions; never
+# seed a new target for the unsupported pubinfo_Sun.zip URL.
+DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
 DEFAULT_CADENCE_SECONDS = 86400
 MAX_OBSERVATION_SECONDS = 300
 TLS_REPAIR_CYCLE_LIMIT = 2
@@ -62,11 +66,13 @@ def _transaction_deadline(seconds: float = MAX_OBSERVATION_SECONDS):
 
 
 def seed_ca_targets(db, *, enable: bool = False) -> int:
-    """Idempotently register the seven reviewed, current-session CA deltas.
+    """Idempotently register the six reviewed, current-session CA deltas.
 
     This does not change any bill or action. Existing target configuration is
     validated, never silently replaced. Enabling requires the caller's explicit
     switch, and the existing next-check/backoff state survives another seed.
+    Previously registered Sunday rows remain untouched for explicit retirement;
+    re-seeding is not authorization to alter their retained operational state.
     """
     from billcommons_ingest.official_observer import _target_day
 
@@ -298,7 +304,7 @@ def _bounded_int(minimum: int, maximum: int):
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed-ca", action="store_true",
-                        help="register seven reviewed CA daily delta targets")
+                        help="register six reviewed CA delta targets (Monday–Saturday)")
     parser.add_argument("--seed-discovery", action="store_true",
                         help="register reviewed official landing pages for all 50 states and DC")
     parser.add_argument("--enable-seeded", action="store_true",

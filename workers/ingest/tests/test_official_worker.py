@@ -33,15 +33,16 @@ def test_seed_requires_existing_jurisdiction(db_session):
 def test_registration_is_disabled_idempotent_and_preserves_schedule(db_session):
     db_session.add(Jurisdiction(abbreviation="CA", name="California", classification="state"))
     db_session.flush()
-    assert seed_ca_targets(db_session) == 7
+    assert seed_ca_targets(db_session) == 6
     targets = db_session.scalars(select(OfficialSourceTarget)).all()
-    assert len(targets) == 7
+    assert len(targets) == 6
+    assert {target.scope["day"] for target in targets} == {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
     assert all(not target.enabled for target in targets)
     next_check = datetime.now(timezone.utc) + timedelta(days=2)
     targets[0].next_check_at = next_check
     targets[0].consecutive_failures = 3
-    assert seed_ca_targets(db_session, enable=True) == 7
-    assert len(db_session.scalars(select(OfficialSourceTarget)).all()) == 7
+    assert seed_ca_targets(db_session, enable=True) == 6
+    assert len(db_session.scalars(select(OfficialSourceTarget)).all()) == 6
     assert all(target.enabled for target in targets)
     assert targets[0].next_check_at == next_check
     assert targets[0].consecutive_failures == 3
@@ -69,13 +70,39 @@ def test_registration_preserves_valid_observation_continuation(db_session):
               "next_bill_index": 500, "adapter_version": ADAPTER_VERSION}
     target.scope = {**target.scope, "continuation": cursor}
     db_session.flush()
-    assert seed_ca_targets(db_session, enable=True) == 7
+    assert seed_ca_targets(db_session, enable=True) == 6
     assert target.scope["continuation"] == cursor
     assert target.enabled is True
     target.scope = {**target.scope, "continuation": None}
     db_session.flush()
     with pytest.raises(ValueError, match="differs from reviewed scope"):
         seed_ca_targets(db_session, enable=True)
+
+
+def test_registration_preserves_legacy_sunday_target_for_explicit_retirement(db_session):
+    jurisdiction = Jurisdiction(abbreviation="CA", name="California", classification="state")
+    db_session.add(jurisdiction)
+    db_session.flush()
+    next_check = datetime.now(timezone.utc) + timedelta(days=3)
+    legacy = OfficialSourceTarget(
+        jurisdiction_id=jurisdiction.id,
+        adapter_name="ca_official_actions",
+        source_url=ca_actions.ca_delta_url("Sun"),
+        scope={"day": "Sun", "sessions": ["20252026 regular", "special1"]},
+        enabled=True, cadence_seconds=86400, consecutive_failures=3,
+        next_check_at=next_check,
+    )
+    db_session.add(legacy)
+    db_session.flush()
+    original_id = legacy.id
+    assert seed_ca_targets(db_session, enable=True) == 6
+    db_session.refresh(legacy)
+    assert legacy.id == original_id
+    assert legacy.enabled is True
+    assert legacy.consecutive_failures == 3
+    assert legacy.next_check_at == next_check
+    assert official_observer._target_day(legacy, jurisdiction) == "Sun"
+    assert len(db_session.scalars(select(OfficialSourceTarget)).all()) == 7
 
 
 class SessionProbe:

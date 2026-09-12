@@ -44,9 +44,19 @@ candidates (same table set, refreshed daily) but are the same order of
 magnitude in size as the annual dump, so there is no bandwidth advantage to
 preferring them for a first run; `run_ca_fulltext()`'s default derives the
 current odd session-year's annual zip URL. A future refresh cadence could
-switch to `pubinfo_daily_<today's-weekday>.zip` for smaller day-to-day
-deltas once the initial backfill is done, without any parser change (same
-`BILL_VERSION_TBL.dat` + `.lob` layout).
+use `pubinfo_daily_<today's-weekday>.zip` for a newer full snapshot, without
+changing the `BILL_VERSION_TBL.dat` + `.lob` layout. Those files are not
+small daily deltas and require the full-snapshot resource budget.
+
+The September 12, 2026 source review reconfirmed that the small delta family
+has **six** files, Monday through Saturday. The publisher's
+[README](https://downloads.leginfo.legislature.ca.gov/pubinfo_Readme.pdf)
+lists Sunday only in the `pubinfo_daily_*` full-snapshot family; its
+[directory](https://downloads.leginfo.legislature.ca.gov/) likewise has no
+`pubinfo_Sun.zip`. New action-observer registration therefore seeds six
+delta targets. Historical Sunday URLs remain readable for retained evidence;
+the existing production target needs separate, explicit retirement under
+[the dated plan](../operations/ca-sunday-target-retirement.md).
 
 ## Zip internal structure
 
