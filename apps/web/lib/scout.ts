@@ -470,11 +470,11 @@ function scoutServiceNote(value: string, jurisdiction?: string): string {
 
 function apiError(response: Response, payload: unknown): ScoutApiError {
   const body = record(payload);
-  const structuredDetail = record(body?.detail);
+  const structuredDetail = record(body?.error) ?? record(body?.detail);
   if (response.status === 422 && structuredDetail?.message === "invalid_california_retained_query") {
     return new ScoutApiError("For California, enter a bill and session, such as AB 123 2025-2026. Add Special Session 1 only for that session.", response.status);
   }
-  const detail = optionalString(body?.detail) ?? optionalString(body?.message);
+  const detail = optionalString(structuredDetail?.message) ?? optionalString(body?.detail) ?? optionalString(body?.message);
   if (response.status === 401 || response.status === 403) {
     return new ScoutApiError("Sign in is required to start or view Scout research.", response.status);
   }

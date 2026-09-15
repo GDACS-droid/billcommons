@@ -250,14 +250,24 @@ test("California unavailable evidence remains partial and does not imply officia
   assert.deepEqual(normalizeScoutJob({ jurisdiction: "FL", error_class: "unsupported_query" }).errors, ["unsupported_query"]);
 });
 
-test("California admission errors explain the exact session grammar", async (t) => {
+for (const envelope of ["detail", "error"]) test(`California admission errors explain the exact session grammar (${envelope})`, async (t) => {
   const original = globalThis.fetch;
   t.after(() => { globalThis.fetch = original; });
   globalThis.fetch = async (_url, options) => {
     assert.deepEqual(JSON.parse(options.body), { query: "AB 123", jurisdiction: "CA" });
-    return new Response(JSON.stringify({ detail: { code: "invalid_scout_request", message: "invalid_california_retained_query" } }), { status: 422 });
+    return new Response(JSON.stringify({ [envelope]: { code: "invalid_scout_request", message: "invalid_california_retained_query" } }), { status: 422 });
   };
   await assert.rejects(compiled.exports.createScoutJob("AB 123", "CA"), (error) => error.status === 422 && /AB 123 2025-2026/.test(error.message));
+});
+
+test("monitor errors preserve the API envelope's actionable message", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  globalThis.fetch = async () => new Response(JSON.stringify({ error: {
+    code: "scout_monitor_limit", message: "Saved monitor limit reached.", request_id: "fixture",
+  } }), { status: 429 });
+  await assert.rejects(compiled.exports.saveScoutMonitor("fixture", 86400), (error) =>
+    error.status === 429 && error.message === "Saved monitor limit reached.");
 });
 
 test("saved monitor client uses owner-scoped endpoints and preserves bounded history state", async (t) => {
