@@ -82,3 +82,10 @@ This migration is `0031_snapshot_blockers` and revises `0030`. The separate,
 undeployed saved-monitor branch also owns a `0031` revision. Before a combined
 deployment, rebase one revision or create the appropriate Alembic merge
 revision; do not edit either branch's migration in place after deployment.
+
+The controlled migration runner accepts the exact target
+`0031_snapshot_blockers` with its matching
+`--acknowledge-upgrade-0031_snapshot_blockers` flag and an explicit
+`--expected-current 0030`. Its legacy default remains `0025`. An empty migration
+version table is not a valid starting point: establish the actual schema and
+resolve migration metadata recovery separately before invoking this upgrade.

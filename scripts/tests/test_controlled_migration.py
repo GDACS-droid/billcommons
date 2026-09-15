@@ -206,7 +206,7 @@ def test_target_specific_acknowledgement_rejects_wrong_revision_before_alembic()
         )
 
 
-@pytest.mark.parametrize("revision", ["0026", "0027", "0028", "0029", "0030"])
+@pytest.mark.parametrize("revision", ["0026", "0027", "0028", "0029", "0030", "0031_snapshot_blockers"])
 @pytest.mark.parametrize("acknowledgement_revision", [None, ""])
 def test_legacy_boolean_cannot_acknowledge_a_newer_target(revision, acknowledgement_revision):
     with pytest.raises(migration.ControlledMigrationError, match="does not match"):
@@ -224,7 +224,7 @@ def test_legacy_boolean_cannot_acknowledge_a_newer_target(revision, acknowledgem
         )
 
 
-@pytest.mark.parametrize("revision", ["0026", "0027", "0028", "0029", "0030"])
+@pytest.mark.parametrize("revision", ["0026", "0027", "0028", "0029", "0030", "0031_snapshot_blockers"])
 def test_upgrade_uses_explicit_pinned_revision_and_checks_matching_post_revision(revision: str):
     calls: list[dict] = []
 
