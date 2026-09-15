@@ -138,3 +138,167 @@ def test_high_ratio_compressed_pdf_cannot_exhaust_parent_worker():
         "pdf_extract_failed",
     }
     assert time.monotonic() - started < 3
+
+
+def test_large_pdf_with_failed_spawn_bootstrap_does_not_stall_parent(tmp_path):
+    """The deadline must be reachable when the child exits before unpickling."""
+    import os
+    from pathlib import Path
+    import signal
+    import subprocess
+    import sys
+
+    if os.name != "posix":
+        pytest.skip("process-group cleanup for the historical hang requires POSIX")
+    module_root = str(Path(__file__).resolve().parents[1])
+    program = (
+        "import sys, __main__\n"
+        f"sys.path.insert(0, {module_root!r})\n"
+        f"__main__.__file__ = {str(tmp_path / 'missing-bootstrap.py')!r}\n"
+        "from billcommons_scout.pdf_extract import PDFExtractionError, extract_pdf_text\n"
+        "try:\n"
+        "    extract_pdf_text(b'%PDF-' + b'x' * (2 * 1024 * 1024), "
+        "max_pages=1, max_text_chars=128, timeout_seconds=1)\n"
+        "except PDFExtractionError as exc:\n"
+        "    print(str(exc), flush=True)\n"
+        "else:\n"
+        "    raise AssertionError('unexpected extraction success')\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", program], stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, start_new_session=True,
+    )
+    try:
+        output, _ = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate(timeout=2)
+        pytest.fail("large PDF blocked process startup before the extraction deadline")
+    finally:
+        # Also remove a surviving resource tracker after a failed interpreter
+        # bootstrap. The session contains only this test's owned processes.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    assert process.returncode == 0
+    assert output.strip() in {"pdf_extract_failed", "pdf_extract_timeout", "pdf_isolation_unavailable"}
+
+
+@pytest.mark.parametrize("mode", ["success", "invalid", "timeout", "startup_failure"])
+def test_private_pdf_snapshot_is_removed_on_every_outcome(tmp_path, monkeypatch, mode):
+    import multiprocessing
+    import os
+    from pathlib import Path
+    import tempfile
+    import billcommons_scout.pdf_extract as module
+
+    original_directory = tempfile.TemporaryDirectory
+    original_file = tempfile.NamedTemporaryFile
+    seen_directories = []
+    seen_files = []
+
+    def private_directory(**kwargs):
+        context = original_directory(dir=tmp_path, **kwargs)
+        seen_directories.append(Path(context.name))
+        assert os.stat(context.name).st_mode & 0o777 == 0o700
+        return context
+
+    def private_file(**kwargs):
+        stream = original_file(**kwargs)
+        seen_files.append(Path(stream.name))
+        assert os.stat(stream.name).st_mode & 0o777 == 0o600
+        return stream
+
+    monkeypatch.setattr(module.tempfile, "TemporaryDirectory", private_directory)
+    monkeypatch.setattr(module.tempfile, "NamedTemporaryFile", private_file)
+    if mode == "startup_failure":
+        def fail_start(_process):
+            raise OSError("private path must not appear in the public error")
+        monkeypatch.setattr(multiprocessing.process.BaseProcess, "start", fail_start)
+    if mode == "success":
+        assert extract_pdf_text(_pdf_with_text("retained evidence"), max_pages=1, max_text_chars=128) == "retained evidence"
+    else:
+        expected = {"invalid": "pdf_invalid", "timeout": "pdf_extract_timeout", "startup_failure": "pdf_isolation_unavailable"}[mode]
+        with pytest.raises(PDFExtractionError, match=f"^{expected}$"):
+            if mode == "timeout":
+                _run_isolated(_slow_worker, b"input", max_pages=1, max_text_chars=128,
+                              timeout_seconds=0.05, memory_limit_bytes=256 * 1024 * 1024, cpu_limit_seconds=1)
+            else:
+                extract_pdf_text(b"%PDF-invalid", max_pages=1, max_text_chars=128)
+    assert len(seen_directories) == len(seen_files) == 1
+    assert all(not path.exists() for path in seen_directories + seen_files)
+
+
+def test_pdf_snapshot_staging_time_consumes_deadline_before_start(tmp_path, monkeypatch):
+    import billcommons_scout.pdf_extract as module
+
+    ticks = iter((0.0, 2.0))
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(ticks))
+    def forbidden_start(*_args, **_kwargs):
+        raise AssertionError("must not start a parser after staging exhausts the budget")
+    monkeypatch.setattr(module.multiprocessing, "get_context", forbidden_start)
+    with pytest.raises(PDFExtractionError, match="^pdf_extract_timeout$"):
+        extract_pdf_text(b"%PDF-input", max_pages=1, max_text_chars=128, timeout_seconds=1)
+
+
+def test_pdf_snapshot_staging_failure_is_sanitized(monkeypatch):
+    import billcommons_scout.pdf_extract as module
+
+    def fail_directory(**_kwargs):
+        raise OSError("private filesystem details")
+    monkeypatch.setattr(module.tempfile, "TemporaryDirectory", fail_directory)
+    with pytest.raises(PDFExtractionError, match="^pdf_isolation_unavailable$"):
+        extract_pdf_text(b"%PDF-input", max_pages=1, max_text_chars=128)
+
+
+@pytest.mark.parametrize("payload", [b"ab", b"abcd"])
+def test_child_rejects_changed_snapshot_before_invoking_parser(monkeypatch, payload):
+    import billcommons_scout.pdf_extract as module
+
+    limits_applied = []
+    reads = []
+    parser_calls = []
+    messages = []
+    class Input(BytesIO):
+        def read(self, count):
+            reads.append(count)
+            return super().read(count)
+    class Reply:
+        closed = False
+        def send(self, value):
+            messages.append(value)
+        def close(self):
+            self.closed = True
+    def open_snapshot(path, mode):
+        assert limits_applied == [(1000, 1)]
+        assert (path, mode) == ("private-input.pdf", "rb")
+        return Input(payload)
+    monkeypatch.setattr(module, "_apply_resource_limits", lambda memory, cpu: limits_applied.append((memory, cpu)))
+    monkeypatch.setattr(module, "open", open_snapshot, raising=False)
+    reply = Reply()
+    module._dispatch_pdf_worker(reply, "private-input.pdf", 3, lambda *args: parser_calls.append(args), 1, 128, 1000, 1)
+    assert reads == [4]
+    assert parser_calls == []
+    assert messages == [("error", "pdf_extract_failed")]
+    assert reply.closed
+
+
+def test_pipe_endpoints_close_when_process_construction_fails(monkeypatch):
+    import multiprocessing
+    import billcommons_scout.pdf_extract as module
+
+    context = multiprocessing.get_context("spawn")
+    endpoints = []
+    class FailingContext:
+        def Pipe(self, **kwargs):
+            pair = context.Pipe(**kwargs)
+            endpoints.extend(pair)
+            return pair
+        def Process(self, **_kwargs):
+            raise OSError("private setup diagnostics")
+    monkeypatch.setattr(module.multiprocessing, "get_context", lambda _method: FailingContext())
+    with pytest.raises(PDFExtractionError, match="^pdf_isolation_unavailable$"):
+        extract_pdf_text(b"%PDF-input", max_pages=1, max_text_chars=128)
+    assert len(endpoints) == 2
+    assert all(endpoint.closed for endpoint in endpoints)

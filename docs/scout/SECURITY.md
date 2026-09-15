@@ -14,7 +14,15 @@ jurisdiction, not an arbitrary URL.
 - Direct retrieval has request/redirect/retry/time/decompression limits and a 2 MiB
   body ceiling. PDFs additionally require MIME plus `%PDF-`; parsing occurs only in
   a spawned child with parent wall timeout, CPU/address-space, page, and returned-text
-  caps. There is no in-process parser fallback.
+  caps. The candidate worker stages each PDF in a 0600 file inside a private
+  0700 temporary directory and sends only the path and byte count during spawn;
+  a failed child bootstrap therefore cannot block serialization of a large PDF
+  before the result timeout. Staging time consumes the deadline. The child applies
+  resource limits before its bounded input read, and normal completion/failure
+  paths remove the snapshot after child cleanup. Writable temporary storage is
+  required; unavailable storage fails with the existing sanitized isolation error.
+  Abrupt parent-process death may leave a snapshot for host/container temporary-file
+  cleanup. There is no in-process parser fallback.
 - Retrieved excerpts render as React text, never HTML. Extractors cannot execute a
   shell, call tools, read credentials, or treat document prose as instructions.
 - Browser work uses an allowlisted target, a fresh context, blocked service workers,

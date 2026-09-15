@@ -8,6 +8,7 @@ does not fall back to in-process parsing when process isolation is unavailable.
 from __future__ import annotations
 
 import multiprocessing
+import tempfile
 import time
 from collections.abc import Callable
 from multiprocessing.connection import Connection
@@ -101,6 +102,42 @@ def _extract_pdf_worker(
 WorkerTarget = Callable[[Connection, bytes, int, int, int, int], None]
 
 
+
+def _dispatch_pdf_worker(
+    connection: Connection,
+    document_path: str,
+    document_size: int,
+    worker: WorkerTarget,
+    max_pages: int,
+    max_text_chars: int,
+    memory_limit_bytes: int,
+    cpu_limit_seconds: int,
+) -> None:
+    """Load the private snapshot after spawn startup, inside resource limits.
+
+    Passing the document in Process.args makes spawn synchronously write the
+    entire PDF into its bootstrap pipe. A child that dies before unpickling can
+    leave that write blocked before the parent reaches its timeout.
+    """
+    try:
+        _apply_resource_limits(memory_limit_bytes, cpu_limit_seconds)
+        with open(document_path, "rb") as stream:
+            document = stream.read(document_size + 1)
+        if len(document) != document_size:
+            raise ValueError("input snapshot size changed")
+        worker(connection, document, max_pages, max_text_chars, memory_limit_bytes, cpu_limit_seconds)
+    except Exception:
+        try:
+            connection.send(("error", "pdf_extract_failed"))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        try:
+            connection.close()
+        except OSError:
+            pass
+
+
 def _run_isolated(
     worker: WorkerTarget,
     document: bytes,
@@ -111,59 +148,74 @@ def _run_isolated(
     memory_limit_bytes: int,
     cpu_limit_seconds: int,
 ) -> str:
-    """Run a picklable parser worker under a strict wall-clock deadline.
+    """Run a picklable parser worker with a parent-enforced result deadline.
 
     The injectable worker is intentionally private and exists only to make the
     timeout and oversized-result boundary deterministic in tests.
     """
-    context = multiprocessing.get_context("spawn")
-    receive, send = context.Pipe(duplex=False)
-    process = context.Process(
-        target=worker,
-        args=(send, document, max_pages, max_text_chars, memory_limit_bytes, cpu_limit_seconds),
-        daemon=True,
-    )
     started = time.monotonic()
     try:
-        process.start()
-    except Exception as exc:
-        receive.close()
-        send.close()
-        raise PDFExtractionError("pdf_isolation_unavailable") from exc
-    finally:
-        # The parent must not retain the write end; otherwise EOF cannot prove
-        # that a crashed child produced no result.
-        try:
-            send.close()
-        except OSError:
-            pass
+        with tempfile.TemporaryDirectory(prefix="billcommons-scout-pdf-") as directory:
+            # NamedTemporaryFile creates the input with mode 0600 inside the
+            # TemporaryDirectory's 0700 directory. Close before the spawned read.
+            with tempfile.NamedTemporaryFile(dir=directory, suffix=".pdf", delete=False) as stream:
+                stream.write(document)
+                document_path = stream.name
+            if time.monotonic() - started >= timeout_seconds:
+                raise PDFExtractionError("pdf_extract_timeout")
+            context = multiprocessing.get_context("spawn")
+            receive, send = context.Pipe(duplex=False)
+            try:
+                process = context.Process(
+                    target=_dispatch_pdf_worker,
+                    args=(send, document_path, len(document), worker, max_pages, max_text_chars, memory_limit_bytes, cpu_limit_seconds),
+                    daemon=True,
+                )
+                process.start()
+            except Exception as exc:
+                receive.close()
+                send.close()
+                raise PDFExtractionError("pdf_isolation_unavailable") from exc
+            finally:
+                # The parent must not retain the write end; otherwise EOF cannot prove
+                # that a crashed child produced no result.
+                try:
+                    send.close()
+                except OSError:
+                    pass
 
-    try:
-        remaining = max(0.0, timeout_seconds - (time.monotonic() - started))
-        if not receive.poll(remaining):
-            raise PDFExtractionError("pdf_extract_timeout")
-        try:
-            result = receive.recv()
-        except EOFError as exc:
-            raise PDFExtractionError("pdf_extract_failed") from exc
-        if not isinstance(result, tuple) or len(result) != 2:
-            raise PDFExtractionError("pdf_extract_failed")
-        outcome, payload = result
-        if outcome == "ok" and isinstance(payload, str) and len(payload) <= max_text_chars:
-            return payload
-        if outcome == "error" and payload in {"pdf_invalid", "pdf_page_limit"}:
-            raise PDFExtractionError(payload)
-        # Never trust a child response that exceeds the parent-side output cap.
-        raise PDFExtractionError("pdf_extract_failed")
-    finally:
-        receive.close()
-        process.join(timeout=0.1)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=0.5)
-        if process.is_alive():  # pragma: no cover - defensive platform fallback.
-            process.kill()
-            process.join(timeout=0.5)
+            try:
+                remaining = max(0.0, timeout_seconds - (time.monotonic() - started))
+                if not receive.poll(remaining):
+                    raise PDFExtractionError("pdf_extract_timeout")
+                try:
+                    result = receive.recv()
+                except EOFError as exc:
+                    raise PDFExtractionError("pdf_extract_failed") from exc
+                if not isinstance(result, tuple) or len(result) != 2:
+                    raise PDFExtractionError("pdf_extract_failed")
+                outcome, payload = result
+                if outcome == "ok" and isinstance(payload, str) and len(payload) <= max_text_chars:
+                    return payload
+                if outcome == "error" and payload in {"pdf_invalid", "pdf_page_limit"}:
+                    raise PDFExtractionError(payload)
+                # Never trust a child response that exceeds the parent-side output cap.
+                raise PDFExtractionError("pdf_extract_failed")
+            finally:
+                receive.close()
+                process.join(timeout=0.1)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=0.5)
+                if process.is_alive():  # pragma: no cover - defensive platform fallback.
+                    process.kill()
+                    process.join(timeout=0.5)
+    except PDFExtractionError:
+        raise
+    except Exception as exc:
+        # Staging and process setup failures are infrastructure errors. Keep
+        # local paths and operating-system diagnostics out of the public error.
+        raise PDFExtractionError("pdf_isolation_unavailable") from exc
 
 
 def extract_pdf_text(
