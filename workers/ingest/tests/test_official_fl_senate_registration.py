@@ -27,7 +27,19 @@ def _seed_reviewed_initial_inventory(db):
     db.add_all(jurisdictions.values())
     db.flush()
     assert official_worker.seed_discovery_targets(db) == 51
-    assert official_worker.seed_ca_targets(db) == 7
+    assert official_worker.seed_ca_targets(db) == 6
+    # This command validates the historical 58-target inventory, including
+    # the legacy Sunday row. Current seeding deliberately does not create
+    # Sunday; model the retained row explicitly instead of weakening the
+    # registration command's exact-inventory checks.
+    db.add(OfficialSourceTarget(
+        jurisdiction_id=jurisdictions["CA"].id,
+        adapter_name="ca_official_actions",
+        source_url=official_worker.ca_delta_url("Sun"),
+        scope={"day": "Sun", "sessions": ["20252026 regular", "special1"]},
+        enabled=False, cadence_seconds=official_worker.DEFAULT_CADENCE_SECONDS,
+    ))
+    db.flush()
     return jurisdictions
 
 
