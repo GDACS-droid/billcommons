@@ -76,3 +76,41 @@ The manifest always ends in `promotion_state: "requires_human_review"` and
 `execution_authorized: false`. A successful replay only supplies a candidate
 fixture and regression evidence for a separately reviewed repair proposal and
 controlled canary.
+
+## Preparing proposed code and tests
+
+Once a repair author supplies candidate parser source and regression test source,
+bind both to a separately retained baseline manifest digest:
+
+```bash
+python -m billcommons_ingest.official_repair_proposal /absolute/local/path/ca-repair-bundle \
+  --baseline-sha256 TRUSTED_MANIFEST_SHA256 \
+  --candidate-source /absolute/local/path/candidate.py \
+  --regression-source /absolute/local/path/test_candidate.py \
+  --output-dir /absolute/local/path/ca-repair-proposal
+```
+
+This command validates and copies the baseline evidence, retains the exact
+baseline parser source, and stores candidate source and tests as `.py.txt`
+artifacts, alongside a unified `candidate.patch` restricted to the shared CA
+parser path. It hashes every artifact and binds the baseline manifest in
+`proposal.json`. It accepts only a changed parser and bounded UTF-8 source
+files; it rejects symlinks and non-empty output directories. Source text is
+neither compiled nor imported during preparation. The baseline validation runs
+the installed baseline parser, as it does for the original bundle.
+
+The command reports a canonical `proposal_sha256`; retain it separately from
+the proposal. Before consuming the artifact, call
+`validate_repair_proposal(proposal_dir, expected_proposal_sha256=trusted_digest)`
+from `billcommons_ingest.official_repair_proposal`. It validates the exact file
+topology, baseline bundle, source hashes and sizes, and canonical patch against
+the retained baseline and candidate bytes. It does not execute candidate code.
+Artifact names discourage accidental test collection; they are
+not a security boundary. Candidate execution needs a separate isolated runner
+without application credentials or network access. The proposal records
+`evaluation.status: "not_run"` and does not claim that candidate syntax,
+regressions, or repaired output have passed. The original baseline regression
+test still pins the original parser; do not weaken it to accept the candidate.
+
+Automated repair authorship, isolated candidate evaluation, comparison against
+known-good archives, and promotion are still separate unfinished workflow steps.
