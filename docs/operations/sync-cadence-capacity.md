@@ -46,6 +46,40 @@ all three behaviors when changing cadence.
 
 ## Next operational decision
 
+### Local request accounting added September 15
+
+The sync worker now emits version-one JSON `openstates_request_usage` records
+around each API-sync job and session-date top-up. Records share a generated
+`cycle_id`; `openstates_request_cycle_finished` identifies a cycle that reached
+the end of its work phases. Group usage records by that identifier and sum
+their counters. An absent finish record means the observed cycle is incomplete.
+These records are implemented locally; no production demand measurement is
+claimed until this candidate is deployed and complete cycles are observed.
+
+`attempted_requests` counts admitted client calls, including calls that fail
+with a transport error. `retry_attempts` is the subset made after a retryable
+response or transport failure. `logical_bills_requests` counts page/search
+operations before admission, and `logical_jurisdictions_requests` counts
+jurisdiction metadata operations. Their difference from attempts exposes retry
+cost and admission denials; a logical operation is not proof of a fetched page.
+Response classes, transport errors, budget denials, and budget-unavailable
+events have separate counters. Missing counter keys mean zero.
+
+Phase records are emitted while unwinding exceptions, before the caller's
+transaction rollback, so a failed job does not erase observed request costs.
+`phase_returned` says only whether the phase returned normally; it does not
+prove its transaction committed or its jurisdiction became fresh. Elapsed time
+includes admission/pacing waits and local work within that phase.
+
+Accounting is local to the synchronous phase and covers all standard client
+instances it creates. It excludes other processes and consumers, and injected
+clients can have different transport behavior. The normal client does not
+follow redirects automatically. These observations never replace the shared
+durable admission ledger or prove the provider's account entitlement. Records
+contain fixed counters, phase identity and a two-letter state when available;
+they exclude request/response bodies, URLs, query parameters, headers and
+exception messages. Log loss or abrupt process termination can lose observations.
+
 First obtain a complete, bounded observation of per-cycle request demand,
 including pages, retries and session-date calls. The retained daily ledger
 cannot attribute the 35 requests to individual runs or establish a worst-case

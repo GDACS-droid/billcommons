@@ -42,6 +42,7 @@ Subcommands (per BRIEF-wave2.md):
 from __future__ import annotations
 
 import os
+import json
 import argparse
 import math
 import random
@@ -68,6 +69,7 @@ from billcommons_ingest import scheduler as scheduler_mod
 from billcommons_ingest import status as status_mod
 from billcommons_ingest import validation as validation_mod
 from billcommons_ingest.openstates_api import OpenStatesDailyBudgetExceeded
+from billcommons_ingest.openstates_usage import observe_openstates_requests
 from billcommons_ingest.openstates_bulk import ingest_session_csv_zip, peek_session_slug
 from billcommons_ingest.session_match import (
     MatchPath,
@@ -2554,6 +2556,7 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
         while True:
             touched_this_cycle: set = set()
             touched_causal_evidence_by_bill: dict = {}
+            request_cycle_id = str(uuid.uuid4())
 
             # Step 1: enqueue whatever is due.
             db = get_session()
@@ -2594,11 +2597,12 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                     state = job.payload.get("state")
                     try:
                         continuation = api_sync_continuation_kwargs(job.payload)
-                        result = api_sync_mod.run_api_sync_job(
-                            db,
-                            state,
-                            **continuation,
-                        )
+                        with observe_openstates_requests(cycle_id=request_cycle_id, phase="api_sync", state=state):
+                            result = api_sync_mod.run_api_sync_job(
+                                db,
+                                state,
+                                **continuation,
+                            )
                         enqueue_api_sync_continuation(db, result)
                         queue_mod.complete_job(db, job)
                         db.commit()
@@ -2866,7 +2870,8 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                     needy = _needy(session_date_checked)
                 session_date_checked |= {j.id for j in needy}
                 if needy:
-                    stats = refresh_session_dates(db, needy, delay=11.0)
+                    with observe_openstates_requests(cycle_id=request_cycle_id, phase="session_dates"):
+                        stats = refresh_session_dates(db, needy, delay=11.0)
                     db.commit()
                     print(
                         f"sync-worker {worker_id}: session-date top-up -- "
@@ -2947,6 +2952,11 @@ def cmd_sync_worker(args: argparse.Namespace) -> int:
                 finally:
                     db.close()
 
+            print(json.dumps({
+                "event": "openstates_request_cycle_finished", "schema_version": 1,
+                "cycle_id": request_cycle_id, "synced": processed,
+                "failed": failed, "deferred": deferred_count,
+            }, sort_keys=True), flush=True)
             if args.once:
                 return 0
             time.sleep(interval)

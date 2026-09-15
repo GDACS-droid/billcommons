@@ -1,5 +1,6 @@
 """CLI completion status must preserve committed partial-progress evidence."""
 from argparse import Namespace
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -110,6 +111,13 @@ def test_sync_worker_bounds_deferrals_without_spending_attempts(monkeypatch, cap
     output = capsys.readouterr().out
     assert "0 synced, 0 failed, 1 deferred" in output
     assert ("defer skipped" in output) is (not deferred)
+    records = [json.loads(line) for line in output.splitlines() if line.startswith('{"')]
+    usage = next(record for record in records if record["event"] == "openstates_request_usage")
+    finished = next(record for record in records if record["event"] == "openstates_request_cycle_finished")
+    assert usage["phase"] == "api_sync" and usage["state"] == "AK"
+    assert usage["phase_returned"] is False
+    assert usage["cycle_id"] == finished["cycle_id"]
+    assert finished["deferred"] == 1
 
 
 def test_manual_sync_reports_busy_and_rolls_back(monkeypatch, capsys):

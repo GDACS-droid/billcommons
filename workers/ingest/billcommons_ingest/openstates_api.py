@@ -37,6 +37,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from billcommons_ingest.openstates_usage import count_request_event
+
 from billcommons_shared.httpc import DEFAULT_TIMEOUT, RateLimiter, new_client
 from billcommons_shared.source_budget import (
     RequestBudgetExhausted,
@@ -204,6 +206,8 @@ class OpenStatesClient:
     ) -> tuple[dict, bytes, str]:
         api_key = self._resolve_api_key()
         headers = {"X-API-KEY": api_key}
+        endpoint = "bills" if path == "/bills" else "jurisdictions" if path == "/jurisdictions" or path.startswith("/jurisdictions/") else "other"
+        count_request_event(f"logical_{endpoint}_requests")
 
         attempt = 0  # 429 attempts -- unchanged from before this change
         http_retry = 0  # timeout/transport-error/5xx attempts (Change 1)
@@ -212,16 +216,29 @@ class OpenStatesClient:
             # Checked/counted AFTER the (possibly blocking) limiter wait so
             # the UTC date used is the day the request actually goes out on
             # -- see _check_and_consume_budget's docstring.
-            (self.consume_budget or _consume_shared_budget)()
+            try:
+                (self.consume_budget or _consume_shared_budget)()
+            except OpenStatesDailyBudgetExceeded:
+                count_request_event("budget_denials")
+                raise
+            except OpenStatesBudgetUnavailable:
+                count_request_event("budget_unavailable")
+                raise
+            count_request_event("attempted_requests")
+            if attempt or http_retry:
+                count_request_event("retry_attempts")
             try:
                 response = self.client.request(method, path, params=params, headers=headers)
             except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TransportError) as exc:
+                count_request_event("transport_errors")
                 http_retry += 1
                 if http_retry > MAX_HTTP_RETRIES:
                     raise
                 # Paced, not a tight loop: the next iteration re-acquires
                 # the rate limiter before retrying.
                 continue
+            category = response.status_code // 100
+            count_request_event(f"http_{category}xx" if category in range(1, 6) else "http_other")
             if response.status_code == 429:
                 attempt += 1
                 if attempt > self.max_retries_on_429:
