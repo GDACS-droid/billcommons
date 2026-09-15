@@ -112,8 +112,67 @@ without application credentials or network access. The proposal records
 regressions, or repaired output have passed. The original baseline regression
 test still pins the original parser; do not weaken it to accept the candidate.
 
-Automated repair authorship, isolated candidate evaluation, comparison against
-known-good archives, and promotion are still separate unfinished workflow steps.
+## Evaluating a pinned proposal locally
+
+The native evaluator now runs the pinned baseline and candidate in separate
+restricted interpreters and compares their full returned action facts with a
+baseline computed by the trusted parent:
+
+```bash
+python -m billcommons_ingest.official_repair_evaluation /absolute/local/path/ca-repair-proposal \
+  --proposal-sha256 TRUSTED_PROPOSAL_SHA256
+```
+
+This is an explicit execution command. The inert proposal's manifest is not an
+execution authorization and is never rewritten. The report binds the proposal,
+fixture, actual source bytes, and bootstrap digests, records the host runtime,
+and labels its scope `one_retained_ca_archive`. Retain the report alongside the
+separately trusted proposal digest. No application record, source target, Git
+branch, or deployment is changed by evaluation.
+
+`same_as_current_baseline` means that every returned action field and raw source
+field matched for this archive, including ordering. Equal bill/event counts with
+different content do not match. This result is a regression observation, not
+proof of historical repair or general correctness. Different facts require an
+independent expected-fact oracle; a rejected current baseline is explicitly
+reported as requiring such an oracle. Authored regression tests remain inert
+and `not_run`, and every report sets `promotion_authorized: false`. The command
+exits zero only for `same_as_current_baseline`, one for other evaluation results,
+and two for rejected input evidence.
+
+The supported runner host is Linux x86_64 with Landlock ABI 4 or newer,
+`libseccomp.so.2`, and a responsive local `/tmp` filesystem. Missing required
+confinement stops before candidate loading. There is no weaker fallback.
+The parent launches a fresh `python -I -S -B` process with an empty environment,
+closed inherited descriptors, `/dev/null` input and captured output pipes. The
+child verifies one thread and the staged files before applying filesystem and
+syscall restrictions. Only the staged inputs are readable; file writes,
+networking, process creation, signals to other processes, and process-memory
+access are denied. Filesystem metadata syscalls remain available. The supported
+parser imports are the preloaded standard-library dependencies of the existing
+CA parser; importing additional modules may fail in this environment.
+
+Policy caps are 256 KiB source, 8 MiB archive, 256 MiB child address space,
+five CPU seconds, 16 MiB combined stdout/stderr, and a 12-second staging/execution
+budget. Staging uses local `/tmp` rather than environment-selected `TMPDIR`;
+the deadline is checked before launch, but a stalled host filesystem is outside
+the wall-time guarantee. The parent kills the fresh process group before reaping
+its leader, including when a descendant retains a pipe after leader exit. The
+whole child interpreter and its output remain untrusted; separate Python globals
+are not an isolation boundary. Error output is discarded, and the parent
+independently validates and hashes all returned facts. This kernel boundary does
+not defend against a compromised host or kernel vulnerability.
+
+The first retained-archive smoke proposal deliberately changed only a source
+comment. Baseline and candidate both returned 275 bills / 7,094 events and full
+fact SHA-256 `5150ff4a18ea9fcabbdb36d6b261566fa304672fbaf10359d65f869f8b1847df`.
+Its local report is retained at
+`/home/alberto/.local/share/billcommons/reliability-release-20260908/native-evaluation-smoke-20260915-th2sosgj/evaluation.json`.
+This proves the execution/comparison path for that proposal, not a parser repair.
+
+Automated repair authorship, executing proposed regression tests, comparison
+against a separately selected known-good corpus, and promotion remain
+unfinished workflow steps.
 
 ## Native isolation feasibility — September 15, 2026
 
@@ -141,10 +200,11 @@ under a 256 MiB address-space limit; a separate infinite-loop probe terminated
 with signal 9 after 5.01 seconds under a five-second CPU limit, before its
 12-second parent timeout. These observations cover these probes only.
 
-The trusted prototype and results are retained locally in
+The original trusted prototype and results are retained locally in
 `/home/alberto/.local/share/billcommons/reliability-release-20260908/native-sandbox-probe-20260915/`.
-They must not be used to execute generated code. The production evaluator still
-needs a fresh single-thread child, explicit failure handling, closed inherited
+They must not be used to execute generated code. The review identified the
+following requirements, now implemented by the separate evaluator above:
+a fresh single-thread child, explicit failure handling, closed inherited
 file descriptors, private immutable verified inputs, a bounded pipe reader,
 wall timeout and kill/reap handling, and a separately trusted comparison of
 returned facts. Treat the whole child interpreter and its output as untrusted:

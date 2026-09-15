@@ -13,24 +13,30 @@ in the original checkout are preserved. The canonical inventory covers 50 states
 plus DC. Generic website observation is never treated as proof of statewide
 semantic freshness or completeness.
 
-## Repair executor feasibility — September 15
+## Native repair evaluator — September 15
 
-A new trusted-only native probe passed the unchanged CA parser and retained
-archive under Landlock ABI 4 plus a default-deny libseccomp syscall filter.
-The replay matched 275 bills and 7,094 events, with matching parser and archive
-digests. Synthetic file/network/process denials and separate memory/CPU limit
-probes passed. This changes the next action: implement and adversarially verify
-a bounded native evaluator instead of treating the earlier CLI sandbox failure
-as proof that this host cannot isolate native Python. The earlier WASI prototype
-could isolate execution but could not support the unchanged parser's LZMA import.
+The local evaluator now authenticates a proposal, runs its baseline and candidate
+in separate restricted native interpreters, and independently compares every
+returned action field and raw source field. A pinned retained-archive smoke
+proposal changed only a comment; both sources returned 275 bills / 7,094 events
+with full fact digest
+`5150ff4a18ea9fcabbdb36d6b261566fa304672fbaf10359d65f869f8b1847df`.
+This proves that execution/comparison path, not a parser repair. Authored tests
+remain unexecuted, the scope is one retained CA archive, and promotion remains
+unauthorized. See the [evaluation command and limitations](adapter-repair-lab.md#evaluating-a-pinned-proposal-locally).
 
-The native probe is not a production candidate runner. No generated code was
-executed. The reviewer identified required descriptor hygiene, single-thread
-bootstrap, immutable minimal staging, output limits, timeout/reaping, and
-host-side verification of child results. Separate Python globals are not a
-security boundary; the entire child is untrusted. See the
-[repair-lab evidence and remaining gates](adapter-repair-lab.md#native-isolation-feasibility--september-15-2026).
-The production revision-metadata coordination hold below is unchanged.
+The integrated parent/child/evaluation/proposal/bundle/CA checks passed 94 tests;
+the subsequent missing-library failure gate passed its four-test child suite.
+Tests include actual file/network/process denials, an inherited descriptor,
+resource overruns, malformed or forged output, content changes with equal
+counts, and group cleanup after leader exit. The canonical review is still
+required before declaring this change verified or deploying it.
+
+The earlier native probe established Landlock ABI 4 plus libseccomp feasibility
+without changing the parser's LZMA support. That prototype remains trusted-only;
+use the separate evaluator for proposals. Its full child interpreter and output
+remain untrusted, with evidence and comparisons computed by the parent. The
+production revision-metadata coordination hold below is unchanged.
 
 ## Fresh production observation — September 15, 15:29–15:33 UTC
 
