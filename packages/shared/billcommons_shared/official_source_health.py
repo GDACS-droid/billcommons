@@ -30,6 +30,41 @@ class OfficialTargetHealth:
     next_check_at: datetime
 
 
+_OFFICIAL_SOURCE_HEALTH_SQL = """
+    WITH bounded_targets AS MATERIALIZED (
+        SELECT t.jurisdiction_id, t.id AS target_id, t.adapter_name,
+               t.source_url, t.enabled, t.cadence_seconds, t.next_check_at
+          FROM official_source_targets t
+         WHERE t.jurisdiction_id IN :jurisdiction_ids
+         ORDER BY t.jurisdiction_id, t.id
+         LIMIT :row_limit
+    )
+    SELECT t.jurisdiction_id, t.target_id, t.adapter_name,
+           t.source_url, t.enabled, t.cadence_seconds, t.next_check_at,
+           o.id AS observation_id, o.adapter_name AS observed_adapter_name,
+           o.source_url AS observed_source_url, o.retrieved_at,
+           o.upstream_updated_at, o.status
+      FROM bounded_targets t
+      LEFT JOIN LATERAL (
+          SELECT id, adapter_name, source_url, retrieved_at,
+                 upstream_updated_at, status
+            FROM official_source_observations
+           WHERE target_id = t.target_id
+           ORDER BY retrieved_at DESC, created_at DESC, id DESC
+           LIMIT 1
+      ) o ON true
+     ORDER BY t.jurisdiction_id, t.target_id
+"""
+
+
+def _health_statement(*, explain_analyze: bool = False):
+    """Build the collector statement, optionally as an exact plan probe for tests."""
+    prefix = "EXPLAIN (ANALYZE, FORMAT JSON) " if explain_analyze else ""
+    return text(prefix + _OFFICIAL_SOURCE_HEALTH_SQL).bindparams(
+        bindparam("jurisdiction_ids", expanding=True),
+    )
+
+
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         raise ValueError("official observation health requires timezone-aware timestamps")
@@ -75,26 +110,7 @@ def collect_official_source_health(
     """
     if not jurisdiction_ids:
         return {}
-    statement = text("""
-        SELECT t.jurisdiction_id, t.id AS target_id, t.adapter_name,
-               t.source_url, t.enabled, t.cadence_seconds, t.next_check_at,
-               o.id AS observation_id, o.adapter_name AS observed_adapter_name,
-               o.source_url AS observed_source_url, o.retrieved_at,
-               o.upstream_updated_at, o.status
-          FROM official_source_targets t
-          LEFT JOIN LATERAL (
-              SELECT id, adapter_name, source_url, retrieved_at,
-                     upstream_updated_at, status
-                FROM official_source_observations
-               WHERE target_id = t.id
-               ORDER BY retrieved_at DESC, created_at DESC, id DESC
-               LIMIT 1
-          ) o ON true
-         WHERE t.jurisdiction_id IN :jurisdiction_ids
-         ORDER BY t.jurisdiction_id, t.id
-         LIMIT :row_limit
-    """).bindparams(bindparam("jurisdiction_ids", expanding=True))
-    rows = db.execute(statement, {
+    rows = db.execute(_health_statement(), {
         "jurisdiction_ids": jurisdiction_ids,
         "row_limit": MAX_OFFICIAL_HEALTH_TARGETS + 1,
     }).mappings().all()
