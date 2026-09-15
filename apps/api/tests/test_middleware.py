@@ -14,6 +14,7 @@ from billcommons_api.middleware import AccountCorsMiddleware
 _ALLOWED_ORIGIN = "https://billcommons.org"
 _DENIED_ORIGIN = "https://evil.example"
 _SCOUT_PREFLIGHT_PATHS = (
+    "/api/v1/scout/monitors/00000000-0000-0000-0000-000000000001",
     "/api/v1/scout/jobs",
     "/api/v1/scout/jobs/00000000-0000-0000-0000-000000000001",
     "/api/v1/scout/jobs/00000000-0000-0000-0000-000000000001/cancel",
@@ -37,12 +38,13 @@ def cors_client():
 
 
 @pytest.mark.parametrize("path", _SCOUT_PREFLIGHT_PATHS)
-def test_scout_preflight_all_job_paths_allow_credentials_only_for_allowlisted_origin(cors_client, path):
+@pytest.mark.parametrize("method", ["POST", "PATCH"])
+def test_scout_preflight_all_job_paths_allow_credentials_only_for_allowlisted_origin(cors_client, path, method):
     allowed = cors_client.options(
         path,
         headers={
             "Origin": _ALLOWED_ORIGIN,
-            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Method": method,
             "Access-Control-Request-Headers": "Content-Type",
         },
     )
@@ -50,11 +52,12 @@ def test_scout_preflight_all_job_paths_allow_credentials_only_for_allowlisted_or
     assert allowed.status_code == 204
     assert allowed.headers["access-control-allow-origin"] == _ALLOWED_ORIGIN
     assert allowed.headers["access-control-allow-credentials"] == "true"
+    assert method in {value.strip() for value in allowed.headers["access-control-allow-methods"].split(",")}
     assert "Origin" in allowed.headers["vary"]
 
     denied = cors_client.options(
         path,
-        headers={"Origin": _DENIED_ORIGIN, "Access-Control-Request-Method": "POST"},
+        headers={"Origin": _DENIED_ORIGIN, "Access-Control-Request-Method": method},
     )
 
     assert denied.status_code == 204
