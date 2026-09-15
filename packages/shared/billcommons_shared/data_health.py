@@ -9,7 +9,8 @@ In particular, a recent ``ingestion_runs`` timestamp means only that the
 local pipeline reported a successful run.  It does not prove that the
 upstream source was current, complete, or unchanged.  Until an adapter stores
 an official differential reconciliation result, every jurisdiction's
-``official_reconciliation`` state remains ``unavailable``.
+``official_reconciliation`` state remains ``unavailable``. Stored official
+observation health is included separately and does not change that state.
 
 The worker package supplies the command-line wrapper.  Keeping this module
 free of worker imports lets API-only images expose the same report contract.
@@ -32,6 +33,11 @@ from billcommons_schema.models import (
     JurisdictionCoverage,
 )
 from billcommons_schema.models import Session as SessionModel
+from billcommons_shared.official_source_health import (
+    OFFICIAL_TARGET_STATES,
+    OfficialTargetHealth,
+    collect_official_source_health,
+)
 
 
 REPORT_VERSION = 1
@@ -66,6 +72,7 @@ RECENTLY_ADJOURNED_WINDOW_DAYS = 30
 # small allowance for clock propagation or a report captured across a boundary,
 # but surface a materially future local success rather than treating it as fresh.
 MAX_FUTURE_SYNC_SKEW_MINUTES = 5
+MAX_OFFICIAL_TARGET_SAMPLES = 5
 
 SEVERITY_ORDER = {"critical": 0, "error": 1, "warning": 2, "info": 3}
 FAIL_ON_ORDER = {"critical": 0, "error": 1, "warning": 2}
@@ -133,6 +140,7 @@ class JurisdictionEvidence:
     oldest_running_api_sync_at: datetime | None = None
     deferred_api_sync_jobs: int = 0
     next_deferred_api_sync_at: datetime | None = None
+    official_targets: tuple[OfficialTargetHealth, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -449,6 +457,45 @@ def defects_for(evidence: JurisdictionEvidence, *, now: datetime) -> list[Defect
                 )
             )
 
+    official_defects = {
+        "failed": (
+            "warning", "OFFICIAL_SOURCE_OBSERVATION_FAILED",
+            "Official-source targets have failed or invalid latest observations.",
+        ),
+        "observation_overdue": (
+            "warning", "OFFICIAL_SOURCE_OBSERVATION_OVERDUE",
+            "Official-source observations are older than their configured observation cadence.",
+        ),
+        "not_observed": (
+            "info", "OFFICIAL_SOURCE_NOT_OBSERVED",
+            "Enabled official-source targets have no recorded observation.",
+        ),
+        "changed_target": (
+            "warning", "OFFICIAL_SOURCE_TARGET_CHANGED",
+            "Official-source targets differ from the endpoints or adapters in their latest observations.",
+        ),
+        "future_observation": (
+            "error", "OFFICIAL_SOURCE_FUTURE_OBSERVATION",
+            "Official-source retrieval timestamps are more than five minutes in the future.",
+        ),
+    }
+    for state, (severity, code, message) in official_defects.items():
+        targets = sorted(
+            (target for target in evidence.official_targets if target.state == state),
+            key=lambda target: target.target_id,
+        )
+        if targets:
+            defects.append(Defect(severity, code, jurisdiction, message, {
+                "target_count": len(targets),
+                "target_ids": [target.target_id for target in targets[:MAX_OFFICIAL_TARGET_SAMPLES]],
+                "sample_truncated": len(targets) > MAX_OFFICIAL_TARGET_SAMPLES,
+                "evidence_url": f"/api/v1/official-evidence/observations?jurisdiction={jurisdiction}",
+                "interpretation": (
+                    "Observation health only; this does not establish statewide freshness "
+                    "or authorize a retry."
+                ),
+            }))
+
     return defects
 
 
@@ -487,6 +534,7 @@ def build_report(evidence: Iterable[JurisdictionEvidence], *, now: datetime | No
                     "oldest_running_api_sync_at": _timestamp(item.oldest_running_api_sync_at),
                     "deferred_api_sync_jobs": item.deferred_api_sync_jobs,
                     "next_deferred_api_sync_at": _timestamp(item.next_deferred_api_sync_at),
+                    "official_sources": _official_source_health_dict(item),
                 },
                 "parser_health": asdict(item.bills),
                 "coverage": asdict(item.coverage) if item.coverage else None,
@@ -497,7 +545,10 @@ def build_report(evidence: Iterable[JurisdictionEvidence], *, now: datetime | No
                 ),
                 "official_reconciliation": {
                     "state": RECONCILIATION_UNAVAILABLE,
-                    "reason": "This local ingestion report does not assess official observations or differential results.",
+                    "reason": (
+                        "This report assesses stored observation health but does not assess per-bill "
+                        "differential reconciliation results."
+                    ),
                     "evidence_url": f"/api/v1/official-evidence/observations?jurisdiction={item.abbreviation}",
                 },
             }
@@ -520,6 +571,35 @@ def build_report(evidence: Iterable[JurisdictionEvidence], *, now: datetime | No
         },
         "jurisdictions": rows,
         "defects": [asdict(defect) for defect in defects],
+    }
+
+
+def _official_source_health_dict(item: JurisdictionEvidence) -> dict[str, Any]:
+    counts = {state: 0 for state in OFFICIAL_TARGET_STATES}
+    for target in item.official_targets:
+        counts[target.state] += 1
+    priority = {state: index for index, state in enumerate((
+        "future_observation", "failed", "changed_target", "observation_overdue",
+        "not_observed", "disabled", "observed",
+    ))}
+    samples = sorted(item.official_targets, key=lambda target: (priority[target.state], target.target_id))
+    return {
+        "target_count": len(item.official_targets),
+        "targets_by_state": counts,
+        "samples_truncated": len(samples) > MAX_OFFICIAL_TARGET_SAMPLES,
+        "samples": [{
+            "target_id": target.target_id,
+            "observation_id": target.observation_id,
+            "state": target.state,
+            "retrieved_at": _timestamp(target.retrieved_at),
+            "source_response_updated_at": _timestamp(target.upstream_updated_at),
+            "next_check_at": _timestamp(target.next_check_at),
+        } for target in samples[:MAX_OFFICIAL_TARGET_SAMPLES]],
+        "evidence_url": f"/api/v1/official-evidence/observations?jurisdiction={item.abbreviation}",
+        "interpretation": (
+            "Retained observation health only. Source-response timestamps are not legislative action dates "
+            "or statewide freshness proof."
+        ),
     }
 
 
@@ -759,6 +839,7 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
             )
             jobs_by_state[str(row.state).upper()][row.status] = (int(row.count), oldest_at)
 
+    official_sources = collect_official_source_health(db, jurisdiction_ids=jurisdiction_ids, now=now)
     result = []
     for abbreviation in canonical_codes:
         jurisdiction = jurisdictions_by_code.get(abbreviation)
@@ -813,6 +894,7 @@ def collect_evidence(db: OrmSession, *, now: datetime | None = None) -> list[Jur
                 oldest_running_api_sync_at=jobs.get("running", (0, None))[1],
                 deferred_api_sync_jobs=deferred_by_state.get(abbreviation, (0, None))[0],
                 next_deferred_api_sync_at=deferred_by_state.get(abbreviation, (0, None))[1],
+                official_targets=official_sources.get(jurisdiction.id, ()),
             )
         )
     return result
@@ -831,7 +913,7 @@ def render_text(report: dict[str, Any]) -> str:
     lines = [
         "Bill Commons Data Reliability Control Plane (read-only)",
         f"generated at: {report['generated_at']}",
-        "official freshness: UNVERIFIED (no official-source fetch or stored differential)",
+        "official freshness: UNVERIFIED (stored observation health does not prove statewide freshness)",
         (
             f"jurisdictions: {summary['jurisdiction_count']}; defects: {summary['defect_count']} "
             f"(critical={summary['defects_by_severity']['critical']}, "

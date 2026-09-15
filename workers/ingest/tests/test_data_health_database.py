@@ -7,6 +7,8 @@ semantics rather than a mocked query result.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+import hashlib
+import uuid
 
 import pytest
 
@@ -16,9 +18,13 @@ from billcommons_schema.models import (
     IngestionRun,
     Jurisdiction,
     JurisdictionCoverage,
+    OfficialRawBlob,
+    OfficialSourceObservation,
+    OfficialSourceTarget,
     Session as SessionModel,
 )
 from billcommons_shared.data_health import collect_report
+from billcommons_shared import official_source_health
 
 
 NOW = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
@@ -57,6 +63,91 @@ def _seed_current_session(db_session, abbreviation: str):
 
 def _report_row(report, abbreviation):
     return next(row for row in report["jurisdictions"] if row["jurisdiction"] == abbreviation)
+
+
+def _official_target(db_session, jurisdiction):
+    target = OfficialSourceTarget(
+        jurisdiction_id=jurisdiction.id,
+        adapter_name="source-health-test/1",
+        source_url=f"https://example.invalid/{uuid.uuid4()}",
+        enabled=True,
+        cadence_seconds=3600,
+        next_check_at=NOW + timedelta(hours=1),
+    )
+    db_session.add(target)
+    db_session.flush()
+    return target
+
+
+def test_latest_official_observation_is_scoped_and_deterministic(db_session):
+    jurisdiction, _ = _seed_current_session(db_session, "CA")
+    other_jurisdiction, _ = _seed_current_session(db_session, "FL")
+    target = _official_target(db_session, jurisdiction)
+    other_target = _official_target(db_session, other_jurisdiction)
+    raw = b"source health fixture"
+    digest = hashlib.sha256(raw).hexdigest()
+    db_session.add(OfficialRawBlob(sha256=digest, data=raw, content_type="text/plain"))
+    db_session.flush()
+
+    def observation(identity, status, retrieved, created):
+        return OfficialSourceObservation(
+            id=uuid.UUID(int=identity),
+            target_id=target.id,
+            adapter_name=target.adapter_name,
+            adapter_version="test/1",
+            source_url=target.source_url,
+            retrieved_at=retrieved,
+            created_at=created,
+            status=status,
+            upstream_updated_at=NOW - timedelta(days=2),
+            raw_sha256=digest if status == "succeeded" else None,
+            record_count=1 if status == "succeeded" else None,
+            error_class="safe_fixture_failure" if status == "failed" else None,
+        )
+
+    # Retrieval time wins over creation time; creation time wins over UUID.
+    failure = observation(2, "failed", NOW, NOW)
+    db_session.add_all([
+        observation(5, "succeeded", NOW - timedelta(hours=1), NOW + timedelta(hours=1)),
+        observation(4, "succeeded", NOW, NOW - timedelta(seconds=1)),
+        failure,
+    ])
+    db_session.flush()
+    report = collect_report(db_session, now=NOW)
+    source = _report_row(report, "CA")["source_health"]["official_sources"]
+    assert source["target_count"] == 1
+    assert source["targets_by_state"]["failed"] == 1
+    assert source["samples"][0]["observation_id"] == str(failure.id)
+    assert _report_row(report, "FL")["source_health"]["official_sources"]["targets_by_state"]["not_observed"] == 1
+    assert other_target.id != target.id
+    assert not db_session.new and not db_session.dirty and not db_session.deleted
+
+    latest = observation(3, "succeeded", NOW, NOW)
+    db_session.add(latest)
+    db_session.flush()
+    source = _report_row(collect_report(db_session, now=NOW), "CA")["source_health"]["official_sources"]
+    assert source["targets_by_state"]["observed"] == 1
+    assert source["samples"][0]["observation_id"] == str(latest.id)
+    assert source["samples"][0]["source_response_updated_at"] == (NOW - timedelta(days=2)).isoformat()
+
+    target.source_url += "/changed"
+    db_session.flush()
+    source = _report_row(collect_report(db_session, now=NOW), "CA")["source_health"]["official_sources"]
+    assert source["targets_by_state"]["changed_target"] == 1
+
+
+def test_official_source_inventory_fails_instead_of_truncating(db_session, monkeypatch):
+    jurisdiction, _ = _seed_current_session(db_session, "CA")
+    monkeypatch.setattr(official_source_health, "MAX_OFFICIAL_HEALTH_TARGETS", 2)
+    for _ in range(2):
+        _official_target(db_session, jurisdiction)
+    result = official_source_health.collect_official_source_health(
+        db_session, jurisdiction_ids=(jurisdiction.id,), now=NOW,
+    )
+    assert len(result[jurisdiction.id]) == 2
+    _official_target(db_session, jurisdiction)
+    with pytest.raises(ValueError, match="inventory exceeds"):
+        collect_report(db_session, now=NOW)
 
 
 def test_session_coverage_and_source_specific_sync_health_use_real_postgres_rows(

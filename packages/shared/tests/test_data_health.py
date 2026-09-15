@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from billcommons_shared.official_source_health import OfficialTargetHealth
+
 from billcommons_shared.data_health import (
     BillEvidence,
     CoverageEvidence,
@@ -19,6 +21,45 @@ from billcommons_shared.data_health import (
 
 
 NOW = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+
+
+def test_official_source_failures_join_ledger_with_bounded_evidence():
+    targets = tuple(OfficialTargetHealth(
+        target_id=f"target-{index}", observation_id=f"observation-{index}",
+        state="failed", retrieved_at=NOW, upstream_updated_at=NOW - timedelta(days=2),
+        next_check_at=NOW + timedelta(hours=1),
+    ) for index in range(8))
+    report = build_report([_evidence(official_targets=targets)], now=NOW)
+    source_health = report["jurisdictions"][0]["source_health"]["official_sources"]
+    assert source_health["target_count"] == 8
+    assert source_health["targets_by_state"]["failed"] == 8
+    assert len(source_health["samples"]) == 5 and source_health["samples_truncated"]
+    defect = next(d for d in report["defects"] if d["code"] == "OFFICIAL_SOURCE_OBSERVATION_FAILED")
+    assert defect["evidence"]["target_count"] == 8
+    assert len(defect["evidence"]["target_ids"]) == 5
+    assert report["honesty"]["official_freshness"] == "unverified"
+    assert report["jurisdictions"][0]["official_reconciliation"]["state"] == "unavailable"
+
+
+def test_observed_and_disabled_targets_do_not_create_operational_failure():
+    targets = tuple(OfficialTargetHealth(
+        target_id=state, observation_id=state, state=state,
+        retrieved_at=NOW, upstream_updated_at=None, next_check_at=NOW,
+    ) for state in ("observed", "disabled"))
+    report = build_report([_evidence(official_targets=targets)], now=NOW)
+    assert not any(d["code"].startswith("OFFICIAL_SOURCE_") for d in report["defects"])
+    assert report["honesty"]["official_freshness"] == "unverified"
+
+
+def test_future_official_observation_fails_error_gate():
+    target = OfficialTargetHealth(
+        target_id="target", observation_id="observation", state="future_observation",
+        retrieved_at=NOW + timedelta(minutes=6), upstream_updated_at=None, next_check_at=NOW,
+    )
+    report = build_report([_evidence(official_targets=(target,))], now=NOW)
+    defect = next(d for d in report["defects"] if d["code"] == "OFFICIAL_SOURCE_FUTURE_OBSERVATION")
+    assert defect["severity"] == "error"
+    assert exit_code(report, "error") == 1
 
 
 def _evidence(**overrides) -> JurisdictionEvidence:
