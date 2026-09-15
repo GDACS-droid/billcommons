@@ -1,7 +1,7 @@
 """Fail-closed native bootstrap for one untrusted CA parser candidate.
 
 This file is copied as ``bootstrap.py`` into a parent-created private stage and
-is executed as ``python -I -S -B bootstrap.py STAGE``.  It deliberately trusts
+is executed as ``python -I -S -B bootstrap.py STAGE PARENT_PID``. It deliberately trusts
 only the parent to create the immutable stage.  The candidate interpreter,
 candidate source, and every byte written to stdout are untrusted; separate
 Python globals are not a security boundary.  This is also a same-user,
@@ -70,6 +70,7 @@ LANDLOCK_ACCESS_FS_READ_FILE = 1 << 2
 LANDLOCK_ACCESS_FS_READ_DIR = 1 << 3
 PR_SET_DUMPABLE = 4
 PR_SET_NO_NEW_PRIVS = 38
+PR_SET_PDEATHSIG = 1
 SCMP_ACT_ALLOW = 0x7FFF0000
 SCMP_ACT_ERRNO = 0x00050000
 
@@ -188,7 +189,7 @@ def _strict_request(raw: bytes) -> tuple[str, datetime.datetime]:
     return source_url, parsed_at
 
 
-def _configure_native(stage: str) -> None:
+def _configure_native(stage: str, expected_parent: int) -> None:
     _check(sys.platform == "linux" and platform.machine() == "x86_64")
     # Load libraries inside the bootstrap error boundary and before Landlock
     # removes system-library access. Missing libseccomp must fail closed.
@@ -196,6 +197,14 @@ def _configure_native(stage: str) -> None:
     seccomp = ctypes.CDLL("libseccomp.so.2", use_errno=True)
     libc.syscall.restype = ctypes.c_long
     libc.prctl.restype = ctypes.c_int
+    # A sleeping candidate does not consume its CPU limit. Tie its lifetime to
+    # the creating supervisor thread before loading any candidate bytes. The
+    # second identity check closes the race where that parent died just before
+    # prctl: the kernel does not send this signal retroactively. Seccomp later
+    # denies prctl, credential changes and fork, so the candidate cannot undo it.
+    _check(expected_parent > 0 and os.getppid() == expected_parent)
+    _checked_call(libc.prctl(PR_SET_PDEATHSIG, 9, 0, 0, 0))
+    _check(os.getppid() == expected_parent)
     abi = libc.syscall(LANDLOCK_CREATE_RULESET, 0, 0, LANDLOCK_CREATE_RULESET_VERSION)
     _check(abi >= 4)
     rules = _LandlockRulesetAttr(LANDLOCK_ACCESS_FS_ALL, LANDLOCK_ACCESS_NET_TCP)
@@ -292,12 +301,13 @@ def _run_candidate() -> None:
 def main() -> int:
     os.environ.clear()
     try:
-        _check(len(sys.argv) == 2)
+        _check(len(sys.argv) == 3 and len(sys.argv[2]) <= 16)
         stage = sys.argv[1]
+        expected_parent = int(sys.argv[2])
         _single_thread_and_fds()
         _verify_standard_fds()
         _validate_stage(stage)
-        _configure_native(stage)
+        _configure_native(stage, expected_parent)
     except BaseException:
         return BOOTSTRAP_EXIT
     try:

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import textwrap
 
 
 CHILD = Path(__file__).parents[1] / "billcommons_ingest" / "official_repair_sandbox_child.py"
@@ -46,9 +48,10 @@ def _stage(tmp_path: Path, source: str) -> Path:
     return stage
 
 
-def _run(stage: Path) -> subprocess.CompletedProcess[str]:
+def _run(stage: Path, *, parent_pid: int | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-I", "-S", "-B", str(stage / "bootstrap.py"), str(stage)],
+        [sys.executable, "-I", "-S", "-B", str(stage / "bootstrap.py"), str(stage),
+         str(os.getpid() if parent_pid is None else parent_pid)],
         env={},
         stdin=subprocess.DEVNULL,
         capture_output=True,
@@ -106,3 +109,69 @@ def test_missing_native_library_stops_before_candidate_loading(tmp_path):
     assert completed.returncode == 78
     assert completed.stdout == completed.stderr == ""
     assert not marker.exists()
+
+
+def test_wrong_parent_identity_stops_before_candidate_loading(tmp_path):
+    completed = _run(_stage(tmp_path, "import os\nos.write(1, b'candidate-loaded')\n"), parent_pid=0)
+    assert completed.returncode == 78
+    assert completed.stdout == completed.stderr == ""
+
+
+def test_blocked_candidate_dies_when_supervisor_is_killed(tmp_path):
+    # A real FUTEX_WAIT sleeps without using RLIMIT_CPU. Run a separate trusted
+    # subreaper harness so pytest never acquires global child-reaping duties.
+    stage = _stage(tmp_path, """import os, ctypes
+os.write(1, b'candidate-started\\n')
+word = ctypes.c_int(0)
+ctypes.CDLL(None).syscall(202, ctypes.byref(word), 0, 0, 0, 0, 0)
+""")
+    supervisor = textwrap.dedent('''
+        import os, signal, subprocess, sys, time
+        signal.alarm(7)
+        stage = sys.argv[1]
+        child = subprocess.Popen([sys.executable, '-I', '-S', '-B', stage + '/bootstrap.py',
+            stage, str(os.getpid())], env={}, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        print(child.pid, flush=True)
+        assert child.stdout.readline() == b'candidate-started\\n'
+        print('ready', flush=True)
+        time.sleep(30)
+    ''')
+    harness = textwrap.dedent('''
+        import ctypes, json, os, signal, subprocess, sys, time
+        assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+        parent = subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child_pid = None
+        child_reaped = False
+        try:
+            child_pid = int(parent.stdout.readline())
+            assert parent.stdout.readline().strip() == 'ready'
+            parent.kill()
+            parent.wait(timeout=2)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                found, status = os.waitpid(child_pid, os.WNOHANG)
+                if found:
+                    child_reaped = True
+                    assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+                    print(json.dumps({'blocked_candidate_killed': True}))
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError('candidate survived supervisor death')
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+            parent.wait(timeout=2)
+            if child_pid is not None and not child_reaped:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(child_pid, 0)
+    ''')
+    completed = subprocess.run([sys.executable, "-c", harness, supervisor, str(stage)],
+                               capture_output=True, text=True, timeout=15)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"blocked_candidate_killed": True}
