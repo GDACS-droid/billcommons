@@ -13,6 +13,31 @@ in the original checkout are preserved. The canonical inventory covers 50 states
 plus DC. Generic website observation is never treated as proof of statewide
 semantic freshness or completeness.
 
+## Fresh production observation — September 15, 15:29–15:33 UTC
+
+The public inventory reported 51 jurisdictions and 59 official targets:
+51 observed and eight failed. Data Health still reported 19 defects: two
+Alaska errors and 17 warnings. These are fresh observations of the deployed
+system, not evidence that the current local candidate is deployed.
+
+A new transaction explicitly set to read-only confirmed zero rows in the
+ordinary `public.alembic_version` table. Saved-monitor and snapshot-blocker
+tables were absent. No other revision-table lock or active statement matching
+the bounded migration inspection was visible at that instant. This observation
+does not establish operator clearance or explain the missing revision marker.
+The recovery procedure and deployment remain held pending coordination.
+
+Indiana's retained observation `699b3c62-08ad-4111-b49e-ec75ba62b277` recorded
+`javascript_rendering_required`, but its robots and landing-page body hashes
+were identical. The 691 retained bytes were independently verified against
+SHA-256 `61d9d1265c828684df265d5139ee43f21d5325cb19aa861c7da7816dd28ac732`.
+Offline replay with the local validator returned `robots_html_response` and
+stopped before requesting the landing page. Route that diagnosis to source
+access review; it is not evidence permitting a browser fallback. No upstream
+Indiana request, target mutation, migration, or deployment was made for this
+replay. The restricted release evidence directory retains the current public
+captures, read-only revision status, and Indiana replay result.
+
 ## Resumed September 12 — next natural stopping point
 
 Alberto explicitly resumed work after the overnight stop and requested a

@@ -89,6 +89,7 @@ def test_missing_capture_does_not_invent_http_failure(db_session, unique_abbr):
 
 @pytest.mark.parametrize('error,action', [
     ('robots_disallowed', 'review_source_access_policy'),
+    ('robots_html_response', 'review_source_access_policy'),
     ('SsrfRejected', 'review_source_endpoint'),
     ('TimeoutFailure', 'retry_as_scheduled'),
     ('javascript_rendering_required', 'review_browser_adapter'),

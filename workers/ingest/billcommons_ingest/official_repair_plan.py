@@ -32,6 +32,7 @@ _DISCOVERY_ACTIONS = {
     'robots_disallowed': 'review_source_access_policy',
     'robots_unavailable': 'retry_as_scheduled',
     'robots_body_invalid': 'review_source_access_policy',
+    'robots_html_response': 'review_source_access_policy',
     'robots_slow_cadence_review_required': 'review_source_access_policy',
     'https_source_review_required': 'review_source_endpoint',
     'SsrfRejected': 'review_source_endpoint',
