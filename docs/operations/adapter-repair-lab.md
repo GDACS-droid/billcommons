@@ -458,3 +458,55 @@ release directory, report SHA-256
 `e2a47a2938c20d5e37a0cf8f53d6da4997ca82596eb04af408a3641733ded7b5`.
 This addition has not received a new canonical verify-ship verdict and is not
 deployed. Automatic patch authorship and worker promotion remain incomplete.
+
+## Text-only repair authoring — September 15, 2026
+
+The local authoring command connects a separately pinned failure bundle to a
+model-authored proposal:
+
+```bash
+python -m billcommons_ingest.official_repair_author /absolute/local/path/ca-repair-bundle \
+  --baseline-sha256 TRUSTED_BASELINE_MANIFEST_SHA256 \
+  --model MODEL_WITH_STRUCTURED_OUTPUT_SUPPORT \
+  --output-dir /absolute/local/path/new-authoring-result
+```
+
+This command uses the configured `OPENAI_API_KEY` and makes a model request.
+Keep the key in the process environment; never pass it as an argument or retain
+it with an evidence artifact. It sends the authenticated bundle manifest, exact
+baseline parser source, and at most 24 KiB from each of the two official archive
+tables. Every excerpt has a prefix digest, byte counts, and a truncation flag;
+missing or partial evidence is never presented as a complete archive or an
+independent expected-fact oracle. Archive samples follow the current parser's
+ZIP admission and CRC policy. A model can return `needs_more_evidence` when that
+policy prevents sampling or when the visible material cannot justify a repair.
+
+The author uses the Responses API with no tools and a strict JSON output schema.
+The response supplies a disposition, rationale, complete candidate parser, and
+`run_regression/1` test source. Both code fields remain text. The model may also
+return `no_change`; an old failure that the current parser no longer reproduces
+does not require an invented change. Structured JSON provides a transport
+contract, not proof that the proposed code or explanation is correct. See the
+[official Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs)
+and [tool-choice documentation](https://developers.openai.com/api/docs/guides/function-calling).
+
+The output directory contains `context.json`, `author-output.json`, and
+`authoring.json`. A `propose` response also produces the existing authenticated
+`proposal/` artifact. The authoring report binds context and model-result hashes
+to the original bundle digest and provider evidence; retain the separately
+reported authoring digest. It never updates application data, runs returned
+Python, changes the installed parser, or authorizes promotion. Evaluation and
+independent corpus checks are separate explicit operations. A nonproposal
+response preserves the reasoning and source context without creating a patch.
+Input/provider failures publish no partial result. The CLI exits zero for an
+inert proposal, one for a nonproposal disposition, and two for a failed request
+or rejected input. No disposition or exit code authorizes deployment.
+
+The integrated local repair suite passed **190 tests** after adding the author
+adapter, bundle-to-proposal workflow, and their failure/inertness checks. The
+provider permits bounded reasoning metadata but consumes exactly one completed
+assistant text result; tool output and refusals fail closed. It makes one
+request without redirects or automatic retries. Its 180-second monotonic
+transport deadline plus a possible in-progress 60-second socket read gives a
+normal return bound of 240 seconds. This does not establish a successful live
+model request, automatic worker scheduling, or a release verdict.
