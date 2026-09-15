@@ -114,3 +114,48 @@ test still pins the original parser; do not weaken it to accept the candidate.
 
 Automated repair authorship, isolated candidate evaluation, comparison against
 known-good archives, and promotion are still separate unfinished workflow steps.
+
+## Native isolation feasibility — September 15, 2026
+
+A trusted-only local probe established that the development host supports
+Landlock ABI 4 and a libseccomp default-deny syscall policy. The earlier CLI
+sandbox failure therefore does not establish that native Python isolation is
+unavailable on this host. This is feasibility evidence, not a candidate executor
+or authorization to run proposed code.
+
+The unchanged shared CA parser, source SHA-256
+`496bd79b54eabee11f37ec73652b7579f9d91a0045156ae612613afb22f25201`,
+loaded after both restrictions were active and replayed the retained archive
+SHA-256 `0a0bff772076a5879238cf3e1c69c02000b4a4ed2653bd4ca7192fdfc91ce7b8`.
+It produced the recorded **275 bills and 7,094 events**. Its import-time source
+witness remained intact; neither the parser nor its LZMA support was modified.
+The probe preloaded its required standard-library modules before restriction,
+then allowed file reads only in the private staged input directory.
+
+Synthetic checks confirmed denial of outside-file reads and writes, staged-file
+writes, IPv4/IPv6/Unix stream and datagram sockets, fork, exec, and signals.
+Direct invalid-argument syscall probes also returned `EPERM` for ptrace,
+process-memory reads/writes, pidfd creation, io_uring setup, clone3, mount and BPF.
+The synthetic outside canary remained unchanged. A 512 MiB allocation failed
+under a 256 MiB address-space limit; a separate infinite-loop probe terminated
+with signal 9 after 5.01 seconds under a five-second CPU limit, before its
+12-second parent timeout. These observations cover these probes only.
+
+The trusted prototype and results are retained locally in
+`/home/alberto/.local/share/billcommons/reliability-release-20260908/native-sandbox-probe-20260915/`.
+They must not be used to execute generated code. The production evaluator still
+needs a fresh single-thread child, explicit failure handling, closed inherited
+file descriptors, private immutable verified inputs, a bounded pipe reader,
+wall timeout and kill/reap handling, and a separately trusted comparison of
+returned facts. Treat the whole child interpreter and its output as untrusted:
+separate Python globals do not provide isolation, and a child-reported pass or
+source hash cannot attest a candidate. The host must bind actual staged bytes
+to its evaluation report. Proposed regression tests and controlled promotion
+remain subsequent gates.
+
+The kernel documents that Landlock restrictions apply to the calling thread
+and its future children, and that rights already obtained through open file
+descriptors need separate handling. ABI 4 also lacks later signal and Unix
+socket scoping, which is why filesystem rules alone are insufficient here.
+See the [kernel Landlock documentation](https://docs.kernel.org/userspace-api/landlock.html)
+and [seccomp API documentation](https://man7.org/linux/man-pages/man2/seccomp.2.html).

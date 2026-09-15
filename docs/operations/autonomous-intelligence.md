@@ -13,6 +13,25 @@ in the original checkout are preserved. The canonical inventory covers 50 states
 plus DC. Generic website observation is never treated as proof of statewide
 semantic freshness or completeness.
 
+## Repair executor feasibility — September 15
+
+A new trusted-only native probe passed the unchanged CA parser and retained
+archive under Landlock ABI 4 plus a default-deny libseccomp syscall filter.
+The replay matched 275 bills and 7,094 events, with matching parser and archive
+digests. Synthetic file/network/process denials and separate memory/CPU limit
+probes passed. This changes the next action: implement and adversarially verify
+a bounded native evaluator instead of treating the earlier CLI sandbox failure
+as proof that this host cannot isolate native Python. The earlier WASI prototype
+could isolate execution but could not support the unchanged parser's LZMA import.
+
+The native probe is not a production candidate runner. No generated code was
+executed. The reviewer identified required descriptor hygiene, single-thread
+bootstrap, immutable minimal staging, output limits, timeout/reaping, and
+host-side verification of child results. Separate Python globals are not a
+security boundary; the entire child is untrusted. See the
+[repair-lab evidence and remaining gates](adapter-repair-lab.md#native-isolation-feasibility--september-15-2026).
+The production revision-metadata coordination hold below is unchanged.
+
 ## Fresh production observation — September 15, 15:29–15:33 UTC
 
 The public inventory reported 51 jurisdictions and 59 official targets:
