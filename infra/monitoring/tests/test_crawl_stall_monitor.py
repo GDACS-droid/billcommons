@@ -317,6 +317,26 @@ def test_valid_sample_ends_an_undelivered_yellow_episode():
     assert "check_failed_attempt_at" in next_outage
 
 
+def test_stalled_valid_sample_ends_an_undelivered_yellow_episode():
+    failed, actions = monitor.evaluate_check_failed({}, now=NOW)
+    assert actions == ["check_failed"]
+    failed = monitor.acknowledge_deliveries(failed, {"check_failed": False}, now=NOW)
+
+    stalled, actions = monitor.evaluate(
+        _health("stalled", last_text_at=NOW - timedelta(hours=2)),
+        failed,
+        now=NOW + timedelta(minutes=10),
+    )
+    assert actions == []
+    assert stalled["last_status"] == "stalled_pending"
+    assert stalled["bad_checks"] == 1
+    assert "check_failed_attempt_at" not in stalled
+
+    next_outage, actions = monitor.evaluate_check_failed(stalled, now=NOW + timedelta(minutes=20))
+    assert actions == ["check_failed"]
+    assert "check_failed_attempt_at" in next_outage
+
+
 def test_health_payload_validation_rejects_incomplete_and_inconsistent_data():
     valid = _health("producing", last_text_at=NOW)
     valid.update(
