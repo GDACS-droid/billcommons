@@ -26,7 +26,7 @@ DEFAULT_MAX_RETAINED_RAWSTORE_BYTES = 512 * 1024 * 1024
 # Bump whenever extraction changes user-visible evidence semantics. Jobs from
 # earlier namespaces remain auditable records, but must not be returned as a
 # fresh result under a corrected presentation contract.
-SCOUT_CACHE_NAMESPACE = "scout-p0-3-provenance"
+SCOUT_CACHE_NAMESPACE = "scout-p0-4-bill-text-version"
 SCOUT_CA_RETAINED_CACHE_NAMESPACE = "scout-ca-retained-p0"
 OFFICIAL_FLORIDA_HOSTS = frozenset({
     "www.flsenate.gov", "flsenate.gov", "www.myfloridahouse.gov",
@@ -76,7 +76,8 @@ _FLORIDA_SENATE_BILL_PATH = re.compile(
 _FLORIDA_SENATE_RELATED_PATH = re.compile(
     r"^/Session/Bill/(?P<session>\d{4})/(?P<bill>\d{1,6})/"
     r"(?:(?P<kind>Analyses|Amendment)/(?P<document>(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+)(?:/PDF)?"
-    r"|Vote/(?P<vote_document>(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+\.PDF))$",
+    r"|Vote/(?P<vote_document>(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+\.PDF)"
+    r"|BillText/(?P<bill_text_version>(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+)/PDF)$",
     re.I,
 )
 _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
@@ -103,7 +104,10 @@ class FloridaRelatedDocument:
     """A safe, bill-scoped primary document discovered on a Senate bill page."""
 
     canonical_url: str
-    artifact_type: Literal["committee analysis", "amendment", "vote record"]
+    artifact_type: Literal["committee analysis", "amendment", "vote record", "bill text version"]
+    # Only the admitted Senate URL establishes this token. It is deliberately
+    # kept separate from the PDF contents, which may not identify a stage.
+    version_token: str | None = None
 
 
 class ScoutPolicyError(ValueError):
@@ -128,6 +132,9 @@ class ScoutSettings:
     # A vote record is independently capped so one rich bill page cannot use
     # its document allowance to crowd out every action-level primary source.
     max_related_vote_records: int = 1
+    # One direct Senate bill-text version follows the existing related and
+    # vote lanes. It is a distinct, immutable per-job allowance.
+    max_related_bill_versions: int = 1
     max_retries: int = 1
     cache_ttl_seconds: int = 3600
     max_pdf_pages: int = 20
@@ -158,6 +165,11 @@ class ScoutSettings:
     platform_max_daily_jobs: int = DEFAULT_PLATFORM_MAX_DAILY_JOBS
     platform_max_daily_browser_seconds: int = DEFAULT_PLATFORM_MAX_DAILY_BROWSER_SECONDS
     max_retained_rawstore_bytes: int = DEFAULT_MAX_RETAINED_RAWSTORE_BYTES
+    # Saved monitors are deliberately few and slow: each due run uses the
+    # normal Scout admission path and may consume the same provider budget.
+    max_saved_monitors_per_customer: int = 3
+    monitor_min_cadence_seconds: int = 6 * 60 * 60
+    monitor_max_cadence_seconds: int = 7 * 24 * 60 * 60
 
     def __post_init__(self) -> None:
         for name in (
@@ -165,10 +177,15 @@ class ScoutSettings:
             "platform_max_daily_jobs",
             "platform_max_daily_browser_seconds",
             "max_retained_rawstore_bytes",
+            "max_saved_monitors_per_customer",
+            "monitor_min_cadence_seconds",
+            "monitor_max_cadence_seconds",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.monitor_min_cadence_seconds > self.monitor_max_cadence_seconds:
+            raise ValueError("monitor cadence bounds are invalid")
         if any(
             not email
             or "@" not in email
@@ -302,6 +319,15 @@ class ScoutSettings:
             max_retained_rawstore_bytes=positive(
                 "BILLCOMMONS_SCOUT_MAX_RETAINED_RAWSTORE_BYTES",
                 DEFAULT_MAX_RETAINED_RAWSTORE_BYTES,
+            ),
+            max_saved_monitors_per_customer=positive(
+                "BILLCOMMONS_SCOUT_MAX_SAVED_MONITORS", 3
+            ),
+            monitor_min_cadence_seconds=positive(
+                "BILLCOMMONS_SCOUT_MONITOR_MIN_CADENCE_SECONDS", 6 * 60 * 60
+            ),
+            monitor_max_cadence_seconds=positive(
+                "BILLCOMMONS_SCOUT_MONITOR_MAX_CADENCE_SECONDS", 7 * 24 * 60 * 60
             ),
         )
 
@@ -453,6 +479,28 @@ def discover_florida_senate_vote_records(
     )
 
 
+def discover_florida_senate_bill_text_versions(
+    bill_page_url: str,
+    body: bytes,
+    *,
+    maximum: int = 1,
+    max_html_bytes: int = 256 * 1024,
+) -> tuple[FloridaRelatedDocument, ...]:
+    """Find bounded, bill-scoped Florida Senate bill-text-version PDFs.
+
+    The route token distinguishes an official version endpoint only. It does
+    not establish a filing, enrollment, substitution, or other legislative
+    stage unless the retained PDF itself proves that claim.
+    """
+    return _discover_florida_senate_attachments(
+        bill_page_url,
+        body,
+        maximum=maximum,
+        max_html_bytes=max_html_bytes,
+        allowed_kinds=frozenset({"bill_text"}),
+    )
+
+
 def _safe_attachment_document(value: str) -> bool:
     """Accept one canonical encoded path segment, never another path layer."""
 
@@ -468,6 +516,20 @@ def _safe_attachment_document(value: str) -> bool:
         character.isascii() and (character.isalnum() or character in " ._~-")
         for character in decoded
     ) and decoded not in {".", ".."}
+
+
+def _safe_bill_text_version(value: str) -> str | None:
+    """Return one non-route Senate version token, or reject it."""
+    try:
+        decoded = unquote(value, errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if decoded in {".", ".."} or not all(
+        character.isascii() and (character.isalnum() or character in "._~-")
+        for character in decoded
+    ):
+        return None
+    return decoded
 
 
 def _discover_florida_senate_attachments(
@@ -542,12 +604,25 @@ def _discover_florida_senate_attachments(
         if related_match is None:
             continue
         kind = related_match.group("kind")
-        route_kind = kind.casefold() if kind is not None else "vote"
-        document = related_match.group("document") or related_match.group("vote_document")
+        route_kind = (
+            kind.casefold()
+            if kind is not None
+            else "vote" if related_match.group("vote_document") is not None else "bill_text"
+        )
+        document = (
+            related_match.group("document")
+            or related_match.group("vote_document")
+            or related_match.group("bill_text_version")
+        )
+        version_token = (
+            _safe_bill_text_version(document)
+            if route_kind == "bill_text" and document is not None
+            else None
+        )
         if (
             route_kind not in allowed_kinds
             or document is None
-            or not _safe_attachment_document(document)
+            or (version_token is None if route_kind == "bill_text" else not _safe_attachment_document(document))
             or related_match.group("session") != parent_session
             or str(int(related_match.group("bill"))) != parent_bill
             or (
@@ -558,12 +633,13 @@ def _discover_florida_senate_attachments(
             ) in seen
         ):
             continue
-        artifact_type: Literal["committee analysis", "amendment", "vote record"] = (
+        artifact_type: Literal["committee analysis", "amendment", "vote record", "bill text version"] = (
             "committee analysis" if route_kind == "analyses"
             else "amendment" if route_kind == "amendment"
-            else "vote record"
+            else "vote record" if route_kind == "vote"
+            else "bill text version"
         )
-        discovered.append(FloridaRelatedDocument(candidate, artifact_type))
+        discovered.append(FloridaRelatedDocument(candidate, artifact_type, version_token))
         seen.add((
             related_match.group("session"),
             str(int(related_match.group("bill"))),

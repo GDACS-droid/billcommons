@@ -372,8 +372,11 @@ must verify the expected current revision and bound database identity before
 any production upgrade. Do not substitute `head`, the saved-monitor `0031`,
 or `0031_snapshot_blockers` for a combined target without that integration.
 
-The runner in this branch currently supports `0031_snapshot_blockers` only;
-it does not yet authorize or implement a combined migration. Release readiness
+The isolated integration candidate now joins both histories at
+`0032_intelligence_merge` and the controlled runner accepts that exact target
+with its matching acknowledgement. Both parent IDs remain unchanged. This
+resolves the migration graph locally; disposable-database upgrade/rollback and
+combined-candidate review remain required before production use. Release readiness
 remains **NOT READY** pending metadata recovery, migration integration, and the
 remaining candidate review and service rollout gates. The September 8 schema
 comparison above is historical evidence and must be repeated before recovery.

@@ -9,9 +9,9 @@ import uuid
 import inspect
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
@@ -26,6 +26,8 @@ from billcommons_schema.models import (
     ScoutBrowserSession,
     ScoutFinding,
     ScoutJobEvent,
+    ScoutMonitor,
+    ScoutMonitorRun,
     ScoutRawBlob,
     ScoutResearchJob,
     ScoutSource,
@@ -40,6 +42,9 @@ from billcommons_shared.scout import (
     scout_cache_key,
     scout_cache_namespace,
 )
+from billcommons_shared.scout_admission import ScoutAdmissionError, admit_scout_job, customer_is_admitted
+from billcommons_shared.scout_monitors import is_operator_strategy, source_snapshot
+
 
 router = APIRouter(prefix="/scout", tags=["scout"])
 
@@ -50,6 +55,15 @@ _sqlite_platform_admission_lock = threading.RLock()
 class CreateScoutJob(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     jurisdiction: str = Field(default="FL", min_length=2, max_length=2)
+
+
+class SaveScoutMonitor(BaseModel):
+    cadence_seconds: int = Field(default=6 * 60 * 60, ge=6 * 60 * 60, le=7 * 24 * 60 * 60)
+
+
+class UpdateScoutMonitor(BaseModel):
+    active: bool | None = None
+    cadence_seconds: int | None = Field(default=None, ge=6 * 60 * 60, le=7 * 24 * 60 * 60)
 
 
 def _enabled() -> ScoutSettings:
@@ -375,7 +389,6 @@ def create_job(
         if jurisdiction == CALIFORNIA and extract_california_bill_query(body.query) is None:
             raise ScoutPolicyError("invalid_california_retained_query")
     except ScoutPolicyError as exc:
-        # The API validation contract need not disclose policy implementation.
         from fastapi import HTTPException
         raise HTTPException(status_code=422, detail={"code": "invalid_scout_request", "message": str(exc)}) from exc
     key = scout_cache_key(
@@ -383,150 +396,255 @@ def create_job(
         jurisdiction,
         freshness_bucket=scout_cache_namespace(jurisdiction),
     )
-
-    # Serializes a customer's quota/check-and-create decision on Postgres.
-    # The partial cache-key index remains the authority for equivalent jobs.
-    db.execute(select(ApiCustomer.id).where(ApiCustomer.id == customer.id).with_for_update())
-
-    # An equivalent request is allowed to coalesce even when the owner has
-    # exhausted their unrelated active-job budget.
-    existing = db.execute(
-        select(ScoutResearchJob).where(
-            ScoutResearchJob.customer_id == customer.id,
-            ScoutResearchJob.cache_key == key,
-            ScoutResearchJob.status.in_(("queued", "running")),
+    try:
+        admission = admit_scout_job(
+            db, customer, original_query=body.query, normalized_query=normalized,
+            jurisdiction=jurisdiction, cache_key=key, settings=settings,
         )
-    ).scalar_one_or_none()
+    except ScoutAdmissionError as exc:
+        raise too_many_requests(exc.code, exc.message, exc.retry_after) from exc
+    if admission.created:
+        db.commit()
+        db.refresh(admission.job)
+    else:
+        response.status_code = 200
+    response.headers["Cache-Control"] = "no-store"
+    payload = {"coalesced": admission.coalesced, "job": _job_payload(db, admission.job)}
+    if admission.cached:
+        payload.update({"cached": True, "cache_hit": True})
+    return payload
+
+
+def _monitor_for_owner(db: Session, customer: ApiCustomer, monitor_id: uuid.UUID, *, lock: bool = False) -> ScoutMonitor:
+    stmt = select(ScoutMonitor).where(ScoutMonitor.id == monitor_id, ScoutMonitor.customer_id == customer.id)
+    if lock:
+        stmt = stmt.with_for_update()
+    monitor = db.execute(stmt).scalar_one_or_none()
+    if monitor is None:
+        raise not_found("scout_monitor_not_found", "Scout monitor was not found.")
+    return monitor
+
+
+def _monitor_payload(monitor: ScoutMonitor) -> dict:
+    return {
+        "id": str(monitor.id),
+        "query": monitor.original_query,
+        "jurisdiction": monitor.jurisdiction,
+        "cadence_seconds": monitor.cadence_seconds,
+        "active": monitor.active,
+        "next_run_at": monitor.next_run_at.isoformat() if monitor.next_run_at else None,
+        "consecutive_deferrals": monitor.consecutive_deferrals,
+        "last_completed_run_id": str(monitor.last_completed_run_id) if monitor.last_completed_run_id else None,
+        "created_at": monitor.created_at.isoformat() if monitor.created_at else None,
+        "updated_at": monitor.updated_at.isoformat() if monitor.updated_at else None,
+    }
+
+
+def _monitor_run_payload(run: ScoutMonitorRun, job: ScoutResearchJob | None) -> dict:
+    return {
+        "id": str(run.id),
+        "job_id": str(run.job_id) if run.job_id else None,
+        "baseline_run_id": str(run.baseline_run_id) if run.baseline_run_id else None,
+        "status": run.status,
+        "execution_mode": run.execution_mode,
+        "scheduled_for": run.scheduled_for.isoformat() if run.scheduled_for else None,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "error_class": run.error_class,
+        "source_snapshot": run.source_snapshot or {},
+        "change_summary": run.change_summary or {},
+        "job": _job_payload_for_monitor(job) if job is not None else None,
+    }
+
+
+def _job_payload_for_monitor(job: ScoutResearchJob) -> dict:
+    """A bounded run reference; detailed evidence remains owner-readable by job ID."""
+    return {
+        "id": str(job.id), "status": job.status, "query": job.original_query,
+        "jurisdiction": job.jurisdiction, "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    }
+
+
+def _validate_monitor_cadence(cadence_seconds: int, settings: ScoutSettings) -> None:
+    if not settings.monitor_min_cadence_seconds <= cadence_seconds <= settings.monitor_max_cadence_seconds:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_monitor_cadence", "message": "Monitor cadence is outside the configured safe range."},
+        )
+
+
+def _require_monitorable_baseline(job: ScoutResearchJob) -> None:
+    if job.status not in {"completed", "partial"} or is_operator_strategy(job):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_monitor_baseline",
+                "message": "Save a completed Scout result with user-visible evidence.",
+            },
+        )
+
+
+@router.post("/jobs/{job_id}/monitor", status_code=201)
+def save_monitor(
+    job_id: uuid.UUID,
+    body: SaveScoutMonitor,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    settings = _require_enabled()
+    _check_origin(request)
+    customer = _require_session(request, db)
+    _require_canary(customer, settings)
+    _validate_monitor_cadence(body.cadence_seconds, settings)
+    # A running job may be terminalizing while it holds its job lock and walks
+    # monitor runs. Reject it before taking the customer lock, so an invalid
+    # save cannot form monitor -> customer -> job with that terminalizer.
+    _require_monitorable_baseline(_job_for_owner(db, customer, job_id))
+    # Once the preflight sees a terminal result, acquire owner then job for a
+    # deterministic duplicate-save decision and revalidate under that lock.
+    db.execute(select(ApiCustomer.id).where(ApiCustomer.id == customer.id).with_for_update())
+    job = _job_for_owner(db, customer, job_id, lock=True)
+    _require_monitorable_baseline(job)
+    evidence_count = db.scalar(select(func.count()).select_from(ScoutFinding).where(ScoutFinding.job_id == job.id)) or 0
+    if evidence_count < 1:
+        raise HTTPException(status_code=422, detail={"code": "monitor_baseline_missing_evidence", "message": "Save a Scout result that retained evidence."})
+    try:
+        snapshot = source_snapshot(db, job.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": str(exc), "message": "Baseline evidence is too large to monitor safely."}) from exc
+    if not snapshot["sources"]:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "monitor_baseline_missing_final_evidence",
+                "message": "Save a Scout result with a retained final official source.",
+            },
+        )
+    existing = db.execute(select(ScoutMonitor).where(
+        ScoutMonitor.customer_id == customer.id,
+        ScoutMonitor.normalized_query == job.normalized_query,
+        ScoutMonitor.jurisdiction == job.jurisdiction,
+    )).scalar_one_or_none()
     if existing is not None:
         response.status_code = 200
         response.headers["Cache-Control"] = "no-store"
-        return {"coalesced": True, "job": _job_payload(db, existing)}
-    fresh = db.execute(
-        select(ScoutResearchJob).where(
-            ScoutResearchJob.customer_id == customer.id,
-            ScoutResearchJob.cache_key == key,
-            ScoutResearchJob.status.in_(("completed", "partial")),
-            ScoutResearchJob.fresh_until > datetime.now(timezone.utc),
-        ).order_by(ScoutResearchJob.completed_at.desc()).limit(1)
-    ).scalar_one_or_none()
-    if fresh is not None:
-        response.status_code = 200
-        response.headers["Cache-Control"] = "no-store"
-        return {"coalesced": True, "cached": True, "cache_hit": True, "job": _job_payload(db, fresh)}
-
-    # The PostgreSQL advisory xact lock makes platform-wide aggregates a
-    # check-and-create decision rather than a best-effort observation. The
-    # customer row lock above keeps same-owner cache/coalescing race-safe
-    # without charging those free reads against the global lock.
-    with _platform_admission_lock(db):
-        day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        active_jobs, daily_browser_ms, reserved_browser_ms = _browser_budget_totals(
-            db, settings, day_start, customer_id=customer.id
-        )
-        active_count = len(active_jobs)
-        platform_active, platform_daily_browser_ms, platform_reserved_browser_ms = _browser_budget_totals(
-            db, settings, day_start
-        )
-        daily_jobs = db.scalar(
-            select(func.count()).select_from(ScoutResearchJob).where(
-                ScoutResearchJob.customer_id == customer.id,
-                ScoutResearchJob.created_at >= day_start,
-            )
-        ) or 0
-        platform_daily_jobs = db.scalar(
-            select(func.count()).select_from(ScoutResearchJob).where(
-                ScoutResearchJob.created_at >= day_start,
-            )
-        ) or 0
-        new_reservation_ms = settings.max_external_requests * (
-            settings.browser_wall_seconds + 2 * settings.browser_cleanup_seconds
-        ) * 1000
-        new_rawstore_reservation = settings.max_external_requests * settings.max_direct_bytes
-        if len(platform_active) >= settings.platform_max_active_jobs:
-            raise too_many_requests("scout_platform_active_job_limit", "Scout is at platform capacity.", 60)
-        retained_rawstore_bytes = _retained_rawstore_bytes(db)
-        active_rawstore_reservations = sum(
-            _rawstore_reservation_bytes(job, settings) for job in platform_active
-        )
-        if (
-            retained_rawstore_bytes + active_rawstore_reservations + new_rawstore_reservation
-            > settings.max_retained_rawstore_bytes
-        ):
-            raise too_many_requests(
-                "scout_rawstore_capacity_limit", "Scout evidence capacity reached.", 3600
-            )
-        if platform_daily_jobs >= settings.platform_max_daily_jobs:
-            raise too_many_requests("scout_platform_daily_job_limit", "Scout daily platform capacity reached.", 3600)
-        if (
-            platform_daily_browser_ms + platform_reserved_browser_ms + new_reservation_ms
-            > settings.platform_max_daily_browser_seconds * 1000
-        ):
-            raise too_many_requests("scout_platform_daily_browser_limit", "Scout browser capacity reached.", 3600)
-        if daily_jobs >= settings.per_customer_daily_jobs:
-            raise too_many_requests("scout_daily_job_limit", "Daily Scout job limit reached.", 3600)
-        if daily_browser_ms + reserved_browser_ms + new_reservation_ms > settings.per_customer_daily_browser_seconds * 1000:
-            raise too_many_requests("scout_daily_browser_limit", "Daily Scout browser budget reached.", 3600)
-        if active_count >= settings.per_customer_active_jobs:
-            raise too_many_requests("scout_active_job_limit", "Too many active Scout jobs.", 60)
-
-        is_california_retained = jurisdiction == CALIFORNIA
-        job = ScoutResearchJob(
-            customer_id=customer.id,
-            original_query=body.query.strip(),
-            normalized_query=normalized,
-            jurisdiction=jurisdiction,
-            cache_key=key,
-            strategy=(
-                {"adapter": "california_retained_p0", "mode": "retained_official_archive"}
-                if is_california_retained
-                else {"adapter": "florida_p0", "mode": "structured_first"}
-            ),
-            limits={
-                "max_pages": settings.max_pages,
-                "max_actions": settings.max_actions,
-                "max_external_requests": settings.max_external_requests,
-                "max_related_documents": settings.max_related_documents,
-                "max_related_vote_records": settings.max_related_vote_records,
-                "max_direct_bytes": settings.max_direct_bytes,
-                "max_pdf_pages": settings.max_pdf_pages,
-                "max_pdf_text_chars": settings.max_pdf_text_chars,
-                "max_pdf_extract_seconds": settings.max_pdf_extract_seconds,
-                "max_pdf_extract_memory_bytes": settings.max_pdf_extract_memory_bytes,
-                "max_pdf_extract_cpu_seconds": settings.max_pdf_extract_cpu_seconds,
-                "max_ca_parse_seconds": settings.max_ca_parse_seconds,
-                "max_routed_requests": settings.max_browser_routed_requests,
-                "max_retries": settings.max_retries,
-                "daily_jobs": settings.per_customer_daily_jobs,
-                "daily_browser_seconds": settings.per_customer_daily_browser_seconds,
-                "browser_wall_seconds": settings.browser_wall_seconds,
-                "browser_cleanup_seconds": settings.browser_cleanup_seconds,
-                "daily_browser_reservation_ms": new_reservation_ms,
-            },
-            usage={},
-        )
-        db.add(job)
-        try:
-            db.flush()
-        except IntegrityError:
-            # The partial unique index is the race-safe authority. Query it
-            # only after rollback; do not solve concurrent submits in memory.
-            db.rollback()
-            existing = db.execute(
-                select(ScoutResearchJob).where(
-                    ScoutResearchJob.customer_id == customer.id,
-                    ScoutResearchJob.cache_key == key,
-                    ScoutResearchJob.status.in_(("queued", "running")),
-                )
-            ).scalar_one_or_none()
-            if existing is None:
-                raise
-            response.status_code = 200
-            response.headers["Cache-Control"] = "no-store"
-            return {"coalesced": True, "job": _job_payload(db, existing)}
-        db.commit()
-    db.refresh(job)
+        return {"created": False, "monitor": _monitor_payload(existing)}
+    count = db.scalar(select(func.count()).select_from(ScoutMonitor).where(ScoutMonitor.customer_id == customer.id)) or 0
+    if count >= settings.max_saved_monitors_per_customer:
+        raise too_many_requests("scout_monitor_limit", "Saved Scout monitor limit reached.", 3600)
+    now = datetime.now(timezone.utc)
+    monitor = ScoutMonitor(
+        customer_id=customer.id,
+        original_query=job.original_query,
+        normalized_query=job.normalized_query,
+        jurisdiction=job.jurisdiction,
+        cache_key=job.cache_key,
+        cadence_seconds=body.cadence_seconds,
+        active=True,
+        next_run_at=now + timedelta(seconds=body.cadence_seconds),
+    )
+    db.add(monitor)
+    db.flush()
+    baseline = ScoutMonitorRun(
+        monitor_id=monitor.id,
+        job_id=job.id,
+        status="baseline",
+        execution_mode="baseline",
+        scheduled_for=now,
+        completed_at=now,
+        source_snapshot=snapshot,
+        change_summary={
+            "baseline": True,
+            "comparison_complete": job.status == "completed",
+            "absence_evaluated": False,
+            "observed_source_count": len(snapshot["sources"]),
+        },
+    )
+    db.add(baseline)
+    db.flush()
+    monitor.last_completed_run_id = baseline.id
+    db.commit()
+    db.refresh(monitor)
     response.headers["Cache-Control"] = "no-store"
-    return {"coalesced": False, "job": _job_payload(db, job)}
+    return {"created": True, "monitor": _monitor_payload(monitor)}
+
+
+@router.get("/monitors")
+def list_monitors(request: Request, response: Response, db: Session = Depends(get_db)):
+    customer = _require_session(request, db)
+    monitors = db.scalars(select(ScoutMonitor).where(ScoutMonitor.customer_id == customer.id).order_by(ScoutMonitor.created_at.desc())).all()
+    response.headers["Cache-Control"] = "no-store"
+    return {"monitors": [_monitor_payload(monitor) for monitor in monitors]}
+
+
+@router.get("/monitors/{monitor_id}/runs")
+def list_monitor_runs(
+    monitor_id: uuid.UUID, request: Request, response: Response,
+    limit: int = Query(default=50, ge=1, le=100), cursor: uuid.UUID | None = None,
+    db: Session = Depends(get_db),
+):
+    customer = _require_session(request, db)
+    monitor = _monitor_for_owner(db, customer, monitor_id)
+    stmt = select(ScoutMonitorRun, ScoutResearchJob).outerjoin(
+        ScoutResearchJob, ScoutResearchJob.id == ScoutMonitorRun.job_id
+    ).where(ScoutMonitorRun.monitor_id == monitor.id)
+    if cursor is not None:
+        anchor = db.execute(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.id == cursor, ScoutMonitorRun.monitor_id == monitor.id
+        )).scalar_one_or_none()
+        if anchor is None:
+            raise HTTPException(status_code=422, detail={"code": "invalid_monitor_cursor", "message": "Monitor history cursor is invalid."})
+        stmt = stmt.where(or_(
+            ScoutMonitorRun.scheduled_for < anchor.scheduled_for,
+            and_(ScoutMonitorRun.scheduled_for == anchor.scheduled_for, ScoutMonitorRun.id < anchor.id),
+        ))
+    rows = list(db.execute(stmt.order_by(
+        ScoutMonitorRun.scheduled_for.desc(), ScoutMonitorRun.id.desc()
+    ).limit(limit + 1)).all())
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    # Resume after the final row returned.  Using the first unseen row as the
+    # cursor would make the strict "older than cursor" predicate skip it.
+    next_cursor = str(rows[-1][0].id) if has_more else None
+    response.headers["Cache-Control"] = "no-store"
+    return {"monitor": _monitor_payload(monitor), "runs": [
+        _monitor_run_payload(run, job) for run, job in rows
+    ], "next_cursor": next_cursor}
+
+
+@router.patch("/monitors/{monitor_id}")
+def update_monitor(
+    monitor_id: uuid.UUID,
+    body: UpdateScoutMonitor,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    if body.active is None and body.cadence_seconds is None:
+        raise HTTPException(status_code=422, detail={"code": "empty_monitor_update", "message": "Supply active or cadence_seconds."})
+    _check_origin(request)
+    customer = _require_session(request, db)
+    monitor = _monitor_for_owner(db, customer, monitor_id, lock=True)
+    settings: ScoutSettings | None = None
+    if body.active is True:
+        settings = _require_enabled()
+        _require_canary(customer, settings)
+    if body.cadence_seconds is not None:
+        settings = settings or _enabled()
+        _validate_monitor_cadence(body.cadence_seconds, settings)
+        monitor.cadence_seconds = body.cadence_seconds
+    if body.active is not None:
+        monitor.active = body.active
+        if body.active:
+            monitor.consecutive_deferrals = 0
+            monitor.next_run_at = datetime.now(timezone.utc) + timedelta(seconds=monitor.cadence_seconds)
+    elif body.cadence_seconds is not None and monitor.active:
+        monitor.next_run_at = datetime.now(timezone.utc) + timedelta(seconds=monitor.cadence_seconds)
+    db.commit()
+    db.refresh(monitor)
+    response.headers["Cache-Control"] = "no-store"
+    return {"monitor": _monitor_payload(monitor)}
 
 
 @router.get("/jobs/{job_id}")
@@ -551,6 +669,12 @@ def cancel_job(job_id: uuid.UUID, request: Request, response: Response, db: Sess
         job.status = "canceled"
         job.completed_at = datetime.now(timezone.utc)
         db.add(ScoutJobEvent(job_id=job.id, kind="finished", detail={"status": "canceled", "error_class": None}))
+        for run in db.scalars(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.job_id == job.id, ScoutMonitorRun.status == "queued"
+        )).all():
+            run.status = "canceled"
+            run.completed_at = job.completed_at
+            run.error_class = None
         db.commit()
         db.refresh(job)
     response.headers["Cache-Control"] = "no-store"

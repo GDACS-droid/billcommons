@@ -20,7 +20,7 @@ from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.orm import sessionmaker
 
 from billcommons_schema.base import Base
-from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutRawBlob, ScoutResearchJob, ScoutSource
+from billcommons_schema.models import ApiCustomer, ScoutBrowserSession, ScoutFinding, ScoutJobEvent, ScoutMonitor, ScoutMonitorRun, ScoutRawBlob, ScoutResearchJob, ScoutSource
 from billcommons_shared.rawstore import FilesystemRawStore
 from billcommons_shared.db import _use_psycopg3
 from billcommons_shared.safe_http import SsrfRejected
@@ -52,7 +52,8 @@ def _runner(tmp_path, provider, fetcher, *, settings=None, limits=None):
 
     tables = [Base.metadata.tables[name] for name in (
         "api_customers", "scout_research_jobs", "scout_job_events", "scout_sources",
-        "scout_findings", "scout_browser_sessions",
+        "scout_findings", "scout_browser_sessions", "scout_monitors", "scout_monitor_runs",
+        "scout_raw_blobs",
     )]
     Base.metadata.create_all(engine, tables=tables)
     sessions = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -158,6 +159,20 @@ def test_california_retained_archive_creates_evidence_without_fetch_or_browser(t
         job.jurisdiction = "CA"
         job.original_query = "AB 123 2025-2026"
         job.limits = {"max_direct_bytes": len(raw)}
+        monitor = ScoutMonitor(
+            customer_id=job.customer_id, original_query=job.original_query,
+            normalized_query="ab 123 2025-2026", jurisdiction="CA", cache_key=job.cache_key,
+            cadence_seconds=6 * 60 * 60, next_run_at=datetime.now(timezone.utc),
+        )
+        db.add(monitor)
+        db.flush()
+        run = ScoutMonitorRun(
+            monitor_id=monitor.id, job_id=job.id, status="queued", execution_mode="new",
+            scheduled_for=datetime.now(timezone.utc), source_snapshot={}, change_summary={},
+        )
+        db.add(run)
+        db.flush()
+        monitor_run_id = run.id
         db.commit()
 
     runner.process(job_id, "initial-claim")
@@ -177,6 +192,47 @@ def test_california_retained_archive_creates_evidence_without_fetch_or_browser(t
         assert "does not establish a current or comprehensive" in finding.why_it_matters
         selected = db.execute(select(ScoutJobEvent).where(ScoutJobEvent.job_id == job_id, ScoutJobEvent.kind == "retained_official_archive_selected")).scalar_one()
         assert selected.detail == {"observation_id": str(observation_id), "coverage": "delta_only"}
+        monitor_run = db.get(ScoutMonitorRun, monitor_run_id)
+        assert monitor_run.status == "completed"
+        assert monitor_run.source_snapshot["sources"][0]["content_hash"] == source.content_hash
+        assert monitor_run.source_snapshot["sources"][0]["finding_ids"] == [str(finding.id)]
+
+
+def test_california_monitor_scheduler_uses_retained_admission_and_parse_limit(tmp_path):
+    settings = ScoutSettings(enabled=True, allow_public_rollout=True, max_ca_parse_seconds=7, browser_cleanup_seconds=1)
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")), settings=settings)
+    with sessions() as db:
+        baseline = db.get(ScoutResearchJob, job_id)
+        baseline.status = "completed"
+        baseline.completed_at = datetime.now(timezone.utc)
+        baseline.claim_token = None
+        baseline.lease_expires_at = None
+        baseline.original_query = "AB 123 2025-2026"
+        baseline.normalized_query = "ab 123 2025-2026"
+        baseline.jurisdiction = "CA"
+        baseline.cache_key = "ca-monitor-retained-admission"
+        baseline.strategy = {"adapter": "california_retained_p0", "mode": "retained_official_archive"}
+        monitor = ScoutMonitor(
+            customer_id=baseline.customer_id, original_query=baseline.original_query,
+            normalized_query=baseline.normalized_query, jurisdiction="CA", cache_key=baseline.cache_key,
+            cadence_seconds=6 * 60 * 60, next_run_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+        db.add(monitor)
+        db.commit()
+        monitor_id = monitor.id
+    assert runner.schedule_one_due_monitor() is True
+    with sessions() as db:
+        run = db.execute(select(ScoutMonitorRun).where(
+            ScoutMonitorRun.monitor_id == monitor_id, ScoutMonitorRun.status == "queued"
+        )).scalar_one()
+        scheduled = db.get(ScoutResearchJob, run.job_id)
+    assert run.execution_mode == "new"
+    assert scheduled.jurisdiction == "CA"
+    assert scheduled.strategy == {"adapter": "california_retained_p0", "mode": "retained_official_archive"}
+    assert scheduled.limits["max_ca_parse_seconds"] == 7
+    # The scheduler shares the same immutable admission snapshot as the API.
+    # This Florida-only lane remains inert for California retained jobs.
+    assert scheduled.limits["max_related_bill_versions"] == 1
 
 
 def test_california_retained_archive_over_job_cap_is_truthful_partial_and_not_copied(tmp_path):
@@ -1059,6 +1115,144 @@ def test_florida_vote_record_rejects_pdf_masquerade_without_a_finding(tmp_path):
         assert db.get(ScoutResearchJob, job_id).status == "partial"
 
 
+def test_florida_bill_text_version_follows_existing_direct_lanes_and_retains_evidence(tmp_path):
+    bill_url = "https://www.flsenate.gov/Session/Bill/2026/625/ByCategory"
+    analysis_url = "https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF"
+    amendment_url = "https://www.flsenate.gov/Session/Bill/2026/625/Amendment/154926/PDF"
+    vote_url = "https://www.flsenate.gov/Session/Bill/2026/625/Vote/HouseVote_h0625__063.PDF"
+    bill_text_url = "https://www.flsenate.gov/Session/Bill/2026/625/BillText/Filed/PDF"
+    bill_page = b"""
+        HB 625 Filed
+        <a href="/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF">Analysis</a>
+        <a href="/Session/Bill/2026/625/Amendment/154926/PDF">Amendment</a>
+        <a href="/Session/Bill/2026/625/Vote/HouseVote_h0625__063.PDF">Vote</a>
+        <a href="/Session/Bill/2026/625/BillText/Filed/PDF">Version</a>
+    """
+    calls: list[str] = []
+    responses = {
+        bill_url: (200, "text/html", bill_page),
+        analysis_url: (200, "application/pdf", _pdf_with_text("HB 625 analysis")),
+        amendment_url: (200, "application/pdf", _pdf_with_text("HB 625 amendment")),
+        vote_url: (200, "application/pdf", _pdf_with_text("HB 625 vote")),
+        bill_text_url: (200, "application/pdf", _pdf_with_text("HB 625 2026 Legislature")),
+    }
+
+    def fetcher(url):
+        calls.append(url)
+        return responses[url]
+
+    runner, sessions, job_id = _runner(
+        tmp_path,
+        MockResearchBrowserProvider(),
+        fetcher,
+        limits={
+            "max_related_documents": 2,
+            "max_related_vote_records": 1,
+            "max_related_bill_versions": 1,
+            "max_external_requests": 5,
+            "max_retries": 0,
+        },
+    )
+    runner._candidates = lambda _db, _job: [_candidate(url=bill_url, title="HB 625", status="Filed")]
+    runner.process(job_id)
+
+    assert calls == [bill_url, analysis_url, amendment_url, vote_url, bill_text_url]
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        source = db.scalar(select(ScoutSource).where(ScoutSource.job_id == job_id, ScoutSource.canonical_url == bill_text_url))
+        finding = db.scalar(select(ScoutFinding).where(ScoutFinding.source_id == source.id))
+        assert (job.status, job.usage["external_requests"]) == ("completed", 5)
+        assert (source.official, source.retrieval_mechanism, source.content_hash) == (
+            True, "direct", content_hash(_pdf_with_text("HB 625 2026 Legislature")),
+        )
+        assert runner.rawstore.exists(source.raw_ref)
+        assert (finding.title, finding.what_happened, finding.confidence) == (
+            "HB 625: official bill text version (Filed)",
+            "Official bill text version (Filed) retrieved for HB 625.",
+            "medium",
+        )
+        assert finding.why_it_matters is None and "HB 625" in finding.excerpt
+        events = db.execute(select(ScoutJobEvent).where(ScoutJobEvent.job_id == job_id)).scalars().all()
+        assert any(event.kind == "bill_text_versions_discovered" and event.detail == {"count": 1} for event in events)
+        assert any(event.kind == "direct_retrieval" and event.detail.get("related_document") == "bill text version" for event in events)
+        assert db.execute(select(ScoutBrowserSession).where(ScoutBrowserSession.job_id == job_id)).scalars().all() == []
+
+
+@pytest.mark.parametrize(
+    "limits",
+    ({}, {"max_related_bill_versions": 0}),
+)
+def test_florida_bill_text_version_requires_explicit_immutable_cap(tmp_path, limits):
+    bill_url = "https://www.flsenate.gov/Session/Bill/2026/625/ByCategory"
+    bill_text_url = "https://www.flsenate.gov/Session/Bill/2026/625/BillText/Filed/PDF"
+    calls: list[str] = []
+
+    def fetcher(url):
+        calls.append(url)
+        if url == bill_url:
+            return 200, "text/html", b'HB 625 Filed <a href="/Session/Bill/2026/625/BillText/Filed/PDF">Version</a>'
+        raise AssertionError(f"legacy or zero cap must not fetch {url}")
+
+    runner, _sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), fetcher, limits={**limits, "max_retries": 0})
+    runner._candidates = lambda _db, _job: [_candidate(url=bill_url, title="HB 625", status="Filed")]
+    runner.process(job_id)
+    assert calls == [bill_url]
+
+
+@pytest.mark.parametrize(
+    ("mime", "body"),
+    (("text/html", b"%PDF-1.4\nHB 625"), ("application/pdf", b"<html>HB 625 unavailable</html>")),
+)
+def test_florida_bill_text_version_rejects_pdf_mime_or_magic_failure_without_browser(tmp_path, mime, body):
+    bill_url = "https://www.flsenate.gov/Session/Bill/2026/625/ByCategory"
+    bill_text_url = "https://www.flsenate.gov/Session/Bill/2026/625/BillText/Filed/PDF"
+
+    def fetcher(url):
+        if url == bill_url:
+            return 200, "text/html", b'HB 625 Filed <a href="/Session/Bill/2026/625/BillText/Filed/PDF">Version</a>'
+        if url == bill_text_url:
+            return 200, mime, body
+        raise AssertionError(f"unexpected fetch {url}")
+
+    runner, sessions, job_id = _runner(
+        tmp_path, MockResearchBrowserProvider(), fetcher,
+        limits={"max_related_bill_versions": 1, "max_retries": 0},
+    )
+    runner._candidates = lambda _db, _job: [_candidate(url=bill_url, title="HB 625", status="Filed")]
+    runner.process(job_id)
+    with sessions() as db:
+        source = db.scalar(select(ScoutSource).where(ScoutSource.job_id == job_id, ScoutSource.canonical_url == bill_text_url))
+        assert source is not None and source.official is False
+        assert db.scalar(select(ScoutFinding).where(ScoutFinding.source_id == source.id)) is None
+        assert db.get(ScoutResearchJob, job_id).status == "partial"
+        assert db.execute(select(ScoutBrowserSession).where(ScoutBrowserSession.job_id == job_id)).scalars().all() == []
+
+
+def test_florida_bill_text_version_omits_finding_when_pdf_extraction_fails(tmp_path, monkeypatch):
+    bill_url = "https://www.flsenate.gov/Session/Bill/2026/625/ByCategory"
+    bill_text_url = "https://www.flsenate.gov/Session/Bill/2026/625/BillText/Filed/PDF"
+
+    def fetcher(url):
+        if url == bill_url:
+            return 200, "text/html", b'HB 625 Filed <a href="/Session/Bill/2026/625/BillText/Filed/PDF">Version</a>'
+        if url == bill_text_url:
+            return 200, "application/pdf", _pdf_with_text("HB 625 2026 Legislature")
+        raise AssertionError(f"unexpected fetch {url}")
+
+    monkeypatch.setattr(scout_runner_module, "extract_pdf_text", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("extract_failed")))
+    runner, sessions, job_id = _runner(
+        tmp_path, MockResearchBrowserProvider(), fetcher,
+        limits={"max_related_bill_versions": 1, "max_retries": 0},
+    )
+    runner._candidates = lambda _db, _job: [_candidate(url=bill_url, title="HB 625", status="Filed")]
+    runner.process(job_id)
+    with sessions() as db:
+        source = db.scalar(select(ScoutSource).where(ScoutSource.job_id == job_id, ScoutSource.canonical_url == bill_text_url))
+        assert source is not None and source.official is False and source.raw_ref is None
+        assert db.scalar(select(ScoutFinding).where(ScoutFinding.source_id == source.id)) is None
+        assert db.get(ScoutResearchJob, job_id).status == "partial"
+
+
 def test_old_scout_job_without_vote_limit_does_not_grant_vote_fetches(tmp_path):
     bill_url = "https://www.flsenate.gov/Session/Bill/2026/625/ByCategory"
     analysis_url = "https://www.flsenate.gov/Session/Bill/2026/625/Analyses/h0625c.JDC.PDF"
@@ -1207,6 +1401,22 @@ def test_related_document_does_not_attribute_a_chamber_from_a_late_cross_referen
     )
     assert description.title == "HB 625: Official Florida committee bill analysis (h0625c.JDC)"
     assert description.confidence == "medium"
+
+
+def test_bill_text_version_uses_only_its_safe_route_token_when_pdf_header_is_silent():
+    description = describe_related_document(
+        "HB 625 2026 Legislature",
+        identifier="HB 625",
+        artifact_type="bill text version",
+        url="https://www.flsenate.gov/Session/Bill/2026/625/BillText/er/PDF",
+        version_token="er",
+    )
+    assert (description.title, description.what_happened, description.relevant_date, description.confidence) == (
+        "HB 625: official bill text version (er)",
+        "Official bill text version (er) retrieved for HB 625.",
+        None,
+        "medium",
+    )
 
 
 def test_florida_related_documents_obey_the_shared_request_budget(tmp_path):
