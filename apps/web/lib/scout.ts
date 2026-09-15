@@ -343,7 +343,7 @@ export function normalizeScoutJob(payload: unknown): ScoutJob {
     sources: list(item.sources).map(normalizeSource),
     findings: list(item.findings).map(normalizeFinding),
     browserSessions,
-    errors,
+    errors: errors.map((error) => scoutServiceNote(error, optionalString(item.jurisdiction))),
   };
 }
 
@@ -457,8 +457,23 @@ async function responseJson(response: Response): Promise<unknown> {
   return response.json().catch(() => null);
 }
 
+/** Explain the bounded CA evidence outcomes without turning missing coverage into a factual claim. */
+function scoutServiceNote(value: string, jurisdiction?: string): string {
+  if (value === "unsupported_query" && jurisdiction === "CA") return "Scout could not match that California bill and session in Bill Commons. Check the bill number and session; this does not establish that the official bill is absent.";
+  const notes: Record<string, string> = {
+    retained_archive_exceeds_job_limit: "The retained California archive is larger than this research job can attach. No finding was created from that archive.",
+    retained_archive_integrity_failed: "Scout could not verify the retained California archive. No finding was created from unverified bytes.",
+    retained_archive_unavailable: "No usable matching action was found in the retained California archives checked. This does not mean the bill has no official actions.",
+  };
+  return notes[value] ?? value;
+}
+
 function apiError(response: Response, payload: unknown): ScoutApiError {
   const body = record(payload);
+  const structuredDetail = record(body?.detail);
+  if (response.status === 422 && structuredDetail?.message === "invalid_california_retained_query") {
+    return new ScoutApiError("For California, enter a bill and session, such as AB 123 2025-2026. Add Special Session 1 only for that session.", response.status);
+  }
   const detail = optionalString(body?.detail) ?? optionalString(body?.message);
   if (response.status === 401 || response.status === 403) {
     return new ScoutApiError("Sign in is required to start or view Scout research.", response.status);
@@ -466,7 +481,7 @@ function apiError(response: Response, payload: unknown): ScoutApiError {
   return new ScoutApiError(detail ?? `Scout request failed (${response.status}).`, response.status);
 }
 
-export async function createScoutJob(query: string, jurisdiction: string): Promise<ScoutJob> {
+export async function createScoutJob(query: string, jurisdiction: string, signal?: AbortSignal): Promise<ScoutJob> {
   let response: Response;
   try {
     response = await fetch(`${API_BASE}/api/v1/scout/jobs`, {
@@ -474,8 +489,10 @@ export async function createScoutJob(query: string, jurisdiction: string): Promi
       credentials: "include",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify({ query, jurisdiction }),
+      signal,
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
     throw new ScoutApiError("Scout could not reach the service. Please try again.");
   }
 
@@ -501,7 +518,12 @@ export async function getScoutJob(id: string, signal?: AbortSignal): Promise<Sco
   }
 
   const payload = await responseJson(response);
-  if (!response.ok) throw apiError(response, payload);
+  if (!response.ok) {
+    if (response.status === 404) {
+      throw new ScoutApiError("This Scout research result is unavailable. It may no longer exist or you may not have access to it.", response.status);
+    }
+    throw apiError(response, payload);
+  }
   const job = normalizeScoutJob(payload);
   if (!job.id) throw new ScoutApiError("Scout returned a response without a job identifier.");
   return job;
@@ -548,4 +570,134 @@ export async function getScoutReplay(jobId: string, sessionId: string): Promise<
     available: boolean(replay.available) ?? false,
     url: safeHttpsUrl(optionalString(replay.replay_url)),
   };
+}
+
+export interface ScoutMonitor {
+  id: string;
+  query: string;
+  jurisdiction: string;
+  cadenceSeconds: number;
+  active: boolean;
+  nextRunAt?: string;
+  consecutiveDeferrals: number;
+  lastCompletedRunId?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface ScoutMonitorRun {
+  id: string;
+  jobId?: string;
+  baselineRunId?: string;
+  status: string;
+  executionMode: string;
+  scheduledFor?: string;
+  startedAt?: string;
+  completedAt?: string;
+  errorClass?: string;
+  sourceSnapshot: Record<string, unknown>;
+  changeSummary: Record<string, unknown>;
+  job?: { id: string; status: ScoutStatus; query: string; jurisdiction: string; completedAt?: string };
+}
+
+export interface ScoutMonitorRunsPage {
+  monitor: ScoutMonitor;
+  runs: ScoutMonitorRun[];
+  nextCursor?: string;
+}
+
+function normalizeMonitor(value: unknown): ScoutMonitor {
+  const item = record(value) ?? {};
+  return {
+    id: optionalString(item.id) ?? "",
+    query: optionalString(item.query) ?? "Untitled Scout query",
+    jurisdiction: optionalString(item.jurisdiction) ?? "FL",
+    cadenceSeconds: number(item.cadence_seconds) ?? 0,
+    active: boolean(item.active) ?? false,
+    nextRunAt: optionalString(item.next_run_at),
+    consecutiveDeferrals: number(item.consecutive_deferrals) ?? 0,
+    lastCompletedRunId: optionalString(item.last_completed_run_id),
+    createdAt: optionalString(item.created_at),
+    updatedAt: optionalString(item.updated_at),
+  };
+}
+
+function normalizeMonitorRun(value: unknown, index: number): ScoutMonitorRun {
+  const item = record(value) ?? {};
+  const job = record(item.job);
+  return {
+    id: optionalString(item.id) ?? `monitor-run-${index}`,
+    jobId: optionalString(item.job_id),
+    baselineRunId: optionalString(item.baseline_run_id),
+    status: optionalString(item.status) ?? "unknown",
+    executionMode: optionalString(item.execution_mode) ?? "unknown",
+    scheduledFor: optionalString(item.scheduled_for),
+    startedAt: optionalString(item.started_at),
+    completedAt: optionalString(item.completed_at),
+    errorClass: optionalString(item.error_class),
+    sourceSnapshot: record(item.source_snapshot) ?? {},
+    changeSummary: record(item.change_summary) ?? {},
+    job: job ? {
+      id: optionalString(job.id) ?? "",
+      status: status(job.status),
+      query: optionalString(job.query) ?? "Scout research",
+      jurisdiction: optionalString(job.jurisdiction) ?? "FL",
+      completedAt: optionalString(job.completed_at),
+    } : undefined,
+  };
+}
+
+function monitorPayload(payload: unknown): ScoutMonitor {
+  const outer = record(payload) ?? {};
+  const monitor = normalizeMonitor(outer.monitor);
+  if (!monitor.id) throw new ScoutApiError("Scout returned a monitor without an identifier.");
+  return monitor;
+}
+
+async function monitorRequest(path: string, init?: RequestInit): Promise<unknown> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}/api/v1/scout${path}`, {
+      credentials: "include",
+      cache: "no-store",
+      ...init,
+      headers: { Accept: "application/json", ...(init?.body ? { "Content-Type": "application/json" } : {}), ...init?.headers },
+    });
+  } catch {
+    throw new ScoutApiError("Scout could not reach saved monitors. Please try again.");
+  }
+  const payload = await responseJson(response);
+  if (!response.ok) throw apiError(response, payload);
+  return payload;
+}
+
+export async function listScoutMonitors(): Promise<ScoutMonitor[]> {
+  const payload = record(await monitorRequest("/monitors")) ?? {};
+  return list(payload.monitors).map(normalizeMonitor).filter((monitor) => Boolean(monitor.id));
+}
+
+export async function saveScoutMonitor(jobId: string, cadenceSeconds: number): Promise<{ created: boolean; monitor: ScoutMonitor }> {
+  const payload = record(await monitorRequest(`/jobs/${encodeURIComponent(jobId)}/monitor`, {
+    method: "POST", body: JSON.stringify({ cadence_seconds: cadenceSeconds }),
+  })) ?? {};
+  return { created: boolean(payload.created) ?? false, monitor: monitorPayload(payload) };
+}
+
+export async function updateScoutMonitor(id: string, update: { active?: boolean; cadenceSeconds?: number }): Promise<ScoutMonitor> {
+  const body: Record<string, unknown> = {};
+  if (update.active !== undefined) body.active = update.active;
+  if (update.cadenceSeconds !== undefined) body.cadence_seconds = update.cadenceSeconds;
+  return monitorPayload(await monitorRequest(`/monitors/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }));
+}
+
+export async function getScoutMonitorRuns(id: string, cursor?: string): Promise<ScoutMonitorRunsPage> {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  const payload = record(await monitorRequest(`/monitors/${encodeURIComponent(id)}/runs${query}`)) ?? {};
+  const monitor = normalizeMonitor(payload.monitor);
+  if (!monitor.id) throw new ScoutApiError("Scout returned monitor history without a monitor identifier.");
+  return { monitor, runs: list(payload.runs).map(normalizeMonitorRun), nextCursor: optionalString(payload.next_cursor) };
+}
+
+export function isScoutMonitorEligible(job: ScoutJob): boolean {
+  return (job.status === "complete" || job.status === "partial") && job.findings.length > 0 && !/operator|canary/i.test(job.strategy ?? "");
 }

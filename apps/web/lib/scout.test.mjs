@@ -17,6 +17,7 @@ new Function("exports", "module", javascript)(compiled.exports, compiled);
 
 const {
   isScoutTerminal,
+  getScoutJob,
   normalizeScoutJob,
   safeHttpsUrl,
   scoutAnalyticsFacts,
@@ -234,4 +235,71 @@ test("does not count pre-provider browser slots in terminal analytics", () => {
     ],
   });
   assert.deepEqual(scoutBrowserProviderUsage(mixedAggregate), { sessions: 1, runtimeSeconds: 2 });
+});
+
+
+test("California unavailable evidence remains partial and does not imply official absence", () => {
+  const job = normalizeScoutJob({ id: "ca-partial", jurisdiction: "CA", status: "partial", error_class: "retained_archive_unavailable", findings: [] });
+  assert.equal(job.status, "partial");
+  assert.deepEqual(job.findings, []);
+  assert.match(job.errors[0], /does not mean the bill has no official actions/);
+  const oversized = normalizeScoutJob({ jurisdiction: "CA", status: "partial", error_class: "retained_archive_exceeds_job_limit" });
+  assert.match(oversized.errors[0], /larger than this research job can attach/);
+  const unmatched = normalizeScoutJob({ jurisdiction: "CA", error_class: "unsupported_query" });
+  assert.match(unmatched.errors[0], /does not establish that the official bill is absent/);
+  assert.deepEqual(normalizeScoutJob({ jurisdiction: "FL", error_class: "unsupported_query" }).errors, ["unsupported_query"]);
+});
+
+test("California admission errors explain the exact session grammar", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  globalThis.fetch = async (_url, options) => {
+    assert.deepEqual(JSON.parse(options.body), { query: "AB 123", jurisdiction: "CA" });
+    return new Response(JSON.stringify({ detail: { code: "invalid_scout_request", message: "invalid_california_retained_query" } }), { status: 422 });
+  };
+  await assert.rejects(compiled.exports.createScoutJob("AB 123", "CA"), (error) => error.status === 422 && /AB 123 2025-2026/.test(error.message));
+});
+
+test("saved monitor client uses owner-scoped endpoints and preserves bounded history state", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push([String(url), options]);
+    if (String(url).endsWith("/monitor")) return new Response(JSON.stringify({ created: true, monitor: { id: "m-1", query: "AB 123 2025-2026", jurisdiction: "CA", cadence_seconds: 86400, active: true } }));
+    if (String(url).includes("/runs")) return new Response(JSON.stringify({ monitor: { id: "m-1", query: "AB 123 2025-2026", jurisdiction: "CA", cadence_seconds: 86400, active: true }, runs: [{ id: "r-1", status: "completed", execution_mode: "cached", change_summary: { absence_evaluated: false, new_sources: [], changed_sources: [], unchanged_source_count: 1 } }], next_cursor: "older" }));
+    if (String(url).endsWith("/monitors")) return new Response(JSON.stringify({ monitors: [{ id: "m-1", query: "AB 123 2025-2026", jurisdiction: "CA", cadence_seconds: 86400, active: true }] }));
+    return new Response(JSON.stringify({ monitor: { id: "m-1", query: "AB 123 2025-2026", jurisdiction: "CA", cadence_seconds: 21600, active: false } }));
+  };
+  const saved = await compiled.exports.saveScoutMonitor("job-1", 86400);
+  const monitors = await compiled.exports.listScoutMonitors();
+  const history = await compiled.exports.getScoutMonitorRuns("m-1", "older");
+  const updated = await compiled.exports.updateScoutMonitor("m-1", { active: false, cadenceSeconds: 21600 });
+  assert.equal(saved.monitor.cadenceSeconds, 86400);
+  assert.equal(monitors[0].active, true);
+  assert.equal(history.nextCursor, "older");
+  assert.equal(history.runs[0].changeSummary.absence_evaluated, false);
+  assert.equal(updated.active, false);
+  assert.deepEqual(JSON.parse(calls[0][1].body), { cadence_seconds: 86400 });
+  assert.match(calls[2][0], /\/runs\?cursor=older$/);
+  assert.deepEqual(JSON.parse(calls[3][1].body), { active: false, cadence_seconds: 21600 });
+});
+
+test("monitor eligibility requires retained terminal evidence and excludes operator strategies", () => {
+  assert.equal(compiled.exports.isScoutMonitorEligible(normalizeScoutJob({ status: "completed", findings: [{ id: "f", title: "Evidence" }], strategy: "structured_first" })), true);
+  assert.equal(compiled.exports.isScoutMonitorEligible(normalizeScoutJob({ status: "partial", findings: [], strategy: "structured_first" })), false);
+  assert.equal(compiled.exports.isScoutMonitorEligible(normalizeScoutJob({ status: "completed", findings: [{ id: "f", title: "Evidence" }], strategy: "operator_canary" })), false);
+});
+
+
+test("linked jobs surface unavailable owner-scoped evidence without creating research", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  globalThis.fetch = async (url, options) => {
+    assert.match(String(url), /\/api\/v1\/scout\/jobs\/missing-job$/);
+    assert.equal(options.method, undefined);
+    return new Response(JSON.stringify({ detail: "not found" }), { status: 404 });
+  };
+  await assert.rejects(getScoutJob("missing-job"), (error) =>
+    error.status === 404 && /unavailable/.test(error.message) && /may not have access/.test(error.message));
 });
