@@ -38,9 +38,10 @@ that the current page or PDF will remain unchanged.
 
 ## Cache and monitor integration
 
-Florida's cache namespace is `scout-p0-4-bill-text-version`, so completed
-results from the prior provenance namespace are retained for audit but never
-returned as fresh bill-text-capable results. In the saved-monitor integration,
+Florida's cache namespace is `scout-p0-5-meeting-documents`, so completed
+results from earlier namespaces are retained for audit but never returned as
+fresh results. Explicit meeting queries now use the
+[meeting-document path](FLORIDA_MEETING_DOCUMENTS.md). In the saved-monitor integration,
 the shared `scout_admission._limits` snapshot includes
 `max_related_bill_versions`, so API-created and scheduler-created jobs retain
 the same immutable allowance.

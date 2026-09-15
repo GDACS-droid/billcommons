@@ -26,7 +26,7 @@ DEFAULT_MAX_RETAINED_RAWSTORE_BYTES = 512 * 1024 * 1024
 # Bump whenever extraction changes user-visible evidence semantics. Jobs from
 # earlier namespaces remain auditable records, but must not be returned as a
 # fresh result under a corrected presentation contract.
-SCOUT_CACHE_NAMESPACE = "scout-p0-4-bill-text-version"
+SCOUT_CACHE_NAMESPACE = "scout-p0-5-meeting-documents"
 SCOUT_CA_RETAINED_CACHE_NAMESPACE = "scout-ca-retained-p0"
 OFFICIAL_FLORIDA_HOSTS = frozenset({
     "www.flsenate.gov", "flsenate.gov", "www.myfloridahouse.gov",
@@ -135,6 +135,8 @@ class ScoutSettings:
     # One direct Senate bill-text version follows the existing related and
     # vote lanes. It is a distinct, immutable per-job allowance.
     max_related_bill_versions: int = 1
+    # Explicit meeting queries use this lane within the existing global cap.
+    max_related_meeting_documents: int = 1
     max_retries: int = 1
     cache_ttl_seconds: int = 3600
     max_pdf_pages: int = 20

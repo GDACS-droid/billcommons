@@ -35,6 +35,9 @@ from billcommons_schema.models import (
     Session as LegislativeSession,
 )
 from billcommons_shared.ca_official_actions import OfficialCaActionsError, parse_ca_official_actions_zip
+from billcommons_shared.fl_senate_meetings import (
+    discover_meeting_request, discover_meeting_document, meeting_evidence_excerpt,
+)
 from billcommons_shared.rawstore import RawStore
 from billcommons_shared.scout_admission import ScoutAdmissionError, admit_scout_job, customer_is_admitted
 from billcommons_shared.scout_monitors import defer_delay_seconds, finalize_monitor_run
@@ -54,6 +57,8 @@ from billcommons_scout.pdf_extract import extract_pdf_text
 Fetcher = Callable[[str], tuple[int, str | None, bytes]]
 _INFLIGHT_CLEANUP_LOCK = threading.Lock()
 _INFLIGHT_CLEANUPS: set[uuid.UUID] = set()
+_MEETING_FOCUS_RE = re.compile(r"\b(?:agendas?|meetings?|hearings?)\b", re.I)
+_MEETING_ARTIFACT_TYPES = {"committee expanded agenda", "committee meeting notice"}
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
 _RELATED_HOUSE_RE = re.compile(r"\bFLORIDA\s+HOUSE\s+OF\s+REPRESENTATIVES\b", re.I)
@@ -125,6 +130,13 @@ def describe_related_document(
     similarly named official attachments.
     """
     display_text = _SPACE_RE.sub(" ", text).strip()
+    if artifact_type in _MEETING_ARTIFACT_TYPES:
+        return RelatedDocumentDescription(
+            title=f"{identifier}: official {artifact_type}",
+            what_happened=f"Official {artifact_type} identifying {identifier} retrieved.",
+            relevant_date=None,
+            confidence="medium",
+        )
     if artifact_type == "bill text version":
         # The URL route proves only this safely admitted token. Do not promote
         # it into a legislative stage when the PDF header is absent or silent.
@@ -1260,6 +1272,16 @@ class ScoutRunner:
             vote_maximum = self._vote_record_limit(job)
             bill_text_maximum = self._bill_text_version_limit(job)
             max_direct_bytes = self._job_limit(job, "max_direct_bytes", self.settings.max_direct_bytes)
+            meeting_cap = (job.limits or {}).get("max_related_meeting_documents")
+            meeting_focus = (
+                isinstance(meeting_cap, int) and not isinstance(meeting_cap, bool)
+                and meeting_cap > 0 and bool(_MEETING_FOCUS_RE.search(job.original_query))
+            )
+        if meeting_focus:
+            return self._inspect_florida_meeting_documents(
+                job_id, token, cancel_version, bill_id, bill_title, bill_status,
+                metadata, parent_url, parent_body, seen_urls,
+            )
         related = discover_florida_senate_related_documents(
             parent_url, parent_body, maximum=maximum, max_html_bytes=max_direct_bytes
         )
@@ -1368,6 +1390,102 @@ class ScoutRunner:
                 self._record_failed_source(job_id, token, document.canonical_url, "direct", None, None)
                 failures += 1
         return successes, failures, False
+
+    def _inspect_florida_meeting_documents(
+        self, job_id, token, cancel_version, bill_id, bill_title, bill_status,
+        metadata, parent_url, parent_body, seen_urls,
+    ) -> tuple[int, int, bool]:
+        """Follow one bill-referenced meeting through its session-pinned index.
+
+        Both hops consume the original request budget. The retained index proves
+        discovery; only the PDF can produce a bill finding. No browser fallback.
+        """
+        with self.sessions() as db:
+            job = self._fenced(db, job_id, token)
+            if job is None or self._canceled(db, job, cancel_version, token):
+                return 0, 0, False
+            maximum = self._job_limit(job, "max_direct_bytes", self.settings.max_direct_bytes)
+            retries = self._job_limit(job, "max_retries", self.settings.max_retries)
+        request = discover_meeting_request(parent_url, parent_body, max_html_bytes=maximum)
+        if request is None:
+            with self.sessions() as db:
+                if self._fenced(db, job_id, token) is not None:
+                    db.add(ScoutJobEvent(job_id=job_id, kind="meeting_discovery_incomplete", detail={
+                        "reason": "no_bill_referenced_meeting",
+                    }))
+                    db.commit()
+            return 0, 1, False
+        url = request.canonical_url
+        for stage in ("index", "document"):
+            if url in seen_urls:
+                return 0, 1, False
+            seen_urls.add(url)
+            try:
+                for attempt in range(retries + 1):
+                    with self.sessions() as db:
+                        job = self._fenced(db, job_id, token)
+                        if job is None or self._canceled(db, job, cancel_version, token):
+                            return 0, 0, False
+                    if not self._reserve_external_attempt(job_id, token):
+                        return 0, 0, True
+                    try:
+                        status, mime, body = self._direct_fetch(url, max_body_bytes=maximum)
+                        break
+                    except SafeHttpError:
+                        if attempt == retries:
+                            raise
+                if not self._heartbeat(job_id, token):
+                    return 0, 0, False
+                if len(body) > maximum or classify_direct_response(status, mime, body) != "usable":
+                    self._record_failed_source(job_id, token, url, "direct", status, mime)
+                    return 0, 1, False
+                with self.sessions() as db:
+                    job = self._fenced(db, job_id, token)
+                    if job is None or self._canceled(db, job, cancel_version, token):
+                        return 0, 0, False
+                if stage == "index":
+                    if (mime or "").split(";", 1)[0].strip().lower() != "text/html":
+                        self._record_failed_source(job_id, token, url, "direct", status, mime)
+                        return 0, 1, False
+                    document = discover_meeting_document(request, body, max_html_bytes=maximum)
+                    if document is None:
+                        self._record_failed_source(job_id, token, url, "direct", status, mime)
+                        return 0, 1, False
+                    source_id = self._persist_capture(
+                        job_id, token, bill_id, bill_title, bill_status, metadata,
+                        url, "direct", status, mime, body, create_finding=False,
+                    )
+                    if source_id is None:
+                        return 0, 1, False
+                    with self.sessions() as db:
+                        if self._fenced(db, job_id, token) is None:
+                            return 0, 0, False
+                        db.add(ScoutJobEvent(job_id=job_id, kind="meeting_document_discovered", detail={
+                            "parent_url": parent_url, "index_source_id": str(source_id),
+                            "document_url": document.canonical_url,
+                            "session_year": request.session_year,
+                            "meeting_date": request.meeting_date.isoformat(),
+                        }))
+                        db.commit()
+                    url = document.canonical_url
+                else:
+                    if not is_pdf_attachment_payload(mime, body):
+                        self._record_failed_source(job_id, token, url, "direct", status, mime)
+                        return 0, 1, False
+                    related_metadata = dict(metadata)
+                    related_metadata.update(
+                        related_artifact_type=document.artifact_type,
+                        related_session_year=request.session_year,
+                    )
+                    source_id = self._persist_capture(
+                        job_id, token, bill_id, bill_title, bill_status, related_metadata,
+                        url, "direct", status, mime, body,
+                    )
+                    return (1, 0, False) if source_id else (0, 1, False)
+            except Exception:
+                self._record_failed_source(job_id, token, url, "direct", None, None)
+                return 0, 1, False
+        return 0, 1, False  # pragma: no cover
 
     def _record_failed_source(self, job_id: uuid.UUID, token: str, url: str, mechanism: str, status: int | None, mime: str | None) -> None:
         try:
@@ -1516,7 +1634,7 @@ class ScoutRunner:
                     exact_raw_ref = None
             mime_base = (mime or "").split(";", 1)[0].lower()
             related_artifact_type = metadata.get("related_artifact_type")
-            if related_artifact_type not in {"committee analysis", "amendment", "vote record", "bill text version"}:
+            if related_artifact_type not in {"committee analysis", "amendment", "vote record", "bill text version"} | _MEETING_ARTIFACT_TYPES:
                 related_artifact_type = None
             evidence: tuple[str, int, int] | None = None
             related_description: RelatedDocumentDescription | None = None
@@ -1533,6 +1651,8 @@ class ScoutRunner:
                 else:
                     text = html.unescape(_TAG_RE.sub(" ", body.decode("utf-8", "replace")))[:max_pdf_text_chars].strip()
                 evidence = (
+                    self._meeting_evidence_excerpt(text, metadata)
+                    if related_artifact_type in _MEETING_ARTIFACT_TYPES else
                     self._related_evidence_excerpt(text, metadata)
                     if related_artifact_type
                     else self._evidence_excerpt(text, metadata, bill_status)
@@ -1675,7 +1795,11 @@ class ScoutRunner:
                             excerpt_start=excerpt_start,
                             excerpt_end=excerpt_end,
                             confidence=related_description.confidence,
-                            extractor_version="scout-p0-3-related-provenance",
+                            extractor_version=(
+                                "scout-p0-5-meeting-documents"
+                                if related_artifact_type in _MEETING_ARTIFACT_TYPES
+                                else "scout-p0-3-related-provenance"
+                            ),
                             bill_id=bill_id,
                         )
                     elif create_finding:
@@ -1729,6 +1853,17 @@ class ScoutRunner:
         if identifier not in excerpt.casefold() or action not in excerpt.casefold():  # defensive: preserve the display invariant.
             return None
         return excerpt, start, end
+
+    @staticmethod
+    def _meeting_evidence_excerpt(text: str, metadata: dict) -> tuple[str, int, int] | None:
+        excerpt = meeting_evidence_excerpt(
+            text, str(metadata.get("identifier") or ""), metadata.get("related_session_year"),
+        )
+        if not excerpt:
+            return None
+        display_text = _SPACE_RE.sub(" ", text).strip()
+        start = display_text.find(excerpt)
+        return (excerpt, start, start + len(excerpt)) if start >= 0 else None
 
     @staticmethod
     def _related_evidence_excerpt(text: str, metadata: dict, *, maximum: int = 500) -> tuple[str, int, int] | None:

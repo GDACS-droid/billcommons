@@ -233,6 +233,7 @@ def test_california_monitor_scheduler_uses_retained_admission_and_parse_limit(tm
     # The scheduler shares the same immutable admission snapshot as the API.
     # This Florida-only lane remains inert for California retained jobs.
     assert scheduled.limits["max_related_bill_versions"] == 1
+    assert scheduled.limits["max_related_meeting_documents"] == 1
 
 
 @pytest.mark.parametrize("deferred", [False, True])
@@ -3323,3 +3324,153 @@ def test_rollback_reconcile_is_idempotent_and_preserves_fresh_claim(tmp_path):
         assert db.get(ScoutResearchJob, job_id).status == "running"
         rows = db.execute(select(ScoutResearchJob).where(ScoutResearchJob.id.in_((queued.id, expired.id)))).scalars().all()
         assert {(row.status, row.error_class) for row in rows} == {("failed", "rolled_back")}
+
+
+def _meeting_runner(tmp_path, *, pdf_text=None, limits=None, query="HB 12 committee agenda", index_year=2026):
+    bill_url = "https://www.flsenate.gov/Session/Bill/2026/12"
+    index_url = "https://www.flsenate.gov/Committees/Show/CF/2026"
+    pdf_url = "https://www.flsenate.gov/Committees/Show/CF/ExpandedAgenda/6727"
+    parent = b'''HB 12 Filed <a href="/Committees/Show/CF">Children, Families, and Elder Affairs</a>
+        <table><tr><td>1/6/2026</td><td>On Committee agenda-- Children, Families, and Elder Affairs, 01/12/26, 4:00 pm</td></tr></table>'''
+    index = f'''<table id="meetingsTbl"><caption>{index_year} Meeting Records</caption><tbody>
+        <tr><td>1/12/2026</td><td>
+        <a href="/Committees/Show/CF/MeetingNotice/6727">Notice</a>
+        <a href="/Committees/Show/CF/ExpandedAgenda/6727">Expanded Agenda</a>
+        </td></tr></tbody></table>'''.encode()
+    pdf = _pdf_with_text(pdf_text or "2026 Regular Session COMMITTEE MEETING EXPANDED AGENDA HB 12")
+    responses = {bill_url: (200, "text/html", parent), index_url: (200, "text/html", index), pdf_url: (200, "application/pdf", pdf)}
+    calls = []
+    def fetcher(url):
+        calls.append(url)
+        return responses[url]
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), fetcher, limits=(
+        {"max_related_meeting_documents": 1, "max_external_requests": 5, "max_retries": 0}
+        if limits is None else limits
+    ))
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        job.original_query = query
+        job.normalized_query = query.lower()
+        db.commit()
+    runner._candidates = lambda _db, _job: [_candidate()]
+    return runner, sessions, job_id, calls, responses
+
+
+def test_florida_meeting_discovery_retains_both_hops_and_bill_evidence(tmp_path):
+    runner, sessions, job_id, calls, responses = _meeting_runner(tmp_path)
+    runner.process(job_id)
+    assert calls == list(responses)
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert (job.status, job.usage["external_requests"]) == ("completed", 3)
+        sources = db.scalars(select(ScoutSource).where(ScoutSource.job_id == job_id)).all()
+        findings = db.scalars(select(ScoutFinding).where(ScoutFinding.job_id == job_id)).all()
+        assert len(sources) == 3 and len(findings) == 2
+        for source in sources:
+            assert source.official is True
+            assert source.content_hash == content_hash(responses[source.canonical_url][2])
+            assert runner.rawstore.get(source.raw_ref) == responses[source.canonical_url][2]
+        agenda = next(f for f in findings if "expanded agenda" in f.title)
+        assert agenda.what_happened == "Official committee expanded agenda identifying HB 12 retrieved."
+        assert "HB 12" in agenda.excerpt and agenda.confidence == "medium"
+        assert agenda.relevant_date is None and agenda.why_it_matters is None
+        assert agenda.extractor_version == "scout-p0-5-meeting-documents"
+        assert not db.scalars(select(ScoutBrowserSession)).all()
+        event = db.scalar(select(ScoutJobEvent).where(ScoutJobEvent.kind == "meeting_document_discovered"))
+        assert event.detail["meeting_date"] == "2026-01-12"
+        assert event.detail["session_year"] == 2026
+        assert event.detail["index_source_id"] in {str(s.id) for s in sources}
+
+
+@pytest.mark.parametrize("limits,query", [
+    ({}, "HB 12 agenda"),
+    ({"max_related_meeting_documents": 0}, "HB 12 agenda"),
+    ({"max_related_meeting_documents": True}, "HB 12 agenda"),
+    ({"max_related_meeting_documents": "1"}, "HB 12 agenda"),
+    ({"max_related_meeting_documents": 1}, "HB 12"),
+])
+def test_florida_meetings_require_focus_and_immutable_allowance(tmp_path, limits, query):
+    runner, sessions, job_id, calls, responses = _meeting_runner(tmp_path, limits=limits, query=query)
+    runner.process(job_id)
+    assert calls == list(responses)[:1]
+    with sessions() as db:
+        assert db.get(ScoutResearchJob, job_id).status == "completed"
+
+
+@pytest.mark.parametrize("pdf_text", [
+    "2026 Regular Session COMMITTEE MEETING EXPANDED AGENDA HB 123",
+    "2025 Regular Session COMMITTEE MEETING EXPANDED AGENDA HB 12",
+    "2026 Regular Session HB 12",
+])
+def test_florida_meeting_wrong_bill_or_session_does_not_create_finding(tmp_path, pdf_text):
+    runner, sessions, job_id, calls, responses = _meeting_runner(tmp_path, pdf_text=pdf_text)
+    runner.process(job_id)
+    assert calls == list(responses)
+    with sessions() as db:
+        assert db.get(ScoutResearchJob, job_id).status == "partial"
+        assert len(db.scalars(select(ScoutFinding)).all()) == 1
+        assert not db.scalars(select(ScoutBrowserSession)).all()
+
+
+def test_florida_meeting_global_budget_stops_before_pdf(tmp_path):
+    runner, sessions, job_id, calls, responses = _meeting_runner(
+        tmp_path, limits={"max_related_meeting_documents": 1, "max_external_requests": 2, "max_retries": 0},
+    )
+    runner.process(job_id)
+    assert calls == list(responses)[:2]
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert job.usage["external_requests"] == 2
+        assert job.status == "partial"
+        assert len(db.scalars(select(ScoutFinding)).all()) == 1
+
+
+def test_florida_meeting_wrong_index_session_is_partial_without_followup(tmp_path):
+    runner, sessions, job_id, calls, responses = _meeting_runner(tmp_path, index_year=2025)
+    runner.process(job_id)
+    assert calls == list(responses)[:2]
+    with sessions() as db:
+        assert db.get(ScoutResearchJob, job_id).status == "partial"
+        assert len(db.scalars(select(ScoutFinding)).all()) == 1
+        assert not db.scalars(select(ScoutBrowserSession)).all()
+
+
+@pytest.mark.parametrize("cancel_stage", [1, 2])
+def test_florida_meeting_cancel_during_fetch_prevents_next_write(tmp_path, cancel_stage):
+    runner, sessions, job_id, calls, responses = _meeting_runner(tmp_path)
+    def fetcher(url, **_kwargs):
+        calls.append(url)
+        if url == list(responses)[cancel_stage]:
+            with sessions() as db:
+                job = db.get(ScoutResearchJob, job_id)
+                job.status = "canceled"
+                job.cancel_version += 1
+                db.commit()
+        return responses[url]
+    runner._direct_fetch = fetcher
+    runner.process(job_id)
+    assert calls == list(responses)[:cancel_stage + 1]
+    with sessions() as db:
+        assert db.get(ScoutResearchJob, job_id).status == "canceled"
+        assert len(db.scalars(select(ScoutFinding)).all()) == 1
+        assert len(db.scalars(select(ScoutSource)).all()) == cancel_stage
+
+
+def test_florida_meeting_retries_consume_global_budget(tmp_path):
+    from billcommons_shared.safe_http import SafeHttpError
+    runner, sessions, job_id, calls, responses = _meeting_runner(
+        tmp_path, limits={"max_related_meeting_documents": 1, "max_external_requests": 3, "max_retries": 1},
+    )
+    index_url = list(responses)[1]
+    def fetcher(url, **_kwargs):
+        calls.append(url)
+        if url == index_url and calls.count(index_url) == 1:
+            raise SafeHttpError("temporary")
+        return responses[url]
+    runner._direct_fetch = fetcher
+    runner.process(job_id)
+    assert calls == [list(responses)[0], index_url, index_url]
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        assert (job.status, job.usage["external_requests"]) == ("partial", 3)
+        assert len(db.scalars(select(ScoutFinding)).all()) == 1

@@ -1539,13 +1539,14 @@ def test_postgres_monitor_scheduler_rekeys_legacy_baseline_for_current_api_coale
     assert coalesced.json()["job"]["id"] == str(scheduled.id)
 
 
-def test_postgres_current_florida_namespace_does_not_reuse_fresh_pre_bill_text_cache(
-    pg_scout: PostgresScoutHarness, scout_api
+@pytest.mark.parametrize("old_namespace", ["scout-p0-3-provenance", "scout-p0-4-bill-text-version"])
+def test_postgres_current_florida_namespace_does_not_reuse_fresh_older_cache(
+    pg_scout: PostgresScoutHarness, scout_api, old_namespace
 ):
-    """A terminal p0-3 job stays auditable but cannot hide the new direct lane."""
+    """Older terminal jobs cannot hide a newly added direct discovery lane."""
     customer = pg_scout.customer("pre-bill-text-cache")
     query = "HB 625"
-    old_key = scout_cache_key(query, "FL", freshness_bucket="scout-p0-3-provenance")
+    old_key = scout_cache_key(query, "FL", freshness_bucket=old_namespace)
     current_key = scout_cache_key(
         query, "FL", freshness_bucket=scout_cache_namespace("FL")
     )
@@ -1576,6 +1577,7 @@ def test_postgres_current_florida_namespace_does_not_reuse_fresh_pre_bill_text_c
         current = db.get(ScoutResearchJob, uuid.UUID(created.json()["job"]["id"]))
         assert current is not None and current.cache_key == current_key
         assert current.limits["max_related_bill_versions"] == 1
+        assert current.limits["max_related_meeting_documents"] == 1
 
 
 def test_postgres_saved_monitor_history_cursor_returns_every_run_once(
