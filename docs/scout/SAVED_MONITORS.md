@@ -30,8 +30,12 @@ the final run returned by the previous page.
 
 ## Rollout
 
-1. Apply Alembic revision `0031` to the API and Scout worker database before
-deploying either application revision.
+1. For the combined intelligence release, apply the exact Alembic target
+`0032_intelligence_merge` to the API and Scout worker database before deploying
+either application revision. This joins saved-monitor revision `0031` and
+snapshot-blocker revision `0031_snapshot_blockers`; both retain parent `0030`.
+An empty production revision table requires the separate metadata recovery
+procedure and fresh schema evidence before any upgrade.
 2. Deploy API and worker code together. A worker that lacks the new tables
 cannot run its scheduler; an API that lacks them cannot save monitors.
 3. Keep Scout's existing feature and public/canary controls enabled only for
@@ -39,6 +43,12 @@ approved capacity. Resuming a monitor requires the current rollout policy;
 pause and owner history remain available during a dark rollback.
 4. Monitor `deferred` runs and quota codes before increasing the monitor cap
 or shortening the minimum cadence. No monitor is a reserved provider budget.
+
+Prefer application rollback with the additive tables retained. The local
+disposable-database downgrade to `0030` tests reversibility of the schema, not
+preservation of live monitor history: it drops both monitor tables and the
+snapshot-blocker table. Do not use that downgrade as a production rollback
+after those tables contain live state without an explicit data recovery plan.
 
 The `scout_monitor_runs.job_id` foreign key is `NO ACTION DEFERRABLE
 INITIALLY DEFERRED`. A standalone job deletion is rejected at transaction
