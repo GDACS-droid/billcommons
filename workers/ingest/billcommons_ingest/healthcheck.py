@@ -40,7 +40,7 @@ from sqlalchemy import text
 
 from billcommons_shared.db import get_session
 
-from .fulltext import TERMINAL_STATUSES
+from .fulltext import AWAITING_UPSTREAM_STATUSES, TERMINAL_STATUSES
 
 # A document is extracted every few seconds when healthy, so 30 minutes of
 # complete silence is far outside normal variance -- including the slow tail
@@ -68,6 +68,7 @@ class CrawlHealth:
     queued_total: int
     dead_total: int
     backlog_remains: bool = False
+    awaiting_upstream: int = 0
 
     def render(self) -> str:
         head = "HEALTHY" if self.healthy else "STALLED"
@@ -83,6 +84,7 @@ class CrawlHealth:
             f"  texted last hour  : {self.texted_last_hour:,}\n"
             f"  claimable now     : {self.claimable_now:,}\n"
             f"  queued / dead     : {self.queued_total:,} / {self.dead_total:,}\n"
+            f"  awaiting upstream : {self.awaiting_upstream:,}\n"
             f"  backlog remains   : {self.backlog_remains}"
         )
 
@@ -112,10 +114,32 @@ def check_crawl_health(
         "and updated_at > :cutoff",
         cutoff=now - timedelta(hours=1),
     )
+    # A job whose document is merely waiting on an upstream assignment is
+    # claimable but CANNOT produce text, so counting it as "work available"
+    # makes the stall verdict flip with the retry backoff rather than with the
+    # crawl's actual health. See AWAITING_UPSTREAM_STATUSES for the incident.
+    awaiting_notes = [f"fulltext_status={status}" for status in AWAITING_UPSTREAM_STATUSES]
+    awaiting_decorated = [f"{note} %" for note in awaiting_notes]
+    awaiting_predicate = (
+        "exists (select 1 from bill_documents d "
+        " where d.id = (j.payload->>'document_id')::uuid "
+        "   and (d.license_note = any(:awaiting) "
+        "        or d.license_note like any(:awaiting_decorated)))"
+    )
     claimable_now = scalar(
-        "select count(*) from ingest_jobs where kind='fetch_text' "
-        "and status='queued' and run_after <= :now",
+        "select count(*) from ingest_jobs j where j.kind='fetch_text' "
+        "and j.status='queued' and j.run_after <= :now "
+        f"and not {awaiting_predicate}",
         now=now,
+        awaiting=awaiting_notes,
+        awaiting_decorated=awaiting_decorated,
+    )
+    awaiting_upstream = scalar(
+        "select count(*) as awaiting_upstream from ingest_jobs j "
+        "where j.kind='fetch_text' and j.status='queued' "
+        f"and {awaiting_predicate}",
+        awaiting=awaiting_notes,
+        awaiting_decorated=awaiting_decorated,
     )
     queued_total = scalar("select count(*) from ingest_jobs where kind='fetch_text' and status='queued'")
     dead_total = scalar("select count(*) from ingest_jobs where kind='fetch_text' and status='dead'")
@@ -163,11 +187,17 @@ def check_crawl_health(
         )
     elif claimable_now == 0:
         healthy = True
-        reason = (
-            "no claimable fetch_text work, backlog pending -- top-up due, not stalled"
-            if backlog_remains
-            else "no claimable fetch_text work -- idle, not stalled"
-        )
+        if awaiting_upstream:
+            # Name the wait explicitly: a queue that is non-empty but entirely
+            # upstream-blocked otherwise reads as an unexplained quiet crawl.
+            reason = (
+                f"no actionable fetch_text work -- {awaiting_upstream:,} job(s) waiting on an "
+                "upstream assignment, not stalled"
+            )
+        elif backlog_remains:
+            reason = "no claimable fetch_text work, backlog pending -- top-up due, not stalled"
+        else:
+            reason = "no claimable fetch_text work -- idle, not stalled"
     elif minutes_since is None:
         healthy, reason = False, f"{claimable_now:,} jobs claimable but no document has EVER been extracted"
     elif minutes_since >= stall_minutes:
@@ -191,6 +221,7 @@ def check_crawl_health(
         queued_total=int(queued_total or 0),
         dead_total=int(dead_total or 0),
         backlog_remains=backlog_remains,
+        awaiting_upstream=int(awaiting_upstream or 0),
     )
 
 
