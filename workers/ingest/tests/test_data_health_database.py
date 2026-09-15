@@ -211,6 +211,57 @@ def test_snapshot_blocker_report_counts_all_active_and_bounds_each_jurisdiction(
     assert _report_row(refreshed, "AK")["source_health"]["snapshot_blockers"]["samples"] == []
 
 
+def _plan_nodes(node):
+    yield node
+    for child in node.get("Plans", ()):
+        yield from _plan_nodes(child)
+
+
+def test_official_source_lateral_lookup_is_bounded_before_execution(db_session):
+    jurisdiction, _ = _seed_current_session(db_session, "CA")
+    target_count = official_source_health.MAX_OFFICIAL_HEALTH_TARGETS + 2
+    targets = [OfficialSourceTarget(
+        jurisdiction_id=jurisdiction.id,
+        adapter_name="source-health-bound-test/1",
+        source_url=f"https://example.invalid/bound/{index}",
+        enabled=True,
+        cadence_seconds=3600,
+        next_check_at=NOW + timedelta(hours=1),
+    ) for index in range(target_count)]
+    db_session.add_all(targets)
+    db_session.flush()
+    db_session.add_all(OfficialSourceObservation(
+        target_id=target.id,
+        adapter_name=target.adapter_name,
+        adapter_version="test/1",
+        source_url=target.source_url,
+        retrieved_at=NOW,
+        status="failed",
+        error_class="bounded-plan-fixture",
+    ) for target in targets)
+    db_session.flush()
+
+    plan = db_session.execute(
+        official_source_health._health_statement(explain_analyze=True),
+        {
+            "jurisdiction_ids": (jurisdiction.id,),
+            "row_limit": official_source_health.MAX_OFFICIAL_HEALTH_TARGETS + 1,
+        },
+    ).scalar_one()[0]["Plan"]
+    nodes = tuple(_plan_nodes(plan))
+    target_limit = next(node for node in nodes if node["Node Type"] == "Limit")
+    assert target_limit["Actual Rows"] == official_source_health.MAX_OFFICIAL_HEALTH_TARGETS + 1
+    observation_lookup = [node for node in nodes if node.get("Relation Name") == "official_source_observations"]
+    assert observation_lookup
+    assert max(node["Actual Loops"] for node in observation_lookup) <= (
+        official_source_health.MAX_OFFICIAL_HEALTH_TARGETS + 1
+    )
+    with pytest.raises(ValueError, match="inventory exceeds"):
+        official_source_health.collect_official_source_health(
+            db_session, jurisdiction_ids=(jurisdiction.id,), now=NOW,
+        )
+
+
 def test_session_coverage_and_source_specific_sync_health_use_real_postgres_rows(
     db_session,
 ):
