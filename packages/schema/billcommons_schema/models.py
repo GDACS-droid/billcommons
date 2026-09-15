@@ -815,6 +815,70 @@ class IngestionRun(UUIDPkMixin, TimestampMixin, Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class ApiSyncSnapshotBlocker(UUIDPkMixin, TimestampMixin, Base):
+    """A bounded, durable record of one API bill whose evidence snapshot overflowed.
+
+    The source identity is a SHA-256 fingerprint because a newly-created Bill
+    row is intentionally rolled back with its failed savepoint.  Keeping the
+    blocker outside that savepoint makes the incomplete scan visible without
+    storing source payloads, URLs, or exception text.
+    """
+
+    __tablename__ = "api_sync_snapshot_blockers"
+
+    jurisdiction_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("jurisdictions.id"), nullable=False
+    )
+    bill_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bills.id", ondelete="SET NULL"), nullable=True
+    )
+    source_name: Mapped[str] = mapped_column(Text, nullable=False)
+    source_identity_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    component: Mapped[str] = mapped_column(Text, nullable=False)
+    record_cap: Mapped[int] = mapped_column(Integer, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    processing_version: Mapped[str] = mapped_column(Text, nullable=False)
+    cycle_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cycle_start_page: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_since_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "jurisdiction_id",
+            "source_name",
+            "source_identity_sha256",
+            name="uq_api_sync_snapshot_blocker_identity",
+        ),
+        CheckConstraint("record_cap >= 1", name="ck_api_sync_snapshot_blocker_cap"),
+        CheckConstraint("cycle_start_page >= 1", name="ck_api_sync_snapshot_blocker_page"),
+        CheckConstraint(
+            "component IN ('actions', 'sponsorships', 'versions', 'documents')",
+            name="ck_api_sync_snapshot_blocker_component",
+        ),
+        CheckConstraint(
+            "(active AND resolved_at IS NULL) OR (NOT active AND resolved_at IS NOT NULL)",
+            name="ck_api_sync_snapshot_blocker_resolution",
+        ),
+        CheckConstraint(
+            "source_identity_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_api_sync_snapshot_blocker_identity_hash",
+        ),
+        CheckConstraint(
+            "updated_since_sha256 IS NULL OR updated_since_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_api_sync_snapshot_blocker_window_hash",
+        ),
+        Index(
+            "ix_api_sync_snapshot_blocker_active",
+            "jurisdiction_id",
+            "source_name",
+            postgresql_where=text("active"),
+        ),
+    )
+
+
 class ValidationRun(UUIDPkMixin, TimestampMixin, Base):
     """A validation pass over ingested data for a jurisdiction/session."""
 
@@ -1683,6 +1747,75 @@ class ScoutResearchJob(UUIDPkMixin, TimestampMixin, Base):
             postgresql_where=text("status IN ('queued', 'running')"),
             sqlite_where=text("status IN ('queued', 'running')"),
         ),
+    )
+
+
+class ScoutMonitor(UUIDPkMixin, TimestampMixin, Base):
+    """An owner-saved Scout query with a durable, bounded next due time."""
+
+    __tablename__ = "scout_monitors"
+
+    customer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("api_customers.id", ondelete="CASCADE"), nullable=False
+    )
+    original_query: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_query: Mapped[str] = mapped_column(Text, nullable=False)
+    jurisdiction: Mapped[str] = mapped_column(Text, nullable=False)
+    cache_key: Mapped[str] = mapped_column(Text, nullable=False)
+    cadence_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_completed_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    consecutive_deferrals: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    __table_args__ = (
+        CheckConstraint("cadence_seconds BETWEEN 21600 AND 604800", name="ck_scout_monitors_cadence"),
+        CheckConstraint("consecutive_deferrals >= 0", name="ck_scout_monitors_deferrals"),
+        UniqueConstraint("customer_id", "normalized_query", "jurisdiction", name="uq_scout_monitors_owner_query"),
+        Index(
+            "ix_scout_monitors_due", "next_run_at",
+            postgresql_where=text("active"), sqlite_where=text("active"),
+        ),
+    )
+
+
+class ScoutMonitorRun(UUIDPkMixin, Base):
+    """An owner-visible monitor attempt and immutable evidence comparison record."""
+
+    __tablename__ = "scout_monitor_runs"
+
+    monitor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("scout_monitors.id", ondelete="CASCADE"), nullable=False
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("scout_research_jobs.id", ondelete="NO ACTION", deferrable=True, initially="DEFERRED"),
+        nullable=True,
+    )
+    baseline_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    execution_mode: Mapped[str] = mapped_column(Text, nullable=False)
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_class: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    change_summary: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('baseline','queued','completed','partial','failed','canceled','deferred')",
+            name="ck_scout_monitor_runs_status",
+        ),
+        CheckConstraint(
+            "execution_mode in ('baseline','cached','coalesced','new')",
+            name="ck_scout_monitor_runs_execution_mode",
+        ),
+        Index("ix_scout_monitor_runs_monitor_scheduled", "monitor_id", "scheduled_for"),
+        Index("ix_scout_monitor_runs_job", "job_id"),
     )
 
 

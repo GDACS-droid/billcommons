@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const source = await readFile(new URL("./ScoutExperience.tsx", import.meta.url), "utf8");
+const pageSource = await readFile(new URL("../../app/scout/page.tsx", import.meta.url), "utf8");
 
 test("Scout leaves unsupported significance absent, marks bounded excerpts, and suppresses empty event detail", () => {
   assert.match(source, /const EXCERPT_CHARACTER_LIMIT = 500/);
@@ -28,4 +29,41 @@ test("Scout open waits briefly for the root analytics queue instead of dropping 
 test("Scout intro does not show a signed-out prompt over an authenticated result", () => {
   assert.match(source, /Research jobs are owner-scoped\. <Link href="\/account\/login"[^>]*>Account access<\/Link>/);
   assert.doesNotMatch(source, /Sign in<\/Link> to create and view research jobs/);
+});
+
+test("linked monitor evidence loads an existing job without creating research and rejects malformed identifiers", () => {
+  assert.match(source, /isScoutJobId\(jobId\)/);
+  assert.match(source, /if \(initialJobId === undefined\) \{/);
+  assert.match(source, /The requested Scout research link is invalid\./);
+  assert.match(source, /const beginJobRequest = useCallback/);
+  assert.match(source, /jobRequest\.current\.controller\?\.abort\(\)/);
+  assert.match(source, /getScoutJob\(jobId, request\.controller\.signal\)/);
+  assert.match(source, /createScoutJob\(trimmed, jurisdiction, request\.controller\.signal\)/);
+  assert.match(source, /jobRequest\.current\.generation === request\.generation/);
+  assert.doesNotMatch(source, /new URLSearchParams\(window\.location\.search\)/);
+  assert.match(pageSource, /searchParams: Promise<\{ job\?: string \| string\[\] \}>/);
+  assert.match(pageSource, /initialJobId=\{jobId\}/);
+});
+
+test("Scout polling only applies results from the active request generation", () => {
+  assert.match(source, /const \[jobGeneration, setJobGeneration\] = useState\(0\)/);
+  assert.match(source, /setJobGeneration\(generation\)/);
+  assert.match(source, /const generation = jobGeneration/);
+  assert.match(source, /jobRequest\.current\.generation !== generation/);
+  assert.match(source, /if \(canceling \|\| !pollJobId \|\| !pollJobStatus \|\| isScoutTerminal\(pollJobStatus\)\) return;/);
+  assert.match(source, /\[canceling, jobGeneration, pollJobId, pollJobStatus\]/);
+  assert.match(source, /const request = beginJobRequest\(\);\n    setJob\(null\);/);
+});
+
+test("Scout cancellation cannot apply after a newer request takes ownership", () => {
+  assert.match(source, /setCanceling\(false\);/);
+  assert.match(source, /const jobId = job\.id;/);
+  assert.match(source, /const request = beginJobRequest\(\);\n    const generation = request\.generation;/);
+  assert.match(source, /cancelScoutJob\(jobId\)/);
+  assert.match(source, /if \(jobRequest\.current\.generation !== generation\) return;/);
+  assert.match(source, /if \(jobRequest\.current\.generation === generation\) setCanceling\(false\);/);
+});
+
+test("removing a linked job clears its view and errors", () => {
+  assert.match(source, /if \(initialJobId === undefined\) \{\n      setJob\(null\);\n      setError\(""\);\n      setRefreshError\(""\);/);
 });

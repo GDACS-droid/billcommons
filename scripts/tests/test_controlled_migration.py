@@ -206,7 +206,7 @@ def test_target_specific_acknowledgement_rejects_wrong_revision_before_alembic()
         )
 
 
-@pytest.mark.parametrize("revision", ["0026", "0027", "0028", "0029", "0030"])
+@pytest.mark.parametrize("revision", ["0026", "0027", "0028", "0029", "0030", "0031", "0031_snapshot_blockers", "0032_intelligence_merge"])
 @pytest.mark.parametrize("acknowledgement_revision", [None, ""])
 def test_legacy_boolean_cannot_acknowledge_a_newer_target(revision, acknowledgement_revision):
     with pytest.raises(migration.ControlledMigrationError, match="does not match"):
@@ -224,7 +224,7 @@ def test_legacy_boolean_cannot_acknowledge_a_newer_target(revision, acknowledgem
         )
 
 
-@pytest.mark.parametrize("revision", ["0026", "0027", "0028", "0029", "0030"])
+@pytest.mark.parametrize("revision", ["0026", "0027", "0028", "0029", "0030", "0031", "0031_snapshot_blockers", "0032_intelligence_merge"])
 def test_upgrade_uses_explicit_pinned_revision_and_checks_matching_post_revision(revision: str):
     calls: list[dict] = []
 
@@ -248,6 +248,32 @@ def test_upgrade_uses_explicit_pinned_revision_and_checks_matching_post_revision
 
     assert report.post_revision == revision
     assert calls[0]["args"][-2:] == ["upgrade", revision]
+
+
+def test_0031_upgrade_requires_its_exact_acknowledgement_from_0030():
+    """Saved monitors may use the existing guarded path without widening it."""
+    calls: list[dict] = []
+
+    def runner(*args, **kwargs):
+        kwargs["args"] = args[0]
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(kwargs["args"], 0)
+
+    report = migration.run(
+        target=_target(),
+        repo_root=Path("/repo"),
+        check_only=False,
+        acknowledged=True,
+        acknowledgement_revision="0031",
+        expected_current="0030",
+        target_revision="0031",
+        environ=_environment(),
+        connector=_connector(["0030", "0031"]),
+        runner=runner,
+    )
+    assert report.pre_revision == "0030"
+    assert report.post_revision == "0031"
+    assert calls[0]["args"][-2:] == ["upgrade", "0031"]
 
 
 def test_upgrade_rejects_unexpected_post_revision_for_explicit_target():
