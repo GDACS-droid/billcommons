@@ -11,7 +11,9 @@ from billcommons_ingest.official_repair_bundle import (
     RepairBundleError, _manifest_sha256, build_repair_bundle,
 )
 from billcommons_ingest.official_repair_proposal import prepare_repair_proposal
+from billcommons_ingest.official_repair_sandbox import SandboxResult
 from .test_official_repair_bundle import _archive, _failure_db
+from .test_official_repair_sandbox import isolated_supervisor_state as isolated_supervisor_state
 
 
 def _proposal(tmp_path, transform):
@@ -81,6 +83,32 @@ def test_wrong_trusted_digest_stops_before_execution(tmp_path, monkeypatch):
     monkeypatch.setattr(evaluation, "run_ca_parser", forbidden)
     with pytest.raises(RepairBundleError):
         evaluation.evaluate_repair_proposal(root, expected_proposal_sha256="0" * 64)
+
+
+@pytest.mark.parametrize("status", ["cleanup_pending", "runner_busy", "isolation_unavailable", "supervisor_failed"])
+def test_baseline_host_failure_stops_candidate_execution(tmp_path, monkeypatch, status):
+    root, digest, _ = _proposal(tmp_path, lambda raw: raw + b"\n# candidate\n")
+    calls = []
+    def stopped(source, fixture, **kwargs):
+        calls.append(source)
+        return SandboxResult(status, hashlib.sha256(source).hexdigest(),
+            hashlib.sha256(fixture).hexdigest(), "f" * 64)
+    monkeypatch.setattr(evaluation, "run_ca_parser", stopped)
+    report = evaluation.evaluate_repair_proposal(root, expected_proposal_sha256=digest)
+    assert len(calls) == 1
+    assert report["comparison"] == status
+    assert report["candidate"]["status"] == "not_run"
+    if status == "isolation_unavailable":
+        assert report["baseline"]["status_detail"] == "bootstrap_failure_or_candidate_exit_78"
+
+
+def test_baseline_output_failure_is_distinct_from_a_factual_mismatch(tmp_path, monkeypatch):
+    root, digest, _ = _proposal(tmp_path, lambda raw: raw + b"\n# candidate\n")
+    monkeypatch.setattr(evaluation, "run_ca_parser", lambda source, fixture, **kwargs:
+        SandboxResult("invalid_output", hashlib.sha256(source).hexdigest(),
+                      hashlib.sha256(fixture).hexdigest(), "f" * 64))
+    report = evaluation.evaluate_repair_proposal(root, expected_proposal_sha256=digest)
+    assert report["comparison"] == "baseline_did_not_return_valid_facts"
 
 
 def test_candidate_changed_after_validation_stops_before_execution(tmp_path, monkeypatch):

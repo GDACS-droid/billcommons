@@ -180,7 +180,9 @@ def evaluate_repair_proposal(proposal_dir: str | Path, *, expected_proposal_sha2
             except (ValueError, TypeError, RecursionError):
                 entry["status"] = "invalid_output"
         report[label] = entry
-        if result.status in {"cleanup_pending", "runner_busy"}:
+        if result.status == "isolation_unavailable":
+            entry["status_detail"] = "bootstrap_failure_or_candidate_exit_78"
+        if result.status in {"cleanup_pending", "runner_busy", "isolation_unavailable", "supervisor_failed"}:
             if result.cleanup is not None:
                 entry["cleanup"] = result.cleanup
             if label == "baseline":
@@ -189,6 +191,8 @@ def evaluate_repair_proposal(proposal_dir: str | Path, *, expected_proposal_sha2
             return report
     if expected is None:
         comparison = "requires_independent_oracle"
+    elif report["baseline"]["status"] != "returned":
+        comparison = "baseline_did_not_return_valid_facts"
     elif report["baseline"].get("facts") != expected:
         comparison = "baseline_runtime_mismatch"
     elif report["candidate"]["status"] != "returned":

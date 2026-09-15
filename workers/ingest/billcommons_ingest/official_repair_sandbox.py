@@ -191,7 +191,7 @@ def _record_for_result(record: dict, state: Path) -> dict:
 def _read_record(state: Path) -> dict | None:
     path = _state_path(state)
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
         return None
     try:
@@ -211,7 +211,7 @@ def _read_record(state: Path) -> dict | None:
     try:
         record = json.loads(bytes(data).decode("ascii"), object_pairs_hook=_unique_object,
                             parse_constant=_reject_constant)
-    except (UnicodeDecodeError, ValueError, TypeError):
+    except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
         raise OSError("invalid supervisor recovery record") from None
     if (not isinstance(record, dict) or record.get("version") != 1
             or not isinstance(record.get("status"), str)

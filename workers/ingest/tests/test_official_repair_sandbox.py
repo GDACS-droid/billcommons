@@ -441,6 +441,19 @@ def test_fresh_supervisor_refuses_durable_stale_record_without_cleanup(tmp_path)
     assert sandbox._read_record(state) == record
 
 
+@pytest.mark.parametrize("kind", ["fifo", "deep_json"])
+def test_invalid_recovery_record_stops_without_blocking_or_launching(kind):
+    state = sandbox._supervisor_state()
+    record = state / "recovery.json"
+    if kind == "fifo":
+        os.mkfifo(record, mode=0o600)
+    else:
+        record.write_bytes(b"[" * 2000 + b"]" * 2000)
+        record.chmod(0o600)
+    assert _fresh_supervisor_status(state) == "supervisor_failed"
+    assert record.exists()
+
+
 def test_process_lock_rejects_an_independent_supervisor():
     state = sandbox._supervisor_state()
     lock = state / "lock"
