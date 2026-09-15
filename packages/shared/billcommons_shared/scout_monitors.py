@@ -118,7 +118,13 @@ def finalize_monitor_run(
             snapshot,
             complete=status == "completed",
         )
-        monitor.last_completed_run_id = run.id
+        # Callers hold the monitor row lock. Reconciliation may finalize an
+        # older scheduled run after a newer one, so keep its journal without
+        # moving the baseline pointer backwards. UUID breaks timestamp ties
+        # consistently with the run-history ordering.
+        latest = db.get(ScoutMonitorRun, monitor.last_completed_run_id) if monitor.last_completed_run_id else None
+        if latest is None or (run.scheduled_for, run.id) > (latest.scheduled_for, latest.id):
+            monitor.last_completed_run_id = run.id
 
 
 def defer_delay_seconds(cadence_seconds: int, consecutive_deferrals: int) -> int:

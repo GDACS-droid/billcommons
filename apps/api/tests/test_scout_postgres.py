@@ -1622,6 +1622,41 @@ def test_postgres_saved_monitor_scheduler_uses_admission_and_finalizes_hash_delt
         assert "removed_sources" not in run.change_summary
 
 
+def test_postgres_late_monitor_finalization_preserves_newer_baseline(pg_scout, scout_api):
+    from billcommons_shared.scout_monitors import finalize_monitor_run
+
+    customer = pg_scout.customer("monitor-late-finalization")
+    job = _terminal_monitor_baseline(pg_scout, customer)
+    with TestClient(scout_api) as client:
+        saved = client.post(
+            f"/api/v1/scout/jobs/{job.id}/monitor", json={},
+            headers={"x-test-customer": str(customer.id)},
+        )
+        assert saved.status_code == 201
+        monitor_id = uuid.UUID(saved.json()["monitor"]["id"])
+    with pg_scout.sessions() as db:
+        monitor = db.scalar(select(ScoutMonitor).where(ScoutMonitor.id == monitor_id).with_for_update())
+        initial = monitor.last_completed_run_id
+        now = datetime.now(timezone.utc)
+        older, newer = [ScoutMonitorRun(
+            monitor_id=monitor_id, job_id=job.id, baseline_run_id=initial,
+            status="queued", execution_mode="coalesced",
+            scheduled_for=now + timedelta(hours=offset), source_snapshot={}, change_summary={},
+        ) for offset in (1, 2)]
+        db.add_all([older, newer])
+        stored_job = db.get(ScoutResearchJob, job.id)
+        finalize_monitor_run(db, monitor, newer, stored_job, status="completed", completed_at=now + timedelta(hours=3))
+        finalize_monitor_run(db, monitor, older, stored_job, status="completed", completed_at=now + timedelta(hours=4))
+        newer_id, older_id = newer.id, older.id
+        db.commit()
+    with pg_scout.sessions() as db:
+        assert db.get(ScoutMonitor, monitor_id).last_completed_run_id == newer_id
+        old_run = db.get(ScoutMonitorRun, older_id)
+        assert old_run.status == "completed"
+        assert old_run.source_snapshot["sources"]
+        assert old_run.baseline_run_id == initial
+
+
 def test_postgres_cached_monitor_run_flushes_its_id_before_advancing_baseline(
     pg_scout: PostgresScoutHarness, scout_api, tmp_path
 ):
