@@ -138,7 +138,13 @@ independent expected-fact oracle; a rejected current baseline is explicitly
 reported as requiring such an oracle. Authored regression tests remain inert
 and `not_run`, and every report sets `promotion_authorized: false`. The command
 exits zero only for `same_as_current_baseline`, one for other evaluation results,
-and two for rejected input evidence.
+and two for rejected input evidence. Automated callers must inspect the complete
+JSON report, not classify host health by exit code alone. Missing, malformed or
+unexpected reports also stop scheduling. The compatibility status
+`isolation_unavailable` has the explicit detail
+`bootstrap_failure_or_candidate_exit_78`: an untrusted candidate can choose that
+exit code, so it does not prove that host confinement is absent. Baseline output
+failures are reported separately from a factual runtime mismatch.
 
 The supported runner host is Linux x86_64 with Landlock ABI 4 or newer,
 `libseccomp.so.2`, and a responsive local `/tmp` filesystem. Missing required
@@ -154,29 +160,45 @@ CA parser; importing additional modules may fail in this environment.
 
 Policy caps are 256 KiB source, 8 MiB archive, 256 MiB child address space,
 five CPU seconds, 16 MiB combined stdout/stderr, and a 12-second staging/execution
-budget. Before JSON decoding, a constant-memory scanner caps nesting at eight,
+budget. The parent requires ASCII output without NUL bytes and passes an explicit
+ASCII string to the JSON decoder, so alternate-encoding detection cannot bypass
+the byte scanner. Before JSON decoding, a constant-memory scanner caps nesting at eight,
 containers at 32,768, scalar tokens at 524,288, individual encoded strings at
 1 MiB, and unquoted tokens at 64 bytes. This prevents a short stream of tiny
 objects from amplifying into millions of parent-side allocations.
-Staging uses local `/tmp` rather than environment-selected `TMPDIR`;
+Staging defaults to an owner-only directory beneath
+`/tmp/bc-repair-supervisor-<uid>` rather than environment-selected `TMPDIR`;
 the deadline is checked before launch, but a stalled host filesystem is outside
 the wall-time guarantee. The parent kills the fresh process group before reaping
 its leader, including when a descendant retains a pipe after leader exit. The
 caller must own that child's wait status; an unrelated global child reaper is
 not a supported supervisor environment. Reaping has a separate one-second
 budget. A kernel task that does not exit after `SIGKILL` produces
-`cleanup_pending`, preserves its private stage with `cleanup.json`, and stops
-subsequent evaluations in that supervisor until the leader is reaped, the group
-is absent, and the stage is removed. The group probe is non-destructive; an
+`cleanup_pending`, preserves its private stage and an owner-only `recovery.json`
+outside the candidate-readable stage, and stops subsequent evaluations until the
+leader is reaped, the group is absent, and the stage is removed. The group probe is non-destructive; an
 ambiguous reused ID conservatively retains the stop rather than being signaled.
-Stage-removal errors remain cleanup failures; a stage already removed after
-process cleanup does not wedge the supervisor. A process-local reservation
-rejects concurrent invocations as `runner_busy`.
-Automated callers must stop scheduling on this host-health result. If the CLI
-exits first, its recovery record remains for operator follow-up; do not signal
-a PID from a stale record or resume scheduling without checking process identity
-and host health. The PID and kernel start ticks, when available, are retained
-for that check. The
+Stage-removal errors remain cleanup failures even when no child was spawned;
+a stage already removed after process cleanup does not wedge the supervisor.
+A process-local mutex plus a nonblocking file lock rejects concurrent invocations
+as `runner_busy`. Every automated caller under the same OS account must share the
+same supervisor state directory. `BC_REPAIR_SUPERVISOR_STATE_DIR` is a trusted
+configuration override for that directory; changing it is not a recovery action.
+
+The recovery record is written before spawning, so an abrupt CLI exit leaves a
+durable stop. The child also arms a parent-death `SIGKILL` before candidate loading,
+closing the indefinitely sleeping orphan case. A fresh supervisor returns
+`cleanup_pending` with `cleanup.state_path` for an unfinished record; it never
+signals recorded PIDs or removes an unknown prior stage. Invalid recovery files
+also stop execution, including non-regular files and excessively nested JSON.
+Only the owning live process may resolve its in-memory pending child automatically.
+
+Automated callers must stop scheduling on cleanup, busy, isolation or supervisor
+failure results. Recovery after a supervisor restart requires checking the
+record's origin, PID/start ticks when available, process-group absence, stage
+ownership and host health while holding the same exclusive file lock. Remove
+only the identified completed stage and its recovery record after those checks;
+do not signal a stale PID or clear an unexplained record. The
 whole child interpreter and its output remain untrusted; separate Python globals
 are not an isolation boundary. Error output is discarded, and the parent
 independently validates and hashes all returned facts. This kernel boundary does
@@ -189,9 +211,84 @@ Its local report is retained at
 `/home/alberto/.local/share/billcommons/reliability-release-20260908/native-evaluation-smoke-20260915-th2sosgj/evaluation.json`.
 This proves the execution/comparison path for that proposal, not a parser repair.
 
-Automated repair authorship, executing proposed regression tests, comparison
-against a separately selected known-good corpus, and promotion remain
-unfinished workflow steps.
+Automated repair authorship, executing proposed regression tests, representative
+corpus selection, workflow integration, and promotion remain unfinished steps.
+
+### Evaluating a separately pinned corpus
+
+The local `official_repair_corpus` command now compares the candidate with
+caller-pinned expected fact digests across up to 16 explicit CA fixtures. It
+does not derive expectations from either candidate output or the current parser.
+The caller must curate and review the expected facts independently of repair
+authorship, then retain the SHA-256 of the exact `corpus.json` bytes separately.
+Digest verification establishes artifact integrity; it cannot establish that
+the annotations are true or that the selected corpus represents California.
+
+Each corpus directory contains `corpus.json` and `<case-id>.zip` files. The
+manifest has exactly `corpus_version` (`official-repair-corpus/1`), a nonempty
+`review_reference` identifying the expectation review, and a `cases` array.
+Each case contains exactly `id`, `fixture_sha256`, `source_url`, `retrieved_at`
+(with timezone), and `expected`. Case IDs use lowercase letters, digits,
+underscores and hyphens, start with a letter or digit, and are at most 64
+characters. The expected object contains `bill_count`, `event_count` and
+`facts_sha256`; counts are nonnegative integers. The fact digest covers the
+complete parsed payload, including raw source fields, encoded as Python
+`json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+allow_nan=False).encode("utf-8")`, without a trailing newline. Bill/event order
+is part of this contract. The payload schema is the existing evaluator's
+`status`/`bills` representation, not a count-only or selected-field projection.
+
+```bash
+PYTHONPATH=packages/shared:packages/schema:workers/ingest python -m billcommons_ingest.official_repair_corpus \
+  /absolute/local/path/ca-proposal \
+  --proposal-sha256 "$TRUSTED_PROPOSAL_SHA256" \
+  --corpus-dir /absolute/local/path/reviewed-ca-corpus \
+  --corpus-sha256 "$TRUSTED_CORPUS_SHA256"
+```
+
+Every manifest and fixture is authenticated before candidate execution.
+Fixtures are capped at 8 MiB each and 64 MiB combined, and are pinned in memory
+before the sequence begins. Only candidate source and the current fixture enter
+the sandbox; expected answers remain in the parent. The report binds the
+proposal, corpus, candidate, each fixture and bootstrap hashes, preserves each
+expected/observed comparison, and identifies cases skipped after an unavailable
+isolation boundary, busy supervisor or pending cleanup. A completed match exits
+zero with `matches_pinned_expectations`; a mismatch or host stop exits one;
+invalid input exits two. All reports retain `promotion_authorized: false`.
+
+The 19 focused tests include two synthetic, explicitly annotated TSV fixtures,
+an actual candidate with wrong text but unchanged counts, tampered later-case
+evidence rejected before any candidate run, canonical CA URL and timestamp
+validation, manifest bounds, and propagation of the runner's actual host-stop
+statuses. All source URLs must pass the trusted CA delta URL contract before
+execution; a malformed URL is an input failure, not a confinement diagnosis.
+This new module is outside the evaluator aggregate
+review pinned to `265a001` and is not yet canonically verified or deployed.
+
+A first curated official corpus is retained at
+`/home/alberto/.local/share/billcommons/reliability-release-20260908/ca-corpus-20260915/`.
+Its exact manifest SHA-256 is
+`21f65e4ad7eed6030ee6cd1cd3de7df65caa48a719d6bdb319d2cc537882052d`.
+It contains every retained source row for regular-session AB 115 (11 actions)
+and SB 114 (16 actions), selected from archive
+`0a0bff772076a5879238cf3e1c69c02000b4a4ed2653bd4ca7192fdfc91ce7b8`
+captured on September 8. Explicit ordered annotations preserve dates, sequence,
+history identity, normalized text, source URL and all raw fields. The derived
+ZIPs preserve source-row order, including SB 114's out-of-order input and tied
+sequence numbers. The builder imports no application parser; an independent
+read-only check verified all 27 annotations and complete row selection directly
+against the retained archive, without using candidate output as the oracle.
+
+`build_corpus.py` reproduces the fixtures and compares existing artifacts without
+overwriting them. `review.json` records the source/derivation evidence, and
+`evaluation-final.json` records both cases matching the pinned comment-only candidate
+after integration of the durable supervisor. The deliberately altered-text
+proposal in the sibling `ca-corpus-wrong-text-20260915` directory is a negative
+control: both bill/event counts stay unchanged, but both full fact comparisons
+fail. Its `evaluation.json` retains that result.
+This establishes a two-bill historical corpus, not statewide coverage or current
+freshness. Representative corpus expansion, authored-test execution, repair
+authorship and workflow promotion remain unfinished.
 
 ### Canonical review and follow-up checks
 
@@ -217,6 +314,48 @@ evidence directory above. Subsequent focused review added process-group checks
 after leader reaping, retained-stage error handling, and a supervisor reservation;
 these paths also passed in the final suite. These fixes have not received a new canonical SHIP
 verdict, and the change remains undeployed.
+
+The next full aggregate, base `6639527` through target `265a001`, was reviewed as
+`5ba0582` in `/home/alberto/verify-runs/20260915T175911Z-5ba0582`. The aggregate's
+binary diff and target tree were verified identical to that source range.
+Grok's installed `--verbatim` delivery option resolved the earlier prompt
+offloading. The canonical result was **HALT**: Codex, Grok and Opus BLOCK;
+AGY, Muse and Ox SHIP; DeepSeek failed. Its automatic repeat was stopped after
+the initial failure, and the final adversarial pass was skipped. This is not a
+verification pass.
+
+Confirmed follow-up findings concern alternate-encoding JSON allocation,
+abrupt supervisor death, and incomplete teardown/recovery. The child now arms
+`PR_SET_PDEATHSIG` before candidate execution and checks parent identity on both
+sides of that operation. Seven child tests pass, including a real sleeping
+`futex` candidate killed after supervisor `SIGKILL`, and proof that candidate
+`prctl` cannot clear the death signal. The
+[Linux parent-death signal contract](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html)
+requires the identity recheck because the signal is not retroactive.
+
+Grok's requested errno-bit shift was rejected against the
+[libseccomp header](https://raw.githubusercontent.com/seccomp/libseccomp/main/include/seccomp.h.in):
+`SCMP_ACT_ERRNO` uses the low 16 bits, as the implementation already does. Actual
+denial tests also observe `EPERM`. No policy change was made for that claim.
+Local follow-up fixes and corpus work require their own complete verification;
+the HALT remains the latest canonical result.
+
+The integrated follow-up seven-file offline suite passed **143 tests**. A first
+combined run correctly stopped on an abandoned synthetic delayed-reaping test
+record from the worker's earlier development run; its origin, exact synthetic
+input, absent PID and absent process group were verified before removing only
+that stage and record under the host lock. The recovery evidence is retained at
+`native-supervisor-test-recovery-20260915.json` in the local release evidence
+directory. Parent, evaluator and corpus tests now isolate their durable state.
+
+After integration, the full retained archive again matched **275 bills / 7,094
+events** with fact digest
+`5150ff4a18ea9fcabbdb36d6b261566fa304672fbaf10359d65f869f8b1847df`;
+`native-evaluation-smoke-20260915-th2sosgj/evaluation-durable-supervisor.json`
+records that replay. The curated 27-event corpus matched the pinned comment-only
+candidate and rejected the altered-text negative control with unchanged counts.
+These are local runtime and correctness checks, not a new canonical verdict or
+authorization to promote a repair.
 
 ## Native isolation feasibility — September 15, 2026
 

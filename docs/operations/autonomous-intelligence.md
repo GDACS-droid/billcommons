@@ -8,10 +8,49 @@ and explains/proves updates. Alberto explicitly authorized deployment in this
 session on 2026-09-08. The objective remains active. A control-plane deployment
 alone does not satisfy the full objective.
 
-Implementation is isolated in `mission-reliability-20260908`; pre-existing changes
-in the original checkout are preserved. The canonical inventory covers 50 states
+Current integration is isolated in `mission-intelligence-integration-20260915`;
+pre-existing changes in the original checkout are preserved. The canonical inventory covers 50 states
 plus DC. Generic website observation is never treated as proof of statewide
 semantic freshness or completeness.
+
+## Corpus comparison and supervisor recovery — September 15
+
+A local corpus evaluator now compares proposed CA parser output against
+separately pinned expected facts across an explicit fixture set. It authenticates
+all inputs before running the first case, preserves full fact hashes and per-case
+results, and stops the sequence after a host failure. Nineteen focused corpus
+tests passed, including unchanged counts with wrong action text and invalid
+later-case evidence rejected before execution. Five additional proposal-evaluator
+tests confirm baseline host failures stop candidate execution and distinguish
+invalid baseline output from a factual mismatch.
+
+The first curated corpus contains AB 115 and SB 114 from the September 8 retained
+official archive: two bills and 27 actions. An independent source-row review
+verified complete selection and every expected field without using parser output
+to establish the oracle. The pinned comment-only candidate matched both cases.
+The local corpus, its reproducible builder, exact expected JSON, review evidence
+and evaluation report are retained under
+`/home/alberto/.local/share/billcommons/reliability-release-20260908/ca-corpus-20260915/`.
+This is a small historical corpus, not a statewide or current-freshness benchmark.
+See the [corpus contract](adapter-repair-lab.md#evaluating-a-separately-pinned-corpus).
+
+The complete evaluator aggregate through `265a001` was reviewed as `5ba0582`.
+Canonical run `/home/alberto/verify-runs/20260915T175911Z-5ba0582` ended **HALT**:
+three BLOCK, three SHIP, and a failed DeepSeek leg; its automatic repeat was
+stopped and the final adversarial pass was skipped. Grok's prompt truncation was
+resolved for this run. Confirmed findings require JSON encoding and supervisor
+lifecycle fixes. The child now binds its lifetime to the supervisor; seven child
+tests pass, including an actual blocked candidate killed after supervisor death.
+The parent now records active work before spawning and uses a shared owner-only
+file lock. A fresh process stops on unfinished recovery state, and ordinary
+cleanup failures retain that stop. ASCII/NUL protocol checks precede JSON decoding.
+
+The integrated follow-up passed **143 offline tests** across seven files. The
+retained full-archive replay again matched **275 bills / 7,094 events**, and the
+curated 27-event corpus matched the pinned candidate while rejecting an
+altered-text negative control with unchanged counts. No new canonical verdict
+has been obtained for these fixes or the corpus module. No deployment or
+production metadata mutation was performed; the coordination hold below remains.
 
 ## Native repair evaluator — September 15
 
