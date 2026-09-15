@@ -7,6 +7,8 @@ environment, expected answers, or database access are passed to the child.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -30,6 +32,9 @@ MAX_JSON_DEPTH = 8
 MAX_JSON_STRING_BYTES = 1024 * 1024
 WALL_SECONDS = 12.0
 REAP_SECONDS = 1.0
+_STATE_RECORD_MAX_BYTES = 16 * 1024
+SUPERVISOR_STATE_DIR = Path(os.environ.get(
+    "BC_REPAIR_SUPERVISOR_STATE_DIR", f"/tmp/bc-repair-supervisor-{os.getuid()}"))
 
 
 @dataclass(frozen=True)
@@ -45,7 +50,7 @@ class SandboxResult:
 # Keep ownership of an unreaped, SIGKILL-pending child and refuse another run
 # in this supervisor until it exits. A CLI exit leaves a private recovery
 # record; automated callers must treat cleanup_pending as a host-health stop.
-_PENDING: list[tuple[subprocess.Popen, Path, dict]] = []
+_PENDING: list[tuple[subprocess.Popen | None, Path, dict]] = []
 _RUN_LOCK = threading.Lock()
 
 
@@ -115,6 +120,150 @@ def _check_json_budget(raw: bytes) -> None:
         raise ValueError("incomplete JSON structure")
 
 
+def _validate_child_json_bytes(raw: bytes) -> None:
+    """Accept only the byte encoding scanned by _check_json_budget.
+
+    Passing bytes to json.loads permits its encoding detection, including UTF-16.
+    That would make the byte-oriented scanner observe a different language than
+    the decoder. The child protocol is deliberately ASCII-only.
+    """
+    if b"\0" in raw or not raw.isascii():
+        raise ValueError("child JSON must be ASCII without NUL")
+
+
+def _owned_regular(info: os.stat_result, mode: int) -> bool:
+    return (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+            and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == mode)
+
+
+def _supervisor_state() -> Path:
+    """Return the private durable state root after validating its identity."""
+    try:
+        SUPERVISOR_STATE_DIR.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = SUPERVISOR_STATE_DIR.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise OSError("invalid supervisor state directory")
+    return SUPERVISOR_STATE_DIR
+
+
+def _state_path(state: Path) -> Path:
+    return state / "recovery.json"
+
+
+def _validate_state_file(path: Path, mode: int = 0o600) -> os.stat_result:
+    info = path.lstat()
+    if not _owned_regular(info, mode):
+        raise OSError("invalid supervisor state file")
+    return info
+
+
+@contextmanager
+def _process_reservation():
+    """Reserve the durable state across independent supervisor processes."""
+    state = _supervisor_state()
+    lock = state / "lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not _owned_regular(info, 0o600):
+            raise OSError("invalid supervisor lock")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield None
+            return
+        try:
+            yield state
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _record_for_result(record: dict, state: Path) -> dict:
+    return {**record, "state_path": str(_state_path(state))}
+
+
+def _read_record(state: Path) -> dict | None:
+    path = _state_path(state)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not _owned_regular(info, 0o600) or info.st_size > _STATE_RECORD_MAX_BYTES:
+            raise OSError("invalid supervisor recovery record")
+        data = bytearray()
+        while len(data) <= _STATE_RECORD_MAX_BYTES:
+            chunk = os.read(fd, _STATE_RECORD_MAX_BYTES + 1 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > _STATE_RECORD_MAX_BYTES:
+            raise OSError("oversized supervisor recovery record")
+    finally:
+        os.close(fd)
+    try:
+        record = json.loads(bytes(data).decode("ascii"), object_pairs_hook=_unique_object,
+                            parse_constant=_reject_constant)
+    except (UnicodeDecodeError, ValueError, TypeError):
+        raise OSError("invalid supervisor recovery record") from None
+    if (not isinstance(record, dict) or record.get("version") != 1
+            or not isinstance(record.get("status"), str)
+            or not isinstance(record.get("stage"), str)):
+        raise OSError("invalid supervisor recovery record")
+    return record
+
+
+def _write_record(state: Path, record: dict) -> None:
+    """Atomically replace the owner-only record while the flock is held."""
+    encoded = json.dumps(record, sort_keys=True, ensure_ascii=True,
+                         separators=(",", ":")).encode("ascii")
+    if len(encoded) > _STATE_RECORD_MAX_BYTES:
+        raise OSError("supervisor recovery record too large")
+    path = _state_path(state)
+    if path.exists():
+        _validate_state_file(path)
+    temporary = state / f".recovery-{os.getpid()}-{threading.get_ident()}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temporary, flags, 0o600)
+    try:
+        written = 0
+        while written < len(encoded):
+            written += os.write(fd, encoded[written:])
+        os.fsync(fd)
+        if not _owned_regular(os.fstat(fd), 0o600):
+            raise OSError("invalid temporary supervisor recovery record")
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+    try:
+        os.replace(temporary, path)
+        _validate_state_file(path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _clear_record(state: Path) -> None:
+    path = _state_path(state)
+    _validate_state_file(path)
+    path.unlink()
+
+
 def _private_file(path: Path, contents: bytes) -> None:
     with path.open("xb") as output:
         output.write(contents)
@@ -134,9 +283,13 @@ def _stop(process: subprocess.Popen) -> bool:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except OSError:
+        # A permission or kernel error does not establish that this process
+        # group is gone. Keep the stage and durable recovery record intact.
+        return False
     try:
         process.wait(timeout=REAP_SECONDS)
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
         return False
     return _group_gone(process.pid)
 
@@ -161,20 +314,34 @@ def _start_ticks(pid: int) -> str | None:
         return None
 
 
-def _reap_pending() -> dict | None:
+def _mark_cleanup_failure(state: Path, record: dict) -> dict:
+    record["status"] = "stage_cleanup_failed"
+    try:
+        _write_record(state, record)
+    except OSError:
+        # The already-existing record remains the host stop even when its
+        # status cannot be updated.
+        pass
+    return record
+
+
+def _reap_pending(state: Path) -> dict | None:
+    """Only this process may resolve entries for Popen objects it owns."""
     for process, stage, record in list(_PENDING):
-        if process.poll() is None or not _group_gone(process.pid):
+        if process is not None and (process.poll() is None or not _group_gone(process.pid)):
             return record
         try:
             stage.chmod(0o700)
             shutil.rmtree(stage)
         except FileNotFoundError:
             if stage.exists():
-                record["status"] = "stage_cleanup_failed"
-                return record
+                return _mark_cleanup_failure(state, record)
         except OSError:
-            record["status"] = "stage_cleanup_failed"
-            return record
+            return _mark_cleanup_failure(state, record)
+        try:
+            _clear_record(state)
+        except OSError:
+            return _mark_cleanup_failure(state, record)
         _PENDING.remove((process, stage, record))
     return None
 
@@ -245,25 +412,41 @@ def run_ca_parser(source: bytes, fixture: bytes, *, source_url: str,
     if not _RUN_LOCK.acquire(blocking=False):
         return SandboxResult("runner_busy", **evidence)
     try:
-        return _run_prepared(source, fixture, request, bootstrap, evidence)
+        try:
+            with _process_reservation() as state:
+                if state is None:
+                    return SandboxResult("runner_busy", **evidence)
+                return _run_prepared(source, fixture, request, bootstrap, evidence, state)
+        except OSError:
+            return SandboxResult("supervisor_failed", **evidence)
     finally:
         _RUN_LOCK.release()
 
 
 def _run_prepared(source: bytes, fixture: bytes, request: bytes, bootstrap: bytes,
-                  evidence: dict) -> SandboxResult:
-    pending = _reap_pending()
+                  evidence: dict, state: Path) -> SandboxResult:
+    pending = _reap_pending(state)
     if pending is not None:
-        return SandboxResult("cleanup_pending", cleanup=pending, **evidence)
+        return SandboxResult("cleanup_pending", cleanup=_record_for_result(pending, state),
+                             **evidence)
+    # A record left by another (possibly SIGKILLed) supervisor is deliberately
+    # not interpreted as proof that its child or stage is safe to remove.
+    # Recovery needs an operator who can establish host state out of band.
+    record = _read_record(state)
+    if record is not None:
+        return SandboxResult("cleanup_pending", cleanup=_record_for_result(record, state),
+                             **evidence)
     deadline = time.monotonic() + WALL_SECONDS
-    process = None
-    stage = None
-    preserve_stage = False
-    record = None
+    pending_entry: tuple[subprocess.Popen | None, Path, dict] | None = None
     try:
-        stage = Path(tempfile.mkdtemp(prefix="bc-repair-eval-", dir="/tmp"))
+        stage = Path(tempfile.mkdtemp(prefix="stage-", dir=state))
         try:
             stage.chmod(0o700)
+            # Create the durable stop before the first possible child exists.
+            # It remains outside the candidate-readable immutable stage.
+            record = {"version": 1, "status": "active", "stage": str(stage), "pid": None}
+            pending_entry = (None, stage, record)
+            _write_record(state, record)
             try:
                 for name, contents in {"source.py": source, "fixture.bin": fixture,
                                        "request.json": request,
@@ -273,38 +456,45 @@ def _run_prepared(source: bytes, fixture: bytes, request: bytes, bootstrap: byte
                 if time.monotonic() >= deadline:
                     return SandboxResult("wall_limit", **evidence)
                 process = subprocess.Popen(
-                    [sys.executable, "-I", "-S", "-B", str(stage / "bootstrap.py"), str(stage)],
+                    [sys.executable, "-I", "-S", "-B", str(stage / "bootstrap.py"), str(stage),
+                     str(os.getpid())],
                     env={}, cwd=stage, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     close_fds=True, start_new_session=True,
                 )
+                pending_entry = (process, stage, record)
+                _PENDING.append(pending_entry)
+                record.update({"pid": process.pid, "pid_start_ticks": _start_ticks(process.pid),
+                               "status": "active"})
                 try:
+                    _write_record(state, record)
                     status, output = _collect(process, deadline=deadline)
                 finally:
-                    start_ticks = _start_ticks(process.pid)
                     try:
                         reaped = _stop(process)
                     finally:
                         process.stdout.close()
                         process.stderr.close()
                     if not reaped:
-                        preserve_stage = True
-                        # Record only public process/stage identity. No new
-                        # workload may be scheduled until this is resolved.
-                        record = {"pid": process.pid, "stage": str(stage),
-                                  "pid_start_ticks": start_ticks,
-                                  "status": "sigkill_sent_reap_pending"}
-                        _PENDING.append((process, stage, record))
-                        stage.chmod(0o700)
-                        _private_file(stage / "cleanup.json", json.dumps(record).encode())
-                        stage.chmod(0o500)
+                        record["status"] = "sigkill_sent_reap_pending"
+                        try:
+                            _write_record(state, record)
+                        except OSError:
+                            pass
                 if not reaped:
-                    return SandboxResult("cleanup_pending", cleanup=record, **evidence)
+                    return SandboxResult("cleanup_pending",
+                                         cleanup=_record_for_result(record, state), **evidence)
+                pending = _reap_pending(state)
+                if pending is not None:
+                    return SandboxResult("cleanup_pending",
+                                         cleanup=_record_for_result(pending, state), **evidence)
+                pending_entry = None
                 if status != "returned":
                     return SandboxResult(status, **evidence)
                 try:
+                    _validate_child_json_bytes(output)
                     _check_json_budget(output)
-                    payload = json.loads(output, object_pairs_hook=_unique_object,
+                    payload = json.loads(output.decode("ascii"), object_pairs_hook=_unique_object,
                                          parse_constant=_reject_constant)
                     if (not isinstance(payload, dict) or set(payload) != {"status", "bills"}
                             or payload["status"] != "parsed" or not isinstance(payload["bills"], list)):
@@ -313,14 +503,24 @@ def _run_prepared(source: bytes, fixture: bytes, request: bytes, bootstrap: byte
                     return SandboxResult("invalid_output", **evidence)
                 return SandboxResult("returned", payload=payload, **evidence)
             finally:
-                # The restricted child cannot chmod this directory. Restore
-                # parent write permission only after the child has been reaped.
-                if not preserve_stage:
-                    stage.chmod(0o700)
+                # Any pre-spawn failure has no child; this local supervisor may
+                # safely retry its stage cleanup. A child path only reaches
+                # here after _stop and _reap_pending above.
+                if pending_entry is not None and pending_entry not in _PENDING:
+                    _PENDING.append(pending_entry)
+                    pending = _reap_pending(state)
+                    if pending is not None:
+                        return SandboxResult("cleanup_pending",
+                                             cleanup=_record_for_result(pending, state), **evidence)
+                    pending_entry = None
         finally:
-            if not preserve_stage:
-                shutil.rmtree(stage)
+            pass
     except (OSError, subprocess.SubprocessError):
-        if preserve_stage:
-            return SandboxResult("cleanup_pending", cleanup=record, **evidence)
+        if pending_entry is not None:
+            if pending_entry not in _PENDING:
+                _PENDING.append(pending_entry)
+            pending = _reap_pending(state)
+            if pending is not None:
+                return SandboxResult("cleanup_pending", cleanup=_record_for_result(pending, state),
+                                     **evidence)
         return SandboxResult("supervisor_failed", **evidence)

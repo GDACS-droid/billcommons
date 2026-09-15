@@ -2,10 +2,14 @@
 import hashlib
 import json
 import os
+import fcntl
+import shutil
+import signal
 import subprocess
 import sys
 import textwrap
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -15,6 +19,21 @@ from billcommons_ingest import official_repair_sandbox as sandbox
 
 URL = "https://downloads.leginfo.legislature.ca.gov/pubinfo_Mon.zip"
 WHEN = "2026-09-15T00:00:00+00:00"
+_RMTREE = shutil.rmtree
+
+
+@pytest.fixture(autouse=True)
+def isolated_supervisor_state(tmp_path, monkeypatch):
+    """Keep durable host-stop records from crossing focused test cases."""
+    state = tmp_path / "supervisor-state"
+    monkeypatch.setattr(sandbox, "SUPERVISOR_STATE_DIR", state)
+    monkeypatch.setattr(sandbox, "_PENDING", [])
+    yield state
+    for process, _stage, _record in list(sandbox._PENDING):
+        if process is not None:
+            sandbox._stop(process)
+    sandbox._PENDING.clear()
+    _RMTREE(state, ignore_errors=True)
 
 
 def _run(code):
@@ -31,6 +50,17 @@ def test_returned_json_is_only_untrusted_transport():
     assert result.status == "returned"
     assert result.payload == payload  # The evaluator must independently reject this answer.
     assert result.source_sha256 == hashlib.sha256(_emit(payload).encode()).hexdigest()
+
+
+def test_supervisor_state_and_lock_are_owner_only():
+    assert _run(_emit({"status": "parsed", "bills": []})).status == "returned"
+    state = sandbox._supervisor_state()
+    assert state.stat().st_uid == os.getuid()
+    assert state.stat().st_mode & 0o777 == 0o700
+    lock = state / "lock"
+    assert lock.stat().st_uid == os.getuid()
+    assert lock.stat().st_nlink == 1
+    assert lock.stat().st_mode & 0o777 == 0o600
 
 
 def test_outside_canary_network_and_process_capabilities_are_denied(tmp_path, monkeypatch):
@@ -164,6 +194,17 @@ os._exit(0)
     assert result.payload is None
 
 
+def test_utf16_json_is_rejected_before_json_loads(monkeypatch):
+    payload = json.dumps({"status": "parsed", "bills": []}).encode("utf-16")
+    def no_decode(*args, **kwargs):
+        pytest.fail("UTF-16 output must not reach the JSON scanner or json.loads")
+    monkeypatch.setattr(sandbox, "_check_json_budget", no_decode)
+    monkeypatch.setattr(sandbox.json, "loads", no_decode)
+    result = _run(f"import os\nos.write(1, {payload!r})\nos._exit(0)")
+    assert result.status == "invalid_output"
+    assert result.payload is None
+
+
 def test_scalar_amplification_is_rejected_before_decoding():
     data = b"[" + b"0," * sandbox.MAX_JSON_SCALARS + b"0]"
     with pytest.raises(ValueError, match="scalar count"):
@@ -276,9 +317,11 @@ def test_delayed_reaping_preserves_recovery_record_and_stops_new_work(monkeypatc
     result = _run(_emit({"status": "parsed", "bills": []}))
     assert result.status == "cleanup_pending"
     process, stage, record = sandbox._PENDING[0]
+    state = sandbox._supervisor_state()
     try:
-        assert result.cleanup == record
-        assert json.loads((stage / "cleanup.json").read_bytes()) == record
+        assert result.cleanup == sandbox._record_for_result(record, state)
+        assert sandbox._read_record(state) == record
+        assert not (stage / "cleanup.json").exists()
         assert record["pid_start_ticks"].isdigit()
         with monkeypatch.context() as patch:
             patch.setattr(process, "poll", lambda: None)
@@ -288,7 +331,7 @@ def test_delayed_reaping_preserves_recovery_record_and_stops_new_work(monkeypatc
             assert _run("pass").status == "cleanup_pending"
     finally:
         real_wait(process, timeout=5)
-        assert sandbox._reap_pending() is None
+        assert sandbox._reap_pending(state) is None
     assert not Path(record["stage"]).exists()
 
 
@@ -297,15 +340,17 @@ def test_reaped_leader_does_not_clear_live_group(tmp_path, monkeypatch):
         pid = 42
         def poll(self):
             return 0
-    stage = tmp_path / "stage"
+    state = sandbox._supervisor_state()
+    stage = state / "stage"
     stage.mkdir()
-    record = {"status": "sigkill_sent_reap_pending"}
+    record = {"version": 1, "status": "sigkill_sent_reap_pending", "stage": str(stage)}
+    sandbox._write_record(state, record)
     monkeypatch.setattr(sandbox, "_PENDING", [(ReapedLeader(), stage, record)])
     monkeypatch.setattr(sandbox, "_group_gone", lambda group: False)
-    assert sandbox._reap_pending() is record
+    assert sandbox._reap_pending(state) is record
     assert stage.is_dir() and sandbox._PENDING
     monkeypatch.setattr(sandbox, "_group_gone", lambda group: True)
-    assert sandbox._reap_pending() is None
+    assert sandbox._reap_pending(state) is None
     assert not stage.exists() and not sandbox._PENDING
 
 
@@ -315,10 +360,12 @@ def test_pending_stage_cleanup_failure_and_external_removal(tmp_path, monkeypatc
         pid = 42
         def poll(self):
             return 0
-    stage = tmp_path / "stage"
+    state = sandbox._supervisor_state()
+    stage = state / "stage"
     if not missing:
         stage.mkdir()
-    record = {"status": "sigkill_sent_reap_pending"}
+    record = {"version": 1, "status": "sigkill_sent_reap_pending", "stage": str(stage)}
+    sandbox._write_record(state, record)
     monkeypatch.setattr(sandbox, "_PENDING", [(ReapedLeader(), stage, record)])
     monkeypatch.setattr(sandbox, "_group_gone", lambda group: True)
     if not missing:
@@ -326,17 +373,33 @@ def test_pending_stage_cleanup_failure_and_external_removal(tmp_path, monkeypatc
             def unavailable(*args, **kwargs):
                 raise PermissionError("synthetic cleanup failure")
             patch.setattr(sandbox.shutil, "rmtree", unavailable)
-            assert sandbox._reap_pending() is record
+            assert sandbox._reap_pending(state) is record
             assert record["status"] == "stage_cleanup_failed"
             assert stage.exists() and sandbox._PENDING
-    assert sandbox._reap_pending() is None
+    assert sandbox._reap_pending(state) is None
     assert not stage.exists() and not sandbox._PENDING
+
+
+def test_unspawned_stage_cleanup_failure_retains_durable_host_stop(monkeypatch):
+    state = sandbox._supervisor_state()
+    stage = state / "unspawned-stage"
+    stage.mkdir()
+    record = {"version": 1, "status": "active", "stage": str(stage), "pid": None}
+    sandbox._write_record(state, record)
+    monkeypatch.setattr(sandbox, "_PENDING", [(None, stage, record)])
+    def unavailable(*args, **kwargs):
+        raise PermissionError("synthetic unspawned cleanup denial")
+    monkeypatch.setattr(sandbox.shutil, "rmtree", unavailable)
+    assert sandbox._reap_pending(state) is record
+    assert record["status"] == "stage_cleanup_failed"
+    assert sandbox._read_record(state)["status"] == "stage_cleanup_failed"
+    assert stage.exists() and sandbox._PENDING
 
 
 def test_concurrent_invocation_cannot_pass_supervisor_reservation(monkeypatch):
     entered = threading.Event()
     release = threading.Event()
-    def controlled(source, fixture, request, bootstrap, evidence):
+    def controlled(source, fixture, request, bootstrap, evidence, state):
         entered.set()
         assert release.wait(3)
         return sandbox.SandboxResult("returned", payload={"status": "parsed", "bills": []}, **evidence)
@@ -349,3 +412,106 @@ def test_concurrent_invocation_cannot_pass_supervisor_reservation(monkeypatch):
         finally:
             release.set()
         assert first.result().status == "returned"
+
+
+def _fresh_supervisor_status(state: Path) -> str:
+    root = Path(__file__).resolve().parents[3]
+    environment = os.environ.copy()
+    environment["BC_REPAIR_SUPERVISOR_STATE_DIR"] = str(state)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        str(root / path) for path in ("packages/shared", "packages/schema", "workers/ingest"))
+    code = f'''from billcommons_ingest.official_repair_sandbox import run_ca_parser
+result = run_ca_parser(b"pass", b"fixture", source_url={URL!r}, retrieved_at={WHEN!r})
+print(result.status)
+'''
+    run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         env=environment, timeout=5)
+    assert run.returncode == 0, run.stderr
+    return run.stdout.strip()
+
+
+def test_fresh_supervisor_refuses_durable_stale_record_without_cleanup(tmp_path):
+    state = sandbox._supervisor_state()
+    stage = state / "abandoned-stage"
+    stage.mkdir()
+    record = {"version": 1, "status": "active", "stage": str(stage), "pid": 12345}
+    sandbox._write_record(state, record)
+    assert _fresh_supervisor_status(state) == "cleanup_pending"
+    assert stage.exists()
+    assert sandbox._read_record(state) == record
+
+
+def test_process_lock_rejects_an_independent_supervisor():
+    state = sandbox._supervisor_state()
+    lock = state / "lock"
+    descriptor = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        assert _fresh_supervisor_status(state) == "runner_busy"
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def test_killpg_failure_keeps_durable_host_stop_for_fresh_process(monkeypatch):
+    real_killpg = sandbox.os.killpg
+    def refused(group, signal_number):
+        if signal_number == signal.SIGKILL:
+            raise PermissionError("synthetic killpg denial")
+        return real_killpg(group, signal_number)
+    monkeypatch.setattr(sandbox.os, "killpg", refused)
+    result = _run(_emit({"status": "parsed", "bills": []}))
+    assert result.status == "cleanup_pending"
+    state = sandbox._supervisor_state()
+    assert result.cleanup["status"] == "sigkill_sent_reap_pending"
+    assert sandbox._read_record(state) is not None
+    assert _fresh_supervisor_status(state) == "cleanup_pending"
+
+
+def test_stage_cleanup_failure_keeps_durable_host_stop_for_fresh_process(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise PermissionError("synthetic stage cleanup denial")
+    monkeypatch.setattr(sandbox.shutil, "rmtree", unavailable)
+    result = _run(_emit({"status": "parsed", "bills": []}))
+    assert result.status == "cleanup_pending"
+    state = sandbox._supervisor_state()
+    assert result.cleanup["status"] == "stage_cleanup_failed"
+    assert sandbox._read_record(state)["status"] == "stage_cleanup_failed"
+    assert _fresh_supervisor_status(state) == "cleanup_pending"
+
+
+def test_sigkill_of_supervisor_leaves_fresh_process_in_recovery_stop(tmp_path):
+    state = tmp_path / "killed-supervisor-state"
+    root = Path(__file__).resolve().parents[3]
+    environment = os.environ.copy()
+    environment["BC_REPAIR_SUPERVISOR_STATE_DIR"] = str(state)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        str(root / path) for path in ("packages/shared", "packages/schema", "workers/ingest"))
+    code = f'''from billcommons_ingest.official_repair_sandbox import run_ca_parser
+run_ca_parser(b"import time; time.sleep(60)", b"fixture", source_url={URL!r}, retrieved_at={WHEN!r})
+'''
+    supervisor = subprocess.Popen([sys.executable, "-c", code], env=environment)
+    record_path = state / "recovery.json"
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if record_path.exists():
+                try:
+                    record = json.loads(record_path.read_text("ascii"))
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if record.get("status") == "active":
+                        break
+            time.sleep(0.02)
+        else:
+            pytest.fail("supervisor did not durably record its active child")
+        os.kill(supervisor.pid, signal.SIGKILL)
+        assert supervisor.wait(timeout=5) == -signal.SIGKILL
+        assert _fresh_supervisor_status(state) == "cleanup_pending"
+        assert record_path.exists()
+    finally:
+        if supervisor.poll() is None:
+            supervisor.kill()
+            supervisor.wait(timeout=5)
+        shutil.rmtree(state, ignore_errors=True)
