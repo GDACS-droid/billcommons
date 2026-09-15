@@ -13,7 +13,7 @@ import sys
 from billcommons_shared import ca_official_actions as ca
 from billcommons_ingest.official_repair_bundle import (
     FIXTURE_NAME, RepairBundleError,
-    _reject_symlink_path, validate_repair_bundle,
+    validate_repair_bundle,
 )
 from billcommons_ingest.official_repair_proposal import validate_repair_proposal
 from billcommons_ingest.official_repair_sandbox import (
@@ -26,9 +26,23 @@ _EVENT_KEYS = frozenset({"occurrence_id", "official_bill_id", "history_id", "act
 
 
 def _verified_bytes(path: Path, *, digest: str, maximum: int) -> bytes:
-    _reject_symlink_path(path.absolute())
+    path = path.absolute()
+    if ".." in path.parts or len(path.parts) < 2:
+        raise RepairBundleError("evaluation input path is invalid")
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        # Pin each ancestor instead of checking a pathname and then reopening
+        # it. A later rename or symlink replacement cannot redirect this read.
+        directory = os.open(path.anchor, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            for part in path.parts[1:-1]:
+                next_directory = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
+                                          | os.O_CLOEXEC, dir_fd=directory)
+                os.close(directory)
+                directory = next_directory
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                         | os.O_CLOEXEC, dir_fd=directory)
+        finally:
+            os.close(directory)
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > maximum:
@@ -166,6 +180,13 @@ def evaluate_repair_proposal(proposal_dir: str | Path, *, expected_proposal_sha2
             except (ValueError, TypeError, RecursionError):
                 entry["status"] = "invalid_output"
         report[label] = entry
+        if result.status in {"cleanup_pending", "runner_busy"}:
+            if result.cleanup is not None:
+                entry["cleanup"] = result.cleanup
+            if label == "baseline":
+                report["candidate"] = {"status": "not_run"}
+            report["comparison"] = result.status
+            return report
     if expected is None:
         comparison = "requires_independent_oracle"
     elif report["baseline"].get("facts") != expected:

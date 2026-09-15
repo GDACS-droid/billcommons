@@ -1,5 +1,8 @@
 """Pin proposal evidence, then exercise real isolated candidate comparisons."""
 import inspect
+import hashlib
+import io
+import zipfile
 
 import pytest
 
@@ -93,3 +96,48 @@ def test_candidate_changed_after_validation_stops_before_execution(tmp_path, mon
     monkeypatch.setattr(evaluation, "run_ca_parser", forbidden)
     with pytest.raises(RepairBundleError, match="changed after validation"):
         evaluation.evaluate_repair_proposal(root, expected_proposal_sha256=digest)
+
+
+def test_verified_read_is_pinned_when_parent_path_is_replaced(tmp_path, monkeypatch):
+    parent = tmp_path / "original"
+    parent.mkdir()
+    (parent / "source").write_bytes(b"approved bytes")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "source").write_bytes(b"different synthetic bytes")
+    original_open = evaluation.os.open
+    def swap(path, flags, *args, **kwargs):
+        if path == "source":
+            parent.rename(tmp_path / "renamed")
+            parent.symlink_to(outside, target_is_directory=True)
+        return original_open(path, flags, *args, **kwargs)
+    monkeypatch.setattr(evaluation.os, "open", swap)
+    assert evaluation._verified_bytes(parent / "source",
+        digest=hashlib.sha256(b"approved bytes").hexdigest(), maximum=100) == b"approved bytes"
+
+
+def test_verified_read_rejects_existing_ancestor_symlink(tmp_path):
+    parent = tmp_path / "original"
+    parent.mkdir()
+    (parent / "source").write_bytes(b"approved bytes")
+    linked = tmp_path / "linked"
+    linked.symlink_to(parent, target_is_directory=True)
+    with pytest.raises(RepairBundleError, match="unreadable"):
+        evaluation._verified_bytes(linked / "source",
+            digest=hashlib.sha256(b"approved bytes").hexdigest(), maximum=100)
+
+
+def test_real_parser_preserves_empty_event_mapping():
+    # Reconcile the review's alleged missing-key case using the real parser.
+    # Scoped IDs and the event map are built from the same parsed dictionary.
+    raw = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(_archive())) as before:
+        with zipfile.ZipFile(raw, "w", compression=zipfile.ZIP_STORED) as after:
+            after.writestr("BILL_TBL.dat", before.read("BILL_TBL.dat"))
+            after.writestr("BILL_HISTORY_TBL.dat", b"")
+    from datetime import datetime, timezone
+    batch = evaluation.ca.parse_ca_official_actions_zip(raw.getvalue(),
+        source_url="https://downloads.leginfo.legislature.ca.gov/pubinfo_Mon.zip",
+        retrieved_at=datetime(2026, 9, 15, tzinfo=timezone.utc))
+    assert evaluation._facts(batch) == {"status": "parsed", "bills": [
+        {"bill_id": "202520260AB12", "events": []}]}

@@ -12,17 +12,24 @@ import json
 import os
 from pathlib import Path
 import selectors
+import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 MAX_SOURCE_BYTES = 256 * 1024
 MAX_FIXTURE_BYTES = 8 * 1024 * 1024
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+MAX_JSON_CONTAINERS = 32_768
+MAX_JSON_SCALARS = 524_288
+MAX_JSON_DEPTH = 8
+MAX_JSON_STRING_BYTES = 1024 * 1024
 WALL_SECONDS = 12.0
+REAP_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -32,6 +39,14 @@ class SandboxResult:
     fixture_sha256: str
     bootstrap_sha256: str
     payload: dict | None = None
+    cleanup: dict | None = None
+
+
+# Keep ownership of an unreaped, SIGKILL-pending child and refuse another run
+# in this supervisor until it exits. A CLI exit leaves a private recovery
+# record; automated callers must treat cleanup_pending as a host-health stop.
+_PENDING: list[tuple[subprocess.Popen, Path, dict]] = []
+_RUN_LOCK = threading.Lock()
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict:
@@ -47,6 +62,59 @@ def _reject_constant(value: str) -> None:
     raise ValueError("nonfinite JSON")
 
 
+def _check_json_budget(raw: bytes) -> None:
+    """Bound object-graph amplification BEFORE allocating decoded objects.
+
+    This byte scanner is only a budget gate; json.loads remains the syntax
+    validator. It tracks quoted/escaped text so punctuation in action text
+    cannot consume the structural budget. No input-dependent object graph is
+    allocated by this scan.
+    """
+    containers = scalars = depth = string_bytes = atom_bytes = 0
+    quoted = escaped = False
+    for byte in raw:
+        if quoted:
+            string_bytes += 1
+            if string_bytes > MAX_JSON_STRING_BYTES:
+                raise ValueError("JSON string budget exceeded")
+            if escaped:
+                escaped = False
+            elif byte == 92:
+                escaped = True
+            elif byte == 34:
+                quoted = False
+            continue
+        if byte == 34:
+            scalars += 1
+            if scalars > MAX_JSON_SCALARS:
+                raise ValueError("JSON scalar count exceeded")
+            quoted = True
+            string_bytes = atom_bytes = 0
+        elif byte in (123, 91):
+            containers += 1
+            depth += 1
+            atom_bytes = 0
+            if containers > MAX_JSON_CONTAINERS or depth > MAX_JSON_DEPTH:
+                raise ValueError("JSON container budget exceeded")
+        elif byte in (125, 93):
+            depth -= 1
+            atom_bytes = 0
+            if depth < 0:
+                raise ValueError("invalid JSON depth")
+        elif byte in (32, 9, 10, 13, 44, 58):
+            atom_bytes = 0
+        else:
+            if atom_bytes == 0:
+                scalars += 1
+                if scalars > MAX_JSON_SCALARS:
+                    raise ValueError("JSON scalar count exceeded")
+            atom_bytes += 1
+            if atom_bytes > 64:
+                raise ValueError("JSON primitive budget exceeded")
+    if quoted or depth:
+        raise ValueError("incomplete JSON structure")
+
+
 def _private_file(path: Path, contents: bytes) -> None:
     with path.open("xb") as output:
         output.write(contents)
@@ -58,7 +126,7 @@ def _private_file(path: Path, contents: bytes) -> None:
         raise OSError("invalid private evaluation input")
 
 
-def _stop(process: subprocess.Popen) -> None:
+def _stop(process: subprocess.Popen) -> bool:
     # _collect observes with WNOWAIT and never reaps the leader. Its PID stays
     # reserved until after group teardown, even if it exited before a pipe-
     # holding descendant. Never poll()/wait() before this group kill.
@@ -66,7 +134,49 @@ def _stop(process: subprocess.Popen) -> None:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    process.wait()
+    try:
+        process.wait(timeout=REAP_SECONDS)
+    except subprocess.TimeoutExpired:
+        return False
+    return _group_gone(process.pid)
+
+
+def _group_gone(group: int) -> bool:
+    # This is an existence probe only, never a destructive signal. After leader
+    # reaping, an ambiguous/reused group ID conservatively keeps the host stop.
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _start_ticks(pid: int) -> str | None:
+    try:
+        with open(f"/proc/{pid}/stat", "r") as identity:
+            return identity.read(4096).rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _reap_pending() -> dict | None:
+    for process, stage, record in list(_PENDING):
+        if process.poll() is None or not _group_gone(process.pid):
+            return record
+        try:
+            stage.chmod(0o700)
+            shutil.rmtree(stage)
+        except FileNotFoundError:
+            if stage.exists():
+                record["status"] = "stage_cleanup_failed"
+                return record
+        except OSError:
+            record["status"] = "stage_cleanup_failed"
+            return record
+        _PENDING.remove((process, stage, record))
+    return None
 
 
 def _collect(process: subprocess.Popen, *, deadline: float) -> tuple[str, bytes]:
@@ -132,11 +242,27 @@ def run_ca_parser(source: bytes, fixture: bytes, *, source_url: str,
         "fixture_sha256": hashlib.sha256(fixture).hexdigest(),
         "bootstrap_sha256": hashlib.sha256(bootstrap).hexdigest(),
     }
+    if not _RUN_LOCK.acquire(blocking=False):
+        return SandboxResult("runner_busy", **evidence)
+    try:
+        return _run_prepared(source, fixture, request, bootstrap, evidence)
+    finally:
+        _RUN_LOCK.release()
+
+
+def _run_prepared(source: bytes, fixture: bytes, request: bytes, bootstrap: bytes,
+                  evidence: dict) -> SandboxResult:
+    pending = _reap_pending()
+    if pending is not None:
+        return SandboxResult("cleanup_pending", cleanup=pending, **evidence)
     deadline = time.monotonic() + WALL_SECONDS
     process = None
+    stage = None
+    preserve_stage = False
+    record = None
     try:
-        with tempfile.TemporaryDirectory(prefix="bc-repair-eval-", dir="/tmp") as temporary:
-            stage = Path(temporary)
+        stage = Path(tempfile.mkdtemp(prefix="bc-repair-eval-", dir="/tmp"))
+        try:
             stage.chmod(0o700)
             try:
                 for name, contents in {"source.py": source, "fixture.bin": fixture,
@@ -155,23 +281,46 @@ def run_ca_parser(source: bytes, fixture: bytes, *, source_url: str,
                 try:
                     status, output = _collect(process, deadline=deadline)
                 finally:
-                    _stop(process)
-                    process.stdout.close()
-                    process.stderr.close()
+                    start_ticks = _start_ticks(process.pid)
+                    try:
+                        reaped = _stop(process)
+                    finally:
+                        process.stdout.close()
+                        process.stderr.close()
+                    if not reaped:
+                        preserve_stage = True
+                        # Record only public process/stage identity. No new
+                        # workload may be scheduled until this is resolved.
+                        record = {"pid": process.pid, "stage": str(stage),
+                                  "pid_start_ticks": start_ticks,
+                                  "status": "sigkill_sent_reap_pending"}
+                        _PENDING.append((process, stage, record))
+                        stage.chmod(0o700)
+                        _private_file(stage / "cleanup.json", json.dumps(record).encode())
+                        stage.chmod(0o500)
+                if not reaped:
+                    return SandboxResult("cleanup_pending", cleanup=record, **evidence)
                 if status != "returned":
                     return SandboxResult(status, **evidence)
                 try:
+                    _check_json_budget(output)
                     payload = json.loads(output, object_pairs_hook=_unique_object,
                                          parse_constant=_reject_constant)
                     if (not isinstance(payload, dict) or set(payload) != {"status", "bills"}
                             or payload["status"] != "parsed" or not isinstance(payload["bills"], list)):
                         raise ValueError("invalid child result")
-                except (ValueError, TypeError, RecursionError):
+                except (ValueError, TypeError, RecursionError, MemoryError):
                     return SandboxResult("invalid_output", **evidence)
                 return SandboxResult("returned", payload=payload, **evidence)
             finally:
                 # The restricted child cannot chmod this directory. Restore
                 # parent write permission only after the child has been reaped.
-                stage.chmod(0o700)
+                if not preserve_stage:
+                    stage.chmod(0o700)
+        finally:
+            if not preserve_stage:
+                shutil.rmtree(stage)
     except (OSError, subprocess.SubprocessError):
+        if preserve_stage:
+            return SandboxResult("cleanup_pending", cleanup=record, **evidence)
         return SandboxResult("supervisor_failed", **evidence)

@@ -5,6 +5,9 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -145,6 +148,33 @@ def test_host_refuses_malformed_child_protocol(output):
     assert result.payload is None
 
 
+def test_object_amplification_is_rejected_before_json_decoding(monkeypatch):
+    def no_decode(*args, **kwargs):
+        pytest.fail("object budget must be checked before allocating a JSON graph")
+    monkeypatch.setattr(sandbox.json, "loads", no_decode)
+    source = f'''import os
+os.write(1, b'{{"status":"parsed","bills":[')
+for _ in range({sandbox.MAX_JSON_CONTAINERS}):
+    os.write(1, b'{{}},')
+os.write(1, b'{{}}]}}')
+os._exit(0)
+'''
+    result = _run(source)
+    assert result.status == "invalid_output"
+    assert result.payload is None
+
+
+def test_scalar_amplification_is_rejected_before_decoding():
+    data = b"[" + b"0," * sandbox.MAX_JSON_SCALARS + b"0]"
+    with pytest.raises(ValueError, match="scalar count"):
+        sandbox._check_json_budget(data)
+
+
+def test_json_budget_ignores_escaped_structural_text():
+    payload = {"status": "parsed", "bills": [], "text": '[]{}\\\"' * 1000}
+    sandbox._check_json_budget(json.dumps(payload).encode())
+
+
 def test_candidate_exception_content_is_never_reported():
     result = _run("raise RuntimeError('synthetic-private-error-marker')")
     assert result.status == "child_failed"
@@ -234,3 +264,88 @@ def test_slow_staging_exhausts_budget_without_launching(monkeypatch):
     monkeypatch.setattr(sandbox, "_private_file", slow_write)
     monkeypatch.setattr(sandbox.subprocess, "Popen", no_launch)
     assert _run("pass").status == "wall_limit"
+
+
+def test_delayed_reaping_preserves_recovery_record_and_stops_new_work(monkeypatch):
+    real_wait = subprocess.Popen.wait
+    def delayed_wait(process, timeout=None):
+        if timeout == sandbox.REAP_SECONDS:
+            raise subprocess.TimeoutExpired("synthetic delayed kernel exit", timeout)
+        return real_wait(process, timeout=timeout)
+    monkeypatch.setattr(subprocess.Popen, "wait", delayed_wait)
+    result = _run(_emit({"status": "parsed", "bills": []}))
+    assert result.status == "cleanup_pending"
+    process, stage, record = sandbox._PENDING[0]
+    try:
+        assert result.cleanup == record
+        assert json.loads((stage / "cleanup.json").read_bytes()) == record
+        assert record["pid_start_ticks"].isdigit()
+        with monkeypatch.context() as patch:
+            patch.setattr(process, "poll", lambda: None)
+            def no_launch(*args, **kwargs):
+                pytest.fail("pending cleanup must stop another candidate")
+            patch.setattr(sandbox.subprocess, "Popen", no_launch)
+            assert _run("pass").status == "cleanup_pending"
+    finally:
+        real_wait(process, timeout=5)
+        assert sandbox._reap_pending() is None
+    assert not Path(record["stage"]).exists()
+
+
+def test_reaped_leader_does_not_clear_live_group(tmp_path, monkeypatch):
+    class ReapedLeader:
+        pid = 42
+        def poll(self):
+            return 0
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    record = {"status": "sigkill_sent_reap_pending"}
+    monkeypatch.setattr(sandbox, "_PENDING", [(ReapedLeader(), stage, record)])
+    monkeypatch.setattr(sandbox, "_group_gone", lambda group: False)
+    assert sandbox._reap_pending() is record
+    assert stage.is_dir() and sandbox._PENDING
+    monkeypatch.setattr(sandbox, "_group_gone", lambda group: True)
+    assert sandbox._reap_pending() is None
+    assert not stage.exists() and not sandbox._PENDING
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_pending_stage_cleanup_failure_and_external_removal(tmp_path, monkeypatch, missing):
+    class ReapedLeader:
+        pid = 42
+        def poll(self):
+            return 0
+    stage = tmp_path / "stage"
+    if not missing:
+        stage.mkdir()
+    record = {"status": "sigkill_sent_reap_pending"}
+    monkeypatch.setattr(sandbox, "_PENDING", [(ReapedLeader(), stage, record)])
+    monkeypatch.setattr(sandbox, "_group_gone", lambda group: True)
+    if not missing:
+        with monkeypatch.context() as patch:
+            def unavailable(*args, **kwargs):
+                raise PermissionError("synthetic cleanup failure")
+            patch.setattr(sandbox.shutil, "rmtree", unavailable)
+            assert sandbox._reap_pending() is record
+            assert record["status"] == "stage_cleanup_failed"
+            assert stage.exists() and sandbox._PENDING
+    assert sandbox._reap_pending() is None
+    assert not stage.exists() and not sandbox._PENDING
+
+
+def test_concurrent_invocation_cannot_pass_supervisor_reservation(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    def controlled(source, fixture, request, bootstrap, evidence):
+        entered.set()
+        assert release.wait(3)
+        return sandbox.SandboxResult("returned", payload={"status": "parsed", "bills": []}, **evidence)
+    monkeypatch.setattr(sandbox, "_run_prepared", controlled)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(_run, "pass")
+        try:
+            assert entered.wait(3)
+            assert _run("pass").status == "runner_busy"
+        finally:
+            release.set()
+        assert first.result().status == "returned"

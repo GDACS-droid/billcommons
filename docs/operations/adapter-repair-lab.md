@@ -154,10 +154,29 @@ CA parser; importing additional modules may fail in this environment.
 
 Policy caps are 256 KiB source, 8 MiB archive, 256 MiB child address space,
 five CPU seconds, 16 MiB combined stdout/stderr, and a 12-second staging/execution
-budget. Staging uses local `/tmp` rather than environment-selected `TMPDIR`;
+budget. Before JSON decoding, a constant-memory scanner caps nesting at eight,
+containers at 32,768, scalar tokens at 524,288, individual encoded strings at
+1 MiB, and unquoted tokens at 64 bytes. This prevents a short stream of tiny
+objects from amplifying into millions of parent-side allocations.
+Staging uses local `/tmp` rather than environment-selected `TMPDIR`;
 the deadline is checked before launch, but a stalled host filesystem is outside
 the wall-time guarantee. The parent kills the fresh process group before reaping
 its leader, including when a descendant retains a pipe after leader exit. The
+caller must own that child's wait status; an unrelated global child reaper is
+not a supported supervisor environment. Reaping has a separate one-second
+budget. A kernel task that does not exit after `SIGKILL` produces
+`cleanup_pending`, preserves its private stage with `cleanup.json`, and stops
+subsequent evaluations in that supervisor until the leader is reaped, the group
+is absent, and the stage is removed. The group probe is non-destructive; an
+ambiguous reused ID conservatively retains the stop rather than being signaled.
+Stage-removal errors remain cleanup failures; a stage already removed after
+process cleanup does not wedge the supervisor. A process-local reservation
+rejects concurrent invocations as `runner_busy`.
+Automated callers must stop scheduling on this host-health result. If the CLI
+exits first, its recovery record remains for operator follow-up; do not signal
+a PID from a stale record or resume scheduling without checking process identity
+and host health. The PID and kernel start ticks, when available, are retained
+for that check. The
 whole child interpreter and its output remain untrusted; separate Python globals
 are not an isolation boundary. Error output is discarded, and the parent
 independently validates and hashes all returned facts. This kernel boundary does
@@ -173,6 +192,31 @@ This proves the execution/comparison path for that proposal, not a parser repair
 Automated repair authorship, executing proposed regression tests, comparison
 against a separately selected known-good corpus, and promotion remain
 unfinished workflow steps.
+
+### Canonical review and follow-up checks
+
+Canonical run `/home/alberto/verify-runs/20260915T172457Z-1a99811` returned
+**BLOCK**: Codex, AGY, Grok and Deepseek blocked; Muse, Opus and Ox returned SHIP.
+All seven legs completed, but the final adversarial pass was inconclusive.
+Grok reported truncated review input. No majority-vote approval is implied.
+
+Confirmed findings prompted the pre-decode structural budget, bounded reaping
+with explicit pending cleanup, and descriptor-pinned final artifact reads.
+The replayed empty-action archive preserves an empty event mapping, contradicting
+the alleged missing-key case. The unchanged retained parser also runs with
+`fcntl` denied. The parent does not reap before group teardown, and the installed
+Python subprocess cleanup only polls its tracked abandoned process objects;
+the alleged unconditional global `waitpid(-1)` path is not present.
+
+The final follow-up six-file offline suite passed **106 tests**. It includes actual
+object-amplification rejection before decoding, directory replacement during a
+verified read, a real zero-action archive, and injected delayed-reaping recovery.
+The retained smoke replay again matched all 7,094 events; its report is
+`native-evaluation-smoke-20260915-th2sosgj/evaluation-final.json` in the release
+evidence directory above. Subsequent focused review added process-group checks
+after leader reaping, retained-stage error handling, and a supervisor reservation;
+these paths also passed in the final suite. These fixes have not received a new canonical SHIP
+verdict, and the change remains undeployed.
 
 ## Native isolation feasibility — September 15, 2026
 

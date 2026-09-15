@@ -25,12 +25,20 @@ This proves that execution/comparison path, not a parser repair. Authored tests
 remain unexecuted, the scope is one retained CA archive, and promotion remains
 unauthorized. See the [evaluation command and limitations](adapter-repair-lab.md#evaluating-a-pinned-proposal-locally).
 
-The integrated parent/child/evaluation/proposal/bundle/CA checks passed 94 tests;
-the subsequent missing-library failure gate passed its four-test child suite.
+The final parent/child/evaluation/proposal/bundle/CA follow-up passed 106 tests.
 Tests include actual file/network/process denials, an inherited descriptor,
 resource overruns, malformed or forged output, content changes with equal
-counts, and group cleanup after leader exit. The canonical review is still
-required before declaring this change verified or deploying it.
+counts, pre-decode allocation budgets, directory replacement during evidence
+reads, and group cleanup after leader exit. Delayed reaping is explicitly
+reported as pending cleanup, with a recovery record and a stop until the group
+is absent and staging cleanup succeeds. Concurrent invocations return busy.
+
+Canonical review `/home/alberto/verify-runs/20260915T172457Z-1a99811` returned
+**BLOCK** with four BLOCK and three SHIP legs; all seven completed. The final
+adversarial pass was inconclusive and Grok reported truncated input. Confirmed
+allocation, teardown and final-read race findings have local fixes and focused
+checks, but no new canonical SHIP verdict. No deployment was performed. See the
+[review disposition](adapter-repair-lab.md#canonical-review-and-follow-up-checks).
 
 The earlier native probe established Landlock ABI 4 plus libseccomp feasibility
 without changing the parser's LZMA support. That prototype remains trusted-only;
