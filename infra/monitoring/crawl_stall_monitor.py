@@ -195,6 +195,13 @@ def evaluate(
     now_text = _iso(now)
     status = _health_status(health)
     incident_since = _parse_time(result.get("incident_since"))
+    previous_status = result.get("last_status")
+
+    # A yellow attempt that never reached its recipient has no restoration
+    # lifecycle to close. Any valid health sample, including a stalled crawl
+    # result, ends that failed monitoring episode.
+    if previous_status == "check_failed" and not result.get("check_failed_alerted"):
+        result.pop("check_failed_attempt_at", None)
 
     if status == "stalled":
         # A new bad sample supersedes an undelivered recovery. Never send a
