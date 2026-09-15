@@ -1,0 +1,55 @@
+{
+  "status": "deployed_and_verified",
+  "checked_at": "2026-09-15T19:47:49.026160+00:00",
+  "source_sha": "7d6ad1b0eb302f9bafb5145fdaeade29fd588a5d",
+  "archive_sha256": "7b8c65e5f173e723155efb08a94884d120f20795172e9d2ff81d8c758b3d89e5",
+  "review_sha": "fcec0803d8607d4275973b0dd1d43fd92477e317",
+  "deployment_id": "e49dcc82-f507-4127-9c43-6a9d7ef20e2c",
+  "image_digest": "sha256:9c87f6db053ebed9c271dd60d7d078d3706c1f8ccc21886a0d9ee0ffa1e897f2",
+  "previous_deployment_id": "0cc40220-dde3-4a60-aac6-f5c7bd667a39",
+  "service": "api",
+  "schema_mutations": false,
+  "other_services_unchanged": [
+    "webhooks-worker",
+    "sync-worker",
+    "validate-worker",
+    "official-worker",
+    "Postgres",
+    "scout-worker",
+    "worker",
+    "mcp"
+  ],
+  "validation": {
+    "unit_tests": 30,
+    "postgres_tests": 11,
+    "api_tests": 14,
+    "review_legs": "7SHIP; advocate concerns source-adjudicated",
+    "health_samples": 16,
+    "health_started_at": "2026-09-15T19:31:57.270704+00:00",
+    "health_completed_at": "2026-09-15T19:47:31.212371+00:00",
+    "browser_checks": [
+      "51 live jurisdictions",
+      "New source-failure warning rendered for California",
+      "Jurisdiction search, issues filter, empty state and reset",
+      "Mobile warning and no horizontal overflow",
+      "New API state, source evidence URL and explicit unverified freshness"
+    ],
+    "browser_errors": 0,
+    "browser_http_errors": 0
+  },
+  "official_targets_by_state": {
+    "observed": 51,
+    "failed": 8,
+    "observation_overdue": 0,
+    "not_observed": 0,
+    "disabled": 0,
+    "changed_target": 0,
+    "future_observation": 0
+  },
+  "known_limitations": [
+    "Official observations do not establish statewide semantic freshness",
+    "Saved monitoring and broader integration work remain undeployed",
+    "Migration marker remains empty pending operator coordination; this release does not modify it",
+    "Report is unavailable when the official target inventory exceeds1000"
+  ]
+}
