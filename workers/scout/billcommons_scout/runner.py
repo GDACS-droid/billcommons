@@ -416,9 +416,12 @@ class ScoutRunner:
                     settings=self.settings,
                 )
             except ScoutAdmissionError as exc:
-                self._defer_monitor(db, monitor, now, exc.code)
+                self._defer_monitor(db, monitor, datetime.now(timezone.utc), exc.code)
                 db.commit()
                 return True
+            # Admission can wait on shared capacity locks. Start the cadence
+            # after that wait so the next opportunity remains in the future.
+            now = datetime.now(timezone.utc)
             # A successful admission—not its later terminal outcome—is the
             # boundary for retry backoff.  A failed/canceled admitted job has
             # already consumed a normal scheduling opportunity, and a later

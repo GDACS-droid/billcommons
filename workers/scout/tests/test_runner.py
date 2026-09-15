@@ -235,6 +235,49 @@ def test_california_monitor_scheduler_uses_retained_admission_and_parse_limit(tm
     assert scheduled.limits["max_related_bill_versions"] == 1
 
 
+@pytest.mark.parametrize("deferred", [False, True])
+def test_monitor_next_due_starts_after_admission_wait(tmp_path, monkeypatch, deferred):
+    settings = ScoutSettings(enabled=True, allow_public_rollout=True)
+    runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), None, settings=settings)
+    before = datetime(2026, 9, 15, tzinfo=timezone.utc)
+    after = before + timedelta(days=1)
+    clock = [before]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+
+    with sessions() as db:
+        job = db.get(ScoutResearchJob, job_id)
+        monitor = ScoutMonitor(
+            customer_id=job.customer_id, original_query=job.original_query,
+            normalized_query=job.normalized_query, jurisdiction=job.jurisdiction,
+            cache_key=job.cache_key, cadence_seconds=21600,
+            next_run_at=before - timedelta(seconds=1),
+        )
+        db.add(monitor)
+        db.commit()
+        monitor_id = monitor.id
+
+    def delayed_admission(db, customer, **kwargs):
+        clock[0] = after
+        if deferred:
+            raise scout_runner_module.ScoutAdmissionError("capacity", "Try later", 60)
+        return types.SimpleNamespace(job=db.get(ScoutResearchJob, job_id), cached=False, coalesced=True)
+
+    monkeypatch.setattr(scout_runner_module, "datetime", Clock)
+    monkeypatch.setattr(scout_runner_module, "admit_scout_job", delayed_admission)
+    assert runner.schedule_one_due_monitor() is True
+    with sessions() as db:
+        monitor = db.get(ScoutMonitor, monitor_id)
+        run = db.execute(select(ScoutMonitorRun).where(ScoutMonitorRun.monitor_id == monitor_id)).scalar_one()
+        expected_delay = scout_runner_module.defer_delay_seconds(21600, 0) if deferred else 21600
+        assert monitor.next_run_at.replace(tzinfo=timezone.utc) == after + timedelta(seconds=expected_delay)
+        assert run.scheduled_for.replace(tzinfo=timezone.utc) == after
+        assert run.status == ("deferred" if deferred else "queued")
+
+
 def test_california_retained_archive_over_job_cap_is_truthful_partial_and_not_copied(tmp_path):
     runner, sessions, job_id = _runner(tmp_path, MockResearchBrowserProvider(), lambda _url: (_ for _ in ()).throw(AssertionError("no fetch")))
     raw = _ca_archive()
