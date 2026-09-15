@@ -574,9 +574,17 @@ def save_monitor(
 @router.get("/monitors")
 def list_monitors(request: Request, response: Response, db: Session = Depends(get_db)):
     customer = _require_session(request, db)
+    settings = ScoutSettings.from_env()
     monitors = db.scalars(select(ScoutMonitor).where(ScoutMonitor.customer_id == customer.id).order_by(ScoutMonitor.created_at.desc())).all()
     response.headers["Cache-Control"] = "no-store"
-    return {"monitors": [_monitor_payload(monitor) for monitor in monitors]}
+    return {
+        "monitors": [_monitor_payload(monitor) for monitor in monitors],
+        "policy": {
+            "max_saved_monitors": settings.max_saved_monitors_per_customer,
+            "min_cadence_seconds": settings.monitor_min_cadence_seconds,
+            "max_cadence_seconds": settings.monitor_max_cadence_seconds,
+        },
+    }
 
 
 @router.get("/monitors/{monitor_id}/runs")

@@ -313,3 +313,19 @@ test("linked jobs surface unavailable owner-scoped evidence without creating res
   await assert.rejects(getScoutJob("missing-job"), (error) =>
     error.status === 404 && /unavailable/.test(error.message) && /may not have access/.test(error.message));
 });
+
+test("monitor overview supports custom policy and legacy servers without an invented cap", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  const rawPolicy = { max_saved_monitors: 5, min_cadence_seconds: 43200, max_cadence_seconds: 43200 };
+  globalThis.fetch = async () => new Response(JSON.stringify({ monitors: [], policy: rawPolicy }));
+  const overview = await compiled.exports.getScoutMonitorOverview();
+  assert.deepEqual(overview.policy, { maxSavedMonitors: 5, minCadenceSeconds: 43200, maxCadenceSeconds: 43200 });
+  assert.deepEqual(compiled.exports.scoutMonitorCadences(overview.policy), [43200]);
+  assert.deepEqual(await compiled.exports.listScoutMonitors(), []);
+  globalThis.fetch = async () => new Response(JSON.stringify({ monitors: [] }));
+  assert.equal((await compiled.exports.getScoutMonitorOverview()).policy, undefined);
+  assert.deepEqual(compiled.exports.scoutMonitorCadences(), [21600, 86400, 604800]);
+  globalThis.fetch = async () => new Response(JSON.stringify({ monitors: [], policy: { ...rawPolicy, max_cadence_seconds: 21600 } }));
+  await assert.rejects(compiled.exports.getScoutMonitorOverview(), /invalid monitor limits/);
+});

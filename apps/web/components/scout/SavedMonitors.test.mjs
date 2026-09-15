@@ -5,7 +5,7 @@ import test from "node:test";
 const source = await readFile(new URL("./SavedMonitors.tsx", import.meta.url), "utf8");
 
 test("saved monitor presentation names cadence, paused state, and bounded comparisons", () => {
-  assert.match(source, /Keep up to three evidence-backed queries on a cadence/);
+  assert.match(source, /policy.maxSavedMonitors/);
   assert.match(source, /monitor\.active \? `Next due/);
   assert.match(source, /"Paused"/);
   assert.match(source, /new · \{changedSources\} changed · \{unchanged\} unchanged observed sources/);

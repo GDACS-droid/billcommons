@@ -5,7 +5,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   getScoutMonitorRuns,
   isScoutMonitorEligible,
-  listScoutMonitors,
+  getScoutMonitorOverview,
+  scoutMonitorCadences,
+  type ScoutMonitorPolicy,
   saveScoutMonitor,
   updateScoutMonitor,
   type ScoutJob,
@@ -26,7 +28,7 @@ function when(value?: string): string {
 }
 
 function cadenceLabel(seconds: number): string {
-  return CADENCES.find((cadence) => cadence.seconds === seconds)?.label ?? `${Math.max(1, Math.round(seconds / 3600))} hours`;
+  return CADENCES.find((cadence) => cadence.seconds === seconds)?.label ?? (seconds % 3600 === 0 ? `Every ${seconds / 3600} hours` : seconds % 60 === 0 ? `Every ${seconds / 60} minutes` : `Every ${seconds} seconds`);
 }
 
 function count(value: unknown): number | undefined {
@@ -120,8 +122,9 @@ function MonitorHistory({ monitor }: { monitor: ScoutMonitor }) {
   );
 }
 
-function MonitorRow({ monitor, onChange, onMutationStart, onMutationSettled }: { monitor: ScoutMonitor; onChange: (monitor: ScoutMonitor) => void; onMutationStart: () => void; onMutationSettled: () => void }) {
+function MonitorRow({ monitor, policy, onChange, onMutationStart, onMutationSettled }: { monitor: ScoutMonitor; policy?: ScoutMonitorPolicy; onChange: (monitor: ScoutMonitor) => void; onMutationStart: () => void; onMutationSettled: () => void }) {
   const [cadence, setCadence] = useState(monitor.cadenceSeconds);
+  const choices = scoutMonitorCadences(policy, cadence);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   async function update(change: { active?: boolean; cadenceSeconds?: number }) {
@@ -141,8 +144,8 @@ function MonitorRow({ monitor, onChange, onMutationStart, onMutationSettled }: {
       <button type="button" disabled={saving} onClick={() => void update({ active: !monitor.active })} className="text-sm font-semibold text-blue-800 underline underline-offset-2 hover:text-blue-600 disabled:opacity-50">{saving ? "Saving…" : monitor.active ? "Pause" : "Resume"}</button>
     </div>
     <div className="mt-4 flex flex-wrap items-end gap-3">
-      <label className="block text-xs font-semibold text-slate-700">Cadence<select value={cadence} onChange={(event) => setCadence(Number(event.target.value))} className="mt-1 block rounded-sm border border-slate-400 bg-white px-2 py-1.5 text-sm text-slate-950"><option value={cadence}>{cadenceLabel(cadence)}</option>{CADENCES.filter((item) => item.seconds !== cadence).map((item) => <option key={item.seconds} value={item.seconds}>{item.label}</option>)}</select></label>
-      <button type="button" disabled={saving || cadence === monitor.cadenceSeconds} onClick={() => void update({ cadenceSeconds: cadence })} className="pb-1.5 text-sm font-semibold text-blue-800 underline underline-offset-2 hover:text-blue-600 disabled:no-underline disabled:opacity-50">Update cadence</button>
+      <label className="block text-xs font-semibold text-slate-700">Cadence<select value={cadence} onChange={(event) => setCadence(Number(event.target.value))} className="mt-1 block rounded-sm border border-slate-400 bg-white px-2 py-1.5 text-sm text-slate-950"><option value={cadence}>{cadenceLabel(cadence)}</option>{choices.filter((seconds) => seconds !== cadence).map((seconds) => <option key={seconds} value={seconds}>{cadenceLabel(seconds)}</option>)}</select></label>
+      <button type="button" disabled={saving || cadence === monitor.cadenceSeconds || !choices.includes(cadence)} onClick={() => void update({ cadenceSeconds: cadence })} className="pb-1.5 text-sm font-semibold text-blue-800 underline underline-offset-2 hover:text-blue-600 disabled:no-underline disabled:opacity-50">Update cadence</button>
     </div>
     {monitor.jurisdiction === "CA" ? <p className="mt-4 text-xs leading-5 text-slate-600">California monitor runs compare retained weekday archive evidence. They do not establish a current or complete bill history.</p> : null}
     <MonitorHistory monitor={monitor} />
@@ -154,6 +157,7 @@ type ListStatus = "loading" | "ready" | "error";
 
 export default function SavedMonitors({ job }: { job?: ScoutJob }) {
   const [monitors, setMonitors] = useState<ScoutMonitor[]>([]);
+  const [policy, setPolicy] = useState<ScoutMonitorPolicy>();
   const [listStatus, setListStatus] = useState<ListStatus>("loading");
   const [listError, setListError] = useState("");
   const [saveError, setSaveError] = useState("");
@@ -168,9 +172,14 @@ export default function SavedMonitors({ job }: { job?: ScoutJob }) {
     setListStatus("loading");
     setListError("");
     try {
-      const next = await listScoutMonitors();
+      const next = await getScoutMonitorOverview();
       if (monitorVersion.current !== version) return;
-      setMonitors(next);
+      setMonitors(next.monitors);
+      setPolicy(next.policy);
+      if (next.policy) {
+        const { minCadenceSeconds, maxCadenceSeconds } = next.policy;
+        setCadence((current) => Math.max(minCadenceSeconds, Math.min(maxCadenceSeconds, current)));
+      }
       setListStatus("ready");
     } catch (reason) {
       if (monitorVersion.current !== version) return;
@@ -212,16 +221,16 @@ export default function SavedMonitors({ job }: { job?: ScoutJob }) {
     }
   }
 
-  const savedCount = listStatus === "ready" ? `${monitors.length}/3 saved` : listStatus === "loading" ? "Loading saved monitors…" : "Saved monitor count unavailable";
-  const limitReached = listStatus === "ready" && monitors.length >= 3;
+  const savedCount = listStatus === "ready" ? `${monitors.length}${policy ? `/${policy.maxSavedMonitors}` : ""} saved` : listStatus === "loading" ? "Loading saved monitors…" : "Saved monitor count unavailable";
+  const limitReached = listStatus === "ready" && policy !== undefined && monitors.length >= policy.maxSavedMonitors;
   const saveDisabled = saving || listStatus !== "ready" || limitReached;
   const saveLabel = saving ? "Saving…" : listStatus === "loading" ? "Loading saved monitors…" : listStatus === "error" ? "Saved monitor count unavailable" : limitReached ? "Monitor limit reached" : "Save monitor";
   return <section className="mt-10 border-y border-slate-300 py-6" aria-labelledby="saved-monitors-heading">
-    <div className="flex flex-wrap items-baseline justify-between gap-3"><div><h2 id="saved-monitors-heading" className="text-xl font-semibold tracking-tight text-slate-950">Saved monitors</h2><p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">Keep up to three evidence-backed queries on a cadence. A run records observed source changes; it does not claim a source was removed.</p></div><p className="text-sm text-slate-500">{savedCount}</p></div>
-    {job ? <div className="mt-5 border-t border-slate-200 pt-4"><p className="text-sm font-semibold text-slate-900">Save this research result</p>{eligible ? <div className="mt-3 flex flex-wrap items-end gap-3"><label className="text-sm text-slate-700">Cadence<select value={cadence} onChange={(event) => setCadence(Number(event.target.value))} className="ml-2 rounded-sm border border-slate-400 bg-white px-2 py-1.5 text-sm text-slate-950">{CADENCES.map((item) => <option key={item.seconds} value={item.seconds}>{item.label}</option>)}</select></label><button type="button" disabled={saveDisabled} onClick={() => void save()} className="rounded-sm bg-slate-950 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50">{saveLabel}</button></div> : <p className="mt-2 text-sm leading-6 text-slate-600">Only completed or partial results with retained findings can become monitors. Operator and canary research cannot be saved.</p>}</div> : null}
+    <div className="flex flex-wrap items-baseline justify-between gap-3"><div><h2 id="saved-monitors-heading" className="text-xl font-semibold tracking-tight text-slate-950">Saved monitors</h2><p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">{policy ? `Keep up to ${policy.maxSavedMonitors} evidence-backed ${policy.maxSavedMonitors === 1 ? "query" : "queries"} on a cadence.` : "Keep evidence-backed queries on a cadence."} A run records observed source changes; it does not claim a source was removed.</p></div><p className="text-sm text-slate-500">{savedCount}</p></div>
+    {job ? <div className="mt-5 border-t border-slate-200 pt-4"><p className="text-sm font-semibold text-slate-900">Save this research result</p>{eligible ? <div className="mt-3 flex flex-wrap items-end gap-3"><label className="text-sm text-slate-700">Cadence<select value={cadence} onChange={(event) => setCadence(Number(event.target.value))} className="ml-2 rounded-sm border border-slate-400 bg-white px-2 py-1.5 text-sm text-slate-950">{scoutMonitorCadences(policy, cadence).map((seconds) => <option key={seconds} value={seconds}>{cadenceLabel(seconds)}</option>)}</select></label><button type="button" disabled={saveDisabled} onClick={() => void save()} className="rounded-sm bg-slate-950 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50">{saveLabel}</button></div> : <p className="mt-2 text-sm leading-6 text-slate-600">Only completed or partial results with retained findings can become monitors. Operator and canary research cannot be saved.</p>}</div> : null}
     {listStatus === "loading" ? <p className="mt-6 text-sm text-slate-600">Loading saved monitors…</p> : null}
     {listStatus === "ready" && !monitors.length ? <p className="mt-6 text-sm text-slate-600">No saved monitors yet. Save an eligible evidence result to begin a bounded comparison history.</p> : null}
-    {monitors.length ? <ul className="mt-6">{monitors.map((monitor) => <MonitorRow key={monitor.id} monitor={monitor} onChange={acceptMonitor} onMutationStart={beginMutation} onMutationSettled={settleMutation} />)}</ul> : null}
+    {monitors.length ? <ul className="mt-6">{monitors.map((monitor) => <MonitorRow key={monitor.id} monitor={monitor} policy={policy} onChange={acceptMonitor} onMutationStart={beginMutation} onMutationSettled={settleMutation} />)}</ul> : null}
     {listError ? <p role="alert" className="mt-4 text-sm text-red-800">{listError}</p> : null}
     {saveError ? <p role="alert" className="mt-4 text-sm text-red-800">{saveError}</p> : null}
   </section>;

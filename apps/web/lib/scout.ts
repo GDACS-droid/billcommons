@@ -672,8 +672,35 @@ async function monitorRequest(path: string, init?: RequestInit): Promise<unknown
 }
 
 export async function listScoutMonitors(): Promise<ScoutMonitor[]> {
+  return (await getScoutMonitorOverview()).monitors;
+}
+
+export type ScoutMonitorPolicy = {
+  maxSavedMonitors: number;
+  minCadenceSeconds: number;
+  maxCadenceSeconds: number;
+};
+
+export function scoutMonitorCadences(policy?: ScoutMonitorPolicy, current?: number): number[] {
+  const minimum = policy?.minCadenceSeconds ?? 21600;
+  const maximum = policy?.maxCadenceSeconds ?? 604800;
+  return [...new Set([minimum, 21600, 86400, 604800, maximum, ...(current === undefined ? [] : [current])])]
+    .filter((seconds) => seconds >= minimum && seconds <= maximum).sort((a, b) => a - b);
+}
+
+export async function getScoutMonitorOverview(): Promise<{ monitors: ScoutMonitor[]; policy?: ScoutMonitorPolicy }> {
   const payload = record(await monitorRequest("/monitors")) ?? {};
-  return list(payload.monitors).map(normalizeMonitor).filter((monitor) => Boolean(monitor.id));
+  let policy: ScoutMonitorPolicy | undefined;
+  if (payload.policy !== undefined) {
+    const value = record(payload.policy);
+    const values = [value?.max_saved_monitors, value?.min_cadence_seconds, value?.max_cadence_seconds];
+    if (!values.every((item) => typeof item === "number" && Number.isSafeInteger(item) && item > 0)
+      || (values[1] as number) > (values[2] as number)) {
+      throw new ScoutApiError("Scout returned invalid monitor limits. Please try again.");
+    }
+    policy = { maxSavedMonitors: values[0] as number, minCadenceSeconds: values[1] as number, maxCadenceSeconds: values[2] as number };
+  }
+  return { monitors: list(payload.monitors).map(normalizeMonitor).filter((monitor) => Boolean(monitor.id)), policy };
 }
 
 export async function saveScoutMonitor(jobId: string, cadenceSeconds: number): Promise<{ created: boolean; monitor: ScoutMonitor }> {

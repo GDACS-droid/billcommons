@@ -96,6 +96,21 @@ def test_scout_create_coalesces_and_owner_scopes_reads(monkeypatch):
         assert [event.detail["status"] for event in terminal] == ["canceled"]
 
 
+def test_monitor_list_reports_configured_policy_even_when_creation_disabled(monkeypatch):
+    app, owner, _other, _sessions = _app(monkeypatch)
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "0")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MAX_SAVED_MONITORS", "5")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MONITOR_MIN_CADENCE_SECONDS", "43200")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MONITOR_MAX_CADENCE_SECONDS", "43200")
+    with TestClient(app) as client:
+        response = client.get("/api/v1/scout/monitors", headers={"x-test-customer": str(owner.id)})
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {"monitors": [], "policy": {
+        "max_saved_monitors": 5, "min_cadence_seconds": 43200, "max_cadence_seconds": 43200,
+    }}
+
+
 def test_scout_california_admission_requires_explicit_session_and_uses_retained_strategy(monkeypatch):
     app, owner, _other, sessions = _app(monkeypatch)
     headers = {"x-test-customer": str(owner.id)}
