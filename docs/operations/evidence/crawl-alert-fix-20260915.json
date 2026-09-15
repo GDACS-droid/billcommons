@@ -1,0 +1,27 @@
+{
+  "status": "installed",
+  "source_sha": "f61e3f677fb4a3c9cb4545bcbd1625257a058b83",
+  "installed_at": "2026-09-15T21:10:17.469058+00:00",
+  "installed_hashes": {
+    "workers/ingest/billcommons_ingest/healthcheck.py": "3cd0e263329498e0e4a86a18e6003f67df4507e880a70c406175ee267d4eaac8",
+    "infra/monitoring/crawl_stall_monitor.py": "e05c0d1d7d71afb4c61b1e1d173cbd2872f1656466e7d597b7796fc4d99c5b6d"
+  },
+  "dry_run": {
+    "exit_code": 0,
+    "notifications_sent": false,
+    "state_written": false
+  },
+  "timer_state": "active",
+  "unit_tests_passed": 38,
+  "postgres_query_cases_passed": 16,
+  "review_runtime_sha": "33671e74d5b8d9669c560171c888fc3544609214",
+  "review_runtime_byte_identity": true,
+  "review": "canonical seven-family base review and four-family runtime followup; advocate missing stalled test fixed by final test-only commit",
+  "scope": "crawl health classification and notifications; underlying crawler unchanged",
+  "first_scheduled_run": {
+    "exit_code": 0,
+    "completed_at": "2026-09-15T21:20:17Z",
+    "last_status": "waiting_upstream",
+    "bad_checks": 0
+  }
+}

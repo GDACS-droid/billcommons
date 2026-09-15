@@ -1,0 +1,111 @@
+{
+  "status": "deployed_and_verified",
+  "source_sha": "88896d6ba63522ed3d6fa9d48cfe3de2e0438830",
+  "archive_sha256": "3769ab68fe493ce74e3b5b9866ccd7570d25e756ce80962d92d2ba842b910a91",
+  "revision": "0032_intelligence_merge",
+  "api": {
+    "deployment_id": "90703599-70b1-4c18-be0b-7d1210383fd1",
+    "image_digest": "sha256:071ab1c936d5f8a7d4096dc56a182c935568c1480bf34b3430161d1d6e5feb1e",
+    "dockerfile": "infra/docker/Dockerfile.api"
+  },
+  "scout_worker": {
+    "deployment_id": "d3496de7-12c8-402b-963b-738f876cf2ff",
+    "image_digest": "sha256:5d1a93f5af9a7a8e4fb9c2c9567224d6a5c913ce38af7f1aa5f5777eba0f62b1",
+    "dockerfile": "infra/docker/Dockerfile.scout-worker"
+  },
+  "backup_restore": {
+    "status": "complete",
+    "dump_sha256": "0e141a5c370e1fad02609d39603bb32d1390823b530ddb231f952e7d094e91b0",
+    "counts_match": true,
+    "source_revision": "0030",
+    "raw_blobs_verified": 13,
+    "restored_then_upgraded_to": "0032_intelligence_merge",
+    "source_sha": "88896d6ba63522ed3d6fa9d48cfe3de2e0438830",
+    "additive_data_counts_preserved": true,
+    "api_health": true,
+    "api_ready": true,
+    "search": true,
+    "api_source_sha": "7d6ad1b0eb302f9bafb5145fdaeade29fd588a5d",
+    "completed_at": "2026-09-15T20:43:38.483484+00:00"
+  },
+  "sustained_health": {
+    "status": "passed",
+    "samples": 25,
+    "started_at": "2026-09-15T21:00:50.673947+00:00",
+    "last_sample_at": "2026-09-15T21:15:57.877893+00:00",
+    "all_samples_passed": true
+  },
+  "owner_canary": {
+    "status": "passed",
+    "monitors": 2,
+    "ended_paused": true,
+    "new_jobs": 1,
+    "scheduler": "one accelerated CA run; not elapsed cadence",
+    "source_snapshot_scope": "retained reference comparison; not proof of real-world legislative change",
+    "new_browser_sessions": 0
+  },
+  "florida_text_canary": {
+    "status": "passed",
+    "terminal_status": "completed",
+    "scope": "FL HB 625 2026; one direct official PDF version",
+    "new_jobs": 1,
+    "evidence_checks": [
+      "owner API finding",
+      "raw PDF bytes and SHA-256 identity",
+      "extracted HB 625 identifier",
+      "one-version cap",
+      "shared external request cap",
+      "no browser session",
+      "anonymous isolation",
+      "other owner jobs unchanged"
+    ]
+  },
+  "local_checks": {
+    "python_passed": 311,
+    "python_skipped": 3,
+    "frontend_passed": 33,
+    "production_build": "passed",
+    "postgres": "16; upgrades and downgrades from0030 and both sibling revisions",
+    "browser": "desktop and mobile route fixtures with request races"
+  },
+  "review": {
+    "method": "canonical verify-ship",
+    "decision": "root acceptance after live reviewer findings adjudicated against source and production evidence",
+    "missing_required_legs": []
+  },
+  "limits": [
+    "Only bounded Florida/California Scout scope",
+    "Snapshot blocker table inert; no generic ingestion worker release",
+    "No email or webhook delivery",
+    "No claim of autonomous 50-state intelligence"
+  ],
+  "completed_at": "2026-09-15T21:22:19.239606+00:00",
+  "web": {
+    "deployment_id": "dpl_HjfbkfttsjzzBHu9bXAfghkL2vhk",
+    "promoted_at": "2026-09-15T21:19:04.279748+00:00",
+    "public_url": "https://billcommons.org/scout"
+  },
+  "public_browser": {
+    "status": "passed",
+    "ended_paused": true,
+    "idempotent_save": true,
+    "desktop_resume_pause": true,
+    "mobile_resume_pause": true,
+    "history_and_evidence_link": true,
+    "source_health_articles": 51,
+    "console_errors_or_warnings": 0,
+    "http_errors": 0,
+    "blocked_mutations": 0,
+    "new_research_jobs": 0
+  },
+  "postrelease_health": {
+    "status": "passed",
+    "samples": 5,
+    "duration_seconds": 144.4
+  },
+  "browser_helper_corrections": [
+    "First attempt expected nested job response; actual API returns flat job; corrected helper only",
+    "Second attempt used unscoped heading locator; all51 state articles contain heading; corrected helper to open and scope first article",
+    "Final complete attempt passed with no product changes"
+  ]
+}

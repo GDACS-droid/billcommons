@@ -1,14 +1,15 @@
 # Crawl alert flapping — September 15, 2026
 
-The repeated red/green crawl alerts reflect inconsistent treatment of
-upstream-waiting documents. A green “crawl recovered” message does not currently
-require that extraction resumed. This alert concerns the internal full-text
-ingester; it is separate from website/API availability and external bot traffic.
+This document records the pre-fix diagnosis and the installed alert-policy
+correction. The incident concerned the internal full-text ingester; it was
+separate from website/API availability and external bot traffic. The correction
+changes health classification and notification wording. It does not remediate
+the underlying crawler, upstream assignment delays, or a broken top-up worker.
 
 ## Observed pattern
 
-Read-only inspection of the active systemd unit, its journal, the active Python
-module and production aggregates established:
+Read-only inspection before the correction of the active systemd unit, its
+journal, the active Python module, and production aggregates established:
 
 - The timer runs the original checkout's `infra/monitoring/crawl_stall_monitor.py`
   every ten minutes. Its healthcheck resolves to that checkout and its database
@@ -29,11 +30,11 @@ module and production aggregates established:
 Journal state switches are not delivery receipts; this diagnosis does not claim
 that every attempted Telegram message was delivered.
 
-## Execution path and cause
+## Pre-fix execution path and cause
 
-`billcommons_ingest.healthcheck.check_crawl_health` excludes upstream-awaiting
-queued jobs from its `claimable_now` count. If those are the only queued jobs,
-it returns healthy with a waiting-upstream reason.
+The pre-fix `billcommons_ingest.healthcheck.check_crawl_health` excluded
+upstream-awaiting queued jobs from its `claimable_now` count. If those were the
+only queued jobs, it returned healthy with a waiting-upstream reason.
 
 However, its separate `backlog_remains` query still includes those same
 upstream-awaiting documents. Its starvation condition is
@@ -44,15 +45,15 @@ documents still await the same external event.
 The queue lifecycle permits this empty interval. A fetch job can reach its job
 attempt limit and become dead while the Massachusetts grace rule leaves its
 document retryable. A later top-up can create a new job for the document.
-The active health predicates interpret the empty phase as red and the
+The pre-fix health predicates interpreted the empty phase as red and the
 re-enqueued upstream-waiting phase as green. The journal pattern is consistent
 with this lifecycle; it does not retain a complete per-job trace for every
 historical switch.
 
-The notification wrapper turns any healthy result after stalled into “crawl
-recovered.” It does not require a newer text timestamp or a productive result.
-That wording converts a queue classification change into a misleading recovery
-claim.
+The pre-fix notification wrapper turned any healthy result after stalled into
+“crawl recovered.” It did not require a newer text timestamp or a productive
+result. That wording converted a queue classification change into a misleading
+recovery claim.
 
 Two adjacent weaknesses matter when correcting this:
 
@@ -62,37 +63,47 @@ Two adjacent weaknesses matter when correcting this:
   enqueue path also recognizes decorated notes such as
   `fulltext_status=permanently_failed browser_attempted_at=...`.
 
-## Separate notification noise defect
+## Pre-fix notification noise defect
 
-The wrapper compares the six-hour reminder threshold with the original incident
-start, preserves that start after each reminder, and stores no last-alert time.
-Once an uninterrupted stall passes six hours, every subsequent ten-minute run
-qualifies for a reminder. This is separate from the observed red/green pairs.
+The wrapper compared the six-hour reminder threshold with the original incident
+start, preserved that start after each reminder, and stored no last-alert time.
+Once an uninterrupted stall passed six hours, every subsequent ten-minute run
+qualified for a reminder. This was separate from the observed red/green pairs.
 
-The active crawl wrapper also has no two-consecutive-failure gate, despite the
-incident runbook's general description of the monitors. Documentation should
-describe the deployed rule accurately.
+The pre-fix crawl wrapper also had no two-consecutive-failure gate, despite the
+incident runbook's general description of the monitors.
 
-## Corrective design
+## Installed corrected behavior
 
-1. Represent `waiting_upstream` separately from productive, idle, and stalled.
-   Preserve the upstream reason and last actual text timestamp. Do not call
-   red-to-waiting “recovered.”
-2. Use the enqueue path's definition of an actionable pending document for
-   starvation, including exact/decorated terminal and upstream-wait statuses.
-   Account for queued and running coverage. Detect stale running work separately
-   so a stuck running job cannot hide a real failure.
-3. Emit green recovery only after evidence of resumed productive work. Apply
-   a bounded persistence requirement to new red states as a secondary noise
-   control, while retaining prompt detection of sustained failures.
-4. Track incident start and last reminder separately, with explicit send-failure
-   semantics. Test the six-hour boundary and subsequent ten-minute run.
+The reviewed runtime was installed at 21:10:17 UTC from source commit
+`f61e3f677fb4a3c9cb4545bcbd1625257a058b83`. The timer was resumed and verified active.
+Its installation dry run exited zero, sent no notification, and wrote no state.
+The first scheduled run completed at 21:20:17 UTC with exit zero and recorded
+`waiting_upstream` with zero stalled samples. See the
+[sanitized installation evidence](evidence/crawl-alert-fix-20260915.json).
 
-Required regressions include upstream-only documents with an empty queue;
-real uncovered actionable backlog; fresh versus stale running jobs; exact and
-decorated status notes; red-to-waiting versus red-to-producing notifications;
-and reminder suppression after the first six-hour reminder.
+The installed behavior:
 
-This is a diagnosis and corrective design. No alert policy, timer, worker or
-production queue was changed during this investigation, and no test notification
-was sent.
+1. Reports `waiting_upstream` separately from `producing`, `running`,
+   `idle_or_backoff`, and `stalled`. An upstream wait is never a crawl recovery.
+2. Uses the actionable-document definition for starvation: a usable, untexted,
+   retry-eligible document outside terminal and upstream-wait status notes. It
+   accounts for actionable queued and running coverage, reports stale running
+   work separately, and treats decorated status notes consistently.
+3. Calls a crawl recovery only after a productive observation with a text
+   timestamp strictly newer than the incident baseline. A recovery notification
+   records when text was observed; it does not claim that production continues.
+4. Requires two consecutive stalled samples before the initial red alert.
+   Stall, recovery, and notification delivery retries use bounded six-hour
+   attempt spacing.
+5. Treats healthcheck failure as a separate yellow monitoring incident. A later
+   valid sample can send a distinct monitoring-restored notice, which explicitly
+   does not claim crawl recovery.
+
+Focused unit coverage passed 38 tests. A disposable PostgreSQL 16 run passed 16 query cases, covering empty, upstream, decorated-status, terminal, uncovered,
+queued/running, stale-running, clock-race, and recent-output classifications;
+it did not mutate production data.
+
+The correction reduces false alert transitions and misleading recovery wording.
+It does not establish that the crawler is currently producing text or repair any
+underlying extraction, upstream, queue, or top-up failure.
