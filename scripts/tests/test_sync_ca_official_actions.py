@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import csv
+import io
 import sys
+import zipfile
 from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +18,69 @@ if scripts_directory not in sys.path:
     sys.path.insert(0, scripts_directory)
 
 import sync_ca_official_actions as sweep
+from billcommons_shared.ca_official_actions import BILL_COLUMNS, HISTORY_COLUMNS
+
+
+def _archive_bytes(description: str) -> bytes:
+    fields = {
+        "bill_id": "202520260AB1", "session_year": "20252026", "session_num": "0",
+        "measure_type": "AB", "measure_num": "1", "bill_history_id": "10",
+        "action_date": "2026-08-31", "action": description,
+        "trans_update_dt": "2026-09-02", "action_sequence": "1",
+    }
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        for name, columns in (("BILL_TBL.dat", BILL_COLUMNS), ("BILL_HISTORY_TBL.dat", HISTORY_COLUMNS)):
+            table = io.StringIO()
+            csv.writer(table, delimiter="\t", quotechar="`", lineterminator="\n").writerow(
+                [fields.get(column, "") for column in columns])
+            archive.writestr(name, table.getvalue())
+    return output.getvalue()
+
+
+@pytest.mark.parametrize("replacement_mode", ["replace", "overwrite"])
+def test_repair_parses_the_pinned_snapshot_after_source_path_changes(tmp_path, monkeypatch, replacement_mode):
+    original = _archive_bytes("Introduced.")
+    replacement = _archive_bytes("Passed.")
+    path = tmp_path / "source.zip"
+    path.write_bytes(original)
+    loader = sweep.load_official_actions
+    handles = []
+
+    def replace_source_then_parse(snapshot):
+        handles.append(snapshot)
+        if replacement_mode == "replace":
+            new_path = tmp_path / "replacement.zip"
+            new_path.write_bytes(replacement)
+            new_path.replace(path)
+        else:
+            path.write_bytes(replacement)
+        return loader(snapshot)
+
+    monkeypatch.setattr(sweep, "load_official_actions", replace_source_then_parse)
+    parsed, digest = sweep._load_pinned_official_actions(path, hashlib.sha256(original).hexdigest())
+    assert parsed["202520260AB1"][0].description == "Introduced."
+    assert digest == hashlib.sha256(original).hexdigest()
+    assert path.read_bytes() == replacement
+    assert handles[0].closed
+
+
+def test_invalid_pinned_archive_closes_snapshot_without_opening_database(tmp_path, monkeypatch):
+    path = tmp_path / "invalid.zip"
+    raw = b"not a ZIP"
+    path.write_bytes(raw)
+    loader = sweep.load_official_actions
+    handles = []
+
+    def capture(snapshot):
+        handles.append(snapshot)
+        return loader(snapshot)
+
+    monkeypatch.setattr(sweep, "load_official_actions", capture)
+    monkeypatch.setattr(sweep, "get_session", lambda: pytest.fail("database opened before archive validation"))
+    with pytest.raises(sweep.OfficialActionSweepError):
+        sweep.run(zip_path=path, expected_sha256=hashlib.sha256(raw).hexdigest(), apply=True)
+    assert handles[0].closed
 
 
 def _official(

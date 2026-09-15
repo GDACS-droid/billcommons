@@ -17,6 +17,7 @@ import hashlib
 import json
 import signal
 import sys
+import tempfile
 import threading
 import zipfile
 from collections import defaultdict
@@ -25,7 +26,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from time import monotonic
-from typing import Any, Iterable, Sequence
+from typing import Any, BinaryIO, Iterable, Sequence
 
 from sqlalchemy import column, delete, func, select, text, update, values
 from sqlalchemy.orm import Session as OrmSession
@@ -168,12 +169,26 @@ class ActionPlan:
         return len(self.deletions)
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _load_pinned_official_actions(
+    path: Path, expected_sha256: str,
+) -> tuple[dict[str, tuple[OfficialAction, ...]], str]:
+    """Hash and parse the same private snapshot before opening the database.
+
+    Reopening the source path after hashing would allow a replacement archive
+    to drive a repair carrying the first archive's checksum. A temporary file
+    keeps memory bounded while preserving the exact bytes accepted by the pin.
+    """
+    with tempfile.TemporaryFile(mode="w+b") as snapshot:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                snapshot.write(chunk)
+                digest.update(chunk)
+        actual_sha256 = digest.hexdigest()
+        if actual_sha256.lower() != expected_sha256.lower():
+            raise OfficialActionSweepError(f"official ZIP SHA-256 was {actual_sha256}; expected {expected_sha256}")
+        snapshot.seek(0)
+        return load_official_actions(snapshot), actual_sha256
 
 
 def _normal_description(value: str | None) -> str:
@@ -222,7 +237,7 @@ def _official_bill_id(session: Session, bill: Bill) -> str:
     return f"{OFFICIAL_PREFIX}{session_number}{measure}"
 
 
-def load_official_actions(zip_path: Path) -> dict[str, tuple[OfficialAction, ...]]:
+def load_official_actions(zip_path: Path | BinaryIO) -> dict[str, tuple[OfficialAction, ...]]:
     """Read only the bill and history TSVs necessary for action reconciliation."""
     try:
         with zipfile.ZipFile(zip_path) as archive:
@@ -696,10 +711,7 @@ def run(
     *, zip_path: Path, expected_sha256: str, apply: bool,
     total_timeout_seconds: int = TOTAL_TRANSACTION_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    actual_sha256 = _sha256(zip_path)
-    if actual_sha256.lower() != expected_sha256.lower():
-        raise OfficialActionSweepError(f"official ZIP SHA-256 was {actual_sha256}; expected {expected_sha256}")
-    official = load_official_actions(zip_path)
+    official, actual_sha256 = _load_pinned_official_actions(zip_path, expected_sha256)
     db = get_session()
     try:
         with _total_transaction_timeout(total_timeout_seconds):
