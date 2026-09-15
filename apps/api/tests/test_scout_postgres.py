@@ -1092,6 +1092,49 @@ def _terminal_monitor_baseline(
         return job
 
 
+def test_postgres_monitor_real_session_and_origin_guards(monkeypatch, pg_scout):
+    import secrets
+    from billcommons_api.routers import account
+
+    monkeypatch.setenv("ACCOUNT_SESSION_SECRET", secrets.token_hex(32))
+    monkeypatch.setenv("BILLCOMMONS_ALLOWED_ORIGINS", "https://monitor.example.test")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ENABLED", "1")
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_ALLOW_PUBLIC", "1")
+    customer = pg_scout.customer("cookie-owner")
+    other = pg_scout.customer("cookie-other")
+    baseline = _terminal_monitor_baseline(pg_scout, customer)
+    app = create_app()
+
+    def database():
+        with pg_scout.sessions() as db:
+            yield db
+
+    app.dependency_overrides[get_db] = database
+    path = f"/api/v1/scout/jobs/{baseline.id}/monitor"
+    allowed = {"Origin": "https://monitor.example.test"}
+    with TestClient(app) as client:
+        assert client.get("/api/v1/scout/monitors").status_code == 401
+        client.cookies.set("bc_session", "invalid-session")
+        assert client.post(path, json={}, headers=allowed).status_code == 401
+        client.cookies.set("bc_session", account._sign_session(customer.id))
+        assert client.post(path, json={}).status_code == 403
+        assert client.post(path, json={}, headers={"Origin": "https://other.example.test"}).status_code == 403
+        created = client.post(path, json={}, headers=allowed)
+        assert created.status_code == 201
+        monitor_id = created.json()["monitor"]["id"]
+        monitor_path = f"/api/v1/scout/monitors/{monitor_id}"
+        assert client.patch(monitor_path, json={"active": False}).status_code == 403
+        assert client.get(monitor_path + "/runs").status_code == 200
+        client.cookies.set("bc_session", account._sign_session(other.id))
+        assert client.get(monitor_path + "/runs").status_code == 404
+        assert client.patch(monitor_path, json={"active": False}, headers=allowed).status_code == 404
+        assert client.get("/api/v1/scout/monitors").json()["monitors"] == []
+        client.cookies.set("bc_session", account._sign_session(customer.id))
+        paused = client.patch(monitor_path, json={"active": False}, headers=allowed)
+        assert paused.status_code == 200
+        assert paused.json()["monitor"]["active"] is False
+
+
 def test_postgres_saved_monitor_requires_owner_terminal_evidence_and_supports_pause_history(
     monkeypatch, pg_scout: PostgresScoutHarness, scout_api
 ):
