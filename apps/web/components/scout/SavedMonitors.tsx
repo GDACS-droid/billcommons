@@ -37,8 +37,9 @@ function arrayOrCount(value: unknown, fallback: unknown): number | undefined {
   return Array.isArray(value) ? value.length : count(fallback);
 }
 
-function comparisonState(run: ScoutMonitorRun): "pending" | "unavailable" | "available" | "missing" {
-  if (["queued", "running", "scheduled", "deferred"].includes(run.status)) return "pending";
+function comparisonState(run: ScoutMonitorRun): "deferred" | "pending" | "unavailable" | "available" | "missing" {
+  if (run.status === "deferred") return "deferred";
+  if (["queued", "running", "scheduled"].includes(run.status)) return "pending";
   if (["failed", "canceled", "cancelled"].includes(run.status)) return "unavailable";
   const summary = run.changeSummary;
   return arrayOrCount(summary.new_sources, summary.new_source_count) !== undefined
@@ -57,7 +58,7 @@ function RunSummary({ run }: { run: ScoutMonitorRun }) {
   const observed = count(summary.observed_source_count);
   const absenceEvaluated = summary.absence_evaluated === true;
   const comparison = comparisonState(run);
-  const mode = run.executionMode === "cached" ? "Cached matching research" : run.executionMode === "coalesced" ? "Joined active research" : run.executionMode === "new" ? "Fresh research" : run.executionMode.replaceAll("_", " ");
+  const mode = comparison === "deferred" ? "Research not started" : run.executionMode === "cached" ? "Cached matching research" : run.executionMode === "coalesced" ? "Joined active research" : run.executionMode === "new" ? "Fresh research" : run.executionMode.replaceAll("_", " ");
   return (
     <article className="border-t border-slate-200 py-4 first:border-t-0 first:pt-0">
       <div className="flex flex-wrap items-baseline justify-between gap-3">
@@ -74,6 +75,7 @@ function RunSummary({ run }: { run: ScoutMonitorRun }) {
           {comparison === "available" ? <p>{newSources} new · {changedSources} changed · {unchanged} unchanged observed sources.</p> : null}
           {comparison === "available" ? <p className="mt-1 text-slate-600">Compared with the previous observed result. Previously seen sources can reappear after an incomplete run.</p> : null}
           {comparison === "pending" ? <p>Comparison is pending. Source-change counts are not available yet.</p> : null}
+          {comparison === "deferred" ? <p>This attempt was deferred before research started. No comparison was made. An active monitor will try again at its next due time.</p> : null}
           {comparison === "unavailable" ? <p>Comparison is unavailable for this run.</p> : null}
           {comparison === "missing" ? <p>Comparison counts were not returned for this run.</p> : null}
           <p className="mt-1 text-slate-600">{absenceEvaluated ? "Absence evaluation was recorded." : "Source absence is not evaluated: an incomplete fetch cannot prove a source disappeared."}</p>
