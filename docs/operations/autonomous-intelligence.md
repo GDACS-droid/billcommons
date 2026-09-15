@@ -351,6 +351,33 @@ No marker repair has been executed. The restricted release evidence directory
 contains `empty-alembic-schema-comparison.json` and
 `revision-marker-recovery-plan.md`; neither is a deployment approval.
 
+### Migration branch coordination — 2026-09-15
+
+The prepared marker-recovery plan predates the snapshot-blocker work. Its
+instruction to resume the saved-monitor `0031` migration is not a release
+sequence for the current intelligence candidate. Saved monitors use revision
+`0031` with parent `0030`; this branch uses `0031_snapshot_blockers` with the
+same parent. These are distinct revision identifiers and sibling migrations.
+Restoring the literal `0030` marker, if the recovery prerequisites are met,
+does not select or apply either branch.
+
+Before a combined release, integrate both migration histories and establish a
+single reviewed target using an explicit merge revision or a coordinated
+rebase of an undeployed migration. Verify the actual production revision
+before choosing that approach; never rewrite an applied migration. Exercise
+upgrade from `0030`, compatibility with the prior deployed services, and the
+chosen rollback procedure on a disposable database. The controlled runner
+must accept the exact resulting target and acknowledgement, and check-only
+must verify the expected current revision and bound database identity before
+any production upgrade. Do not substitute `head`, the saved-monitor `0031`,
+or `0031_snapshot_blockers` for a combined target without that integration.
+
+The runner in this branch currently supports `0031_snapshot_blockers` only;
+it does not yet authorize or implement a combined migration. Release readiness
+remains **NOT READY** pending metadata recovery, migration integration, and the
+remaining candidate review and service rollout gates. The September 8 schema
+comparison above is historical evidence and must be repeated before recovery.
+
 Codex owns this authorized deployment. The old generic crawl worker has no
 existing drain control or graceful shutdown handler and holds its job claim
 transaction across outbound work. It remains running; a one-time replacement
