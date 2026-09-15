@@ -167,6 +167,37 @@ authorize deployment. Missing schema fails the report visibly rather than
 returning an empty blocker count. The existing read-only transaction, bounded
 statement timeout and report-cache failure behavior remain in effect.
 
+### Local candidate: official observation health in Data Health
+
+The local report now includes `source_health.official_sources` for each
+jurisdiction and adds official-observation defects to the existing ledger.
+It reads each target's latest retained observation in one bounded query,
+ordered by retrieval time, creation time, and observation UUID. An older
+successful capture cannot hide a newer failure. A changed endpoint or adapter
+cannot inherit an old observation's successful state.
+
+Counts distinguish observed, failed, overdue, never-observed, disabled,
+changed-target, and future-dated observations. Disabled targets remain visible
+without creating an enabled-target failure. Future retrieval timestamps beyond
+five minutes produce an error for enabled observed targets, including targets
+whose endpoints changed. Failed captures and observations older than the
+target's cadence produce warnings; recorded backoff remains intact. These
+signals never authorize a retry, target enablement, or corpus mutation.
+
+All target counts are retained, with at most five source samples per
+jurisdiction and five target IDs per defect. More than 1,000 targets across the
+requested jurisdictions fails collection rather than returning incomplete
+totals. The existing read-only transaction, statement timeout, and API cache
+failure behavior still apply. This uses the existing official-evidence tables
+and adds no migration.
+
+`source_response_updated_at` is recorded source-response metadata, not an
+official legislative action date. A successful observation may cover only a
+landing page or one archive. Statewide freshness remains unverified and this
+report still links out to the separate per-bill reconciliation evidence.
+Target-scope changes beyond endpoint or adapter identity are not established
+by this observation-health check. The candidate is not deployed.
+
 ## Remaining release gates
 
 The final Texas nested FTP-to-HTTPS repair fix passed 70 focused PostgreSQL 16
