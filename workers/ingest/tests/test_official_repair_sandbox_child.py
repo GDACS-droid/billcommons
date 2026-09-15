@@ -117,6 +117,18 @@ def test_wrong_parent_identity_stops_before_candidate_loading(tmp_path):
     assert completed.stdout == completed.stderr == ""
 
 
+def test_candidate_cannot_clear_parent_death_signal(tmp_path):
+    source = "import ctypes, errno\n" + _candidate("""    libc = ctypes.CDLL(None, use_errno=True)
+    ctypes.set_errno(0)
+    result = libc.prctl(1, 0, 0, 0, 0)
+    if result != -1 or ctypes.get_errno() != errno.EPERM:
+        raise RuntimeError('parent-death signal could be cleared')
+""")
+    completed = _run(_stage(tmp_path, source))
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout)["status"] == "parsed"
+
+
 def test_blocked_candidate_dies_when_supervisor_is_killed(tmp_path):
     # A real FUTEX_WAIT sleeps without using RLIMIT_CPU. Run a separate trusted
     # subreaper harness so pytest never acquires global child-reaping duties.
