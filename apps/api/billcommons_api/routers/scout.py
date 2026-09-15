@@ -58,7 +58,7 @@ class CreateScoutJob(BaseModel):
 
 
 class SaveScoutMonitor(BaseModel):
-    cadence_seconds: int = Field(default=6 * 60 * 60, ge=6 * 60 * 60, le=7 * 24 * 60 * 60)
+    cadence_seconds: int | None = Field(default=None, ge=6 * 60 * 60, le=7 * 24 * 60 * 60)
 
 
 class UpdateScoutMonitor(BaseModel):
@@ -496,7 +496,8 @@ def save_monitor(
     _check_origin(request)
     customer = _require_session(request, db)
     _require_canary(customer, settings)
-    _validate_monitor_cadence(body.cadence_seconds, settings)
+    cadence = body.cadence_seconds if body.cadence_seconds is not None else settings.monitor_min_cadence_seconds
+    _validate_monitor_cadence(cadence, settings)
     # A running job may be terminalizing while it holds its job lock and walks
     # monitor runs. Reject it before taking the customer lock, so an invalid
     # save cannot form monitor -> customer -> job with that terminalizer.
@@ -540,9 +541,9 @@ def save_monitor(
         normalized_query=job.normalized_query,
         jurisdiction=job.jurisdiction,
         cache_key=job.cache_key,
-        cadence_seconds=body.cadence_seconds,
+        cadence_seconds=cadence,
         active=True,
-        next_run_at=now + timedelta(seconds=body.cadence_seconds),
+        next_run_at=now + timedelta(seconds=cadence),
     )
     db.add(monitor)
     db.flush()

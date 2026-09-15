@@ -24,6 +24,12 @@ from billcommons_shared.scout import (
 )
 
 
+@pytest.mark.parametrize("bounds", [(1, 604800), (21600, 604801), (86400, 43200)])
+def test_monitor_cadence_configuration_cannot_exceed_database_bounds(bounds):
+    with pytest.raises(ValueError, match="monitor cadence bounds"):
+        ScoutSettings(monitor_min_cadence_seconds=bounds[0], monitor_max_cadence_seconds=bounds[1])
+
+
 def test_california_retained_query_requires_an_explicit_current_session():
     regular = extract_california_bill_query("AB 00123 2025-2026")
     assert regular is not None

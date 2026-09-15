@@ -1092,6 +1092,19 @@ def _terminal_monitor_baseline(
         return job
 
 
+def test_postgres_monitor_omitted_cadence_uses_configured_minimum(monkeypatch, pg_scout, scout_api):
+    monkeypatch.setenv("BILLCOMMONS_SCOUT_MONITOR_MIN_CADENCE_SECONDS", "43200")
+    customer = pg_scout.customer("monitor-configured-cadence")
+    baseline = _terminal_monitor_baseline(pg_scout, customer)
+    with TestClient(scout_api) as client:
+        path = f"/api/v1/scout/jobs/{baseline.id}/monitor"
+        headers = {"x-test-customer": str(customer.id)}
+        assert client.post(path, json={"cadence_seconds": 21600}, headers=headers).status_code == 422
+        created = client.post(path, json={}, headers=headers)
+        assert created.status_code == 201
+        assert created.json()["monitor"]["cadence_seconds"] == 43200
+
+
 def test_postgres_monitor_real_session_and_origin_guards(monkeypatch, pg_scout):
     import secrets
     from billcommons_api.routers import account

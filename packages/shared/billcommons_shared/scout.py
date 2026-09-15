@@ -184,7 +184,7 @@ class ScoutSettings:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        if self.monitor_min_cadence_seconds > self.monitor_max_cadence_seconds:
+        if not 6 * 60 * 60 <= self.monitor_min_cadence_seconds <= self.monitor_max_cadence_seconds <= 7 * 24 * 60 * 60:
             raise ValueError("monitor cadence bounds are invalid")
         if any(
             not email
