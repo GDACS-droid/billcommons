@@ -299,6 +299,24 @@ def test_failed_check_failure_and_restoration_messages_retry_on_their_own_clocks
     assert "check_failed_alerted" not in acknowledged
 
 
+def test_valid_sample_ends_an_undelivered_yellow_episode():
+    failed, actions = monitor.evaluate_check_failed({}, now=NOW)
+    assert actions == ["check_failed"]
+    failed = monitor.acknowledge_deliveries(failed, {"check_failed": False}, now=NOW)
+
+    valid, actions = monitor.evaluate(
+        _health("idle_or_backoff", last_text_at=NOW - timedelta(hours=2)),
+        failed,
+        now=NOW + timedelta(minutes=10),
+    )
+    assert actions == []
+    assert "check_failed_attempt_at" not in valid
+
+    next_outage, actions = monitor.evaluate_check_failed(valid, now=NOW + timedelta(minutes=20))
+    assert actions == ["check_failed"]
+    assert "check_failed_attempt_at" in next_outage
+
+
 def test_health_payload_validation_rejects_incomplete_and_inconsistent_data():
     valid = _health("producing", last_text_at=NOW)
     valid.update(
