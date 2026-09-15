@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from billcommons_ingest.healthcheck import check_crawl_health
+from billcommons_ingest.fulltext import AWAITING_UPSTREAM_STATUSES, TERMINAL_STATUSES
 
 
 class _FakeResult:
@@ -28,12 +29,33 @@ class _FakeDb:
     mirroring the check's own SQL."""
 
     def __init__(
-        self, *, last_text_at, texted_last_hour, claimable, queued, dead, backlog, awaiting=0
+        self,
+        *,
+        last_text_at,
+        texted_last_hour,
+        claimable,
+        queued,
+        dead,
+        backlog,
+        awaiting=0,
+        uncovered=None,
+        running=0,
+        stale_running=0,
+        actionable_queued=None,
     ):
+        if uncovered is None:
+            uncovered = backlog and queued == 0 and running == 0
+        if actionable_queued is None:
+            actionable_queued = queued
+        self.executed = []
         self.values = {
             "max(updated_at)": last_text_at,
             "and updated_at > :cutoff": texted_last_hour,
             "as awaiting_upstream": awaiting,
+            "as actionable_queued": actionable_queued,
+            "as running_total": running,
+            "as stale_running": stale_running,
+            "j.status in ('queued', 'running')": uncovered,
             "run_after <= :now": claimable,
             "status='queued'": queued,
             "status='dead'": dead,
@@ -42,16 +64,21 @@ class _FakeDb:
 
     def execute(self, stmt, params=None):
         sql = str(stmt)
+        self.executed.append((stmt, params))
         # Most specific fragments first: the queued/dead counts share text
         # with the claimable query.
         for fragment in (
-            "select exists",
             "max(updated_at)",
             "and updated_at > :cutoff",
             # Before "run_after"/"status='queued'": the awaiting-upstream
             # count also filters on queued status and would otherwise be
             # answered with the wrong number.
             "as awaiting_upstream",
+            "as actionable_queued",
+            "as running_total",
+            "as stale_running",
+            "j.status in ('queued', 'running')",
+            "select exists",
             "run_after <= :now",
             "status='dead'",
             "status='queued'",
@@ -73,6 +100,10 @@ def _db(**kwargs):
         dead=10,
         backlog=True,
         awaiting=0,
+        uncovered=None,
+        running=0,
+        stale_running=0,
+        actionable_queued=None,
     )
     defaults.update(kwargs)
     return _FakeDb(**defaults)
@@ -132,6 +163,7 @@ def test_empty_queue_with_backlog_remaining_is_stalled():
         now=NOW,
     )
     assert health.healthy is False
+    assert health.status == "stalled"
     assert "top-up is not producing" in health.reason
 
 
@@ -219,7 +251,7 @@ def test_queue_of_upstream_blocked_jobs_is_not_a_stall():
             claimable=0,
             awaiting=61,
             queued=61,
-            backlog=True,
+            backlog=False,
         ),
         now=NOW,
     )
@@ -227,6 +259,7 @@ def test_queue_of_upstream_blocked_jobs_is_not_a_stall():
     assert health.awaiting_upstream == 61
     assert "upstream" in health.reason
     assert "top-up" not in health.reason
+    assert health.status == "waiting_upstream"
 
 
 def test_upstream_waiters_do_not_mask_a_real_stall():
@@ -246,3 +279,182 @@ def test_upstream_waiters_do_not_mask_a_real_stall():
     )
     assert health.healthy is False
     assert "1,215" in health.reason
+
+
+def test_upstream_only_documents_with_no_queue_are_waiting_not_stalled():
+    """The documented flapping interval has no queue row between retries."""
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(hours=12),
+            texted_last_hour=0,
+            claimable=0,
+            queued=0,
+            awaiting=176,
+            backlog=False,
+            uncovered=False,
+        ),
+        now=NOW,
+    )
+    assert health.healthy is True
+    assert health.status == "waiting_upstream"
+
+
+def test_new_text_is_producing_even_after_queue_drains_to_upstream_only():
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(minutes=1),
+            texted_last_hour=1,
+            claimable=0,
+            queued=0,
+            awaiting=176,
+            backlog=False,
+            uncovered=False,
+        ),
+        now=NOW,
+    )
+    assert health.healthy is True
+    assert health.status == "producing"
+
+
+def test_claimable_work_with_old_text_is_stalled_even_if_hour_count_is_nonzero():
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(minutes=45),
+            texted_last_hour=1,
+            claimable=1,
+            queued=1,
+            backlog=True,
+            uncovered=False,
+        ),
+        now=NOW,
+    )
+    assert health.healthy is False
+    assert health.status == "stalled"
+
+
+def test_claimable_work_with_old_text_is_not_excused_by_a_fresh_running_job():
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(hours=2),
+            texted_last_hour=0,
+            claimable=1,
+            queued=1,
+            backlog=True,
+            uncovered=False,
+            running=1,
+        ),
+        now=NOW,
+    )
+    assert health.healthy is False
+    assert health.status == "stalled"
+
+
+def test_uncovered_document_is_not_starved_with_actionable_queued_coverage():
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(hours=2),
+            texted_last_hour=0,
+            claimable=0,
+            queued=1,
+            actionable_queued=1,
+            backlog=True,
+            uncovered=True,
+        ),
+        now=NOW,
+    )
+    assert health.healthy is True
+    assert health.status == "idle_or_backoff"
+
+
+def test_uncovered_document_is_not_starved_with_actionable_running_coverage():
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(hours=2),
+            texted_last_hour=0,
+            claimable=0,
+            queued=0,
+            actionable_queued=0,
+            backlog=True,
+            uncovered=True,
+            running=1,
+        ),
+        now=NOW,
+    )
+    assert health.healthy is True
+    assert health.status == "running"
+
+
+def test_future_database_timestamp_is_clamped_to_zero_minutes():
+    health = check_crawl_health(
+        _db(last_text_at=NOW + timedelta(milliseconds=1), texted_last_hour=1), now=NOW
+    )
+    assert health.healthy is True
+    assert health.minutes_since_text == 0.0
+
+
+def test_longer_threshold_does_not_label_zero_output_as_producing():
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(minutes=45),
+            texted_last_hour=0,
+            claimable=1,
+            queued=1,
+            backlog=True,
+            uncovered=False,
+        ),
+        now=NOW,
+        stall_minutes=60,
+    )
+    assert health.healthy is True
+    assert health.status == "idle_or_backoff"
+
+
+def test_fresh_running_job_is_not_mistaken_for_an_empty_queue():
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(hours=2),
+            texted_last_hour=0,
+            claimable=0,
+            queued=0,
+            backlog=True,
+            uncovered=False,
+            running=1,
+        ),
+        now=NOW,
+    )
+    assert health.healthy is True
+    assert health.status == "running"
+
+
+def test_stale_running_job_is_a_distinct_stall():
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(hours=2),
+            texted_last_hour=0,
+            claimable=0,
+            queued=0,
+            backlog=True,
+            uncovered=False,
+            running=1,
+            stale_running=1,
+        ),
+        now=NOW,
+    )
+    assert health.healthy is False
+    assert health.status == "stalled"
+    assert "running longer" in health.reason
+
+
+def test_actionable_query_matches_exact_or_space_decorated_status_tokens():
+    db = _db(backlog=False)
+    check_crawl_health(db, now=NOW)
+    statements = [str(stmt) for stmt, _ in db.executed]
+    params = [params or {} for _, params in db.executed]
+    terminal_match = "split_part(coalesce(d.license_note, ''), ' ', 1) = any(:terminal)"
+    awaiting_match = "split_part(coalesce(d.license_note, ''), ' ', 1) = any(:awaiting)"
+    assert any(terminal_match in statement for statement in statements)
+    assert any(awaiting_match in statement for statement in statements)
+    assert not any(" like any(" in statement for statement in statements)
+    merged = {key: value for query_params in params for key, value in query_params.items()}
+    assert set(merged["terminal"]) == {f"fulltext_status={status}" for status in TERMINAL_STATUSES}
+    assert set(merged["awaiting"]) == {f"fulltext_status={status}" for status in AWAITING_UPSTREAM_STATUSES}

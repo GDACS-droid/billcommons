@@ -40,7 +40,7 @@ from sqlalchemy import text
 
 from billcommons_shared.db import get_session
 
-from .fulltext import AWAITING_UPSTREAM_STATUSES, TERMINAL_STATUSES
+from .fulltext import AWAITING_UPSTREAM_STATUSES, MAX_FETCH_ATTEMPTS, TERMINAL_STATUSES
 
 # A document is extracted every few seconds when healthy, so 30 minutes of
 # complete silence is far outside normal variance -- including the slow tail
@@ -69,6 +69,10 @@ class CrawlHealth:
     dead_total: int
     backlog_remains: bool = False
     awaiting_upstream: int = 0
+    actionable_queued: int = 0
+    running_total: int = 0
+    stale_running: int = 0
+    status: str = "idle_or_backoff"
 
     def render(self) -> str:
         head = "HEALTHY" if self.healthy else "STALLED"
@@ -79,11 +83,14 @@ class CrawlHealth:
         )
         return (
             f"[{head}] {self.reason}\n"
+            f"  status            : {self.status}\n"
             f"  checked at        : {self.checked_at}\n"
             f"  last text landed  : {self.last_text_at} ({since})\n"
             f"  texted last hour  : {self.texted_last_hour:,}\n"
             f"  claimable now     : {self.claimable_now:,}\n"
             f"  queued / dead     : {self.queued_total:,} / {self.dead_total:,}\n"
+            f"  actionable queued : {self.actionable_queued:,}\n"
+            f"  running / stale   : {self.running_total:,} / {self.stale_running:,}\n"
             f"  awaiting upstream : {self.awaiting_upstream:,}\n"
             f"  backlog remains   : {self.backlog_remains}"
         )
@@ -114,58 +121,137 @@ def check_crawl_health(
         "and updated_at > :cutoff",
         cutoff=now - timedelta(hours=1),
     )
-    # A job whose document is merely waiting on an upstream assignment is
-    # claimable but CANNOT produce text, so counting it as "work available"
-    # makes the stall verdict flip with the retry backoff rather than with the
-    # crawl's actual health. See AWAITING_UPSTREAM_STATUSES for the incident.
+    # The top-up and health checks must agree on what work remains.  In
+    # particular, `_mark_status` decorates terminal/upstream notes, so a bare
+    # equality check would resurrect a permanently finished document as a
+    # healthcheck backlog item.  Upstream-awaiting documents are deliberately
+    # excluded too: they cannot produce text until the source assigns them.
+    terminal_notes = [f"fulltext_status={status}" for status in TERMINAL_STATUSES]
     awaiting_notes = [f"fulltext_status={status}" for status in AWAITING_UPSTREAM_STATUSES]
-    awaiting_decorated = [f"{note} %" for note in awaiting_notes]
+    terminal_predicate = (
+        "split_part(coalesce(d.license_note, ''), ' ', 1) = any(:terminal)"
+    )
     awaiting_predicate = (
+        "split_part(coalesce(d.license_note, ''), ' ', 1) = any(:awaiting)"
+    )
+    actionable_document = (
+        "d.extracted_text is null and d.url is not null and d.url <> '' "
+        "and coalesce(d.fetch_attempts, 0) < :max_fetch_attempts "
+        f"and (d.license_note is null or not {terminal_predicate} and not {awaiting_predicate})"
+    )
+    job_has_actionable_document = (
         "exists (select 1 from bill_documents d "
-        " where d.id = (j.payload->>'document_id')::uuid "
-        "   and (d.license_note = any(:awaiting) "
-        "        or d.license_note like any(:awaiting_decorated)))"
+        "where j.payload->>'document_id' = d.id::text "
+        f"and {actionable_document})"
     )
     claimable_now = scalar(
         "select count(*) from ingest_jobs j where j.kind='fetch_text' "
         "and j.status='queued' and j.run_after <= :now "
-        f"and not {awaiting_predicate}",
+        f"and {job_has_actionable_document}",
         now=now,
+        terminal=terminal_notes,
         awaiting=awaiting_notes,
-        awaiting_decorated=awaiting_decorated,
+        max_fetch_attempts=MAX_FETCH_ATTEMPTS,
     )
     awaiting_upstream = scalar(
-        "select count(*) as awaiting_upstream from ingest_jobs j "
-        "where j.kind='fetch_text' and j.status='queued' "
+        "select count(*) as awaiting_upstream from bill_documents d "
+        "where d.extracted_text is null and d.url is not null and d.url <> '' "
+        "and coalesce(d.fetch_attempts, 0) < :max_fetch_attempts "
         f"and {awaiting_predicate}",
         awaiting=awaiting_notes,
-        awaiting_decorated=awaiting_decorated,
+        max_fetch_attempts=MAX_FETCH_ATTEMPTS,
     )
     queued_total = scalar("select count(*) from ingest_jobs where kind='fetch_text' and status='queued'")
     dead_total = scalar("select count(*) from ingest_jobs where kind='fetch_text' and status='dead'")
 
-    # Is there fetchable text left in the corpus that no job covers? An empty
-    # queue only means "finished" if this is false. EXISTS with LIMIT 1 so the
-    # cost is a partial scan, not a count over ~700k rows.
-    terminal_notes = tuple(f"fulltext_status={status}" for status in TERMINAL_STATUSES)
+    # A queued or running job covers its document.  Looking for uncovered work
+    # instead of merely an empty queue prevents a freshly claimed job from
+    # reading as a broken top-up, while an old locked job is handled below.
     backlog_remains = bool(
         scalar(
-            "select exists (select 1 from bill_documents "
-            "where extracted_text is null and url is not null and url <> '' "
-            "and (license_note is null or license_note <> all(:terminal)) limit 1)",
-            terminal=list(terminal_notes),
+            "select exists (select 1 from bill_documents d "
+            f"where {actionable_document} limit 1)",
+            terminal=terminal_notes,
+            awaiting=awaiting_notes,
+            max_fetch_attempts=MAX_FETCH_ATTEMPTS,
         )
+    )
+    uncovered_actionable = bool(
+        scalar(
+            "select exists (select 1 from bill_documents d "
+            f"where {actionable_document} and not exists (select 1 from ingest_jobs j "
+            "where j.kind='fetch_text' and j.status in ('queued', 'running') "
+            "and j.payload->>'document_id' = d.id::text) limit 1)",
+            terminal=terminal_notes,
+            awaiting=awaiting_notes,
+            max_fetch_attempts=MAX_FETCH_ATTEMPTS,
+        )
+    )
+    actionable_queued = scalar(
+        "select count(*) as actionable_queued from ingest_jobs j "
+        "where j.kind='fetch_text' and j.status='queued' "
+        f"and {job_has_actionable_document}",
+        terminal=terminal_notes,
+        awaiting=awaiting_notes,
+        max_fetch_attempts=MAX_FETCH_ATTEMPTS,
+    )
+    running_total = scalar(
+        "select count(*) as running_total from ingest_jobs j "
+        "where j.kind='fetch_text' and j.status='running' "
+        f"and {job_has_actionable_document}",
+        terminal=terminal_notes,
+        awaiting=awaiting_notes,
+        max_fetch_attempts=MAX_FETCH_ATTEMPTS,
+    )
+    stale_running = scalar(
+        "select count(*) as stale_running from ingest_jobs j "
+        "where j.kind='fetch_text' and j.status='running' "
+        "and (j.locked_at is null or j.locked_at <= :running_cutoff) "
+        f"and {job_has_actionable_document}",
+        running_cutoff=now - timedelta(minutes=idle_minutes),
+        terminal=terminal_notes,
+        awaiting=awaiting_notes,
+        max_fetch_attempts=MAX_FETCH_ATTEMPTS,
+    )
+    fresh_running = max(0, int(running_total or 0) - int(stale_running or 0))
+
+    # A top-up may deliberately operate in bounded batches, so an uncovered
+    # actionable document is not itself a failure while ANY actionable job is
+    # queued or running.  Starvation means no actionable coverage at all.
+    starved = (
+        uncovered_actionable
+        and int(actionable_queued or 0) == 0
+        and int(running_total or 0) == 0
     )
 
     minutes_since = None
     if last_text_at is not None:
         if last_text_at.tzinfo is None:
             last_text_at = last_text_at.replace(tzinfo=timezone.utc)
-        minutes_since = (now - last_text_at).total_seconds() / 60.0
+        # The app clock is sampled before the database query.  A text commit
+        # in that tiny interval can be a few milliseconds newer than ``now``;
+        # do not turn that benign race into negative liveness time.
+        minutes_since = max(0.0, (now - last_text_at).total_seconds() / 60.0)
 
-    starved = queued_total == 0 and backlog_remains
-    if starved and (minutes_since is None or minutes_since >= stall_minutes):
-        # An EMPTY queue with work still to do means the TOP-UP is broken,
+    stale = minutes_since is None or minutes_since >= stall_minutes
+    if stale_running and stale:
+        healthy = False
+        status = "stalled"
+        reason = (
+            f"{int(stale_running):,} fetch_text job(s) running longer than "
+            f"{idle_minutes} min while extraction is stale"
+        )
+    elif claimable_now and stale:
+        healthy = False
+        status = "stalled"
+        reason = (
+            f"{claimable_now:,} jobs claimable but nothing extracted for "
+            f"{minutes_since:.0f} min (threshold {stall_minutes})"
+            if minutes_since is not None
+            else f"{claimable_now:,} jobs claimable but no document has EVER been extracted"
+        )
+    elif starved and stale:
+        # Uncovered work means the TOP-UP is broken,
         # not that the crawl finished. This is the 2026-07-26 shape: the
         # enqueue query began failing (DiskFull on a parallel worker's shared
         # memory segment), the queue drained to zero, and the first version of
@@ -173,42 +259,49 @@ def check_crawl_health(
         # alert while the crawl was dead, and the stall ran for two hours.
         # An empty queue is only good news when there is nothing left to fetch.
         #
-        # Keyed on queued_total, not claimable_now: a queue full of backed-off
-        # jobs is retrying, not starved, and must not read as a broken top-up.
         healthy = False
+        status = "stalled"
         reason = (
-            "fetch_text queue is EMPTY but unfetched documents remain -- "
-            "top-up is not producing jobs"
+            "uncovered actionable documents remain -- top-up is not producing coverage"
             + (
                 f" (nothing extracted for {minutes_since:.0f} min)"
                 if minutes_since is not None
                 else " (nothing has EVER been extracted)"
             )
         )
-    elif claimable_now == 0:
+    elif int(texted_last_hour or 0) > 0 and not stale:
+        # A newly landed document is the only affirmative liveness signal.
+        # Keep it visible even when the queue has drained, remaining documents
+        # await upstream assignment, or the last job has just been claimed.
         healthy = True
-        if awaiting_upstream:
-            # Name the wait explicitly: a queue that is non-empty but entirely
-            # upstream-blocked otherwise reads as an unexplained quiet crawl.
-            reason = (
-                f"no actionable fetch_text work -- {awaiting_upstream:,} job(s) waiting on an "
-                "upstream assignment, not stalled"
-            )
-        elif backlog_remains:
-            reason = "no claimable fetch_text work, backlog pending -- top-up due, not stalled"
-        else:
-            reason = "no claimable fetch_text work -- idle, not stalled"
-    elif minutes_since is None:
-        healthy, reason = False, f"{claimable_now:,} jobs claimable but no document has EVER been extracted"
-    elif minutes_since >= stall_minutes:
-        healthy = False
+        status = "producing"
+        reason = f"producing -- {texted_last_hour:,} documents extracted in the last hour"
+    elif fresh_running and not claimable_now:
+        healthy = True
+        status = "running"
+        reason = f"{fresh_running:,} actionable fetch_text job(s) running, not stalled"
+    elif claimable_now:
+        healthy = True
+        status = "idle_or_backoff"
         reason = (
-            f"{claimable_now:,} jobs claimable but nothing extracted for "
-            f"{minutes_since:.0f} min (threshold {stall_minutes})"
+            f"{claimable_now:,} jobs claimable inside the {stall_minutes}-min "
+            "liveness window; no new text observed"
+        )
+    elif awaiting_upstream and not backlog_remains:
+        healthy = True
+        status = "waiting_upstream"
+        reason = (
+            f"no actionable fetch_text work -- {awaiting_upstream:,} document(s) waiting on an "
+            "upstream assignment, not stalled"
         )
     else:
         healthy = True
-        reason = f"producing -- {texted_last_hour:,} documents extracted in the last hour"
+        status = "idle_or_backoff"
+        reason = (
+            "no actionable fetch_text work, backlog covered by queued work -- idle/backoff"
+            if backlog_remains
+            else "no actionable fetch_text work -- idle, not stalled"
+        )
 
     return CrawlHealth(
         healthy=healthy,
@@ -222,6 +315,10 @@ def check_crawl_health(
         dead_total=int(dead_total or 0),
         backlog_remains=backlog_remains,
         awaiting_upstream=int(awaiting_upstream or 0),
+        actionable_queued=int(actionable_queued or 0),
+        running_total=int(running_total or 0),
+        stale_running=int(stale_running or 0),
+        status=status,
     )
 
 
