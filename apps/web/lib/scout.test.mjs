@@ -329,3 +329,12 @@ test("monitor overview supports custom policy and legacy servers without an inve
   globalThis.fetch = async () => new Response(JSON.stringify({ monitors: [], policy: { ...rawPolicy, max_cadence_seconds: 21600 } }));
   await assert.rejects(compiled.exports.getScoutMonitorOverview(), /invalid monitor limits/);
 });
+
+test("research links accept UUID identifiers and reject malformed values before fetching", () => {
+  for (const id of ['fcfb507b-9f9a-4ca4-818d-e1f703de7212', 'FCFB507B-9F9A-4CA4-818D-E1F703DE7212', 'fcfb507b9f9a4ca4818de1f703de7212']) {
+    assert.equal(compiled.exports.isScoutJobId(id), true, id);
+  }
+  for (const id of ['', 'abc', 'job-1', 'fcfb507b-9f9a-4ca4-818d-e1f703de721z', '../jobs', 'fcfb507b-9f9a-4ca4-818d-e1f703de7212/']) {
+    assert.equal(compiled.exports.isScoutJobId(id), false, id);
+  }
+});

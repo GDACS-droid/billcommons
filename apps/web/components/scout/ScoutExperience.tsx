@@ -10,6 +10,7 @@ import {
   getScoutJob,
   getScoutReplay,
   isScoutTerminal,
+  isScoutJobId,
   scoutAnalyticsFacts,
   scoutBrowserProviderUsage,
   scoutPollRetryDelay,
@@ -28,7 +29,6 @@ const CALIFORNIA_EXAMPLES = ["AB 123 2025-2026", "SB 1 2025-2026", "AB 1 2025-20
 // Scout evidence windows are bounded in the worker.  Preserve the original
 // retained excerpt while making a potentially bounded display unmistakable.
 const EXCERPT_CHARACTER_LIMIT = 500;
-const SCOUT_JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 function label(value?: string | null): string {
   return value ? value.replaceAll("_", " ") : "Not recorded";
 }
@@ -464,7 +464,7 @@ export default function ScoutExperience({ enabled, initialJobId }: { enabled: bo
       return;
     }
     const jobId = initialJobId?.trim() ?? "";
-    if (!SCOUT_JOB_ID_PATTERN.test(jobId)) {
+    if (!isScoutJobId(jobId)) {
       setJob(null);
       setError("The requested Scout research link is invalid.");
       setRefreshError("");

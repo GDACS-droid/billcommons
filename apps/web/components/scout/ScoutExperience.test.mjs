@@ -32,7 +32,7 @@ test("Scout intro does not show a signed-out prompt over an authenticated result
 });
 
 test("linked monitor evidence loads an existing job without creating research and rejects malformed identifiers", () => {
-  assert.match(source, /const SCOUT_JOB_ID_PATTERN = \/\^\[A-Za-z0-9\]\[A-Za-z0-9_-\]\{0,127\}\$\//);
+  assert.match(source, /isScoutJobId\(jobId\)/);
   assert.match(source, /if \(initialJobId === undefined\) \{/);
   assert.match(source, /The requested Scout research link is invalid\./);
   assert.match(source, /const beginJobRequest = useCallback/);

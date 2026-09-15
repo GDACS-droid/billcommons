@@ -453,6 +453,10 @@ export function safeHttpsUrl(value?: string): string | undefined {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
+export function isScoutJobId(value: string): boolean {
+  return /^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.test(value);
+}
+
 async function responseJson(response: Response): Promise<unknown> {
   return response.json().catch(() => null);
 }
