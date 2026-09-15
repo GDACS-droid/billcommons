@@ -1092,6 +1092,47 @@ def _terminal_monitor_baseline(
         return job
 
 
+def test_postgres_admission_uses_day_after_platform_lock_wait(monkeypatch, pg_scout):
+    from contextlib import contextmanager
+    from billcommons_shared import scout_admission as admission
+
+    customer = pg_scout.customer("admission-midnight")
+    prior = _terminal_monitor_baseline(pg_scout, customer)
+    midnight = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    before = midnight - timedelta(seconds=1)
+    with pg_scout.sessions() as db:
+        stored = db.get(ScoutResearchJob, prior.id)
+        stored.created_at = before
+        stored.fresh_until = before
+        db.commit()
+
+    class Clock(datetime):
+        current = before
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    original_lock = admission._platform_admission_lock
+
+    @contextmanager
+    def crossing_lock(db):
+        with original_lock(db):
+            Clock.current = midnight + timedelta(seconds=1)
+            yield
+
+    monkeypatch.setattr(admission, "datetime", Clock)
+    monkeypatch.setattr(admission, "_platform_admission_lock", crossing_lock)
+    with pg_scout.sessions() as db:
+        result = admission.admit_scout_job(
+            db, db.get(ApiCustomer, customer.id), original_query="HB 626",
+            normalized_query="hb 626", jurisdiction="FL", cache_key="midnight-" + uuid.uuid4().hex,
+            settings=ScoutSettings(enabled=True, allow_public_rollout=True, per_customer_daily_jobs=1),
+        )
+        assert result.created
+        db.rollback()
+
+
 def test_postgres_monitor_omitted_cadence_uses_configured_minimum(monkeypatch, pg_scout, scout_api):
     monkeypatch.setenv("BILLCOMMONS_SCOUT_MONITOR_MIN_CADENCE_SECONDS", "43200")
     customer = pg_scout.customer("monitor-configured-cadence")

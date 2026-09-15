@@ -228,6 +228,9 @@ def admit_scout_job(
         return ScoutAdmission(fresh, created=False, coalesced=True, cached=True)
 
     with _platform_admission_lock(db):
+        # Admission can wait across UTC midnight. Count quotas for the day
+        # when the reservation is made, not when the cache lookup began.
+        now = datetime.now(timezone.utc)
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         active_jobs, daily_browser_ms, reserved_browser_ms = _browser_budget_totals(
             db, settings, day_start, customer_id=customer.id
