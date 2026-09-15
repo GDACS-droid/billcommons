@@ -1,0 +1,18 @@
+{
+  "status": "repair_complete",
+  "completed_at": "2026-09-15T20:03:13.142387+00:00",
+  "pre_revision": [],
+  "post_revision": [
+    "0030"
+  ],
+  "schema_unchanged": true,
+  "schema_sha256": "8db8e8e05d62bd7e4e393b0ee66f48555b2236c0c09ec86686e3e72f4dd7511c",
+  "public_health": {
+    "checked_at": "2026-09-15T20:02:04.471631+00:00",
+    "health": true,
+    "readiness": true,
+    "bill_read": true
+  },
+  "application_data_modified": false,
+  "cause_established": false
+}

@@ -426,6 +426,27 @@ The previous deployment remains recorded for rollback. These checks establish
 one bounded FL research path; deep California and comprehensive Florida
 material discovery remain acceptance gaps.
 
+## Revision-marker recovery — September 15, 20:02 UTC
+
+Alberto approved the pending work and explicitly confirmed that no other operator
+was working on Bill Commons. Fresh read-only checks bound the existing production
+project, environment and PostgreSQL deployment, verified the known database
+fingerprint and empty ordinary revision table, and found no competing schema
+activity. The live schema exactly matched the checksum-verified `0030` backup.
+
+The documented one-row recovery then acquired an exclusive revision-table lock,
+asserted the empty state, inserted the literal `0030`, and committed. A fresh
+connection read back exactly that marker with the same database fingerprint.
+Public health, readiness and a real bill read passed. A post-commit schema dump
+again matched the backup exactly. The durable recovery journal is closed as
+`repair_complete`; no application rows or schema objects were changed. This
+restores migration metadata without establishing why it disappeared.
+
+The historical coordination hold below is resolved. Saved monitors still require
+the reviewed combined migration and service rollout gates before deployment.
+Recovery evidence is summarized in
+[evidence/revision-marker-recovery-20260915.json](evidence/revision-marker-recovery-20260915.json).
+
 ## Current release gates
 
 ### Missing production revision marker — 2026-09-08 13:37 UTC
