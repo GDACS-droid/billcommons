@@ -5,12 +5,12 @@ imports, compiles, writes, or executes that text.  The caller remains
 responsible for staging and independently evaluating a proposal.
 
 One request is made to the fixed OpenAI Responses endpoint.  Socket timeouts
-are connect=5s, read=10s, write=10s, and pool=5s.  A 20s monotonic deadline is
-checked before and after every provider-controlled operation; because synchronous
-httpx cannot interrupt a socket call already in progress, normal transport can
-cross that deadline by one 10s read/write operation, giving a 30s return bound.
-Redirects and retries are disabled.  A process stuck inside an uninterruptible
-host syscall is outside Python's wall-clock guarantee.
+are connect=5s, read=60s, write=10s, and pool=5s.  A 180s monotonic deadline
+is checked before and after every provider-controlled operation; because
+synchronous httpx cannot interrupt a socket call already in progress, normal
+transport can cross that deadline by one 60s read operation, giving a 240s
+return bound.  Redirects and retries are disabled.  A process stuck inside an
+uninterruptible host syscall is outside Python's wall-clock guarantee.
 """
 from __future__ import annotations
 
@@ -35,9 +35,9 @@ MAX_JSON_DEPTH = 32
 MAX_JSON_CONTAINERS = 8_192
 MAX_JSON_SCALARS = 65_536
 MAX_JSON_STRING_BYTES = 1024 * 1024
-TOTAL_WALL_SECONDS = 20.0
+TOTAL_WALL_SECONDS = 180.0
 MAX_OUTPUT_TOKENS = 16_384
-_SOCKET_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
+_SOCKET_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
 
 _EXPECTED_RESULT_KEYS = frozenset({"disposition", "rationale", "candidate_source", "regression_source"})
 _DISPOSITIONS = frozenset({"propose", "needs_more_evidence", "no_change"})
@@ -258,12 +258,31 @@ def _extract_output_text(response: dict[str, Any]) -> str:
             or response.get("error") not in (None,)):
         _fail("invalid_response")
     output = response.get("output")
-    if not isinstance(output, list) or len(output) != 1:
+    if not isinstance(output, list):
         _fail("invalid_response")
-    message = output[0]
+    messages = []
+    for item in output:
+        if not isinstance(item, dict):
+            _fail("invalid_response")
+        if item.get("type") == "reasoning":
+            # Reasoning may accompany the final message for reasoning-capable
+            # models.  It is transport metadata only: never parse, return, or
+            # treat it as author output.
+            summary = item.get("summary", [])
+            if (item.get("status") not in (None, "completed") or not isinstance(summary, list)
+                    or any(not isinstance(part, dict) or part.get("type") != "summary_text"
+                           or not isinstance(part.get("text"), str) for part in summary)):
+                _fail("invalid_response")
+            continue
+        if item.get("type") != "message":
+            _fail("invalid_response")
+        messages.append(item)
+    if len(messages) != 1:
+        _fail("invalid_response")
+    message = messages[0]
     if not isinstance(message, dict) or message.get("type") != "message" or message.get("role") != "assistant":
         _fail("invalid_response")
-    if message.get("status") not in (None, "completed"):
+    if message.get("status") != "completed":
         _fail("invalid_response")
     content = message.get("content")
     if not isinstance(content, list) or len(content) != 1:

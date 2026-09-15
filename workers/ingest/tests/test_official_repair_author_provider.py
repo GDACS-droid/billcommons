@@ -72,7 +72,7 @@ def test_request_uses_fixed_structured_output_contract_and_keeps_source_inert(mo
     assert request.method == "POST"
     assert captured["kwargs"]["follow_redirects"] is False
     timeout = captured["kwargs"]["timeout"]
-    assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (5.0, 10.0, 10.0, 5.0)
+    assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (5.0, 60.0, 10.0, 5.0)
     assert body["model"] == "requested-model-2026"
     assert body["tools"] == []
     assert body["tool_choice"] == "none"
@@ -124,10 +124,6 @@ def test_non_proposal_requires_empty_sources(monkeypatch, disposition):
         "type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "no"}],
     }]),
     ("completed", [{"type": "function_call", "name": "unexpected", "arguments": "{}"}]),
-    ("completed", [
-        {"type": "reasoning", "summary": []},
-        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "{}"}]},
-    ]),
 ])
 def test_incomplete_refusal_and_tool_outputs_are_rejected_without_network(monkeypatch, status, output):
     calls = []
@@ -140,6 +136,47 @@ def test_incomplete_refusal_and_tool_outputs_are_rejected_without_network(monkey
     with pytest.raises(provider.AuthorProviderError, match="^invalid_response$"):
         _call()
     assert len(calls) == 1
+
+
+def test_completed_reasoning_item_is_ignored_before_one_completed_author_message(monkeypatch):
+    def handler(request):
+        return _response(output=[
+            {"type": "reasoning", "status": "completed", "summary": [{
+                "type": "summary_text", "text": "Private model reasoning not retained by this provider.",
+            }]},
+            {"type": "message", "role": "assistant", "status": "completed", "content": [{
+                "type": "output_text", "text": json.dumps({
+                    "disposition": "no_change",
+                    "rationale": "The current retained baseline is accepted.",
+                    "candidate_source": "",
+                    "regression_source": "",
+                }),
+            }]},
+        ])
+
+    _install_mock_client(monkeypatch, handler)
+    result = _call()
+    assert result["result"]["disposition"] == "no_change"
+    assert "Private model reasoning" not in repr(result)
+
+
+def test_malformed_reasoning_or_uncompleted_message_is_rejected(monkeypatch):
+    _install_mock_client(monkeypatch, lambda request: _response(output=[
+        {"type": "reasoning", "summary": "not-a-list"},
+        {"type": "message", "role": "assistant", "status": "completed", "content": [{
+            "type": "output_text", "text": "{}",
+        }]},
+    ]))
+    with pytest.raises(provider.AuthorProviderError, match="^invalid_response$"):
+        _call()
+
+    _install_mock_client(monkeypatch, lambda request: _response(output=[{
+        "type": "message", "role": "assistant", "status": "in_progress", "content": [{
+            "type": "output_text", "text": "{}",
+        }],
+    }]))
+    with pytest.raises(provider.AuthorProviderError, match="^invalid_response$"):
+        _call()
 
 
 @pytest.mark.parametrize("raw", [
