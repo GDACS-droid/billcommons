@@ -27,10 +27,13 @@ class _FakeDb:
     each, so the test states the WORLD (what the DB contains) rather than
     mirroring the check's own SQL."""
 
-    def __init__(self, *, last_text_at, texted_last_hour, claimable, queued, dead, backlog):
+    def __init__(
+        self, *, last_text_at, texted_last_hour, claimable, queued, dead, backlog, awaiting=0
+    ):
         self.values = {
             "max(updated_at)": last_text_at,
             "and updated_at > :cutoff": texted_last_hour,
+            "as awaiting_upstream": awaiting,
             "run_after <= :now": claimable,
             "status='queued'": queued,
             "status='dead'": dead,
@@ -45,6 +48,10 @@ class _FakeDb:
             "select exists",
             "max(updated_at)",
             "and updated_at > :cutoff",
+            # Before "run_after"/"status='queued'": the awaiting-upstream
+            # count also filters on queued status and would otherwise be
+            # answered with the wrong number.
+            "as awaiting_upstream",
             "run_after <= :now",
             "status='dead'",
             "status='queued'",
@@ -65,6 +72,7 @@ def _db(**kwargs):
         queued=500,
         dead=10,
         backlog=True,
+        awaiting=0,
     )
     defaults.update(kwargs)
     return _FakeDb(**defaults)
@@ -191,3 +199,50 @@ def test_naive_timestamp_from_the_database_is_handled():
     )
     assert health.healthy is True
     assert health.minutes_since_text == 1.0
+
+
+def test_queue_of_upstream_blocked_jobs_is_not_a_stall():
+    """2026-08-30, ~22 hours of Telegram alerts every 10 minutes.
+
+    The whole fetch_text queue was 61 Massachusetts dockets that MA has not
+    assigned bill numbers to yet. They retry on a 60/120/240/480s backoff, so
+    whether any were past `run_after` at the moment the 10-minute monitor
+    ticked was effectively a coin flip -- the verdict alternated
+    healthy/stalled every single run and the monitor alerted on each flip.
+    These jobs cannot produce text no matter how healthy the crawl is, so
+    they must not count as "work is available".
+    """
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(minutes=1337),
+            texted_last_hour=0,
+            claimable=0,
+            awaiting=61,
+            queued=61,
+            backlog=True,
+        ),
+        now=NOW,
+    )
+    assert health.healthy is True
+    assert health.awaiting_upstream == 61
+    assert "upstream" in health.reason
+    assert "top-up" not in health.reason
+
+
+def test_upstream_waiters_do_not_mask_a_real_stall():
+    """The 2026-08-30 fix must not buy quiet by going blind: real claimable
+    work that produces nothing is still the 2026-07-25 shape, whatever else
+    happens to be sitting in the queue behind it."""
+    health = check_crawl_health(
+        _db(
+            last_text_at=NOW - timedelta(minutes=90),
+            texted_last_hour=0,
+            claimable=1215,
+            awaiting=61,
+            queued=1276,
+            backlog=True,
+        ),
+        now=NOW,
+    )
+    assert health.healthy is False
+    assert "1,215" in health.reason

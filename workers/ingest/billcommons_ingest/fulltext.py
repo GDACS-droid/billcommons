@@ -163,6 +163,26 @@ STATUS_WORKER_ERROR = "worker_error"
 MA_DOCKET_NO_BILL_NUMBER_GRACE_DAYS = 180
 NO_FETCH_ATTEMPT_CHARGE_STATUSES = frozenset({STATUS_MA_DOCKET_NO_BILL_NUMBER})
 
+# Statuses where the document is waiting on an UPSTREAM event that no amount
+# of crawling can hurry along -- MA has not assigned the docket a bill number
+# yet. Such a job is legitimately claimable and legitimately produces no text,
+# so it is NOT evidence that the crawl is stalled. The liveness check
+# (healthcheck.py) excludes these from its "work is available" signal.
+#
+# Why this exists: on 2026-08-30 the fetch_text queue held 61 jobs, ALL of
+# them MA dockets on the 60/120/240/480s retry cycle. Depending on where the
+# 10-minute stall-monitor tick landed in that cycle, 0 or 1-2 of them were
+# past run_after, so the check alternated healthy/stalled every single run and
+# Telegram got an alert every 10 minutes for ~22 hours. An alert stream that
+# repeats gets muted, and a muted alert is worse than none.
+#
+# Kept separate from NO_FETCH_ATTEMPT_CHARGE_STATUSES (identical today)
+# because the two answer different questions: that set is about retry
+# ACCOUNTING (does this failure spend the document's budget), this one is
+# about LIVENESS (does this pending job imply the crawl should be producing).
+# A future status could easily be one and not the other.
+AWAITING_UPSTREAM_STATUSES = frozenset({STATUS_MA_DOCKET_NO_BILL_NUMBER})
+
 # Statuses that will NEVER change on a retry -- the document's URL/robots.txt/
 # content shape is a fixed fact about that source, not a transient condition.
 # enqueue_fulltext_jobs skips documents already marked with one of these so a
