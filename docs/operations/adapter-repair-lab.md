@@ -135,10 +135,13 @@ field matched for this archive, including ordering. Equal bill/event counts with
 different content do not match. This result is a regression observation, not
 proof of historical repair or general correctness. Different facts require an
 independent expected-fact oracle; a rejected current baseline is explicitly
-reported as requiring such an oracle. Authored regression tests remain inert
-and `not_run`, and every report sets `promotion_authorized: false`. The command
-exits zero only for `same_as_current_baseline`, one for other evaluation results,
-and two for rejected input evidence. Automated callers must inspect the complete
+reported as requiring such an oracle. Without `--run-regressions`, authored tests
+remain inert and `not_run`; every report sets `promotion_authorized: false`.
+The default command exits zero for `same_as_current_baseline`, one for other
+evaluation results, and two for rejected input evidence. With `--run-regressions`,
+zero additionally requires both regression invocations to return the expected
+observation; see “Authored regression observations” below for the contract and
+its limitations. Automated callers must inspect the complete
 JSON report, not classify host health by exit code alone. Missing, malformed or
 unexpected reports also stop scheduling. The compatibility status
 `isolation_unavailable` has the explicit detail
@@ -402,3 +405,56 @@ descriptors need separate handling. ABI 4 also lacks later signal and Unix
 socket scoping, which is why filesystem rules alone are insufficient here.
 See the [kernel Landlock documentation](https://docs.kernel.org/userspace-api/landlock.html)
 and [seccomp API documentation](https://man7.org/linux/man-pages/man2/seccomp.2.html).
+
+## Authored regression observations — September 15, 2026
+
+The local evaluator accepts `--run-regressions` to execute the authenticated
+`candidate-regression.py.txt` against the pinned baseline and candidate in
+separate sandbox invocations. The default remains inert for existing callers.
+The supported contract is a dependency-free function:
+
+```python
+def run_regression(parser, fixture, *, source_url, retrieved_at):
+    batch = parser.parse_ca_official_actions_zip(
+        fixture, source_url=source_url, retrieved_at=retrieved_at)
+    assert batch.scoped_bill_ids
+    # Assert independently justified expectations here; return None.
+```
+
+The archive is supplied as bytes. The function must raise on failure and return
+`None` otherwise; pytest discovery and repository imports are not supported.
+Imports are limited to standard-library modules already resident in the sandbox
+bootstrap; arbitrary standard-library imports can also fail under confinement.
+Both sources are encoded into a bounded program without host compilation or
+imports. The existing native sandbox loads them, with all existing filesystem,
+network, resource, process, and cleanup restrictions. Each module has a virtual
+`__file__`; source files under those names are not materialized, so parser
+import-time file witnesses may be unavailable. The parent binds the exact
+original sources and complete executed program through hashes instead.
+
+The report records the regression source digest, each executed program digest,
+fixture digest, bootstrap digest, and separate baseline/candidate outcomes.
+`returned_without_error` is an observation of untrusted output, **not a trusted
+pass**: either proposed code file can bypass assertions or forge that output.
+`trusted_correctness_proof` and `promotion_authorized` remain false. A difference
+between baseline and candidate outcomes does not establish that a real defect
+was repaired. Independently pinned source facts, representative corpus checks,
+and the promotion review are still required.
+
+Any sandbox host-stop status halts subsequent execution and retains its cleanup
+evidence. Input substitution or an oversized combined program is rejected before
+any child starts. With `--run-regressions`, the CLI returns nonzero if either
+regression invocation fails to return the expected observation, even when the
+archive comparison matches. CLI zero is still not promotion authorization.
+
+Local verification of this addition: the eight-file repair suite passed **162
+tests**, including real sandbox assertions, a baseline-fails/candidate-returns
+probe, denied host-file writes, source substitution, invalid code and return
+values, host-stop sequencing, forged observations, and CLI failure exits. The
+retained 275-bill / 7,094-event archive matched the same fact digest recorded
+above, and both authored count checks returned without error. Its evidence is
+`authored-regression-smoke-20260915/evaluation.json` under the local reliability
+release directory, report SHA-256
+`e2a47a2938c20d5e37a0cf8f53d6da4997ca82596eb04af408a3641733ded7b5`.
+This addition has not received a new canonical verify-ship verdict and is not
+deployed. Automatic patch authorship and worker promotion remain incomplete.

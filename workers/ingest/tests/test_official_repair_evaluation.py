@@ -16,7 +16,7 @@ from .test_official_repair_bundle import _archive, _failure_db
 from .test_official_repair_sandbox import isolated_supervisor_state as isolated_supervisor_state
 
 
-def _proposal(tmp_path, transform):
+def _proposal(tmp_path, transform, regression_text="raise RuntimeError('authored regression must remain inert')\n"):
     db, observation = _failure_db(raw=_archive())
     bundle = tmp_path / "bundle"
     baseline = build_repair_bundle(db, observation.id, bundle)
@@ -25,7 +25,7 @@ def _proposal(tmp_path, transform):
     candidate = tmp_path / "candidate.py"
     candidate.write_bytes(transform(original))
     regression = tmp_path / "regression.py"
-    regression.write_text("raise RuntimeError('authored regression must remain inert')\n")
+    regression.write_text(regression_text)
     output = tmp_path / "proposal"
     manifest = prepare_repair_proposal(bundle,
         expected_manifest_sha256=_manifest_sha256(baseline),

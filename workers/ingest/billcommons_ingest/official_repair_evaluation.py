@@ -23,6 +23,57 @@ from billcommons_ingest.official_repair_sandbox import (
 EVALUATION_VERSION = "official-repair-evaluation/1"
 _EVENT_KEYS = frozenset({"occurrence_id", "official_bill_id", "history_id", "action_date",
                          "description", "sequence", "updated_at", "source_url", "raw_fields"})
+_HOST_STOP = frozenset({"cleanup_pending", "runner_busy", "isolation_unavailable", "supervisor_failed"})
+
+
+def _regression_program(parser_source: bytes, regression_source: bytes) -> bytes:
+    """Encode two inert sources for loading only inside the existing sandbox."""
+    program = f'''import sys
+import types
+
+def parse_ca_official_actions_zip(fixture, *, source_url, retrieved_at):
+    parser = types.ModuleType("_regression_parser")
+    parser.__file__ = "candidate-parser.py"
+    sys.modules[parser.__name__] = parser
+    exec(compile({parser_source!r}, "candidate-parser.py", "exec"), parser.__dict__)
+    regression = types.ModuleType("_authored_regression")
+    regression.__file__ = "candidate-regression.py"
+    sys.modules[regression.__name__] = regression
+    exec(compile({regression_source!r}, "candidate-regression.py", "exec"), regression.__dict__)
+    result = regression.run_regression(parser, fixture, source_url=source_url, retrieved_at=retrieved_at)
+    if result is not None:
+        raise ValueError("run_regression must return None; raise on failure")
+    return types.SimpleNamespace(scoped_bill_ids=(), events_by_official_bill_id={{}})
+'''.encode("utf-8")
+    if len(program) > MAX_SOURCE_BYTES:
+        raise RepairBundleError("combined regression program exceeds sandbox source limit")
+    return program
+
+
+def _run_regressions(programs: dict[str, bytes], fixture: bytes, replay: dict,
+                     regression_digest: str) -> dict:
+    report = {"status": "observed", "source_sha256": regression_digest,
+              "contract": "run_regression/1", "trusted_correctness_proof": False}
+    for label, program in programs.items():
+        result = run_ca_parser(program, fixture, source_url=replay["source_url"],
+                               retrieved_at=replay["retrieved_at"])
+        entry = {"status": result.status, "program_sha256": result.source_sha256,
+                 "fixture_sha256": result.fixture_sha256,
+                 "bootstrap_sha256": result.bootstrap_sha256}
+        if result.status == "returned":
+            entry["status"] = ("returned_without_error" if result.payload == {"status": "parsed", "bills": []}
+                               else "invalid_output")
+        report[label] = entry
+        if result.status in _HOST_STOP:
+            report["status"] = result.status
+            if result.cleanup is not None:
+                entry["cleanup"] = result.cleanup
+            if result.status == "isolation_unavailable":
+                entry["status_detail"] = "bootstrap_failure_or_candidate_exit_78"
+            if label == "baseline":
+                report["candidate"] = {"status": "not_run"}
+            break
+    return report
 
 
 def _verified_bytes(path: Path, *, digest: str, maximum: int) -> bytes:
@@ -120,12 +171,14 @@ def _fact_evidence(payload: dict) -> dict:
             "facts_sha256": digest.hexdigest()}
 
 
-def evaluate_repair_proposal(proposal_dir: str | Path, *, expected_proposal_sha256: str) -> dict:
+def evaluate_repair_proposal(proposal_dir: str | Path, *, expected_proposal_sha256: str,
+                             run_regressions: bool = False) -> dict:
     """Compare one pinned proposal on its retained fixture; no promotion writes.
 
     Matching the current baseline is a regression observation, not proof that a
     historical failure is repaired. A differing result requires an independent
-    expected-fact oracle and review. Authored regression code remains inert.
+    expected-fact oracle and review. Opt-in authored regressions are untrusted
+    observations, including when they return without error.
     """
     root = Path(proposal_dir).absolute()
     proposal = validate_repair_proposal(root, expected_proposal_sha256=expected_proposal_sha256)
@@ -138,6 +191,14 @@ def evaluate_repair_proposal(proposal_dir: str | Path, *, expected_proposal_sha2
     fixture = _verified_bytes(root / "baseline" / FIXTURE_NAME,
                               digest=baseline["fixture"]["sha256"], maximum=MAX_FIXTURE_BYTES)
     replay = baseline["replay_input"]
+    programs = None
+    regression_digest = proposal["artifacts"]["candidate-regression.py.txt"]["sha256"]
+    if run_regressions:
+        regression = _verified_bytes(root / "candidate-regression.py.txt",
+                                     digest=regression_digest, maximum=MAX_SOURCE_BYTES)
+        # Validate both complete programs before starting any child process.
+        programs = {label: _regression_program(source, regression)
+                    for label, source in sources.items()}
     report = {
         "evaluation_version": EVALUATION_VERSION,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
@@ -182,7 +243,7 @@ def evaluate_repair_proposal(proposal_dir: str | Path, *, expected_proposal_sha2
         report[label] = entry
         if result.status == "isolation_unavailable":
             entry["status_detail"] = "bootstrap_failure_or_candidate_exit_78"
-        if result.status in {"cleanup_pending", "runner_busy", "isolation_unavailable", "supervisor_failed"}:
+        if result.status in _HOST_STOP:
             if result.cleanup is not None:
                 entry["cleanup"] = result.cleanup
             if label == "baseline":
@@ -202,6 +263,8 @@ def evaluate_repair_proposal(proposal_dir: str | Path, *, expected_proposal_sha2
     else:
         comparison = "different_from_current_baseline"
     report["comparison"] = comparison
+    if programs is not None:
+        report["regression_tests"] = _run_regressions(programs, fixture, replay, regression_digest)
     return report
 
 
@@ -209,15 +272,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("proposal_dir", type=Path)
     parser.add_argument("--proposal-sha256", required=True)
+    parser.add_argument("--run-regressions", action="store_true",
+                        help="Execute untrusted run_regression/1 observations in the sandbox")
     args = parser.parse_args()
     try:
         report = evaluate_repair_proposal(args.proposal_dir,
-                                          expected_proposal_sha256=args.proposal_sha256)
+                                          expected_proposal_sha256=args.proposal_sha256,
+                                          run_regressions=args.run_regressions)
     except (RepairBundleError, OSError, ValueError):
         print(json.dumps({"status": "evaluation_input_rejected"}))
         return 2
     print(json.dumps(report, sort_keys=True, allow_nan=False))
-    return 0 if report["comparison"] == "same_as_current_baseline" else 1
+    regressions_ok = not args.run_regressions or (
+        report["regression_tests"].get("status") == "observed"
+        and all(report["regression_tests"].get(label, {}).get("status") == "returned_without_error"
+                for label in ("baseline", "candidate")))
+    return 0 if report["comparison"] == "same_as_current_baseline" and regressions_ok else 1
 
 
 if __name__ == "__main__":
